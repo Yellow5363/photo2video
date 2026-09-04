@@ -12,6 +12,30 @@ fn main() {
         res.set("LegalCopyright", "Copyright © 2026 Yellow Huang");
         res.set("OriginalFilename", "photo2video.exe");
         res.set("InternalName", "photo2video");
+        // 相依 Common Controls 6：確認框才走得到 TaskDialog，按鈕上才能寫
+        // 「清除」「取消」這種真正的動作名稱，而不是系統給的「是／否」
+        // （見 rfd 的 common-controls-v6 功能）。
+        //
+        // 這份清單**故意不寫 dpiAware**：視窗的 DPI 感知是 winit 在啟動時
+        // 自己呼叫 API 設定的，清單裡一旦寫死就會蓋掉它
+        res.set_manifest(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>
+"#,
+        );
         res.compile().expect("嵌入應用程式圖示失敗");
     }
     println!("cargo:rerun-if-changed=assets/icon.ico");

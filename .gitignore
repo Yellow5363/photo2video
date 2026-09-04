@@ -1,2 +1,6 @@
 /target
 /dist
+# 真實測試照片：單張就 6~25MB，遠大於 repo 裡其他所有檔案（歷史上最大的
+# 是 main.rs 的 0.3MB）。進了版控就永久留在歷史裡拖慢每一次 clone。
+# test_images 原有的 *.png 是 3.6KB 的合成測試圖，那些照舊追蹤
+/test_images/*.jpg

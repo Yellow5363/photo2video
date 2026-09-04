@@ -2,20 +2,30 @@
 name = "photo2video"
 version = "0.14.0"
 edition = "2021"
-# 下面兩行會被 build.rs 經 winresource 讀到（未明寫時的 CompanyName、
-# FileDescription 來源）。空白的公司名稱是防毒啟發式掃描的加權指標之一
+# 下面三行會被 build.rs 經 winresource 寫進 exe 的版本資訊（CompanyName、
+# FileDescription）。空白的公司名稱是防毒啟發式掃描的加權指標之一
 authors = ["Yellow Huang"]
 description = "photo2video 照片轉影片、去煙霧與夜空後製工具"
 
 [dependencies]
 eframe = "0.31"
 egui = "0.31"
-rfd = "0.15"
+# common-controls-v6：讓確認框的按鈕可以自己命名（「清除」「取消」而不是
+# 「是」「否」），需要 Windows 的 TaskDialog；靠 build.rs 嵌的資訊清單啟用
+rfd = { version = "0.15", features = ["common-controls-v6"] }
+raw-window-handle = "0.6"
 ffmpeg-sidecar = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp", "tiff"] }
+ab_glyph = "0.2"
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
+# 換掉系統預設的記憶體配置器：去煙霧一格要來回配置好幾百 MB 的暫存平面，
+# 影片模組又是幾十條執行緒同時在配。Windows 的預設堆積把大區塊直接丟給
+# VirtualAlloc，每一塊都要進核心、每一頁都要歸零，多執行緒下整批卡在同一把
+# 鎖上——實測 32 條執行緒的效率只剩 16%。mimalloc 各執行緒自己留著大區塊重用
+mimalloc = { version = "0.1", default-features = false }
 
 [build-dependencies]
 winresource = "0.1"

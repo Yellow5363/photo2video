@@ -1,9 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// 見 Cargo.toml 對 mimalloc 的說明：去煙霧是「大量大區塊暫存」的工作型態，
+// 系統預設的配置器在多執行緒下會成為瓶頸
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -16,8 +21,25 @@ use ffmpeg_sidecar::event::FfmpegEvent;
 mod dehaze;
 use dehaze::SmokeParams;
 
+mod edit;
+use edit::{Finish, TextItem};
+
+mod enhance;
+
+mod movie;
+use movie::{MovieMsg, VideoInfo};
+
+mod stack;
+use stack::BlendMode;
+
+mod track;
+
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff"];
 const AUDIO_EXTS: &[&str] = &["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "wma"];
+/// 影片去煙霧收得下的影片副檔名（都是 ffmpeg 讀得動的常見容器）
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mov", "mkv", "avi", "m4v", "mts", "m2ts", "wmv", "webm", "mpg", "mpeg",
+];
 
 /// 轉場/動態效果啟用時的輸出影格率（純幻燈片模式則維持照片張數 = 影格數）
 const OUT_FPS: u32 = 30;
@@ -34,14 +56,110 @@ mod theme {
     pub const CARD: Color32 = Color32::from_rgb(0x25, 0x27, 0x2D); // 卡片、按鈕
     pub const CARD_HOVER: Color32 = Color32::from_rgb(0x2E, 0x30, 0x38);
     pub const BORDER: Color32 = Color32::from_rgb(0x32, 0x34, 0x3C);
+    /// 兩欄之間那種「獨立畫在大片深色背景上」的分隔線。
+    /// BORDER 是貼著元件的邊框，靠元件本身的底色襯著才看得出來；
+    /// 長線孤零零畫在背景上用 BORDER 幾乎看不見，要亮一階
+    /// （這個值本來就在配色裡：滑鼠指到元件時的邊框色）
+    pub const DIVIDER: Color32 = Color32::from_rgb(0x45, 0x48, 0x52);
     pub const TEXT: Color32 = Color32::from_rgb(0xE9, 0xEA, 0xEE);
     pub const TEXT_WEAK: Color32 = Color32::from_rgb(0x9A, 0x9C, 0xA8);
     pub const ACCENT: Color32 = Color32::from_rgb(0x5B, 0x8C, 0xFF);
     pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x74, 0x9D, 0xFF);
     pub const ACCENT_ACTIVE: Color32 = Color32::from_rgb(0x48, 0x76, 0xE6);
     pub const SUCCESS: Color32 = Color32::from_rgb(0x3D, 0xBE, 0x7B);
+    /// 清除筆刷的筆跡與游標圈。夜空照片上藍色不夠跳，用淡粉紅最看得清楚
+    pub const WIPE: Color32 = Color32::from_rgb(0xFF, 0xA6, 0xC8);
+    /// 主體追蹤的框。裁切框是白的、文字選取框是藍的，追蹤用橘色才不會混淆
+    pub const TRACK: Color32 = Color32::from_rgb(0xFF, 0x8A, 0x3D);
     pub const ERROR: Color32 = Color32::from_rgb(0xE5, 0x60, 0x5A);
     pub const PREVIEW_BG: Color32 = Color32::from_rgb(0x0D, 0x0E, 0x10);
+}
+
+/// 主畫面右上角的功能模組（比照 Lightroom 的「圖庫｜編輯相片｜地圖…」）。
+///
+/// 要再加一個功能時只要動三個地方，其餘版面不必碰：
+/// 1. 這裡加一個 variant，並補進 [`Module::ALL`]（順序＝模組列由左到右的順序）
+/// 2. [`Module::label`] / [`Module::icon`] / [`Module::hint`] 各補一條分支
+/// 3. [`App::ui_module_body`] 加一條分支，畫這個模組自己的面板
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Module {
+    /// 照片轉影片（本程式最早、也是主要的功能）
+    Video,
+    /// 去煙霧（把煙火照片裡的煙霧散掉，只留線條）
+    Dehaze,
+    /// 煙火疊圖（把好幾張煙火疊成一張「一次放完」的照片）
+    Stack,
+    /// 影片去煙霧（把整支影片逐格套上去煙霧，輸出成新影片）
+    Movie,
+    /// 優化影像（自動判斷該怎麼調色與強化主體，整批處理）
+    Enhance,
+}
+
+impl Module {
+    /// 模組列的顯示順序
+    const ALL: [Module; 5] = [
+        Module::Video,
+        Module::Dehaze,
+        Module::Stack,
+        Module::Movie,
+        Module::Enhance,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Module::Video => "照片轉影片",
+            Module::Dehaze => "去煙霧",
+            Module::Stack => "煙火疊圖",
+            Module::Movie => "影片去煙霧",
+            Module::Enhance => "優化影像",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Module::Video => "🎬",
+            Module::Dehaze => "💨",
+            Module::Stack => "🎆",
+            Module::Movie => "🎥",
+            Module::Enhance => "✨",
+        }
+    }
+
+    /// 滑鼠停在模組名稱上時的一句話說明
+    fn hint(self) -> &'static str {
+        match self {
+            Module::Video => "把一疊照片排成影片：調色、加文字、配背景音樂後輸出 MP4",
+            Module::Dehaze => "去掉煙火照片裡的煙霧、保留煙火線條，處理後另存新檔",
+            Module::Stack => "把多張煙火用加亮／濾色疊成一張，可調色後存檔",
+            Module::Movie => "把整支影片逐格去掉煙霧，輸出成一支新的 MP4（聲音原樣保留）",
+            Module::Enhance => {
+                "整批照片自動調色並強化主體：層次、光影、通透度一次調好，處理後另存新檔"
+            }
+        }
+    }
+}
+
+/// 功能表列點下去要做的事。選單的 closure 借著 `self`，開檔案／訊息對話框
+/// 會擋住整個 UI 執行緒，所以先記下動作、畫完選單再執行
+enum MenuAction {
+    NewProject,
+    OpenProject,
+    OpenRecent(PathBuf),
+    SaveProject,
+    SaveProjectAs,
+    AddFolder,
+    AddPhotos,
+    ClearPhotos,
+    ResetAdjustments,
+    ClearDehaze,
+    ClearStack,
+    ClearMovie,
+    ClearEnhance,
+    Switch(Module),
+    CheckUpdate,
+    About,
+    OpenUrl(String),
+    Quit,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -121,6 +239,275 @@ impl Resolution {
     ];
 }
 
+/// 裁切與旋轉。順序固定是**先轉再裁**：照片先轉正（90° 的整圈 `quarter`
+/// ＋拉直用的細角度 `angle`），轉完會得到一張比較大的「旋轉後畫布」
+/// （外接框，四角空的地方補黑），`x0`/`y0`/`x1`/`y1` 就是在**那張畫布上**
+/// 要留下來的那一塊，`x0`/`y0` 是左上角、`x1`/`y1` 是右下角，
+/// 整張未裁切＝(0, 0, 1, 1)。
+///
+/// 存相對座標而不是像素，理由與遮色片相同：預覽是縮圖、輸出是原尺寸，
+/// 同一組數字要能同時套在兩邊。ffmpeg 那邊也一樣（見 [`Crop::filter`]），
+/// 用 `iw`/`ih` 的比例寫，套在原圖或縮圖上切到的都是同一塊
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Crop {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    /// 拉直角度（度，順時針為正）。只負責小角度的水平校正，範圍 ±45；
+    /// 要轉大角度用 [`Crop::quarter`]
+    angle: f32,
+    /// 順時針轉幾個 90°（0~3）。整圈的旋轉不會有取樣損失，
+    /// 與拉直分開存才能各自用最好的作法（見 [`edit::apply_rotate`]）
+    quarter: u8,
+}
+
+impl Default for Crop {
+    fn default() -> Self {
+        Self { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0, angle: 0.0, quarter: 0 }
+    }
+}
+
+/// 裁切框小到這個比例以下就不讓再拖了（免得拖成一條線或 0 像素）
+const CROP_MIN: f32 = 0.05;
+
+/// 拉直角度的上下限（度）。再大就該用 90° 整圈轉了
+const CROP_MAX_ANGLE: f32 = 45.0;
+
+impl Crop {
+    /// 旋轉＋裁切串成一段 ffmpeg 濾鏡（含結尾逗號，都沒有就是空字串）。
+    /// 順序固定「先轉再裁」，與 CPU 那條路徑一致
+    fn vf_prefix(&self) -> String {
+        let mut s = String::new();
+        if let Some(r) = self.rotate_filter() {
+            s.push_str(&r);
+            s.push(',');
+        }
+        if let Some(c) = self.filter() {
+            s.push_str(&c);
+            s.push(',');
+        }
+        s
+    }
+
+    /// 完全沒動過（四邊都貼著畫布、也沒轉）。用容差判斷：拖回去很難剛好
+    /// 回到 0 與 1，差幾個 10⁻⁴ 卻要為它跑一次裁切濾鏡並不划算
+    fn is_full(&self) -> bool {
+        const EPS: f32 = 5e-4;
+        !self.has_rotation()
+            && self.x0 <= EPS
+            && self.y0 <= EPS
+            && self.x1 >= 1.0 - EPS
+            && self.y1 >= 1.0 - EPS
+    }
+
+    /// 有沒有轉過（整圈或拉直都算）
+    fn has_rotation(&self) -> bool {
+        self.quarter % 4 != 0 || self.angle.abs() > 1e-3
+    }
+
+    /// 總共要轉幾度（順時針）
+    fn total_deg(&self) -> f32 {
+        (self.quarter % 4) as f32 * 90.0 + self.angle
+    }
+
+    /// 夾回合法範圍：座標 0~1、左上在右下的左上、留住最小尺寸，
+    /// 角度與圈數也各自夾好。專案檔可能被手改出超界值，
+    /// 直接拿去組濾鏡會產生不合法的參數
+    fn clamped(self) -> Self {
+        let (x0, x1) = (self.x0.min(self.x1), self.x0.max(self.x1));
+        let (y0, y1) = (self.y0.min(self.y1), self.y0.max(self.y1));
+        let x0 = x0.clamp(0.0, 1.0 - CROP_MIN);
+        let y0 = y0.clamp(0.0, 1.0 - CROP_MIN);
+        Self {
+            x0,
+            y0,
+            x1: x1.clamp(x0 + CROP_MIN, 1.0),
+            y1: y1.clamp(y0 + CROP_MIN, 1.0),
+            angle: if self.angle.is_finite() {
+                self.angle.clamp(-CROP_MAX_ANGLE, CROP_MAX_ANGLE)
+            } else {
+                0.0
+            },
+            quarter: self.quarter % 4,
+        }
+    }
+
+    fn w(&self) -> f32 {
+        self.x1 - self.x0
+    }
+
+    fn h(&self) -> f32 {
+        self.y1 - self.y0
+    }
+
+    /// `w`×`h` 的照片轉完之後，外接框有多大（也就是「旋轉後畫布」的尺寸）。
+    /// 裁切框的相對座標是對著它算的
+    fn canvas(&self, w: f32, h: f32) -> (f32, f32) {
+        let (w, h) = (w.max(1.0), h.max(1.0));
+        if !self.has_rotation() {
+            return (w, h);
+        }
+        let a = self.total_deg().to_radians();
+        let (s, c) = (a.sin().abs(), a.cos().abs());
+        ((w * c + h * s).max(1.0), (w * s + h * c).max(1.0))
+    }
+
+    /// 旋轉的 ffmpeg 濾鏡（要接在 crop 之前）；沒轉就回 None。
+    ///
+    /// 90° 的整圈用 transpose（純搬像素，不會糊），細角度才用 rotate；
+    /// rotate 把畫布撐成外接框（`rotw`/`roth`），四角補黑
+    fn rotate_filter(&self) -> Option<String> {
+        let c = self.clamped();
+        if !c.has_rotation() {
+            return None;
+        }
+        let mut f: Vec<String> = Vec::new();
+        // transpose=1 是順時針 90°，轉幾圈就串幾次
+        for _ in 0..c.quarter {
+            f.push("transpose=1".into());
+        }
+        if c.angle.abs() > 1e-3 {
+            let rad = c.angle.to_radians();
+            f.push(format!(
+                "rotate={rad:.6}:ow=rotw({rad:.6}):oh=roth({rad:.6}):c=black:bilinear=1"
+            ));
+        }
+        Some(f.join(","))
+    }
+
+    /// ffmpeg 的 crop 濾鏡；沒裁到東西就回 None。
+    /// 一律用 `iw`/`ih` 的比例寫——這裡的 `iw`/`ih` 已經是旋轉後的畫布
+    /// （crop 接在 rotate 後面），套在原圖或預覽縮圖上切到的都是同一塊
+    fn filter(&self) -> Option<String> {
+        let c = self.clamped();
+        if c.x0 <= 5e-4 && c.y0 <= 5e-4 && c.x1 >= 1.0 - 5e-4 && c.y1 >= 1.0 - 5e-4 {
+            return None;
+        }
+        Some(format!(
+            "crop=iw*{:.6}:ih*{:.6}:iw*{:.6}:ih*{:.6}",
+            c.w(),
+            c.h(),
+            c.x0,
+            c.y0
+        ))
+    }
+
+    /// 換算成像素範圍 (x, y, w, h)，供 CPU 版裁切用（`iw`/`ih` 是**旋轉後**
+    /// 那張的尺寸）。至少留 1×1，四捨五入後也不會超出影像
+    fn pixels(&self, iw: u32, ih: u32) -> (u32, u32, u32, u32) {
+        let c = self.clamped();
+        let x = ((c.x0 * iw as f32).round() as u32).min(iw.saturating_sub(1));
+        let y = ((c.y0 * ih as f32).round() as u32).min(ih.saturating_sub(1));
+        let w = ((c.w() * iw as f32).round() as u32).clamp(1, iw - x);
+        let h = ((c.h() * ih as f32).round() as u32).clamp(1, ih - y);
+        (x, y, w, h)
+    }
+
+    /// 裁切框有沒有整個落在「轉進來的那張照片」裡（也就是不會切到四角補的黑）。
+    /// `w`×`h` 是原始照片的尺寸
+    fn inside_photo(&self, w: f32, h: f32) -> bool {
+        if !self.has_rotation() {
+            return true;
+        }
+        let (cw, ch) = self.canvas(w, h);
+        let a = -self.total_deg().to_radians();
+        let (sin, cos) = a.sin_cos();
+        let c = self.clamped();
+        // 四個角轉回原圖座標系，看有沒有超出原圖的範圍
+        [(c.x0, c.y0), (c.x1, c.y0), (c.x1, c.y1), (c.x0, c.y1)]
+            .iter()
+            .all(|&(u, v)| {
+                let (px, py) = (u * cw - cw / 2.0, v * ch - ch / 2.0);
+                let (rx, ry) = (px * cos - py * sin, px * sin + py * cos);
+                rx.abs() <= w / 2.0 + 0.5 && ry.abs() <= h / 2.0 + 0.5
+            })
+    }
+
+    /// 把裁切框縮到剛好塞進轉後的照片裡（維持中心與長寬比），避免切到四角的黑。
+    /// 用二分逼近而不是解析解：任意長寬比、任意角度都適用，寫起來也不會錯
+    fn shrunk_into_photo(self, w: f32, h: f32) -> Self {
+        if self.inside_photo(w, h) {
+            return self.clamped();
+        }
+        let c = self.clamped();
+        let (cx, cy) = ((c.x0 + c.x1) / 2.0, (c.y0 + c.y1) / 2.0);
+        let (bw, bh) = (c.w(), c.h());
+        let scaled = |k: f32| Crop {
+            x0: cx - bw * k / 2.0,
+            y0: cy - bh * k / 2.0,
+            x1: cx + bw * k / 2.0,
+            y1: cy + bh * k / 2.0,
+            ..c
+        };
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..24 {
+            let mid = (lo + hi) / 2.0;
+            if scaled(mid).inside_photo(w, h) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        // 留一點餘量，浮點誤差才不會在邊緣露出一條黑線
+        scaled(lo * 0.999).clamped()
+    }
+}
+
+/// 裁切要固定成哪個長寬比
+#[derive(Clone, Copy, PartialEq)]
+enum CropAspect {
+    /// 自由：四角各拖各的
+    Free,
+    /// 跟原圖同比例
+    Original,
+    /// 固定比例（寬:高）
+    Ratio(u32, u32),
+}
+
+impl CropAspect {
+    /// 選單順序
+    const PRESETS: [CropAspect; 7] = [
+        CropAspect::Free,
+        CropAspect::Original,
+        CropAspect::Ratio(1, 1),
+        CropAspect::Ratio(4, 3),
+        CropAspect::Ratio(3, 2),
+        CropAspect::Ratio(16, 9),
+        CropAspect::Ratio(9, 16),
+    ];
+
+    fn label(self) -> String {
+        match self {
+            CropAspect::Free => "自由".into(),
+            CropAspect::Original => "原圖".into(),
+            CropAspect::Ratio(a, b) => format!("{a}:{b}"),
+        }
+    }
+
+    /// 要維持的「寬 ÷ 高」（像素）；自由裁切沒有限制。
+    /// `src` 是原圖的像素尺寸（原圖比例要靠它算）
+    fn ratio(self, src: Option<(u32, u32)>) -> Option<f32> {
+        match self {
+            CropAspect::Free => None,
+            CropAspect::Original => {
+                let (w, h) = src?;
+                (w > 0 && h > 0).then(|| w as f32 / h as f32)
+            }
+            CropAspect::Ratio(a, b) => (b > 0).then(|| a as f32 / b as f32),
+        }
+    }
+
+    /// 直橫對調（16:9 ⇄ 9:16）；自由與原圖沒有方向可轉
+    fn flipped(self) -> Self {
+        match self {
+            CropAspect::Ratio(a, b) => CropAspect::Ratio(b, a),
+            other => other,
+        }
+    }
+}
+
 /// 調色參數，全部以 -100 ~ +100 表示，0 為不調整
 #[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -134,17 +521,41 @@ struct Adjustments {
     whites: i32,     // 白色
     blacks: i32,     // 黑色
     clarity: i32,    // 清晰度
+    dehaze: i32,     // 去朦朧（+ 減掉薄霧 / − 加上薄霧）
     vibrance: i32,   // 鮮豔度
     saturation: i32, // 飽和度
+    /// 裁切框。與十二條滑桿放在一起是刻意的：它跟著調色一起被記進專案、
+    /// 一起做個別照片覆寫、一起被「清除所有修改內容」歸零。
+    /// 但**不在** [`Adjustments::values`] 裡——那組專指那十二條滑桿
+    crop: Crop,
 }
+
+/// 去朦朧拉到底時要減掉（或加上）多厚的一層白幕。
+/// 影片模組走 ffmpeg 的 colorlevels、去煙霧模組走 CPU（見 [`edit::apply_grade`]），
+/// 兩邊共用這個常數，同一個數字才會是同一種效果
+const DEHAZE_MAX_VEIL: f64 = 0.22;
 
 impl Adjustments {
     fn is_neutral(&self) -> bool {
         *self == Self::default()
     }
 
+    /// 只留調色、把裁切歸零的一份。CPU 那兩個模組的預覽貼圖與裁切無關
+    /// （裁切在預覽是「只給看某一塊」、在成品是最後切下去），拿這一份去比對
+    /// 「要不要重算」才不會拖一下裁切框就整張重跑一次調色
+    fn grade_only(self) -> Self {
+        Self { crop: Crop::default(), ..self }
+    }
+
+    /// 那十二條滑桿有沒有動過（**不看裁切**）。裁切不走調色那條管線
+    /// （ffmpeg 是獨立的 crop 濾鏡、CPU 版是 [`edit::apply_crop`]），
+    /// 只設了裁切時不該白跑一趟調色運算
+    fn grade_is_neutral(&self) -> bool {
+        self.values() == Self::default().values()
+    }
+
     /// 所有參數的值（固定順序，與 values_mut 對應）
-    fn values(&self) -> [i32; 11] {
+    fn values(&self) -> [i32; 12] {
         [
             self.temp,
             self.tint,
@@ -155,12 +566,13 @@ impl Adjustments {
             self.whites,
             self.blacks,
             self.clarity,
+            self.dehaze,
             self.vibrance,
             self.saturation,
         ]
     }
 
-    fn values_mut(&mut self) -> [&mut i32; 11] {
+    fn values_mut(&mut self) -> [&mut i32; 12] {
         [
             &mut self.temp,
             &mut self.tint,
@@ -171,6 +583,7 @@ impl Adjustments {
             &mut self.whites,
             &mut self.blacks,
             &mut self.clarity,
+            &mut self.dehaze,
             &mut self.vibrance,
             &mut self.saturation,
         ]
@@ -182,6 +595,7 @@ impl Adjustments {
         for v in self.values_mut() {
             *v = (*v).clamp(-100, 100);
         }
+        self.crop = self.crop.clamped();
         self
     }
 
@@ -243,6 +657,19 @@ impl Adjustments {
                 .join(" ");
             filters.push(format!("curves=all='{pts_str}'"));
         }
+        if self.dehaze != 0 {
+            // 薄霧就是一層加在畫面上的白幕：黑點被墊高、對比與彩度一起被壓平。
+            // 正值把那層幕減掉再把範圍拉回滿格，負值反過來加一層上去——
+            // 都是同一個仿射變換，colorlevels 做的正好就是這件事。
+            // 三個通道一起做，通道之間的差距會跟著被放大，所以彩度也會回來，
+            // 不必另外偷加飽和度
+            let k = self.dehaze.unsigned_abs() as f64 / 100.0 * DEHAZE_MAX_VEIL;
+            if self.dehaze > 0 {
+                filters.push(format!("colorlevels=rimin={k:.4}:gimin={k:.4}:bimin={k:.4}"));
+            } else {
+                filters.push(format!("colorlevels=romin={k:.4}:gomin={k:.4}:bomin={k:.4}"));
+            }
+        }
         if self.vibrance != 0 {
             let v = self.vibrance as f64 / 100.0 * 2.0;
             filters.push(format!("vibrance=intensity={v:.4}"));
@@ -256,7 +683,9 @@ impl Adjustments {
                 "unsharp=luma_msize_x={msize}:luma_msize_y={msize}:luma_amount={amount:.4}"
             ));
         }
-        Some(filters.join(","))
+        // 只動了裁切（裁切不在這條鏈裡，見 Crop::filter）時這裡是空的；
+        // 回 Some("") 會讓呼叫端串出「scale=…,,pad=…」這種不合法的濾鏡
+        (!filters.is_empty()).then(|| filters.join(","))
     }
 }
 
@@ -361,8 +790,14 @@ struct MusicJob {
 struct OutputFx {
     transition: Transition,
     ken_burns: bool,
+    /// 影片結尾把畫面漸漸壓到全黑（見 [`FADE_OUT_SECS`]）
+    fade_out: bool,
     music: Option<MusicJob>,
 }
+
+/// 結尾淡出要幾秒。太短像是被切掉、太長會吃掉最後幾張照片的畫面；
+/// 影片本身很短時再依比例縮短（最多佔全片的三分之一）
+const FADE_OUT_SECS: f64 = 1.0;
 
 /// 專案檔副檔名（內容為 JSON）
 const PROJECT_EXT: &str = "p2v";
@@ -397,9 +832,24 @@ struct ProjectFile {
     sub_outline_w: i32,
     sub_outline_color: [u8; 4],
     sub_boxed: bool,
+    /// 每張照片的主體框：(照片, [x0, y0, x1, y1] 相對座標, 來源, 把握程度)。
+    /// 來源 0＝手動、1＝自動框選、2＝追蹤（見 [`BoxSrc`]）。
+    ///
+    /// 整份存下來，開檔後才接得下去檢查與修改；鏡頭切出來的裁切框則另外存在
+    /// `adj_overrides` 裡（那是實際會影響輸出的東西）
+    track_boxes: Vec<(PathBuf, [f32; 4], u8, f32)>,
+    /// 追蹤動到每張照片之前，它原本的個別調色（None＝原本沒有覆寫）。
+    /// 有它「↺ 清除追蹤」才還原得回去——`adj_overrides` 存的是**套了鏡頭
+    /// 之後**的樣子，光看它認不出原本的構圖
+    track_prev: Vec<(PathBuf, Option<Adjustments>)>,
+    /// 主體追蹤的鏡頭範圍（主體框的幾倍）與平滑度（0~100）
+    track_zoom: f32,
+    track_smooth: i32,
     /// 轉場（none/fade_black）
     transition: String,
     ken_burns: bool,
+    /// 影片結尾淡出（畫面漸黑）
+    fade_out: bool,
     music_path: Option<PathBuf>,
     music_volume: i32,
     music_fade: bool,
@@ -423,8 +873,13 @@ impl Default for ProjectFile {
             sub_outline_w: style.outline_w,
             sub_outline_color: style.outline_color.to_array(),
             sub_boxed: style.boxed,
+            track_boxes: Vec::new(),
+            track_prev: Vec::new(),
+            track_zoom: 3.0,
+            track_smooth: 20,
             transition: "none".into(),
             ken_burns: false,
+            fade_out: true,
             music_path: None,
             music_volume: 100,
             music_fade: true,
@@ -478,16 +933,41 @@ fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("photo2video_{}_{name}", std::process::id()))
 }
 
-/// 設定檔路徑：%APPDATA%\photo2video\config.json
-fn config_path() -> PathBuf {
+/// 設定與紀錄的存放資料夾，各平台用各自的慣例位置：
+/// Windows 是 %APPDATA%\photo2video、macOS 是 ~/Library/Application Support/
+/// photo2video、其他是 $XDG_CONFIG_HOME（或 ~/.config）/photo2video。
+/// 取不到才退回暫存資料夾——設定會隨系統清暫存消失，但不至於讀寫失敗
+#[cfg(windows)]
+fn config_dir() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("photo2video")
-        .join("config.json")
 }
 
-/// 閃退紀錄路徑：%APPDATA%\photo2video\crash.log
+#[cfg(target_os = "macos")]
+fn config_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("photo2video")
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("photo2video")
+}
+
+/// 設定檔路徑（見 config_dir）
+fn config_path() -> PathBuf {
+    config_dir().join("config.json")
+}
+
+/// 閃退紀錄路徑，與設定檔同一資料夾
 fn crash_log_path() -> PathBuf {
     config_path().with_file_name("crash.log")
 }
@@ -523,14 +1003,385 @@ fn install_panic_hook() {
     }));
 }
 
-/// 讀出上次留下的閃退紀錄並刪除檔案（讀過就清掉，避免每次啟動重複提示）
+/// 歷次問題紀錄的存放檔（與設定檔同一資料夾）
+fn history_log_path() -> PathBuf {
+    config_path().with_file_name("problem-history.log")
+}
+
+/// 歷史紀錄留到這麼大就把前面的丟掉。一次 panic 連 backtrace 大約幾 KB，
+/// 這個大小夠留最近十幾次；再多也只是留著看不到的舊事
+const HISTORY_MAX: usize = 256 * 1024;
+
+/// 把這一次的紀錄**接到歷史檔後面**。
+///
+/// 讀過就刪掉的原始檔只夠「這次開機提醒一下」——使用者按了 × 或當下沒空看，
+/// 內容就永遠找不回來了，事後想追也無從追起。留一份歷史才查得到
+fn archive_report(kind: &str, text: &str) {
+    let path = history_log_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entry = format!("\n===== {kind}（unix {stamp}）=====\n{text}\n");
+    let mut all = std::fs::read_to_string(&path).unwrap_or_default();
+    all.push_str(&entry);
+    // 超過上限就從前面砍，砍在分隔線上才不會留半截紀錄
+    if all.len() > HISTORY_MAX {
+        let cut = all.len() - HISTORY_MAX;
+        let keep = all[cut..].find("\n===== ").map(|i| cut + i).unwrap_or(cut);
+        all = all[keep..].to_string();
+    }
+    let _ = std::fs::write(&path, all);
+}
+
+/// 讀出上次留下的閃退紀錄並刪除檔案（讀過就清掉，避免每次啟動重複提示）。
+/// 刪之前先抄一份進歷史檔（見 [`archive_report`]）
 fn take_crash_report() -> Option<String> {
     let path = crash_log_path();
     let report = std::fs::read_to_string(&path)
         .ok()
         .filter(|s| !s.trim().is_empty())?;
+    archive_report("閃退", &report);
     let _ = std::fs::remove_file(&path);
     Some(report)
+}
+
+/// 上次執行的問題紀錄：閃退優先（比較嚴重），沒有才看停止回應的紀錄
+fn take_last_run_report() -> Option<LastRunReport> {
+    if let Some(text) = take_crash_report() {
+        // 停止回應後被強制結束、又剛好留下 panic 紀錄時，兩份都清掉，
+        // 否則下次啟動又會再報一次已經看過的舊事
+        let _ = take_hang_report();
+        return Some(LastRunReport { hang: false, text });
+    }
+    take_hang_report().map(|text| LastRunReport { hang: true, text })
+}
+
+/// 上次執行留下的問題紀錄：閃退（panic）或畫面停止回應（看門狗）
+struct LastRunReport {
+    /// true＝畫面停止回應，false＝閃退
+    hang: bool,
+    text: String,
+}
+
+/// 畫面停止回應的紀錄路徑，與設定檔同一資料夾
+fn hang_log_path() -> PathBuf {
+    config_path().with_file_name("hang.log")
+}
+
+/// 讀出上次留下的停止回應紀錄並刪除檔案（比照 take_crash_report）
+fn take_hang_report() -> Option<String> {
+    let path = hang_log_path();
+    let report = std::fs::read_to_string(&path)
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    archive_report("停止回應", &report);
+    let _ = std::fs::remove_file(&path);
+    Some(report)
+}
+
+// ---------- 系統對話框（檔案選擇／訊息確認）----------
+
+/// 建立系統檔案對話框，並指定「擁有者視窗」。
+///
+/// rfd 預設不設擁有者（傳 NULL HWND），Windows 於是不會把對話框壓在程式
+/// 視窗之上、也不會停用底下的視窗：使用者一點程式視窗，對話框
+/// 就沉到後面看不見了。而叫出對話框的是 UI 執行緒，它正停在這裡等回應，
+/// 視窗不會重畫、按 ✕ 也沒反應——看起來就是整個程式當掉又關不掉。
+/// 指定擁有者後對話框永遠在該視窗之上，點到被停用的視窗還會閃動提示
+fn file_dialog() -> rfd::FileDialog {
+    ui_phase(PHASE_FILE_DIALOG);
+    let d = rfd::FileDialog::new();
+    #[cfg(windows)]
+    if let Some(owner) = dialog_owner() {
+        return d.set_parent(&owner);
+    }
+    d
+}
+
+/// 建立系統訊息對話框（擁有者處理同 [`file_dialog`]）
+fn message_dialog() -> rfd::MessageDialog {
+    ui_phase(PHASE_MSG_DIALOG);
+    let d = rfd::MessageDialog::new();
+    #[cfg(windows)]
+    if let Some(owner) = dialog_owner() {
+        return d.set_parent(&owner);
+    }
+    d
+}
+
+/// 三選一確認框的答案（見 [`ask3`]）
+#[derive(PartialEq, Eq)]
+enum Ask3 {
+    /// 第一顆
+    First,
+    /// 第二顆
+    Second,
+    /// 第三顆，或直接把視窗關掉
+    Cancel,
+}
+
+/// 兩顆按鈕的確認框。**按鈕上寫的是真的要做的事**（「清除」「覆蓋」「取消」），
+/// 不是系統預設的「是／否」——光看「是(Y)」不知道按下去會發生什麼，
+/// 得回頭把整段說明再讀一次；按鈕自己說清楚就不用。
+///
+/// 回傳 true＝按了 `go` 那顆。把視窗直接關掉算 `back`
+fn ask2(level: rfd::MessageLevel, title: &str, body: &str, go: &str, back: &str) -> bool {
+    let r = message_dialog()
+        .set_level(level)
+        .set_title(title)
+        .set_description(body)
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(
+            go.to_string(),
+            back.to_string(),
+        ))
+        .show();
+    // 自訂名稱回的是 Custom；平台若不吃自訂名稱就會回原本的 Ok，兩種都認
+    matches!(r, rfd::MessageDialogResult::Ok | rfd::MessageDialogResult::Yes)
+        || r == rfd::MessageDialogResult::Custom(go.to_string())
+}
+
+/// 三顆按鈕的確認框（例如「存檔／不存檔／取消」），規則同 [`ask2`]
+fn ask3(level: rfd::MessageLevel, title: &str, body: &str, a: &str, b: &str, c: &str) -> Ask3 {
+    let r = message_dialog()
+        .set_level(level)
+        .set_title(title)
+        .set_description(body)
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+            a.to_string(),
+            b.to_string(),
+            c.to_string(),
+        ))
+        .show();
+    match r {
+        rfd::MessageDialogResult::Yes => Ask3::First,
+        rfd::MessageDialogResult::No => Ask3::Second,
+        rfd::MessageDialogResult::Custom(t) if t == a => Ask3::First,
+        rfd::MessageDialogResult::Custom(t) if t == b => Ask3::Second,
+        _ => Ask3::Cancel,
+    }
+}
+
+/// 本執行緒目前作用中的視窗，包成 rfd 要的 handle；程式沒有視窗在前景時回傳 None
+#[cfg(windows)]
+fn dialog_owner() -> Option<DialogOwner> {
+    // 只是要一個 HWND，不值得為此多拉一個 windows-sys 相依。
+    // GetActiveWindow 取的是「本執行緒」作用中的視窗，正好是使用者剛才
+    // 操作的那個，對話框就會綁在它上面
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetActiveWindow() -> isize;
+    }
+    let hwnd = unsafe { GetActiveWindow() };
+    std::num::NonZeroIsize::new(hwnd).map(DialogOwner)
+}
+
+/// 包一層讓 rfd 取得 HWND（rfd 的 set_parent 收 raw-window-handle 的型別）
+#[cfg(windows)]
+struct DialogOwner(std::num::NonZeroIsize);
+
+#[cfg(windows)]
+impl raw_window_handle::HasWindowHandle for DialogOwner {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        let raw = raw_window_handle::RawWindowHandle::Win32(
+            raw_window_handle::Win32WindowHandle::new(self.0),
+        );
+        // SAFETY: HWND 取自本執行緒的作用中視窗；對話框顯示期間 UI 執行緒
+        // 就停在這個呼叫裡，視窗不可能在這段期間被銷毀
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) })
+    }
+}
+
+#[cfg(windows)]
+impl raw_window_handle::HasDisplayHandle for DialogOwner {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(raw_window_handle::DisplayHandle::windows())
+    }
+}
+
+// ---------- 畫面停止回應的看門狗 ----------
+
+/// UI 執行緒目前在做什麼；畫面凍住時程式自己講不出話，靠這個留線索
+const PHASE_STARTUP: u8 = 0;
+const PHASE_UPDATE: u8 = 1;
+const PHASE_IDLE: u8 = 2;
+const PHASE_FILE_DIALOG: u8 = 3;
+const PHASE_MSG_DIALOG: u8 = 4;
+
+static UI_PHASE: AtomicU8 = AtomicU8::new(PHASE_STARTUP);
+/// UI 執行緒最後一次進入 update 的時刻（程式啟動後毫秒）
+static UI_TICK: AtomicU64 = AtomicU64::new(0);
+/// 看門狗最後一次成功送出重畫請求的時刻（同上時間軸）
+static WAKE_TICK: AtomicU64 = AtomicU64::new(0);
+/// 目前停在哪個功能模組（[`Module::ALL`] 的索引）：只在某個模組才發生的
+/// 問題，回報時看得出來
+static ACTIVE_MODULE: AtomicU8 = AtomicU8::new(0);
+
+/// 看門狗檢查間隔（同時也是心跳喚醒間隔）
+const WATCHDOG_POLL: Duration = Duration::from_secs(3);
+/// 一般狀態下多久沒更新算停止回應（真的當掉是永遠不會恢復，門檻寬一點也不影響判斷）
+const HANG_MS: u64 = 15_000;
+/// 系統對話框開著時 UI 本來就停著（使用者可能正慢慢找檔案），門檻放寬
+const DIALOG_HANG_MS: u64 = 120_000;
+
+/// 程式啟動時刻；所有時間戳都以它為基準（不受系統時鐘調整影響）
+fn app_start() -> Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+fn now_ms() -> u64 {
+    app_start().elapsed().as_millis() as u64
+}
+
+fn ui_phase(phase: u8) {
+    UI_PHASE.store(phase, Ordering::Relaxed);
+}
+
+/// 監看 UI 執行緒：太久沒更新就把「卡在哪」寫進 hang.log，
+/// 下次啟動時在底欄顯示（畫面凍住時程式沒辦法自己報告，只能留檔）
+fn spawn_ui_watchdog(ctx: &egui::Context) {
+    UI_TICK.store(now_ms(), Ordering::Relaxed);
+    WAKE_TICK.store(now_ms(), Ordering::Relaxed);
+    // 心跳：閒置的 egui 本來就不重畫，沒有這個就分不出「閒著」與「當掉」。
+    // 和監看分成兩條執行緒：萬一是 egui 內部鎖死，request_repaint 自己也會
+    // 卡住，監看那條才不會跟著沉沒（而且「心跳也卡住」本身就是重要線索）
+    let wake_ctx = ctx.clone();
+    thread::spawn(move || loop {
+        thread::sleep(WATCHDOG_POLL);
+        wake_ctx.request_repaint_of(egui::ViewportId::ROOT);
+        WAKE_TICK.store(now_ms(), Ordering::Relaxed);
+    });
+    thread::spawn(|| {
+        let mut reported = false;
+        // 上一次記下的那筆是不是「對話框開著」時記的。
+        // 對話框關掉之後要把它撤銷，見 [`HangAction::Withdraw`]
+        let mut reported_dialog = false;
+        loop {
+            let before = now_ms();
+            thread::sleep(WATCHDOG_POLL);
+            // 電腦睡眠/程式被暫停：整台機器停了，UI 執行緒當然沒更新，
+            // 這不是當機。看門狗自己這一覺睡太久就是暫停過的證據，
+            // 把心跳時間補到現在重新計算，避免喚醒後誤報
+            if now_ms().saturating_sub(before) > WATCHDOG_POLL.as_millis() as u64 * 3 {
+                UI_TICK.store(now_ms(), Ordering::Relaxed);
+                WAKE_TICK.store(now_ms(), Ordering::Relaxed);
+                reported = false;
+                reported_dialog = false;
+                continue;
+            }
+            let phase = UI_PHASE.load(Ordering::Relaxed);
+            let stalled = now_ms().saturating_sub(UI_TICK.load(Ordering::Relaxed));
+            match hang_action(phase, stalled, reported, reported_dialog) {
+                HangAction::Fine => {
+                    reported = false;
+                    reported_dialog = false;
+                }
+                HangAction::Withdraw => {
+                    let _ = std::fs::remove_file(hang_log_path());
+                    reported = false;
+                    reported_dialog = false;
+                }
+                HangAction::Report => {
+                    reported = true;
+                    reported_dialog = is_dialog_phase(phase);
+                    write_hang_log(stalled, phase);
+                }
+                HangAction::AlreadyReported => {}
+            }
+        }
+    });
+}
+
+/// 對話框開著時 UI 執行緒本來就停在那個呼叫裡，門檻要放寬（見 [`DIALOG_HANG_MS`]）
+fn is_dialog_phase(phase: u8) -> bool {
+    matches!(phase, PHASE_FILE_DIALOG | PHASE_MSG_DIALOG)
+}
+
+/// 看門狗這一輪該做什麼
+#[derive(PartialEq, Eq, Debug)]
+enum HangAction {
+    /// 沒卡住（或已經恢復），也沒有東西要撤銷
+    Fine,
+    /// 恢復了，而且剛才記的那筆是「對話框開著」——把紀錄撤銷。
+    ///
+    /// 使用者在選檔對話框裡翻資料夾翻上兩分鐘是完全正常的事（要一次挑
+    /// 一整個資料夾的照片時尤其如此），程式並沒有當掉，對話框一關就自己
+    /// 回來了。留著那筆的話，下次開程式會跳出「⚠ 程式上次畫面停止回應」，
+    /// 要使用者回報一個根本不存在的問題。
+    ///
+    /// 真正卡死的對話框（被別的視窗蓋住、只能用工作管理員強制結束）
+    /// 永遠等不到恢復，紀錄就留著——那才是要回報的。
+    ///
+    /// **只對對話框這樣做**：一般畫面凍住十五秒後又自己恢復，
+    /// 那本身就是個該追的問題，紀錄不能撤
+    Withdraw,
+    /// 卡住了，而且還沒記過：記一筆
+    Report,
+    /// 卡住了但已經記過：繼續等，不重複寫
+    AlreadyReported,
+}
+
+/// 停止回應的判斷規則。抽出來是為了測得到——原本整段埋在一條
+/// 每三秒醒一次的執行緒裡，只能靠讀程式碼確認對不對
+fn hang_action(phase: u8, stalled_ms: u64, reported: bool, reported_dialog: bool) -> HangAction {
+    let limit = if is_dialog_phase(phase) {
+        DIALOG_HANG_MS
+    } else {
+        HANG_MS
+    };
+    if stalled_ms < limit {
+        // 已經恢復了
+        return if reported && reported_dialog {
+            HangAction::Withdraw
+        } else {
+            HangAction::Fine
+        };
+    }
+    if reported {
+        HangAction::AlreadyReported
+    } else {
+        HangAction::Report
+    }
+}
+
+/// 寫下停止回應的紀錄（覆蓋舊的：最新一次最接近使用者遇到的狀況）
+fn write_hang_log(stalled_ms: u64, phase: u8) {
+    let doing = match phase {
+        PHASE_FILE_DIALOG => "系統檔案對話框（程式在等它關閉；它可能被其他視窗蓋住）",
+        PHASE_MSG_DIALOG => "系統訊息對話框（程式在等它關閉；它可能被其他視窗蓋住）",
+        PHASE_UPDATE => "畫面更新／繪製中",
+        PHASE_IDLE => "等待事件（沒有進入畫面更新）",
+        _ => "啟動中",
+    };
+    let wake_stalled = now_ms().saturating_sub(WAKE_TICK.load(Ordering::Relaxed));
+    let wake = if wake_stalled > HANG_MS {
+        "看門狗的重畫請求也被卡住（疑似 egui 內部鎖死）"
+    } else {
+        "看門狗的重畫請求仍正常送出"
+    };
+    let report = format!(
+        "Photo2Video v{}\n畫面停止回應：{} 秒沒有更新\n當時狀態：{doing}\n{wake}\n目前模組：{}\n",
+        env!("CARGO_PKG_VERSION"),
+        stalled_ms / 1000,
+        Module::ALL
+            .get(ACTIVE_MODULE.load(Ordering::Relaxed) as usize)
+            .copied()
+            .unwrap_or(Module::Video)
+            .label(),
+    );
+    let path = hang_log_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, report);
 }
 
 /// 讀取上次儲存的每秒張數；沒有設定檔或值不合法時回傳 None
@@ -572,6 +1423,271 @@ fn update_config(key: &str, value: serde_json::Value) {
     }
 }
 
+/// 縮圖列上一幀畫到的可視範圍，夾回「現在」的清單長度。
+///
+/// 換一批照片時清單先變短，縮圖列要**下一幀**才會寫進新的範圍——中間那一下
+/// 若照舊範圍去取索引就會越界（實照上踩過：46 張換成 3 張，`photos[3]` 當場
+/// panic）。沒有範圍時（剛開檔、剛清空）先抓開頭一段，視窗一開就有東西看
+fn clamp_vis_range(vis: Option<(usize, usize)>, n: usize, prefetch: usize) -> (usize, usize) {
+    let (first, last) = vis.unwrap_or((0, n.min(prefetch)));
+    let last = last.min(n);
+    (first.min(last), last)
+}
+
+/// 存檔時要不要把成品縮到指定尺寸（比照 Lightroom 的「調整影像大小」）。
+///
+/// 是「**塞得進** W×H」而不是硬拉成那個比例：長邊照 W、短邊照 H 各算一次
+/// 縮放比，取小的那個，原本的長寬比不變。去煙霧與煙火疊圖共用同一組設定
+/// ——同一批照片多半是為了同一個用途（發文、投稿）才要縮
+#[derive(Clone, Copy, PartialEq)]
+struct ExportSize {
+    on: bool,
+    w: u32,
+    h: u32,
+    /// 原圖比指定尺寸還小時不要放大（放大只會糊掉，不會多出細節）
+    no_upscale: bool,
+    /// 尺寸是自己打的（true）還是從常用尺寸選的（false，見 [`EXPORT_PRESETS`]）。
+    /// 兩者都是同一組 w×h，這個旗標只決定那一列要不要露出數字欄
+    custom: bool,
+}
+
+impl Default for ExportSize {
+    fn default() -> Self {
+        Self {
+            on: false,
+            w: 2048,
+            h: 1400,
+            no_upscale: true,
+            custom: true,
+        }
+    }
+}
+
+/// 存檔尺寸的常用選項：（顯示名稱, 寬, 高）。
+///
+/// 意思與自訂尺寸完全相同——「**塞得進**這個框」，長寬比不變，
+/// 所以直拍橫拍都適用（見 [`ExportSize::target`]）。
+/// 名稱沿用「影片去煙霧」那邊的講法，同一個 4K 在兩個模組是同一件事
+const EXPORT_PRESETS: [(&str, u32, u32); 5] = [
+    ("4K（3840×2160）", 3840, 2160),
+    ("2K（2560×1440）", 2560, 1440),
+    ("Full HD（1920×1080）", 1920, 1080),
+    ("HD（1280×720）", 1280, 720),
+    ("網頁（1024×768）", 1024, 768),
+];
+
+impl ExportSize {
+    /// 夾回合理範圍：太小沒有意義，太大會把記憶體吃光
+    fn clamped(self) -> Self {
+        Self {
+            w: self.w.clamp(16, 20000),
+            h: self.h.clamp(16, 20000),
+            ..self
+        }
+    }
+
+    /// 這張圖存出去要縮成多大；不必縮就回傳 None
+    fn target(&self, iw: u32, ih: u32) -> Option<(u32, u32)> {
+        if !self.on || iw == 0 || ih == 0 {
+            return None;
+        }
+        let s = self.clamped();
+        let k = (s.w as f32 / iw as f32).min(s.h as f32 / ih as f32);
+        let k = if s.no_upscale { k.min(1.0) } else { k };
+        // 差不到一個像素就別重取樣一次（Lanczos 再好也是有損）
+        let (w, h) = (
+            ((iw as f32 * k).round() as u32).max(1),
+            ((ih as f32 * k).round() as u32).max(1),
+        );
+        (w != iw || h != ih).then_some((w, h))
+    }
+}
+
+/// 把成品縮到設定的尺寸（不必縮就原樣回傳）。
+/// 縮圖用 Lanczos3：存出去的成品是要看的，銳利度差得出來
+fn fit_export(img: image::RgbImage, size: ExportSize) -> image::RgbImage {
+    match size.target(img.width(), img.height()) {
+        Some((w, h)) => image::imageops::resize(&img, w, h, image::imageops::FilterType::Lanczos3),
+        None => img,
+    }
+}
+
+/// 讀存檔尺寸設定：**尺寸記著、開關不記**。
+///
+/// 每次開程式一律從「不調整」開始——縮圖是不可逆的，
+/// 上禮拜勾過的設定不該讓今天存出來的照片默默變小；
+/// 但常用的尺寸留著，勾起來就是上次那組數字
+fn load_export_size() -> ExportSize {
+    let cfg = load_config();
+    let v = &cfg["export_size"];
+    let d = ExportSize::default();
+    ExportSize {
+        on: false,
+        w: v["w"].as_u64().unwrap_or(d.w as u64) as u32,
+        h: v["h"].as_u64().unwrap_or(d.h as u64) as u32,
+        no_upscale: v["no_upscale"].as_bool().unwrap_or(d.no_upscale),
+        // 舊版的設定檔沒有這一欄：當成自訂，數字照舊露出來
+        custom: v["custom"].as_bool().unwrap_or(true),
+    }
+    .clamped()
+}
+
+/// 記住存檔尺寸（開關不寫進去，見 [`load_export_size`]）
+fn save_export_size(s: ExportSize) {
+    let s = s.clamped();
+    update_config(
+        "export_size",
+        serde_json::json!({
+            "w": s.w,
+            "h": s.h,
+            "no_upscale": s.no_upscale,
+            "custom": s.custom,
+        }),
+    );
+}
+
+/// 讀出上次挑的「優化影像」類型；沒記過或認不得就回 None（用預設值）
+fn load_enhance_preset() -> Option<enhance::Preset> {
+    let cfg = load_config();
+    enhance::Preset::from_id(cfg.get("enhance_preset")?.as_str()?)
+}
+
+/// 記住這次挑的「優化影像」類型
+fn save_enhance_preset(p: enhance::Preset) {
+    update_config("enhance_preset", serde_json::json!(p.id()));
+}
+
+/// 不縮的話成品會是幾乘幾：原圖尺寸先套上旋轉與裁切
+/// （順序與存檔時一致，見 [`Crop`]）。原圖尺寸還不知道時回 None
+fn export_natural_dims(src: Option<(u32, u32)>, crop: &Crop) -> Option<(u32, u32)> {
+    let (w, h) = src?;
+    // 裁切框是對著「旋轉後的畫布」算的，所以要先轉再切
+    let (cw, ch) = crop.canvas(w as f32, h as f32);
+    let (_, _, ow, oh) = crop.pixels(cw.round() as u32, ch.round() as u32);
+    Some((ow, oh))
+}
+
+/// 存檔尺寸的那一列（去煙霧與煙火疊圖的存檔列共用）。
+/// 有改動就回傳 true，呼叫端負責寫進設定檔。
+///
+/// `natural` 是「不縮的話會是幾乘幾」（見 [`export_natural_dims`]）：沒勾
+/// 「調整尺寸」時那兩個數字欄要顯示它，不是上次縮到多少——不然框裡明明寫著
+/// 1920×1080，存出來卻是原尺寸，看了只會以為程式壞了
+fn export_size_row(
+    ui: &mut egui::Ui,
+    s: &mut ExportSize,
+    enabled: bool,
+    natural: Option<(u32, u32)>,
+) -> bool {
+    /// 選常用尺寸時的寬度（勾選框＋下拉＋「不放大」）
+    const ROW_W: f32 = 336.0;
+    /// 自訂時還要擺兩個數字欄，整組再寬一點
+    const ROW_W_CUSTOM: f32 = 470.0;
+    /// 下拉固定寬，整組的寬度才算得準
+    const COMBO_W: f32 = 152.0;
+    /// 數字欄固定寬，整組的寬度才算得準
+    const NUM_W: f32 = 66.0;
+
+    let before = *s;
+    let h = ui.spacing().interact_size.y;
+    // 沒勾的時候把原尺寸攤出來給人看，所以那時也要留數字欄的位置
+    let show_natural = !s.on && natural.is_some();
+    let row_w = if s.custom || show_natural {
+        ROW_W_CUSTOM
+    } else {
+        ROW_W
+    };
+    // 這一列是擺在存檔鈕那個「由右往左」的區塊裡的：
+    // 直接用 ui.horizontal 會跟著鏡射成「不放大 × 1400 × 2048 調整尺寸」，
+    // 用 with_layout 又會吃掉整條剩餘寬度、被推到最左邊。
+    // 先配一塊剛好的位置、裡面自己由左到右排，才會緊貼在存檔鈕左邊
+    ui.allocate_ui_with_layout(
+        egui::vec2(row_w, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.checkbox(&mut s.on, "調整尺寸").on_hover_text(
+                    "存檔時把成品縮到指定的尺寸內（長寬比不變，是「塞得進」不是拉變形）。\n\
+                     不勾就是原尺寸輸出",
+                );
+                ui.add_enabled_ui(s.on, |ui| {
+                    // 常用尺寸選一個就好；要自己打數字才選「自訂」
+                    // （從常用尺寸切過去時數字就是剛才那一組，接著改比較快）
+                    let picked = EXPORT_PRESETS
+                        .iter()
+                        .find(|(_, w, h)| !s.custom && *w == s.w && *h == s.h);
+                    let text = match (show_natural, picked) {
+                        // 沒勾就是原尺寸輸出，這時顯示上次選的常用尺寸只會誤導
+                        (true, _) => "原尺寸",
+                        (false, Some((name, _, _))) => *name,
+                        // 選了常用尺寸之後又去改數字（例如用專案檔帶進來的），
+                        // 對不上任何一組就照實說是自訂
+                        (false, None) => "自訂",
+                    };
+                    egui::ComboBox::from_id_salt("export_size_preset")
+                        .selected_text(text)
+                        .width(COMBO_W)
+                        .show_ui(ui, |ui| {
+                            if check_label(ui, s.custom, "自訂").clicked() {
+                                s.custom = true;
+                            }
+                            for (name, w, h) in EXPORT_PRESETS {
+                                let on = !s.custom && s.w == w && s.h == h;
+                                if check_label(ui, on, name).clicked() {
+                                    s.custom = false;
+                                    s.w = w;
+                                    s.h = h;
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "常用尺寸選一個，或選「自訂」自己打。\n\
+                             都是「塞得進這個框」，長寬比不變——直拍的照片\n\
+                             會照高度那一邊縮",
+                        );
+                    // 選常用尺寸時數字欄就不必露出來了（那一列會短一截）；
+                    // 沒勾「調整尺寸」時則相反——那兩個數字正是使用者要確認的
+                    if s.custom || show_natural {
+                        // 沒勾時顯示的是原尺寸，不能寫回設定（那是使用者存起來的
+                        // 縮圖尺寸，勾回去要原樣拿回來），所以走一份暫時的
+                        let (mut dw, mut dh) = natural.filter(|_| show_natural).unwrap_or((s.w, s.h));
+                        let tip = if show_natural {
+                            "沒有縮：成品就是這個尺寸"
+                        } else {
+                            "寬度上限"
+                        };
+                        ui.add_sized(
+                            [NUM_W, h],
+                            egui::DragValue::new(&mut dw)
+                                .speed(8.0)
+                                .range(16..=20000)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text(tip);
+                        ui.label(egui::RichText::new("×").color(theme::TEXT_WEAK));
+                        ui.add_sized(
+                            [NUM_W, h],
+                            egui::DragValue::new(&mut dh)
+                                .speed(8.0)
+                                .range(16..=20000)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text(if show_natural { tip } else { "高度上限" });
+                        if !show_natural {
+                            s.w = dw;
+                            s.h = dh;
+                        }
+                    }
+                    ui.checkbox(&mut s.no_upscale, "不放大")
+                        .on_hover_text("原圖比這個尺寸還小時就維持原樣（放大只會糊掉）");
+                });
+            });
+        },
+    );
+    *s != before
+}
+
 /// 儲存每秒張數設定
 fn save_fps(fps: u32) {
     update_config("fps", serde_json::json!(fps));
@@ -597,6 +1713,150 @@ fn save_recent_projects(list: &[PathBuf]) {
     let arr: Vec<String> = list.iter().map(|p| p.to_string_lossy().into_owned()).collect();
     update_config("recent_projects", serde_json::json!(arr));
 }
+
+/// 「上次停在哪個資料夾」的記錄欄位：**每個模組、每種用途各記一份**。
+///
+/// 開檔與存檔分開、模組之間也不共用——去煙霧的照片來源不會把影片的輸出
+/// 位置蓋掉，選完音樂再去存專案也不會被丟到音樂資料夾。加新模組時在這裡
+/// 補上它自己的欄位即可，彼此不會互相干擾
+#[derive(Clone, Copy)]
+enum LastDir {
+    /// 影片模組：加入照片／選擇資料夾
+    VideoPhotos,
+    /// 影片模組：開啟與儲存 .p2v 專案檔
+    VideoProject,
+    /// 影片模組：背景音樂
+    VideoMusic,
+    /// 影片模組：轉檔輸出的影片
+    VideoOutput,
+    /// 去煙霧模組：要處理的照片
+    DehazePhotos,
+    /// 去煙霧模組：「另存新檔」的存放資料夾
+    DehazeOutput,
+    /// 去煙霧模組：要疊上去的圖片（浮水印、簽名檔之類，通常不跟照片放一起）
+    DehazeOverlay,
+    /// 煙火疊圖模組：要疊的照片
+    StackPhotos,
+    /// 煙火疊圖模組：「另存新檔」的存放資料夾
+    StackOutput,
+    /// 影片去煙霧模組：要處理的影片
+    MovieSource,
+    /// 影片去煙霧模組：輸出的影片
+    MovieOutput,
+    /// 優化影像模組：要處理的照片
+    EnhancePhotos,
+    /// 優化影像模組：「另存新檔」的存放資料夾
+    EnhanceOutput,
+}
+
+impl LastDir {
+    /// 全部的用途。加新欄位時記得補進來——測試會拿它檢查沒有兩個用途
+    /// 共用同一個 config 欄位
+    const ALL: [LastDir; 13] = [
+        LastDir::VideoPhotos,
+        LastDir::VideoProject,
+        LastDir::VideoMusic,
+        LastDir::VideoOutput,
+        LastDir::DehazePhotos,
+        LastDir::DehazeOutput,
+        LastDir::DehazeOverlay,
+        LastDir::StackPhotos,
+        LastDir::StackOutput,
+        LastDir::MovieSource,
+        LastDir::MovieOutput,
+        LastDir::EnhancePhotos,
+        LastDir::EnhanceOutput,
+    ];
+
+    /// config.json 裡的欄位名（改動會讓使用者的記錄重來一次，勿隨意更名）
+    fn key(self) -> &'static str {
+        match self {
+            LastDir::VideoPhotos => "dir_video_photos",
+            LastDir::VideoProject => "dir_video_project",
+            LastDir::VideoMusic => "dir_video_music",
+            LastDir::VideoOutput => "dir_video_output",
+            LastDir::DehazePhotos => "dir_dehaze_photos",
+            LastDir::DehazeOutput => "dir_dehaze_output",
+            LastDir::DehazeOverlay => "dir_dehaze_overlay",
+            LastDir::StackPhotos => "dir_stack_photos",
+            LastDir::StackOutput => "dir_stack_output",
+            LastDir::MovieSource => "dir_movie_source",
+            LastDir::MovieOutput => "dir_movie_output",
+            LastDir::EnhancePhotos => "dir_enhance_photos",
+            LastDir::EnhanceOutput => "dir_enhance_output",
+        }
+    }
+}
+
+/// 讀出這個用途上次用的資料夾。資料夾已被刪除、改名或在拔掉的隨身碟上時
+/// 當作沒記過——把對話框指到不存在的路徑，Windows 的行為並不一致
+fn load_last_dir(which: LastDir) -> Option<PathBuf> {
+    let dir = load_config()
+        .get(which.key())
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)?;
+    dir.is_dir().then_some(dir)
+}
+
+/// 記下這次選到的位置：選到檔案就記它所在的資料夾，選到資料夾就記它自己
+fn remember_dir(which: LastDir, picked: &Path) {
+    let dir = if picked.is_dir() {
+        picked
+    } else {
+        match picked.parent() {
+            // 根目錄下的檔案 parent 是 ""，記了也指不到地方
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => return,
+        }
+    };
+    update_config(which.key(), serde_json::json!(dir.to_string_lossy()));
+}
+
+/// 從「這個用途上次停的資料夾」開始的**選檔**對話框。沒有記錄時不指定
+/// 起始位置，交給作業系統決定（通常是最近用過的地方）
+fn dir_dialog(which: LastDir) -> rfd::FileDialog {
+    let d = file_dialog();
+    match load_last_dir(which) {
+        Some(dir) => d.set_directory(dir),
+        None => d,
+    }
+}
+
+/// 從「這個用途上次停的資料夾」開始的**選資料夾**對話框。
+///
+/// 和選檔不同，資料夾對話框列的是「子資料夾」：直接開在上次選的那一個裡面，
+/// 而照片資料夾底下通常沒有子資料夾，畫面就只剩一句「沒有符合搜尋條件的
+/// 項目」，看起來像壞掉。改成開在它的**上一層**並把名字填進欄位——上次
+/// 選的那個就在清單裡，旁邊同一批的姊妹資料夾也一起看得到，
+/// 要選同一個也只要直接按「選擇資料夾」
+fn folder_dialog(which: LastDir) -> rfd::FileDialog {
+    let d = file_dialog();
+    let Some(dir) = load_last_dir(which) else {
+        return d;
+    };
+    let (start, name) = folder_dialog_start(&dir);
+    let d = d.set_directory(start);
+    match name {
+        Some(n) => d.set_file_name(n),
+        None => d,
+    }
+}
+
+/// [`folder_dialog`] 的位置計算：回傳（對話框要開在哪裡，要預填的名字）。
+/// 一般情況是「上次選的資料夾的上一層 + 它自己的名字」；上一層不存在
+/// （磁碟機根目錄，或路徑只剩一段）時就開在它自己裡面、不預填
+fn folder_dialog_start(dir: &Path) -> (PathBuf, Option<String>) {
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+    match (dir.parent(), name) {
+        (Some(parent), Some(name)) if parent.is_dir() => (parent.to_path_buf(), Some(name)),
+        _ => (dir.to_path_buf(), None),
+    }
+}
+
+/// 是否支援程式內一鍵更新。發佈頁目前只提供 Windows 執行檔
+/// （photo2video.exe），其他平台沒有可下載的對應檔案，UI 改成引導使用者
+/// 到發佈頁自行取得，而不是給一個按了必定失敗的「立即更新」
+const SELF_UPDATE_SUPPORTED: bool = cfg!(windows);
 
 /// 下載指定版本的 photo2video.exe 並原地替換目前的執行檔
 fn download_update(tag: &str, progress: &dyn Fn(f32)) -> Result<(), String> {
@@ -688,19 +1948,55 @@ fn restart_app() {
     std::process::exit(0);
 }
 
-/// Windows 字型資料夾。用 %WINDIR% 而非硬編碼 C:\Windows：Windows 裝在
-/// 非 C: 磁碟時（多系統、企業自訂）硬編碼會找不到字型，導致 UI 中文變
-/// 豆腐、字幕功能整個無法使用。WINDIR 未設時才退回 C:\Windows
-fn windows_fonts_dir() -> PathBuf {
-    std::env::var_os("WINDIR")
+/// 系統字型資料夾（依優先順序；同名檔案出現在多處時取先找到的）
+///
+/// Windows 用 %WINDIR% 而非硬編碼 C:\Windows：Windows 裝在非 C: 磁碟時
+/// （多系統、企業自訂）硬編碼會找不到字型，導致 UI 中文變豆腐、字幕功能
+/// 整個無法使用。WINDIR 未設時才退回 C:\Windows
+#[cfg(windows)]
+fn font_dirs() -> Vec<PathBuf> {
+    let win = std::env::var_os("WINDIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("Fonts")
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    vec![win.join("Fonts")]
 }
 
-/// 掃描 Windows 字型資料夾中常見且支援中文的字型
-fn detect_fonts() -> Vec<(String, PathBuf)> {
-    let candidates: [(&str, &str); 12] = [
+#[cfg(target_os = "macos")]
+fn font_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/System/Library/Fonts"),
+        // Catalina 起，系統內建但非「預設啟用」的字型（Arial、Times、
+        // 標楷體等）改放 Supplemental，不掃這裡會少掉大半可選字型
+        PathBuf::from("/System/Library/Fonts/Supplemental"),
+        PathBuf::from("/Library/Fonts"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join("Library").join("Fonts"));
+    }
+    dirs
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn font_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/usr/share/fonts/opentype/noto"),
+        PathBuf::from("/usr/share/fonts/truetype/noto"),
+        PathBuf::from("/usr/share/fonts/truetype/dejavu"),
+        PathBuf::from("/usr/share/fonts"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".local/share/fonts"));
+        dirs.push(home.join(".fonts"));
+    }
+    dirs
+}
+
+/// 字幕可選字型的候選清單（顯示名稱, 檔名）。清單放寬即可，實際會用
+/// exists() 過濾掉系統上沒有的，所以列到不存在的檔案是無害的
+#[cfg(windows)]
+fn font_candidates() -> &'static [(&'static str, &'static str)] {
+    &[
         ("微軟正黑體", "msjh.ttc"),
         ("微軟正黑體（粗體）", "msjhbd.ttc"),
         ("標楷體", "kaiu.ttf"),
@@ -713,13 +2009,61 @@ fn detect_fonts() -> Vec<(String, PathBuf)> {
         ("Comic Sans MS", "comic.ttf"),
         ("Consolas", "consola.ttf"),
         ("Segoe UI", "segoeui.ttf"),
-    ];
-    let fonts_dir = windows_fonts_dir();
-    candidates
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn font_candidates() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("蘋方", "PingFang.ttc"),
+        ("黑體", "STHeiti Medium.ttc"),
+        ("黑體（細）", "STHeiti Light.ttc"),
+        ("儷黑 Pro", "儷黑 Pro.ttf"),
+        ("標楷體", "BiauKai.ttf"),
+        ("宋體", "Songti.ttc"),
+        ("圓體", "Yuanti.ttc"),
+        ("Arial", "Arial.ttf"),
+        ("Arial（粗體）", "Arial Bold.ttf"),
+        ("Times New Roman", "Times New Roman.ttf"),
+        ("Impact", "Impact.ttf"),
+        ("Comic Sans MS", "Comic Sans MS.ttf"),
+        ("Menlo", "Menlo.ttc"),
+        ("Helvetica", "Helvetica.ttc"),
+    ]
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn font_candidates() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("Noto Sans CJK TC", "NotoSansCJK-Regular.ttc"),
+        ("Noto Sans CJK TC（粗體）", "NotoSansCJK-Bold.ttc"),
+        ("Noto Serif CJK TC", "NotoSerifCJK-Regular.ttc"),
+        ("DejaVu Sans", "DejaVuSans.ttf"),
+        ("DejaVu Sans（粗體）", "DejaVuSans-Bold.ttf"),
+        ("DejaVu Serif", "DejaVuSerif.ttf"),
+    ]
+}
+
+/// 在各字型資料夾中依序找檔案，回傳第一個存在的完整路徑
+fn find_font_file(file: &str) -> Option<PathBuf> {
+    font_dirs().into_iter().find_map(|dir| {
+        let p = dir.join(file);
+        p.exists().then_some(p)
+    })
+}
+
+/// 掃描系統中常見且支援中文的字型（給字幕的字型下拉選單用）
+fn detect_fonts() -> Vec<(String, PathBuf)> {
+    // font_dirs 每次呼叫都要組路徑，先取一次再對所有候選字型比對
+    let dirs = font_dirs();
+    font_candidates()
         .iter()
         .filter_map(|(name, file)| {
-            let p = fonts_dir.join(file);
-            p.exists().then(|| (name.to_string(), p))
+            let p = dirs.iter().find_map(|dir| {
+                let p = dir.join(file);
+                p.exists().then_some(p)
+            })?;
+            Some((name.to_string(), p))
         })
         .collect()
 }
@@ -949,16 +2293,579 @@ enum Thumb {
 /// 所以這裡的縮圖只影響細節銳利度，預覽與實際輸出的去煙程度一致。
 const SMOKE_PREVIEW_MAX: u32 = 1600;
 
+/// 放大檢視時，精細底圖最多解到多大（長邊）。
+///
+/// 1600 的工作縮圖夠快，可是煙火那種一兩個像素寬的細線在縮圖上已經和旁邊的
+/// 煙混在一起了——去煙時救不回來，所以預覽的線條比成品鈍一階、暗一階。
+/// 放大到縮圖不夠用時就改用比較細的底圖重算一次（算完才換上去，不影響拉
+/// 滑桿的手感），看到的才與存檔的結果一致。
+///
+/// 上限訂在這裡是因為去煙的時間與記憶體都跟著像素數走：5120 長邊約 5 秒，
+/// 再往上就接近存檔整張的成本了（那要十幾秒）。超過這個倍率的放大只好用
+/// 內插撐著——要真正的 1:1 得整張用原尺寸算一遍
+const SMOKE_FINE_CAP: u32 = 5120;
+
+/// 精細底圖的尺寸級距。拖視窗、滾滾輪時需求會一直微幅變動，
+/// 對齊到級距才不會每動一下就重解一次底圖
+const SMOKE_FINE_STEP: u32 = 512;
+
+/// 疊圖的精細底圖，整批加起來最多用掉多少像素。
+///
+/// 疊圖與去煙霧不同：**每一層都要同時留在記憶體裡**才疊得起來，所以上限得
+/// 跟張數走。這個量約 240 MB（RGB 一像素 3 bytes），三張時每張可以到長邊
+/// 五千多，二十四張就只剩一千八——那時本來也不該指望放大看細節
+const STACK_FINE_BUDGET_PX: u64 = 80_000_000;
+
+/// 疊圖要不要換一份更細的底圖，換的話「最大那張」該縮到多少長邊
+/// （其餘照同一個比例，見 [`StackTool::common_scale`]）；None＝工作縮圖就夠。
+///
+/// `max_long` 是這批裡最大那張的長邊，`n` 是張數
+fn stack_fine_target(want: u32, max_long: u32, n: usize) -> Option<u32> {
+    if want <= SMOKE_PREVIEW_MAX || n == 0 {
+        return None;
+    }
+    // 每張分得到多少像素 → 換算成長邊。把照片當正方形估是刻意的保守：
+    // 真實的照片扁一點，實際用量只會比這個少
+    let per = STACK_FINE_BUDGET_PX / n as u64;
+    let budget_long = (per as f64).sqrt() as u32;
+    let up = want.div_ceil(SMOKE_FINE_STEP) * SMOKE_FINE_STEP;
+    let want = up.min(SMOKE_FINE_CAP).min(max_long).min(budget_long);
+    (want > SMOKE_PREVIEW_MAX).then_some(want)
+}
+
+/// 畫面上照片佔 `want` 個實體像素時，精細底圖該解到多大；None＝工作縮圖就夠。
+/// `orig` 是原圖長邊——照片本身沒那麼大就別憑空放大
+fn fine_target(want: u32, orig: u32) -> Option<u32> {
+    if want <= SMOKE_PREVIEW_MAX {
+        return None;
+    }
+    let up = want.div_ceil(SMOKE_FINE_STEP) * SMOKE_FINE_STEP;
+    let want = up.min(SMOKE_FINE_CAP).min(orig);
+    (want > SMOKE_PREVIEW_MAX).then_some(want)
+}
+
+/// 前後對照時，兩張照片中間留的空隙（像素）
+const SMOKE_COMPARE_GAP: f32 = 10.0;
+
+/// 自動判參數時解出來的縮圖大小（長邊）。判的都是大尺度的統計量，
+/// 縮到這裡就夠準（dehaze 內部還會再縮一次），開一整批照片才不必等
+const SMOKE_AUTO_EDGE: u32 = 1024;
+
+/// 同時最多幾個執行緒在量。量本身很快，瓶頸是解 JPEG；
+/// 開太多只是跟預覽、縮圖搶 CPU，切張反而變鈍
+const SMOKE_AUTO_WORKERS: usize = 3;
+
+/// 解出「夠自動判參數用」的縮圖，並回傳原始照片的長邊。
+/// 去煙霧與優化影像的背景量測都走這裡。
+///
+/// 長邊要照實回報：估煙霧層的下採樣會吃掉多少煙取決於原尺寸
+/// （見 [`dehaze::auto_params`]），拿縮圖的尺寸去算會低估該扣的量
+fn decode_for_auto(path: &Path) -> Option<(image::RgbImage, u32)> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    // 判參數會假設天空在畫面上緣、主體大致在中間，直拍的照片沒轉正就整個歪掉
+    let orientation = decoder.orientation().ok()?;
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    let long = img.width().max(img.height());
+    Some((
+        img.thumbnail(SMOKE_AUTO_EDGE, SMOKE_AUTO_EDGE).to_rgb8(),
+        long,
+    ))
+}
+
+/// 同時最多幾個執行緒在解照片給追蹤用。比對本身很快，整批的時間幾乎全花在
+/// 解 JPEG；解碼先跑在前面，比對才不會解一張等一張（與去煙的自動判參數
+/// 同一個道理，開太多只是跟預覽、縮圖搶 CPU）
+const TRACK_DECODERS: usize = 3;
+
+/// 解出「追蹤用」的灰階小圖：照 EXIF 轉正、縮到工作解析度，最後套上使用者
+/// 的旋轉——追蹤算出來的座標要拿去當裁切框，兩者得在同一個畫布上
+fn decode_for_track(path: &Path, crop: Crop) -> Option<track::Frame> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    let orientation = decoder.orientation().ok()?;
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    let small = img
+        .thumbnail(track::WORK_EDGE, track::WORK_EDGE)
+        .to_rgb8();
+    Some(track::Frame::from_rgb(&edit::apply_rotate(small, crop)))
+}
+
+/// 追蹤鏡頭每張要切下多大一塊（相對座標的寬與高）。
+///
+/// `size` 是主體框的相對大小、`zoom` 是要放大幾倍、`canvas` 是旋轉後畫布的
+/// 像素尺寸、`aspect` 是輸出解析度的寬高比。長寬比配合輸出，成品才不會補黑邊；
+/// 主體的寬與高都要塞得下（細長的主體橫著飛時，光看寬度會把牠切掉上下）；
+/// 算出來超過整張畫布就縮到剛好塞得下——等於鏡頭拉到最遠、幾乎不裁
+fn track_crop_box(size: (f32, f32), zoom: f32, canvas: (f32, f32), aspect: f32) -> (f32, f32) {
+    let (cw, ch) = (canvas.0.max(1.0), canvas.1.max(1.0));
+    let aspect = if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
+    let zoom = if zoom.is_finite() { zoom.max(0.01) } else { 1.0 };
+    let mut w = (size.0 * zoom).max(size.1 * zoom * aspect * ch / cw);
+    let mut h = w * cw / (aspect * ch);
+    let k = (1.0 / w).min(1.0 / h).min(1.0);
+    w *= k;
+    h *= k;
+    (w.clamp(CROP_MIN, 1.0), h.clamp(CROP_MIN, 1.0))
+}
+
+/// 把沒框到的照片補一個鏡頭位置：前後都有框的用**線性內插**（鏡頭順順地
+/// 滑過去，不會為了一張沒框到就卡住），開頭與結尾沒框到的沿用最近的那張。
+///
+/// 全部都沒框到時回傳全部畫面中央（呼叫端已經擋掉這種情況，這裡只是防呆）
+fn fill_gaps(known: &[Option<(f32, f32)>]) -> Vec<(f32, f32)> {
+    let mut out = vec![(0.5, 0.5); known.len()];
+    let idx: Vec<usize> = (0..known.len()).filter(|&i| known[i].is_some()).collect();
+    if idx.is_empty() {
+        return out;
+    }
+    for (k, &i) in idx.iter().enumerate() {
+        out[i] = known[i].unwrap();
+        // 這一個有框的與下一個之間的空檔
+        if let Some(&j) = idx.get(k + 1) {
+            let (a, b) = (out[i], known[j].unwrap());
+            for m in i + 1..j {
+                let t = (m - i) as f32 / (j - i) as f32;
+                out[m] = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            }
+        }
+    }
+    // 頭尾的空檔沒有另一端可內插，沿用最近的那張
+    for m in 0..idx[0] {
+        out[m] = out[idx[0]];
+    }
+    for m in idx[idx.len() - 1] + 1..known.len() {
+        out[m] = out[idx[idx.len() - 1]];
+    }
+    out
+}
+
+/// 替這一批主體位置挑一個「最適當」的平滑度（0~100）。
+///
+/// 平滑度是一場拉鋸：**調低**，鏡頭死盯著主體、主體釘在正中央，但逐張比對
+/// 的抖動也原封不動搬上畫面；**調高**，鏡頭走得順，主體卻會在中央附近晃。
+/// 兩件事其實可以放在同一把尺上量——都換算成「佔成品畫面的幾分之幾」：
+///
+/// * 偏離＝鏡頭中心與主體真正位置的距離（主體離開正中央多遠）
+/// * 抖動＝鏡頭自己的二階差分（畫面晃得多厲害）
+///
+/// 兩者相加最小的那個平滑度就是最適當的。軌跡乾淨的連拍會選到很低的值
+/// （主體幾乎完全置中），抓得比較勉強的則自動選高一點把抖動壓下去
+fn fit_smooth(raw: &[(f32, f32)], crop: (f32, f32)) -> i32 {
+    if raw.len() < 5 {
+        return 0;
+    }
+    let (cw, ch) = (crop.0.max(1e-3), crop.1.max(1e-3));
+    let med = |v: &mut Vec<f32>| {
+        v.sort_by(f32::total_cmp);
+        v[v.len() / 2]
+    };
+    let mut best = (i32::MAX, f32::MAX);
+    for s in (0..=100).step_by(5) {
+        let mut cam = raw.to_vec();
+        track::smooth(&mut cam, s as f32 / 100.0);
+        // 主體離畫面中心多遠（以成品畫面為單位）
+        let mut off: Vec<f32> = cam
+            .iter()
+            .zip(raw)
+            .map(|(c, r)| ((c.0 - r.0) / cw).hypot((c.1 - r.1) / ch))
+            .collect();
+        // 鏡頭自己晃得多厲害
+        let mut jerk: Vec<f32> = cam
+            .windows(3)
+            .map(|w| {
+                ((w[2].0 - 2.0 * w[1].0 + w[0].0) / cw).hypot((w[2].1 - 2.0 * w[1].1 + w[0].1) / ch)
+            })
+            .collect();
+        let cost = med(&mut off) + med(&mut jerk);
+        if cost < best.1 - 1e-6 {
+            best = (s, cost);
+        }
+    }
+    best.0.clamp(0, 100)
+}
+
+/// 兩個主體框之間，追出來的終點與使用者框的位置差到這個程度以上，就當作
+/// 中途整段跟丟了——那種差距不是慢慢累積的漂移，硬把它攤平只會把原本
+/// 追對的幾張也一起拉歪
+const TRACK_MAX_DRIFT: f32 = 0.25;
+
+/// 把一段追蹤累積的漂移沿路攤掉：最後一張本來就有使用者的框（`target`），
+/// 追到那裡卻差了多少，就是這一段一路累積下來的偏差；照「走了幾張」按比例
+/// 減回去，兩端都釘在使用者框的位置上，中間也不會突然跳一下。
+///
+/// 差得太多（超過 [`TRACK_MAX_DRIFT`]）就當作中途整段跟丟了，原樣不動——
+/// 那不是慢慢累積的漂移，硬攤只會把原本追對的幾張也一起拉歪
+fn spread_drift(hits: &mut [(usize, Option<track::Hit>)], target: (f32, f32)) {
+    let Some(end) = hits.last().and_then(|(_, h)| *h) else { return };
+    let (ex, ey) = (end.cx - target.0, end.cy - target.1);
+    if ex.hypot(ey) >= TRACK_MAX_DRIFT {
+        return;
+    }
+    let n = hits.len() as f32;
+    for (k, (_, hit)) in hits.iter_mut().enumerate() {
+        if let Some(h) = hit {
+            let t = (k + 1) as f32 / n;
+            h.cx -= ex * t;
+            h.cy -= ey * t;
+        }
+    }
+}
+
+/// 追蹤整批照片。
+///
+/// `marks` 是使用者框過的照片（照片順序，至少一個）。整批切成幾段各自追：
+///
+/// * 第一個框**往前**倒著追到第一張
+/// * 相鄰兩個框之間往後追，追到下一個框時把「追到的位置」與「使用者框的
+///   位置」之差當成這一段累積的漂移，沿路按比例攤掉——兩端都釘在使用者
+///   框的地方，中間就不會愈跑愈偏
+/// * 最後一個框往後追到最後一張
+///
+/// 所以多框幾張的意義很實在：每一段都從一片新鮮的樣板重新出發，而且段的
+/// 兩端都被釘住。主體轉身、忽明忽暗、飛遠飛近時，在那附近補框一張就能把
+/// 整段救回來。
+///
+/// `crop` 只取它的旋轉部分（見 [`decode_for_track`]）
+fn run_track(
+    photos: &[PathBuf],
+    marks: &[(usize, [f32; 4])],
+    crop: Crop,
+    send: &dyn Fn(TrackMsg),
+) {
+    let name = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    // 先把有框的那幾張解出來：每一段都要拿它起頭
+    let mut seeds: Vec<track::Frame> = Vec::with_capacity(marks.len());
+    for (i, rect) in marks {
+        let Some(f) = decode_for_track(&photos[*i], crop) else {
+            send(TrackMsg::Failed(format!(
+                "讀不到照片「{}」，無法從這張開始追蹤",
+                name(&photos[*i])
+            )));
+            return;
+        };
+        if track::Tracker::new(&f, *rect).is_none() {
+            send(TrackMsg::Failed(format!(
+                "第 {} 張的框太小了，把主體整個框起來（框到有花紋的部位）再試一次",
+                i + 1
+            )));
+            return;
+        }
+        seeds.push(f);
+    }
+    // 有框的那幾張不必比對：主體就在使用者框的地方（框也已經在畫面上了）
+    for _ in 0..marks.len() {
+        send(TrackMsg::Step);
+    }
+    let photos = Arc::new(photos.to_vec());
+    let need = vec![true; photos.len()];
+    let (locked, total) = follow_fill(&photos, marks, &seeds, &need, crop, true, send);
+    send(TrackMsg::Done(locked + marks.len(), total + marks.len()));
+}
+
+/// 從幾個可靠的框出發，把 `need` 為真的那幾張用「長得像不像」補起來，
+/// 回傳（補到幾張, 處理幾張）。
+///
+/// 這是追蹤的核心，兩個地方都用它：使用者按「從手動框追蹤」時整批補，
+/// 自動框選時只補那些「動態偵測看不見」的張——主體停下來不動時，
+/// 逐張比差異的做法完全找不到牠，但牠**長得還是一樣**，樣板比對就抓得住。
+///
+/// 分段的規矩：每一段從最近的框出發；段的終點也有框時，把追到終點時累積
+/// 的偏差沿路攤平（見 [`spread_drift`]）。整段都不需要補的就跳過不解碼
+fn follow_fill(
+    photos: &Arc<Vec<PathBuf>>,
+    marks: &[(usize, [f32; 4])],
+    seeds: &[track::Frame],
+    need: &[bool],
+    crop: Crop,
+    step: bool,
+    send: &dyn Fn(TrackMsg),
+) -> (usize, usize) {
+    let centre = |r: [f32; 4]| ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
+    let (mut locked, mut total) = (0usize, 0usize);
+
+    // 要跑的每一段：(從哪一個框出發, 依序要追的照片, 終點的框位置)。
+    // 終點有框的段落追完要把漂移攤掉，其餘（頭尾兩段）沒有可對照的終點
+    let mut runs: Vec<(usize, Vec<usize>, Option<(f32, f32)>)> = Vec::new();
+    let first = marks[0].0;
+    if first > 0 {
+        runs.push((0, (0..first).rev().collect(), None));
+    }
+    for k in 0..marks.len().saturating_sub(1) {
+        let (a, b) = (marks[k].0, marks[k + 1].0);
+        if b > a + 1 {
+            // 追到 b 那張為止：終點的誤差就是這一段累積的漂移
+            runs.push((k, (a + 1..=b).collect(), Some(centre(marks[k + 1].1))));
+        }
+    }
+    let last = marks[marks.len() - 1].0;
+    if last + 1 < photos.len() {
+        runs.push((marks.len() - 1, (last + 1..photos.len()).collect(), None));
+    }
+    // 整段都已經有可靠的框就跳過：那一段連解碼都省下來
+    runs.retain(|(_, order, _)| order.iter().any(|&i| need[i]));
+
+    for (seed, order, target) in runs {
+        let rxs = spawn_decoders(&order, &photos, crop);
+        let Some(mut tracker) = track::Tracker::new(&seeds[seed], marks[seed].1) else {
+            continue; // 這個起點的框太小，換下一段（呼叫端已先驗過，理應不會發生）
+        };
+        // 這一段的框都跟著出發那一張的大小走（追蹤只找位置、不量大小）
+        let seed_rect = marks[seed].1;
+        let (sw, sh) = (seed_rect[2] - seed_rect[0], seed_rect[3] - seed_rect[1]);
+        let to_boxes = |got: &[(usize, Option<track::Hit>)]| -> Vec<(usize, Option<Subject>)> {
+            got.iter()
+                // 已經有可靠框的那幾張不覆蓋（自動框選只補看不見的那些）
+                .filter(|(i, _)| need[*i])
+                .map(|(i, h)| {
+                    (
+                        *i,
+                        h.map(|h| Subject {
+                            rect: clamp_rect([
+                                h.cx - sw / 2.0,
+                                h.cy - sh / 2.0,
+                                h.cx + sw / 2.0,
+                                h.cy + sh / 2.0,
+                            ]),
+                            src: BoxSrc::Tracked,
+                            // 比對分數直接當把握程度：勉強對上的（樣板在
+                            // 一片綠葉上總能找到「還算像」的地方）與照速度
+                            // 推出來的一樣要請使用者過目，不能默默放行
+                            score: if h.score >= TRACK_FILL_SURE {
+                                0.9
+                            } else if h.locked {
+                                0.4
+                            } else {
+                                0.2
+                            },
+                        }),
+                    )
+                })
+                .collect()
+        };
+        let mut got: Vec<(usize, Option<track::Hit>)> = Vec::with_capacity(order.len());
+        for n in 0..order.len() {
+            if TRACK_CANCEL.load(Ordering::Relaxed) {
+                send(TrackMsg::Boxes(to_boxes(&got)));
+                return (locked, total);
+            }
+            let Ok((i, frame)) = rxs[n % TRACK_DECODERS].recv() else { break };
+            match frame {
+                Some(f) => got.push((i, Some(tracker.find(&f)))),
+                // 讀不到的那張沒有位置可用；它的裁切框就維持原樣，
+                // 鏡頭在那一格會停一下，總比亂跳到別的地方好
+                None => got.push((i, None)),
+            }
+            // 中段的最後一張是「下一個框」那張，前面已經算過一次進度了
+            if step && (target.is_none() || n + 1 < order.len()) {
+                send(TrackMsg::Step);
+            }
+        }
+        // 這一段的終點有使用者的框：把追到終點時累積的偏差沿路攤掉
+        if let Some(t) = target {
+            spread_drift(&mut got, t);
+            // 終點那張本來就有使用者的框，別讓追出來的結果蓋掉它
+            got.pop();
+        }
+        locked += got
+            .iter()
+            .filter(|(i, h)| need[*i] && h.is_some_and(|h| h.locked))
+            .count();
+        total += got.iter().filter(|(i, _)| need[*i]).count();
+        send(TrackMsg::Boxes(to_boxes(&got)));
+    }
+    (locked, total)
+}
+
+/// 開幾條執行緒把 `order` 裡的照片解成灰階小圖（解碼是整批最花時間的一步，
+/// 讓它先跑在比對前面）。
+///
+/// 第 k 條認領 `order` 裡「每 [`TRACK_DECODERS`] 張的第 k 張」，各走自己的
+/// 通道；消費端照 `n % TRACK_DECODERS` 輪流取，順序就自然對得起來。通道
+/// 容量 1＝最多只超前幾張，上千張的批次也不會把灰階圖堆滿記憶體
+fn spawn_decoders(
+    order: &[usize],
+    photos: &Arc<Vec<PathBuf>>,
+    crop: Crop,
+) -> Vec<Receiver<(usize, Option<track::Frame>)>> {
+    let mut rxs = Vec::with_capacity(TRACK_DECODERS);
+    for k in 0..TRACK_DECODERS {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mine: Vec<usize> = order.iter().skip(k).step_by(TRACK_DECODERS).copied().collect();
+        let photos = Arc::clone(photos);
+        thread::spawn(move || {
+            for i in mine {
+                if TRACK_CANCEL.load(Ordering::Relaxed) {
+                    break;
+                }
+                // 收端已經走人（取消或跑完）就別再白解下去
+                if tx.send((i, decode_for_track(&photos[i], crop))).is_err() {
+                    break;
+                }
+            }
+        });
+        rxs.push(rx);
+    }
+    rxs
+}
+
+/// 自動框選：一張一張往下走，拿「前一張、這一張、下一張」找出正在動的那個
+/// 主體（見 [`track::detect`]），每張各給一個框讓使用者過目。
+///
+/// `keep[i]` 為真的那幾張是使用者自己框的，跳過不動。
+/// 手上永遠只留三張灰階圖（滑動視窗），上千張也不吃記憶體
+fn run_auto_boxes(
+    photos: &[PathBuf],
+    manual: &[Option<[f32; 4]>],
+    crop: Crop,
+    send: &dyn Fn(TrackMsg),
+) {
+    let n = photos.len();
+    let keep: Vec<bool> = manual.iter().map(|m| m.is_some()).collect();
+    let photos = Arc::new(photos.to_vec());
+    let order: Vec<usize> = (0..n).collect();
+    let rxs = spawn_decoders(&order, &photos, crop);
+    let mut win: VecDeque<(usize, Option<track::Frame>)> = VecDeque::new();
+    let mut pulled = 0usize;
+    // 每張各留幾個候選，等整批找完再一起挑出「同一個主體」那一條路徑
+    let mut cands: Vec<Vec<track::Found>> = vec![Vec::new(); n];
+
+    for i in 0..n {
+        if TRACK_CANCEL.load(Ordering::Relaxed) {
+            send(TrackMsg::Done(0, i));
+            return;
+        }
+        // 視窗補到涵蓋「下一張」，再把用不到的舊照片丟掉
+        while pulled < n && pulled <= i + 1 {
+            let Ok(v) = rxs[pulled % TRACK_DECODERS].recv() else { break };
+            win.push_back(v);
+            pulled += 1;
+        }
+        while win.front().is_some_and(|(j, _)| *j + 1 < i) {
+            win.pop_front();
+        }
+        let at = |j: usize| {
+            win.iter()
+                .find(|(k, _)| *k == j)
+                .and_then(|(_, f)| f.as_ref())
+        };
+        // 使用者自己框過的不動；讀不到的那張就當作沒框到。
+        // 第一張與最後一張要拿**同一側的兩張**來比，否則主體在鄰張留下的
+        // 殘影與本尊一樣亮，框到哪一個純屬運氣（見 track::detect_candidates）
+        if let (false, Some(cur)) = (keep[i], at(i)) {
+            let (a, b) = match (i, n) {
+                (0, _) => (at(1), at(2)),
+                (i, n) if i + 1 == n => (at(i - 1), at(i - 2)),
+                (i, _) => (at(i - 1), at(i + 1)),
+            };
+            cands[i] = track::detect_candidates(a, cur, b, track::DET_CANDIDATES);
+        }
+        send(TrackMsg::Step);
+    }
+
+    // 整批一起挑出最連貫的那一條軌跡，再按「與鄰張接不接得上」重估把握程度
+    // （見 track::choose_path / track::path_scores）
+    let picked = track::choose_path(&cands);
+    let conf = track::path_scores(&cands, &picked);
+    let mut boxes: Vec<(usize, Option<Subject>)> = Vec::with_capacity(n);
+    let mut marks: Vec<(usize, [f32; 4])> = Vec::new();
+    let mut need = vec![false; n];
+    for i in 0..n {
+        if keep[i] {
+            continue;
+        }
+        let s = picked[i].map(|k| Subject {
+            rect: clamp_rect(cands[i][k].rect),
+            src: BoxSrc::Auto,
+            score: conf[i],
+        });
+        // 有把握的那幾張當作接下來補洞的起點；其餘的等著被補
+        match s {
+            Some(s) if s.sure() => marks.push((i, s.rect)),
+            _ => need[i] = true,
+        }
+        boxes.push((i, s));
+    }
+    send(TrackMsg::Boxes(boxes));
+
+    // 第二趟：主體停下來不動的那幾張，逐張比差異根本看不見牠——改用「長得
+    // 像不像」，**往前或往後**找到最近那張「已經框到主體」的照片，從它的
+    // 框裡借主體的樣子過來比對（見 follow_fill）；使用者自己框的一律當起點
+    for (i, m) in manual.iter().enumerate() {
+        if let Some(r) = m {
+            marks.push((i, *r));
+        }
+    }
+    marks.sort_by_key(|(i, _)| *i);
+    let missing = need.iter().filter(|x| **x).count();
+    let mut found = n - missing - keep.iter().filter(|k| **k).count();
+    if missing > 0 && !marks.is_empty() {
+        send(TrackMsg::Phase(format!("補上動態偵測看不見的 {missing} 張…")));
+        let mut seeds: Vec<track::Frame> = Vec::with_capacity(marks.len());
+        let mut ok: Vec<(usize, [f32; 4])> = Vec::with_capacity(marks.len());
+        for (i, rect) in &marks {
+            if let Some(f) = decode_for_track(&photos[*i], crop) {
+                if track::Tracker::new(&f, *rect).is_some() {
+                    seeds.push(f);
+                    ok.push((*i, *rect));
+                }
+            }
+        }
+        if !ok.is_empty() {
+            let (filled, _) = follow_fill(&photos, &ok, &seeds, &need, crop, false, send);
+            found += filled;
+        }
+    }
+    send(TrackMsg::Done(found + keep.iter().filter(|k| **k).count(), n));
+}
+
 /// 去煙工具背景執行緒的回報
 enum SmokeMsg {
-    /// 預覽底圖載好了；附上照片路徑，切張切太快時用來丟棄過期結果
-    Loaded(PathBuf, Result<image::RgbImage, String>),
-    /// 預覽算完；附上當時的參數，用來判斷是否已是最新
-    Preview(SmokeParams, image::RgbImage),
+    /// 預覽底圖載好了；附上照片路徑，切張切太快時用來丟棄過期結果。
+    /// 一併帶回原圖的長邊——預覽的強度要照它折算（見 [`dehaze::preview_strength`]）
+    Loaded(PathBuf, Result<(image::RgbImage, u32), String>),
+    /// 去煙預覽算完；附上當時的參數與筆跡用來判斷是否已是最新，接著是
+    /// 清完但還沒調色的中間結果（沒筆跡時為 None）、未清未調色的去煙結果
+    /// （兩份都留著當快取），最後才是畫面上要顯示的成品
+    Preview(
+        SmokeParams,
+        Adjustments,
+        Vec<edit::Wipe>,
+        Option<Arc<image::RgbImage>>,
+        image::RgbImage,
+        image::RgbImage,
+        /// 這一趟是拿多細的底圖算的（長邊，見 [`SMOKE_FINE_CAP`]）
+        u32,
+    ),
+    /// 只重算手動清除與調色的結果（去煙結果沿用快取）；
+    /// 附上當時的兩份設定與清完還沒調色的中間結果
+    Graded(
+        Adjustments,
+        Vec<edit::Wipe>,
+        Option<Arc<image::RgbImage>>,
+        image::RgbImage,
+    ),
     /// 批次輸出的進度（已完成張數）
     SaveProgress(usize),
-    /// 批次輸出結束：成功張數與各張的錯誤訊息
-    SaveDone(usize, Vec<String>),
+    /// 批次輸出結束：成功張數、各張的錯誤訊息，與第一張成功輸出的路徑
+    /// （路徑給「開啟圖片」用，全失敗時為 None）
+    SaveDone(usize, Vec<String>, Option<PathBuf>),
 }
 
 /// 去煙工具目前在背景做的事（同時間只會有一件）
@@ -970,23 +2877,205 @@ enum SmokeBusy {
     Saving,
 }
 
-/// 「去煙霧」工具視窗：照片去除煙火煙霧後另存新檔，與影片專案互不相干
+/// 遮色片工具：決定在照片上拖曳會畫出哪一種形狀（比照 Lightroom 的遮色片面板）
+#[derive(PartialEq, Clone, Copy)]
+enum MaskTool {
+    /// 矩形框選
+    Rect,
+    /// 筆刷（一筆加一次，同一塊塗兩遍就更濃）
+    Brush,
+    /// 線性漸層
+    Linear,
+    /// 放射性漸層
+    Radial,
+    /// 物件：框住要選的東西，程式沿著它自己的輪廓圈出來
+    Object,
+}
+
+/// 正在照片上拖曳、還沒放開的形狀（座標都是影像的相對座標 0~1）
+enum Draft {
+    /// 起點與目前拖到的位置
+    Rect(egui::Pos2, egui::Pos2),
+    Linear(egui::Pos2, egui::Pos2),
+    /// 中心與目前拖到的位置（放射漸層由中心往外拉）
+    Radial(egui::Pos2, egui::Pos2),
+    /// 筆跡經過的點
+    Brush(Vec<[f32; 2]>),
+    /// 物件選取的框：拖的時候只是一個框，放開才去算框裡那個東西的輪廓
+    Object(egui::Pos2, egui::Pos2),
+}
+
+impl Draft {
+    /// 換成實際存進參數的形狀（畫輔助線時也用它，畫出來的才與結果一致）。
+    ///
+    /// 物件換不出來——它的邊界是照片內容決定的，得整張圖跑一趟才算得出來
+    /// （見 [`dehaze::select_object`]），所以回傳 None 交給呼叫端另外處理
+    fn to_shape(&self, radius: f32, invert: bool) -> Option<dehaze::Shape> {
+        Some(match self {
+            Draft::Rect(a, b) => dehaze::Shape::Rect(dehaze::Region {
+                x0: a.x,
+                y0: a.y,
+                x1: b.x,
+                y1: b.y,
+            }),
+            Draft::Linear(a, b) => dehaze::Shape::Linear(dehaze::Linear {
+                x0: a.x,
+                y0: a.y,
+                x1: b.x,
+                y1: b.y,
+            }),
+            // 放射漸層由中心往外拉，拖到的位置就是橢圓的角
+            Draft::Radial(c, b) => dehaze::Shape::Radial(dehaze::Radial {
+                cx: c.x,
+                cy: c.y,
+                rx: (b.x - c.x).abs(),
+                ry: (b.y - c.y).abs(),
+                invert,
+            }),
+            Draft::Brush(pts) => dehaze::Shape::Brush(dehaze::Brush {
+                pts: pts.clone(),
+                radius,
+            }),
+            Draft::Object(..) => return None,
+        })
+    }
+
+    /// 拖出來的框（物件選取用）。從右下往左上拉也算數，由 dehaze 那邊正規化
+    fn region(a: egui::Pos2, b: egui::Pos2) -> dehaze::Region {
+        dehaze::Region {
+            x0: a.x,
+            y0: a.y,
+            x1: b.x,
+            y1: b.y,
+        }
+    }
+}
+
+/// 遮色片那組滑桿底下的一句話。去煙霧與煙火疊圖共用同一組控制項
+/// （尺寸／邊緣羽化／濃度），說明自然也是同一句
+const MASK_HINT: &str = "邊緣羽化＝疊完那一整片的邊界多柔 · 筆刷濃度＝筆刷一筆上多少\n\
+                         每畫一個就疊一次；框選、漸層與物件一律 100%，\
+                         只有筆刷吃濃度（同一塊想更濃就再塗一遍）";
+
+/// 「物件」工具那兩條滑桿底下的一句話。去煙霧與煙火疊圖共用同一組控制項，
+/// 說明自然也是同一句
+const OBJECT_HINT: &str = "拖曳框住要選的東西，程式會自動找出框裡那個東西的輪廓\n\
+                           羽化＝邊界多柔 · 邊緣＝整圈往內收（−）或往外擴（＋）；\
+                           拉這兩條會直接套到剛框好的那一個";
+
+/// 一筆筆跡最多記幾個點：再密也看不出差別，卻會讓參數比對與重繪變慢
+const MAX_BRUSH_PTS: usize = 400;
+
+/// 筆跡取樣的最小間距（相對座標）。滑鼠每動一點就記一個點只是把資料撐大
+const BRUSH_STEP: f32 = 0.004;
+
+/// 物件選取的框至少要拉這麼大（相對座標，兩軸都要）。
+/// 比這還小就是手滑點了一下，什麼都不做——跳一句「分不出東西」反而莫名其妙。
+/// 與 dehaze 那邊丟掉退化框的門檻一致（見 `dehaze::Region::is_usable`）
+const OBJECT_MIN_BOX: f32 = 0.01;
+
+/// 吸管吸到的顏色要拿去做什麼
+#[derive(PartialEq, Clone, Copy)]
+enum PickTarget {
+    /// 保護色：與它相近的地方不去煙
+    Protect,
+    /// 雲色：與它相近的地方當成天空，跟著被壓回夜色
+    Cloud,
+}
+
+/// 「去煙霧」模組的狀態：照片去除煙火煙霧後另存新檔，與影片專案互不相干。
+/// 切到別的模組時整份留著，切回來就是剛才離開的樣子
 struct SmokeTool {
-    open: bool,
     /// 待處理的照片；可一次選多張，逐張切換預覽
     photos: Vec<PathBuf>,
     /// 目前預覽的是第幾張
     cur: usize,
     /// 預覽底圖（目前這張的原圖等比縮到 SMOKE_PREVIEW_MAX）
     base: Option<Arc<image::RgbImage>>,
+    /// 放大檢視時改用的精細底圖（原圖縮到 [`SmokeTool::fine_long`]）；
+    /// None＝還沒解過。跟著目前這張走，換張就放掉
+    base_fine: Option<Arc<image::RgbImage>>,
+    /// `base_fine` 的長邊；0＝沒有
+    fine_long: u32,
+    /// 正在背景解的那一份有多細；Some 代表有工作在跑，同一份不會排兩次
+    fine_loading: Option<u32>,
+    /// 精細底圖的解碼結果通道
+    fine_rx: Option<Receiver<(PathBuf, Option<image::RgbImage>)>>,
+    /// 這張讀不出來，別再排了（讀檔失敗時每一幀都會想再試一次）
+    fine_failed: bool,
+    /// 這一幀畫面上照片佔多少**實體像素**：底圖至少要這麼細才不是放大的
+    /// （畫預覽時寫入，見 [`fine_target`]）
+    want_long: u32,
+    /// `applied` 那份預覽是拿多細的底圖算的。與現在手上最細的那份不同就
+    /// 補算一次——但要等參數本身先停下來，拉滑桿的過程一律先用快的那份
+    applied_long: u32,
+    /// tex_before 是拿多細的底圖上傳的（對照時左右兩邊要一樣細）
+    before_long: u32,
+    /// 目前這張**原圖**的長邊。預覽是縮圖，估煙霧層時少了原尺寸的最小值池化，
+    /// 同樣的強度會去得比成品乾淨；畫預覽前要靠它把強度折算回去
+    /// （見 [`dehaze::preview_strength`]）
+    base_long: u32,
     /// 共用參數：沒有個別設定的照片都套這組
     params: SmokeParams,
     /// 個別照片的參數覆寫；沒有覆寫的沿用 params
     overrides: HashMap<PathBuf, SmokeParams>,
-    /// 開著時滑桿與框選只改目前這張（寫進 overrides），否則改共用參數
+    /// 共用的後製設定（調色與文字）：沒有個別設定的照片都套這組。
+    /// 與去煙參數分開存放，是因為兩者的重算成本差了兩個數量級——
+    /// 去煙要算上近一秒，調色與文字卻是即時的
+    finish: Finish,
+    /// 個別照片的後製覆寫；沒有覆寫的沿用 finish
+    finish_overrides: HashMap<PathBuf, Finish>,
+    /// 文字樣式（字型、顏色、外框，全部文字共用；與影片專案的字幕樣式互不相干）
+    text_style: SubtitleStyle,
+    /// 預覽上目前選取的文字（finish.texts 的索引），用於顯示縮放/旋轉控制框
+    sel_text: Option<usize>,
+    /// 這一幀滑鼠正壓在（或懸在）某段文字上：左鍵讓給文字，不拿來平移預覽
+    text_busy: bool,
+    /// 預覽上目前選取的疊圖片（finish.images 的索引）
+    sel_image: Option<usize>,
+    /// 同 text_busy，但指的是疊上去的圖片（兩者分開存才不會互相蓋掉）
+    image_busy: bool,
+    /// 疊圖片的預覽貼圖，依來源檔快取（第一次畫到才載）
+    image_tex: HashMap<PathBuf, egui::TextureHandle>,
+    /// 「圖片」區塊是否展開
+    image_open: bool,
+    /// 已載進 egui 的預覽字型是清單中的第幾個（換字型才重載一次）
+    font_loaded: Option<usize>,
+    /// 每張照片自動量出來的建議值（開檔後在背景逐張量，見 [`App::spawn_smoke_auto`]）。
+    /// 沒有個別設定的照片就套自己這一組，四條數值滑桿因此一開始
+    /// 就停在這張該有的位置
+    auto: HashMap<PathBuf, dehaze::AutoParams>,
+    /// 自動判參數的開關。關掉就整批回到同一組共用參數
+    auto_on: bool,
+    /// 還沒量完的張數（顯示進度用）
+    auto_left: usize,
+    /// 背景量測的結果通道；量完最後一張就收掉
+    auto_rx: Option<Receiver<(PathBuf, Option<dehaze::AutoParams>)>>,
+    /// 背景量測的待辦佇列。切張時把那一張插到最前面，眼前的先算
+    auto_jobs: Option<Arc<Mutex<VecDeque<PathBuf>>>>,
+    /// 叫上一批量測收工的旗標（重選照片時換一支新的）
+    auto_cancel: Arc<AtomicBool>,
+    /// 開著時滑桿與框選只改目前這張（寫進 overrides），否則改共用參數。
+    ///
+    /// **預設開著**：一批照片的煙各有各的濃淡，逐張調本來就是常態；
+    /// 關著的話在第三張上拉一下滑桿，前兩張已經調好的也一起被改掉
     per_photo: bool,
-    /// tex_after 目前反映的參數；與目前這張的有效參數不同就重算
+    /// after 目前反映的去煙參數；與目前這張的有效參數不同就重算
     applied: Option<SmokeParams>,
+    /// 去煙後、還沒調色的預覽結果。調色改動時只要拿它重跑調色，
+    /// 不必再等一次去煙
+    after: Option<Arc<image::RgbImage>>,
+    /// tex_after 目前反映的調色；與目前這張的有效調色不同就重算
+    graded: Option<Adjustments>,
+    /// tex_after 目前反映的手動清除；與目前這張的筆跡不同就重算
+    /// （與 graded 同一個用途，分開存是因為兩者各自會單獨變動）
+    wiped: Option<Vec<edit::Wipe>>,
+    /// 手動清除的中間結果：`after` 套上 wipe_cache_of 那幾筆、還沒調色的樣子。
+    /// 每一筆都要各自跑一次內插（預覽尺寸約 5ms），整串重跑的話塗到上百筆就
+    /// 要等上一秒；塗新的一筆時接著這份再算新增的那幾筆，筆數再多都一樣快
+    wipe_cache: Option<Arc<image::RgbImage>>,
+    /// wipe_cache 已經套進去的那幾筆（目前這張的筆跡開頭要與它相同才接得上）
+    wipe_cache_of: Vec<edit::Wipe>,
     tex_before: Option<egui::TextureHandle>,
     tex_after: Option<egui::TextureHandle>,
     rx: Option<Receiver<SmokeMsg>>,
@@ -994,15 +3083,66 @@ struct SmokeTool {
     error: Option<String>,
     /// 批次輸出的進度（已完成張數）與取消旗標
     save_done: usize,
+    /// 這一批要存幾張。**不一定等於照片總數**——縮圖列挑過就只存挑到的
+    /// 那幾張（見 [`SmokeTool::multi_sel`]），進度要照這個數字報
+    save_total: usize,
     save_cancel: Arc<AtomicBool>,
     /// 最近一次批次輸出的結果與時間（視窗內短暫顯示提示）
     saved: Option<(String, Instant)>,
-    /// 正在拖曳框選的起點（影像的相對座標 0~1）；放開滑鼠才寫進參數
-    drag_from: Option<egui::Pos2>,
-    /// 吸色模式：下一次在照片上點擊要取為保護色
-    picking: bool,
+    /// 最近一次輸出的第一張成品路徑；有值才顯示「開啟圖片」
+    /// （提示訊息幾秒就消失，這個要留著讓使用者隨時能看成品）
+    saved_path: Option<PathBuf>,
+    /// 正在拖曳、還沒放開的形狀；放開滑鼠才寫進參數觸發重算
+    draft: Option<Draft>,
+    /// 正在用拖的搬移的遮色片形狀：(第幾個, 目前累積的位移)。
+    /// 與 draft 同一個道理——搬的過程只畫在暫時的位置，放開才寫回參數，
+    /// 免得每動一個 pixel 就重跑一次去煙
+    moving: Option<(usize, egui::Vec2)>,
+    /// 目前選用的遮色片工具；None＝沒選（預設），左鍵改成拖曳平移預覽
+    mask_tool: Option<MaskTool>,
+    /// 筆刷粗細：筆跡直徑佔影像長邊的百分比
+    brush_size: i32,
+    /// 手動清除的筆跡，逐張分開存：塗在哪一點是那一張照片自己的事，
+    /// 放進共用的 finish 會把同一塊抹到別張去
+    wipes: HashMap<PathBuf, Vec<edit::Wipe>>,
+    /// 清除筆刷是否啟用（開著時左鍵在預覽上就是塗抹）
+    wipe_on: bool,
+    /// 清除筆刷粗細：筆跡直徑佔影像長邊的百分比（與遮色片筆刷同一個尺規）
+    wipe_size: i32,
+    /// 清除筆刷羽化 0~100：邊緣過渡佔半徑多少（見 [`edit::Wipe::feather`]）
+    wipe_feather: i32,
+    /// 清除筆刷流暢度 0~100：一筆一次上多少（見 [`edit::Wipe::flow`]）
+    wipe_flow: i32,
+    /// 清除筆刷濃度 0~100：一筆最多清到什麼程度（見 [`edit::Wipe::density`]）
+    wipe_density: i32,
+    /// 接下來塗的筆跡要不要保留煙火紋路（只扣掉煙那一層）。
+    /// 每一筆都記著自己塗下去時的設定（見 [`edit::Wipe::keep_detail`]），
+    /// 改這個開關不會動到已經塗好的
+    wipe_keep: bool,
+    /// 正在塗、還沒放開的那一筆；放開才寫進去觸發重算
+    wipe_draft: Option<Vec<[f32; 2]>>,
+    /// 「手動清除」區塊是否展開
+    wipe_open: bool,
+    /// 新畫的放射性漸層要不要反轉（改成橢圓外才去煙）
+    radial_invert: bool,
+    /// 「物件」工具的羽化 0~100：選出來的邊界往外暈開多寬。
+    /// 改它會就地改剛選好的那一個（見 [`dehaze::Object::refined`]），
+    /// 同時也是下一次框選的起始值
+    object_feather: i32,
+    /// 「物件」工具的邊緣 −100~100：邊界整圈往內收（負）或往外擴（正）
+    object_edge: i32,
+    /// 吸色模式：下一次在照片上點擊要把顏色取為哪一種；None＝沒在吸色
+    picking: Option<PickTarget>,
     /// 預覽改顯示遮色片（紅色蓋住的地方不會被去煙）
     show_mask: bool,
+    /// 預覽的顯示比例；None＝縮到剛好塞滿畫面，
+    /// Some(1.0)＝預覽底圖 1 像素對螢幕 1 個**實體像素**（不是 1 點，
+    /// 否則 Windows 的顯示縮放會讓 100% 其實是 125%、150%）
+    zoom: Option<f32>,
+    /// 空白鍵跳到 1:1 之前是哪個比例，再按一次就回到它（None＝沒跳過或已經回來了）
+    zoom_back: Option<Option<f32>>,
+    /// 放大後畫面中央對到照片的哪個位置（相對座標 0~1）
+    pan: egui::Pos2,
     /// 縮圖列的貼圖快取。與主畫面的 thumbs 分開：那邊會依它自己的
     /// 可視範圍淘汰、換專案時清空，共用會互相把對方的縮圖清掉。
     /// 解碼工作池則是共用的（見 request_smoke_thumbs）
@@ -1011,36 +3151,128 @@ struct SmokeTool {
     vis_range: Option<(usize, usize)>,
     /// 縮圖列要捲到目前這張（切張後才捲一次）
     scroll_to_cur: bool,
-    /// 「天空」區塊是否展開（清雲與夜空上色，預設收合不佔版面）
+    /// 縮圖列 Ctrl／Shift＋點選挑出來的那幾張：**存檔只存這幾張**。
+    /// 空的＝沒挑，那就是整批都存（與檔案總管的選取一樣：沒選就是全部）
+    multi_sel: HashSet<PathBuf>,
+    /// 「天空」區塊是否展開。**預設收合**：一開檔先看到的是去除煙霧與細節
+    /// 這兩條主滑桿，版面乾淨、預覽也留得比較高；天空那幾項是要細修時才進去。
+    /// （自動判參數仍會替清雲給保底值，收著不影響它生效）
     sky_open: bool,
+    /// 「調色」區塊是否展開（搬到右側面板後預設就展開）
+    grade_open: bool,
+    /// 正在調整裁切範圍：預覽改顯示整張照片並畫出可拖曳的裁切框
+    crop_editing: bool,
+    /// 裁切要固定成哪個長寬比
+    crop_aspect: CropAspect,
+    /// 「文字」區塊是否展開。預設展開，與影片模組右側面板的三個區塊一致——
+    /// 兩個模組切來切去，右側面板才是同一個樣子
+    text_open: bool,
+    /// 預覽是否左右並排顯示編輯前／編輯後（快捷鍵 Y）
+    compare: bool,
+    /// 上一幀量到的比例列高度（窄視窗會換行，所以要量不能猜）。
+    /// 漏算它的話預覽永遠多佔一列，設定區最底下那排就被裁掉
+    zoom_h: f32,
+    /// 上一幀量到的設定區（自動判參數～保護色那一整段）自然高度。
+    /// 預覽高度照它留位——公式估不準，估少了存檔列就會被視窗裁掉
+    settings_h: Option<f32>,
+    /// 上一幀量到的存檔列高度；這一列不捲動，得先替它留位
+    save_h: f32,
+    /// 使用者拖分隔線調過的預覽高度增減（相對自動配高，正數＝拉高預覽）。
+    /// 存的是差值不是絕對高度，視窗縮放時預覽照樣跟著長大縮小
+    img_extra: f32,
+    /// 這批照片有調整過、還沒存成檔案。關程式或清空照片前用它決定要不要
+    /// 先問一次，照片一選進來就算數——自動判參數已經替每張調好，
+    /// 直接丟掉就是白做
+    dirty: bool,
 }
 
 impl Default for SmokeTool {
     fn default() -> Self {
         Self {
-            open: false,
             photos: Vec::new(),
             cur: 0,
             base: None,
+            base_fine: None,
+            fine_long: 0,
+            fine_loading: None,
+            fine_rx: None,
+            fine_failed: false,
+            want_long: 0,
+            applied_long: 0,
+            before_long: 0,
+            base_long: 0,
             params: SmokeParams::default(),
             overrides: HashMap::new(),
-            per_photo: false,
+            finish: Finish::default(),
+            finish_overrides: HashMap::new(),
+            text_style: SubtitleStyle::default(),
+            sel_text: None,
+            text_busy: false,
+            sel_image: None,
+            image_busy: false,
+            image_tex: HashMap::new(),
+            image_open: true,
+            font_loaded: None,
+            auto: HashMap::new(),
+            auto_on: true,
+            auto_left: 0,
+            auto_rx: None,
+            auto_jobs: None,
+            auto_cancel: Arc::new(AtomicBool::new(false)),
+            per_photo: true,
             applied: None,
+            after: None,
+            graded: None,
+            wiped: None,
+            wipe_cache: None,
+            wipe_cache_of: Vec::new(),
             tex_before: None,
             tex_after: None,
             rx: None,
             busy: SmokeBusy::Idle,
             error: None,
+            save_total: 0,
             save_done: 0,
             save_cancel: Arc::new(AtomicBool::new(false)),
             saved: None,
-            drag_from: None,
-            picking: false,
+            saved_path: None,
+            draft: None,
+            moving: None,
+            mask_tool: None,
+            brush_size: 10,
+            wipes: HashMap::new(),
+            wipe_on: false,
+            wipe_size: 6,
+            // 45 讓實心核心留 55%，與加這幾條滑桿之前的固定值一致
+            wipe_feather: 45,
+            wipe_flow: 100,
+            wipe_density: 100,
+            wipe_keep: true,
+            wipe_draft: None,
+            wipe_open: true,
+            radial_invert: false,
+            object_feather: dehaze::OBJECT_FEATHER,
+            object_edge: 0,
+            picking: None,
             show_mask: false,
+            zoom: None,
+            zoom_back: None,
+            pan: egui::pos2(0.5, 0.5),
             thumbs: HashMap::new(),
             vis_range: None,
             scroll_to_cur: false,
+            multi_sel: HashSet::new(),
             sky_open: false,
+            grade_open: true,
+            crop_editing: false,
+            crop_aspect: CropAspect::Free,
+            text_open: true,
+            compare: false,
+            zoom_h: 26.0,
+            settings_h: None,
+            save_h: 28.0,
+            img_extra: 0.0,
+            dirty: false,
         }
     }
 }
@@ -1051,21 +3283,257 @@ impl SmokeTool {
         self.photos.get(self.cur)
     }
 
-    /// 某張照片實際要套用的參數：有個別設定就用它，否則用共用參數
+    /// 這張照片正在生效的自動值；沒量到、或自動判參數關著就沒有
+    fn auto_for(&self, p: &Path) -> Option<&dehaze::AutoParams> {
+        self.auto_on.then(|| self.auto.get(p)).flatten()
+    }
+
+    /// 某張照片實際要套用的參數。優先序是：個別設定 → 自動值 → 共用參數。
+    /// 自動值只蓋掉四條數值滑桿，遮色片與色票仍沿用共用那一份
     fn params_for(&self, p: &Path) -> SmokeParams {
-        self.overrides.get(p).copied().unwrap_or(self.params)
+        if let Some(v) = self.overrides.get(p) {
+            return v.clone();
+        }
+        let mut base = self.params.clone();
+        if let Some(a) = self.auto_for(p) {
+            a.apply_to(&mut base);
+        }
+        base
     }
 
     /// 目前這張的有效參數
     fn effective(&self) -> SmokeParams {
         self.current()
             .map(|p| self.params_for(p))
-            .unwrap_or(self.params)
+            .unwrap_or_else(|| self.params.clone())
     }
 
-    /// 寫回參數：依「只調這張」決定寫進覆寫還是共用
+    /// 某張照片實際要套用的後製（調色與文字）。與去煙參數各有一份覆寫表：
+    /// 為了某一張的煙量單獨調過去除強度，不該讓它從此收不到整批共用的調色
+    fn finish_for(&self, p: &Path) -> Finish {
+        let mut f = self
+            .finish_overrides
+            .get(p)
+            .cloned()
+            .unwrap_or_else(|| self.finish.clone());
+        // 手動清除不跟著共用／覆寫那一套：塗在哪一點只對這張有意義，
+        // 一律從逐張的那份補上（見 SmokeTool::wipes）
+        f.wipes = self.wipes_for(p).to_vec();
+        f
+    }
+
+    /// 某張照片的手動清除筆跡
+    fn wipes_for(&self, p: &Path) -> &[edit::Wipe] {
+        self.wipes.get(p).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// 目前這張的手動清除筆跡（比對「要不要重算」時每幀都問，不複製）
+    fn cur_wipes(&self) -> &[edit::Wipe] {
+        self.current().map(|p| self.wipes_for(p)).unwrap_or(&[])
+    }
+
+    /// 寫回目前這張的手動清除筆跡；空的就把這張從表裡拿掉
+    fn set_wipes(&mut self, v: Vec<edit::Wipe>) {
+        let Some(p) = self.current().cloned() else {
+            return;
+        };
+        self.dirty = true;
+        if v.is_empty() {
+            self.wipes.remove(&p);
+        } else {
+            self.wipes.insert(p, v);
+        }
+    }
+
+    /// 清除筆刷半徑（佔影像長邊的比例）。粗細滑桿調的是直徑
+    fn wipe_radius(&self) -> f32 {
+        self.wipe_size as f32 / 200.0
+    }
+
+    /// 目前這張的有效後製
+    fn effective_finish(&self) -> Finish {
+        self.current()
+            .map(|p| self.finish_for(p))
+            .unwrap_or_else(|| self.finish.clone())
+    }
+
+    /// 目前這張的有效調色。預覽每幀都要比對一次，不值得為了一個
+    /// Copy 的結構把整份文字也複製一遍
+    fn effective_grade(&self) -> Adjustments {
+        self.current()
+            .and_then(|p| self.finish_overrides.get(p))
+            .unwrap_or(&self.finish)
+            .grade
+    }
+
+    /// 目前這張**原圖**的像素尺寸（裁切面板要拿它顯示裁完多大、算原圖比例）。
+    /// 手上只有預覽縮圖與原圖長邊，兩者夠推回原尺寸
+    fn source_dims(&self) -> Option<(u32, u32)> {
+        let b = self.base.as_ref()?;
+        let (bw, bh) = (b.width(), b.height());
+        if bw == 0 || bh == 0 {
+            return None;
+        }
+        let long = self.base_long.max(bw.max(bh));
+        let s = long as f32 / bw.max(bh) as f32;
+        Some((
+            ((bw as f32 * s).round() as u32).max(1),
+            ((bh as f32 * s).round() as u32).max(1),
+        ))
+    }
+
+    /// 現在有沒有在用「對著原圖座標」的工具（遮色片、清除筆刷、吸色，
+    /// 或開著遮色片檢視）。這些東西存的都是原圖上的位置，畫面一旦轉過就
+    /// 對不上，所以這時預覽要退回沒轉也沒裁的原圖
+    fn source_tools_active(&self) -> bool {
+        self.mask_tool.is_some() || self.wipe_on || self.picking.is_some() || self.show_mask
+    }
+
+    /// 結束編輯：把上面那幾樣工具全部收起來。
+    ///
+    /// 工具還勾著時預覽是「沒轉也沒裁的原圖」、左鍵也還在畫，可是工具那一排
+    /// 在設定區的下半段，捲下去就看不到——常常忘了自己還開著，以為預覽壞了。
+    /// 收起來才看得到**成品**該有的樣子（實際回報過的狀況）
+    fn end_editing(&mut self) {
+        // 遮罩檢視與成品是兩種畫面，切回來要重畫一次
+        if self.show_mask {
+            self.applied = None;
+        }
+        self.mask_tool = None;
+        self.wipe_on = false;
+        self.picking = None;
+        self.show_mask = false;
+    }
+
+    /// 預覽這一幀要照哪個裁切框顯示。
+    ///
+    /// 正在調整裁切範圍時顯示整張**旋轉後的畫布**（要看得到全部才拖得到框，
+    /// 但旋轉要留著，否則拉直了卻看不出效果）；用著原圖座標的工具時連旋轉
+    /// 一起關掉；其餘就照生效的設定，只給看留下來的那塊
+    fn shown_crop(&self) -> Crop {
+        let c = self.effective_grade().crop.clamped();
+        if self.source_tools_active() {
+            Crop::default()
+        } else if self.crop_editing {
+            Crop { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0, ..c }
+        } else {
+            c
+        }
+    }
+
+    /// 寫回後製設定：依「只調整這張」決定寫進覆寫還是共用。
+    /// 這裡不看自動判參數——它只管去煙的四條滑桿，與調色、文字無關；
+    /// 但這張已經有個別設定時一律寫回它自己，否則滑桿顯示的是覆寫的值、
+    /// 改動卻寫進共用那一份，看起來就像滑桿拉不動
+    fn set_finish(&mut self, mut v: Finish) {
+        self.dirty = true;
+        // 筆跡另外逐張存，不能被寫進共用（或某一張的覆寫）那一份
+        v.wipes = Vec::new();
+        let mine = self.per_photo
+            || self
+                .current()
+                .is_some_and(|p| self.finish_overrides.contains_key(p));
+        if mine {
+            if let Some(p) = self.current().cloned() {
+                self.finish_overrides.insert(p, v);
+                return;
+            }
+        }
+        self.finish = v;
+    }
+
+    /// 把目前這張的去煙參數清回「剛載進來」的樣子＝預設值 ＋ 它自己量出來的
+    /// 自動值（沒量到就是純預設值）。
+    ///
+    /// 寫成**個別設定**而不是把個別設定收掉：遮色片、保護色、雲色、夜空色
+    /// 這些是使用者自己畫／吸的，會留在整批共用的那一份裡。只收掉個別設定的話
+    /// 共用那一份會重新套回這張，畫面上的遮色片框線因此看起來「清不掉」。
+    /// 反過來直接清共用那一份，別張照片的遮色片又會跟著消失——所以替這張
+    /// 單獨寫一份乾淨的，別張仍照舊用共用的那一份
+    fn reset_params_for_current(&mut self) {
+        let Some(p) = self.current().cloned() else {
+            self.params = SmokeParams::default();
+            return;
+        };
+        let mut clean = SmokeParams::default();
+        if let Some(a) = self.auto_for(&p) {
+            a.apply_to(&mut clean);
+        }
+        self.overrides.insert(p, clean);
+        self.dirty = true;
+    }
+
+    /// 這張照片有沒有自己的設定（去煙參數、後製任一個有覆寫，或塗過手動清除）
+    fn has_own(&self, p: &Path) -> bool {
+        self.overrides.contains_key(p)
+            || self.finish_overrides.contains_key(p)
+            || self.wipes.contains_key(p)
+    }
+
+    /// 新選進來的這批與手上這批毫無交集＝真的換了一批照片，而不是
+    /// 「同一批增減幾張」。兩者要分開看：後者留著調好的設定才不會白做，
+    /// 前者留著的卻是對著上一批的畫面才成立的東西
+    /// （見 [`SmokeTool::drop_batch_settings`]）。
+    ///
+    /// 手上還沒有照片時**不算**換批：起始畫面右側的調色與文字面板本來就
+    /// 可以先調好、等照片載進來再套上（清除之後也是回到這個狀態），
+    /// 當成換批會把那些先調好的東西直接抹掉
+    fn is_new_batch(&self, paths: &[PathBuf]) -> bool {
+        if self.photos.is_empty() {
+            return false;
+        }
+        let next: HashSet<&PathBuf> = paths.iter().collect();
+        !self.photos.iter().any(|p| next.contains(p))
+    }
+
+    /// 換一批照片時，把「只對上一批的畫面成立」的共用設定收掉：
+    /// 遮色片是對著上一張畫的、保護色與雲色、夜空色是從上一張吸的，
+    /// 調色與文字則是不管換哪一批都照套——上一批拉到底的去朦朧、擺好的
+    /// 落款會直接出現在新照片上（與 [`App::smoke_clear_photos`] 同一個道理）。
+    ///
+    /// 這些東西留下來特別難查：遮色片與色票在畫面上還看得到，天空那一段
+    /// 預設收合，留著的雲色與夜空色根本看不到，卻會讓新照片只有某一塊
+    /// 沒被處理——實際回報過的狀況。
+    ///
+    /// 數值滑桿（去除、細節、羽化、筆刷濃度、容許範圍…）留著不動：那是
+    /// 使用者的手感，換一批照片仍然成立，四條主滑桿本來也會被每張自己的
+    /// 自動值蓋掉
+    fn drop_batch_settings(&mut self) {
+        self.params.clear_shapes();
+        self.params.clear_protect();
+        self.params.clear_cloud();
+        self.params.sky_color = None;
+        self.finish = Finish::default();
+        // 文字與疊圖跟著 finish 一起沒了，選取狀態與貼圖快取不能留著指空
+        self.sel_text = None;
+        self.sel_image = None;
+        self.image_tex.clear();
+    }
+
+    /// 目前這張的羽化寬度（畫輔助線每幀都要，不值得為一個數字複製整份參數）
+    fn feather(&self) -> i32 {
+        self.current()
+            .and_then(|p| self.overrides.get(p))
+            .unwrap_or(&self.params)
+            .feather
+    }
+
+    /// 筆刷半徑（佔影像長邊的比例）。粗細滑桿調的是直徑
+    fn brush_radius(&self) -> f32 {
+        self.brush_size as f32 / 200.0
+    }
+
+    /// 寫回參數：依「只調這張」決定寫進覆寫還是共用。
+    /// 這張正在用自動值時也只能寫成個別設定——自動值是逐張的，
+    /// 寫進共用參數會被它蓋回去，看起來就像滑桿沒反應
     fn set_params(&mut self, v: SmokeParams) {
-        if self.per_photo {
+        self.dirty = true;
+        let mine = self.per_photo
+            || self
+                .current()
+                .map(|p| self.auto_for(p).is_some())
+                .unwrap_or(false);
+        if mine {
             if let Some(p) = self.current().cloned() {
                 self.overrides.insert(p, v);
                 return;
@@ -1073,11 +3541,1700 @@ impl SmokeTool {
         }
         self.params = v;
     }
+
+    /// 目前這張的四條數值滑桿有沒有離開自動判出來的位置。
+    /// 沒有自動值（沒量到、或自動判參數關著）時一律 false：沒有可以回去的地方
+    fn off_auto(&self) -> bool {
+        let Some(p) = self.current() else { return false };
+        let Some(a) = self.auto_for(p) else { return false };
+        // 沒有個別設定的照片本來就停在自動值上（params_for 會替它套上去），
+        // 只有覆寫裡的那一份才可能偏離
+        self.overrides.get(p).is_some_and(|v| !a.matches(v))
+    }
+
+    /// 把目前這張的四條數值滑桿放回它自己量出來的值。
+    /// 遮色片、保護色、雲色、夜空顏色與調色、文字都不動——那些是使用者
+    /// 自己畫、自己挑的，本來就不在自動值的範圍內
+    fn back_to_auto(&mut self) {
+        let Some(path) = self.current().cloned() else { return };
+        let Some(a) = self.auto_for(&path).copied() else { return };
+        let mut v = self.params_for(&path);
+        a.apply_to(&mut v);
+        // 放回去之後與「這張沒有個別設定」算出來的一模一樣時就把覆寫收掉，
+        // 縮圖上的個別設定記號才不會留著一個其實沒有差異的標記
+        let mut shared = self.params.clone();
+        a.apply_to(&mut shared);
+        if v == shared {
+            self.overrides.remove(&path);
+        } else {
+            self.overrides.insert(path, v);
+        }
+    }
 }
 
+/// 煙火疊圖背景執行緒的回報。載入預覽底圖走另一條通道
+/// （見 [`StackTool::load_rx`]）：那邊是一批多個執行緒同時在跑，
+/// 這邊同時間只會有一件事
+enum StackMsg {
+    /// 疊圖算完；附上當時的設定與調色、疊完還沒調色的中間結果，
+    /// 以及各層自己調過色的預覽底圖（見 [`StackTool::layer_previews`]）
+    Composed(
+        StackKey,
+        Adjustments,
+        Arc<image::RgbImage>,
+        image::RgbImage,
+        HashMap<PathBuf, (Adjustments, Arc<image::RgbImage>)>,
+        /// 這一趟是拿多細的底圖疊的（0＝工作縮圖，見 [`stack_fine_target`]）
+        u32,
+    ),
+    /// 只重算調色（疊圖結果沿用快取）
+    Graded(Adjustments, image::RgbImage),
+    /// 存檔進度：已經疊進去幾張（含地景）
+    SaveProgress(usize),
+    /// 存檔結束
+    SaveDone(Result<PathBuf, String>),
+}
+
+/// 疊圖的調色面板現在調的是哪一份。兩者用的是同一組滑桿，
+/// 但套用的時機完全不同（見 [`App::ui_stack_grade`]）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GradeTarget {
+    /// 縮圖列選著的那一層，**疊進去之前**先套在它身上
+    Layer,
+    /// 疊好的成品，**疊完之後**才套用（裁切也算在這一邊）
+    Output,
+}
+
+/// 煙火疊圖目前在背景做的事。載入預覽底圖不算在裡面
+/// （那是可以與疊圖並行的，進度看 [`StackTool::load_left`]）
+#[derive(PartialEq, Clone, Copy)]
+enum StackBusy {
+    Idle,
+    Composing,
+    Saving,
+}
+
+/// 決定疊出來長什麼樣的那一組設定。拿它跟「上次算出來用的那一組」比對，
+/// 相同就不必重算（與去煙霧拿 [`SmokeParams`] 比對是同一個作法）
+#[derive(Clone, PartialEq)]
+struct StackKey {
+    /// 照片清單與順序（順序決定誰疊在誰上面）
+    photos: Vec<PathBuf>,
+    /// 哪一張當地景
+    ground: usize,
+    mode: BlendMode,
+    feather: i32,
+    density: i32,
+    /// 與 photos 一一對應的遮色片
+    masks: Vec<Vec<dehaze::Shape>>,
+    /// 與 photos 一一對應：那張的遮色片是不是反過來用（只疊畫到的地方）
+    inverts: Vec<bool>,
+    /// 與 photos 一一對應的位移（自動對齊＋手動微調，見 [`StackTool::offset_of`]）。
+    /// **地景那一格也算數**：它是畫布本身，擺法得先套上去（見 [`stack::place`]）
+    xforms: Vec<stack::Xform>,
+    /// 與 photos 一一對應：每一層疊進去之前先各自套上的調色（地景也有）
+    grades: Vec<Adjustments>,
+    /// 與 photos 一一對應：這一層要不要略過（對不上地景的那幾張）
+    skip: Vec<bool>,
+    /// 天際線以下不疊圖（見 [`stack::Guard`]）
+    protect_land: bool,
+}
+
+/// 最多能一次疊幾張。預覽要把每一張都留在記憶體裡（每張約 5MB），
+/// 而且疊圖是逐張線性的，張數再多也只是愈疊愈白
+const MAX_STACK_PHOTOS: usize = 24;
+
+/// 「煙火疊圖」模組的狀態：把好幾張煙火疊成一張，與另外兩個模組互不相干。
+/// 切到別的模組時整份留著，切回來就是剛才離開的樣子
+struct StackTool {
+    /// 要疊的照片（兩張以上才有東西可疊）
+    photos: Vec<PathBuf>,
+    /// 哪一張當地景（底圖）：它的地面、燈火、水面倒影原封不動留著
+    ground: usize,
+    /// 縮圖列目前選著哪一張。專業模式下遮色片就畫在它身上
+    cur: usize,
+    /// 專業模式（預設關著＝簡易模式）。開了才有混合方式與遮色片
+    pro: bool,
+    mode: BlendMode,
+    /// 「混合方式不是預設的」那個提醒收下了沒（見 [`StackTool::blend_changed`]）。
+    /// 按「完成編輯」就算收下，之後不再提；再動一次混合方式又會回來
+    blend_noted: bool,
+    /// 每張照片的遮色片形狀。畫在地景上＝保護區（誰都疊不上去），
+    /// 畫在其他張上＝這一層那一塊不要疊進來（見 [`stack::blend`]）
+    masks: HashMap<PathBuf, Vec<dehaze::Shape>>,
+    /// 每張照片自己選的遮色片方向（true＝只疊畫到的地方）。
+    /// 沒有記錄的照預設走，而預設要看它是不是地景——見 [`StackTool::mask_inverted`]
+    mask_polarity: HashMap<PathBuf, bool>,
+    /// 遮罩檢視的紅色貼圖，與它是照哪一組設定算出來的（形狀、羽化、濃度、
+    /// 正反選、貼圖尺寸）。設定沒變就沿用——權重圖每幀重算太貴
+    mask_tex: Option<egui::TextureHandle>,
+    mask_key: Option<(Vec<dehaze::Shape>, i32, i32, bool, usize, usize)>,
+    /// 遮色片邊緣的羽化寬度 0~100（全部形狀共用，與去煙霧同一個尺規）
+    feather: i32,
+    /// 筆刷濃度 0~100：筆刷一筆上多少；另外四種工具一律 100%
+    /// （見 dehaze::ShapeMask）
+    mask_density: i32,
+    /// 使用者自己拖出來的位移（相對座標），逐張存。**地景那張也可以動**
+    /// ——它是畫布，動的是它的內容在畫布裡的位置（專業模式限定）
+    xforms: HashMap<PathBuf, stack::Xform>,
+    /// **每一層自己的調色**，逐張存（地景也有，兩種模式都能調）。
+    /// 疊進去之前先套在那一層身上，與右邊那組「疊完之後才套用」是兩回事
+    grades: HashMap<PathBuf, Adjustments>,
+    /// 調過色的預覽底圖，只存有調過的那幾張：「單層」檢視要看得到自己調的結果。
+    /// 一併記下算它時用的那組參數，參數換了才重做貼圖
+    layer_previews: HashMap<PathBuf, (Adjustments, Arc<image::RgbImage>)>,
+    /// 自動對齊的結果，逐張存：Some＝對齊要挪多少，**None＝對不上地景**。
+    /// 與手動的分開放：關掉自動對齊時手動微調的那一點要留著，開回來也不必重算
+    auto_offsets: HashMap<PathBuf, Option<stack::Xform>>,
+    /// 自動對齊的開關（預設開著）
+    auto_align: bool,
+    /// 「地景以下不疊圖」的開關（預設開著，見 [`stack::Guard`]）
+    protect_land: bool,
+    /// 還沒對齊完的張數（顯示進度用）
+    align_left: usize,
+    /// 背景對齊的結果通道
+    align_rx: Option<Receiver<(PathBuf, Option<stack::Xform>)>>,
+    /// 叫上一批對齊收工的旗標（換地景或重選照片時換一支新的）
+    align_cancel: Arc<AtomicBool>,
+    /// 拖曳時把正在調的那一層**半透明疊在疊圖結果上**（**預設關著**）。
+    ///
+    /// 開著的好處：加亮疊出來的成品裡，這一層只有比地景亮的部分露得出來，
+    /// 暗部（城市、水面）完全看不見——而對位靠的正是那些。
+    /// 預設關著則是因為多數時候看邊框就夠了，畫面也乾淨
+    move_ghost: bool,
+    /// 存好之後要接著開「選擇照片」：在「還沒存檔」那個提問裡選了「存檔」的人，
+    /// 本來就是要換一批照片，存完不該還要自己再按一次
+    pick_after_save: bool,
+    /// 最後一次動到這一層的時刻（見 [`StackTool::ghost_now`]）
+    ghost_at: Option<Instant>,
+    /// 「移動圖層」模式：開著時在疊圖結果上拖曳＝搬縮圖列選著的那一層
+    move_mode: bool,
+    /// 各張的預覽底圖。**整批共用同一個縮小比例**（見 [`StackTool::common_scale`]），
+    /// 彼此的相對大小才留得住——各縮各的會讓預覽與原尺寸成品的構圖對不起來
+    bases: HashMap<PathBuf, Arc<image::RgbImage>>,
+    /// bases 是用哪個比例縮出來的；比例變了整批要重載
+    base_scale: f32,
+    /// 放大檢視時改用的精細底圖（同樣整批共用一個比例，見 [`stack_fine_target`]）。
+    /// 與 bases 並存：拉滑桿、畫遮色片時先用小的疊一次（快），停手才換這一份
+    bases_fine: HashMap<PathBuf, Arc<image::RgbImage>>,
+    /// bases_fine 是照「最大那張縮到多少長邊」載的；0＝還沒有
+    fine_long: u32,
+    /// 正在背景載的那一份是多少長邊（Some＝有工作在跑，同一份不會排兩次），
+    /// 以及收到一半的成果——全部到齊才換上去，中途畫面照舊
+    fine_loading: Option<u32>,
+    fine_pending: HashMap<PathBuf, Arc<image::RgbImage>>,
+    fine_rx: Option<Receiver<(PathBuf, Option<image::RgbImage>)>>,
+    /// 這一幀畫面上照片佔多少**實體像素**：底圖至少要這麼細才不是放大的
+    want_long: u32,
+    /// 畫面上那份疊圖結果是拿多細的底圖疊的（0＝工作縮圖）。與 fine_long
+    /// 不同就補疊一次——比是非題可靠：再往上放大會載更細的一份
+    applied_long: u32,
+    /// 各張**原圖**的像素尺寸（載預覽底圖時順手記下，裁切面板要用）
+    src_dims: HashMap<PathBuf, (u32, u32)>,
+    /// 還沒載完的張數（顯示進度用）
+    load_left: usize,
+    /// 背景載入預覽底圖的結果通道；最後一張進來就收掉
+    load_rx: Option<Receiver<(PathBuf, Result<(image::RgbImage, (u32, u32)), String>)>>,
+    /// 叫上一批載入收工的旗標（重選照片時換一支新的）
+    load_cancel: Arc<AtomicBool>,
+    /// 疊出來、還沒調色的結果。調色改動時只要拿它重跑調色，不必再疊一次
+    stacked: Option<Arc<image::RgbImage>>,
+    /// stacked 反映的那一組設定；與目前的不同就重疊
+    applied: Option<StackKey>,
+    /// tex_out 反映的調色
+    graded: Option<Adjustments>,
+    /// 調色（整張成品共用一組，疊完才套上去）
+    grade: Adjustments,
+    grade_open: bool,
+    /// 調色面板現在調的是哪一份（左右兩邊共用底下同一組滑桿）
+    grade_target: GradeTarget,
+    /// 正在調整裁切範圍：預覽改顯示整張並畫出可拖曳的裁切框
+    crop_editing: bool,
+    /// 裁切要固定成哪個長寬比
+    crop_aspect: CropAspect,
+    /// 疊圖結果的貼圖
+    tex_out: Option<egui::TextureHandle>,
+    /// 單張原圖的貼圖（畫遮色片時看的那一張，以及前後對照的左半邊）
+    tex_raw: Option<egui::TextureHandle>,
+    /// tex_raw 目前是哪一張、套的是哪一組層調色（任一個變了就重做貼圖）
+    tex_raw_of: Option<(PathBuf, Adjustments)>,
+    /// tex_raw 是拿精細底圖上傳的（見 [`stack_fine_target`]）
+    tex_raw_fine: bool,
+    rx: Option<Receiver<StackMsg>>,
+    busy: StackBusy,
+    error: Option<String>,
+    /// 存檔進度（已疊進去幾張）與取消旗標
+    save_done: usize,
+    save_cancel: Arc<AtomicBool>,
+    saved: Option<(String, Instant)>,
+    saved_path: Option<PathBuf>,
+    /// 預覽改看「這一層的原圖」而不是疊圖結果。畫遮色片得看得到那一層本身，
+    /// 選了遮色片工具就自動打開
+    view_layer: bool,
+    /// 目前選用的遮色片工具；None＝沒選（左鍵改成拖曳平移預覽）
+    tool: Option<MaskTool>,
+    brush_size: i32,
+    radial_invert: bool,
+    /// 「物件」工具的羽化與邊緣，與去煙霧那邊同一個意思
+    object_feather: i32,
+    object_edge: i32,
+    /// 正在拖曳、還沒放開的形狀
+    draft: Option<Draft>,
+    /// 正在用拖的搬移的遮色片形狀：(第幾個, 目前累積的位移)
+    moving: Option<(usize, egui::Vec2)>,
+    /// 在單層檢視上把遮色片輪廓畫出來
+    show_mask: bool,
+    /// 預覽的顯示比例；None＝縮到剛好塞滿畫面
+    zoom: Option<f32>,
+    zoom_back: Option<Option<f32>>,
+    pan: egui::Pos2,
+    /// 前後對照：左邊地景原圖、右邊疊圖結果（快捷鍵 Y）
+    compare: bool,
+    thumbs: HashMap<PathBuf, Thumb>,
+    vis_range: Option<(usize, usize)>,
+    scroll_to_cur: bool,
+    /// 上一幀量到的設定區與存檔列高度（預覽高度照它留位）
+    settings_h: Option<f32>,
+    save_h: f32,
+    /// 上一幀量到的比例列高度。視窗一窄它就換行變兩列，
+    /// 拿常數估會少算、把存檔列擠出視窗
+    zoom_h: f32,
+    /// 使用者拖分隔線調過的預覽高度增減
+    img_extra: f32,
+    /// 疊好了、還沒存成檔案
+    dirty: bool,
+}
+
+impl Default for StackTool {
+    fn default() -> Self {
+        Self {
+            photos: Vec::new(),
+            ground: 0,
+            cur: 0,
+            pro: false,
+            mode: BlendMode::Lighten,
+            blend_noted: false,
+            masks: HashMap::new(),
+            mask_polarity: HashMap::new(),
+            mask_tex: None,
+            mask_key: None,
+            feather: 25,
+            mask_density: 80,
+            xforms: HashMap::new(),
+            auto_offsets: HashMap::new(),
+            auto_align: true,
+            protect_land: true,
+            align_left: 0,
+            align_rx: None,
+            align_cancel: Arc::new(AtomicBool::new(false)),
+            move_mode: false,
+            move_ghost: false,
+            ghost_at: None,
+            pick_after_save: false,
+            grades: HashMap::new(),
+            layer_previews: HashMap::new(),
+            bases: HashMap::new(),
+            base_scale: 0.0,
+            bases_fine: HashMap::new(),
+            fine_long: 0,
+            fine_loading: None,
+            fine_pending: HashMap::new(),
+            fine_rx: None,
+            want_long: 0,
+            applied_long: 0,
+            src_dims: HashMap::new(),
+            load_left: 0,
+            load_rx: None,
+            load_cancel: Arc::new(AtomicBool::new(false)),
+            stacked: None,
+            applied: None,
+            graded: None,
+            grade: Adjustments::default(),
+            grade_open: true,
+            grade_target: GradeTarget::Output,
+            crop_editing: false,
+            crop_aspect: CropAspect::Free,
+            tex_out: None,
+            tex_raw: None,
+            tex_raw_of: None,
+            tex_raw_fine: false,
+            rx: None,
+            busy: StackBusy::Idle,
+            error: None,
+            save_done: 0,
+            save_cancel: Arc::new(AtomicBool::new(false)),
+            saved: None,
+            saved_path: None,
+            view_layer: false,
+            tool: None,
+            brush_size: 10,
+            radial_invert: false,
+            object_feather: dehaze::OBJECT_FEATHER,
+            object_edge: 0,
+            draft: None,
+            moving: None,
+            show_mask: true,
+            zoom: None,
+            zoom_back: None,
+            pan: egui::pos2(0.5, 0.5),
+            compare: false,
+            thumbs: HashMap::new(),
+            vis_range: None,
+            scroll_to_cur: false,
+            settings_h: None,
+            save_h: 28.0,
+            zoom_h: 26.0,
+            img_extra: 0.0,
+            dirty: false,
+        }
+    }
+}
+
+impl StackTool {
+    /// 當地景的那張
+    fn ground_path(&self) -> Option<&PathBuf> {
+        self.photos.get(self.ground)
+    }
+
+    /// 縮圖列目前選著的那張
+    fn current(&self) -> Option<&PathBuf> {
+        self.photos.get(self.cur)
+    }
+
+    /// 目前選著的是不是地景那張
+    fn on_ground(&self) -> bool {
+        self.cur == self.ground
+    }
+
+    /// 現在真的畫得動的遮色片工具。**地景上一律 None**——它是底圖，
+    /// 遮色片那一區在它身上整個停用（見 [`App::ui_stack_mask`]），
+    /// 所以選著工具切到地景時，畫布上也不該還當成在畫（否則左鍵既不畫、
+    /// 也因為「有選工具」而不給拖曳平移，變成一塊什麼都不能做的死區）
+    fn active_tool(&self) -> Option<MaskTool> {
+        (!self.on_ground()).then_some(self.tool).flatten()
+    }
+
+    /// 某張照片的遮色片
+    fn mask_of(&self, p: &Path) -> &[dehaze::Shape] {
+        self.masks.get(p).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// 那張的遮色片是不是「只疊畫到的地方」。
+    ///
+    /// **地景一律不是**，而且連選都不給選（那兩顆切換在地景上不顯示）：
+    /// 地景的遮色片是全域的保護區，反選之後只要在它身上畫一個形狀，
+    /// 「其餘所有地方」就一律擋掉別層疊上來——整張瞬間變成沒疊圖。
+    /// 那個效果幾乎不會有人要，卻很容易誤觸。
+    ///
+    /// 其餘的層預設是「選擇疊圖的區域」（圈什麼就只疊什麼，想到什麼圈什麼的
+    /// 直覺用法）；按過那兩顆之後才照自己選的走
+    fn mask_inverted(&self, p: &Path) -> bool {
+        if self.ground_path().is_some_and(|g| g.as_path() == p) {
+            return false;
+        }
+        self.mask_polarity.get(p).copied().unwrap_or(true)
+    }
+
+    /// 目前選著那張的遮色片方向
+    fn cur_inverted(&self) -> bool {
+        self.current().is_some_and(|p| self.mask_inverted(p))
+    }
+
+    /// 某一層自己調的擺法（不含自動對齊）
+    fn xform_of(&self, p: &Path) -> stack::Xform {
+        self.xforms.get(p).copied().unwrap_or_default()
+    }
+
+    /// 某一層實際要怎麼擺：自動對齊算出來的位移，**加上**使用者自己調的
+    /// 平移、縮放與旋轉。相加而不是二選一——自動對齊只負責把機位的位移
+    /// 抓回來，之後想再搬、再縮、再轉是另一回事，兩者互不干擾
+    /// 某一層自己的調色（疊進去之前先套在它身上）
+    fn grade_of(&self, p: &Path) -> Adjustments {
+        self.grades.get(p).copied().unwrap_or_default()
+    }
+
+    /// 只有自動對齊算出來的那一份（不含使用者自己調的）
+    fn auto_xform(&self, p: &Path) -> stack::Xform {
+        self.auto_align
+            .then(|| self.auto_offsets.get(p))
+            .flatten()
+            .and_then(|v| *v)
+            .unwrap_or_default()
+    }
+
+    fn effective_xform(&self, p: &Path) -> stack::Xform {
+        let auto = self.auto_xform(p);
+        let m = self.xform_of(p);
+        // 自動對齊給的是平移與水平（角度），與手動調的相加；
+        // 縮放完全是使用者自己的——每一層都是原尺寸擺進畫布的，
+        // 對齊不需要也不會去縮放它
+        stack::Xform {
+            dx: m.dx + auto.dx,
+            dy: m.dy + auto.dy,
+            rot: m.rot + auto.rot,
+            scale: m.scale,
+        }
+    }
+
+    /// 這一層對不上地景（自動對齊找不到能對準的位移）。
+    /// 開著自動對齊時這種層會被**整個略過**——硬疊上去只會多一份重影；
+    /// 真的想疊就把自動對齊關掉，那時一切照原樣疊
+    fn unaligned(&self, p: &Path) -> bool {
+        self.auto_align && matches!(self.auto_offsets.get(p), Some(None))
+    }
+
+    /// 目前有幾層因為對不上地景被略過
+    fn unaligned_count(&self) -> usize {
+        self.photos
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| *i != self.ground && self.unaligned(p))
+            .count()
+    }
+
+    /// 縮圖列選著的那一層可不可以搬／縮／轉。**專業模式限定**——簡易模式
+    /// 每一層只給調色。地景也可以搬：它是畫布，動的是它的內容在畫布裡的位置
+    /// （見 [`stack::place`]）
+    fn can_move_cur(&self) -> bool {
+        self.pro && self.current().is_some()
+    }
+
+    /// 選著那一層佔畫布（地景）的比例。每一層都是**原尺寸**擺進畫布的，
+    /// 而預覽底圖整批共用同一個縮放，所以用預覽的尺寸算出來的比例，
+    /// 與原尺寸存檔時完全一致（見 [`StackTool::common_scale`]）
+    fn layer_frac(&self) -> Option<egui::Vec2> {
+        let g = self.bases.get(self.ground_path()?)?;
+        let l = self.bases.get(self.current()?)?;
+        Some(egui::vec2(
+            l.width() as f32 / g.width().max(1) as f32,
+            l.height() as f32 / g.height().max(1) as f32,
+        ))
+    }
+
+    /// 「畫面不是成品、左鍵也不是拖曳」的那幾樣還開著。
+    ///
+    /// 遮罩檢視要三個條件都成立才真的蓋得出那片紅：專業模式、單層檢視、
+    /// 這一層真的畫了東西。它**預設是開著的**（畫好遮色片就直接看得到），
+    /// 少了這幾個條件就會變成一開檔就說在編輯（實際回報過的狀況）
+    fn tools_open(&self) -> bool {
+        self.tool.is_some()
+            || self.move_mode
+            || (self.show_mask && self.pro && self.view_layer && !self.cur_mask().is_empty())
+    }
+
+    /// 混合方式不是預設的「加亮」，而且這個提醒還沒被收下。
+    ///
+    /// 疊出來的東西跟著不一樣（地景與殘煙也會變亮），那顆選鈕又在設定區
+    /// 下半段，容易忘了自己改過，所以要提醒；但它是**成品的選擇**，
+    /// 不能像工具那樣替使用者關掉——按「完成編輯」就當作看到了
+    /// （見 [`StackTool::blend_noted`]）。
+    /// 簡易模式一律用加亮（見 [`StackTool::key`]），那時不算數
+    fn blend_changed(&self) -> bool {
+        self.pro && self.mode != BlendMode::Lighten && !self.blend_noted
+    }
+
+    /// 還在編輯狀態（工具開著，或混合方式不是預設的）
+    fn editing(&self) -> bool {
+        self.tools_open() || self.blend_changed()
+    }
+
+    /// 「編輯中」是為了什麼——一次列出來，才知道要去關哪一個
+    fn editing_hint(&self) -> String {
+        let mut why: Vec<&str> = Vec::new();
+        if self.tool.is_some() {
+            why.push("遮色片工具還選著（左鍵是拿來畫的）");
+        }
+        if self.move_mode {
+            why.push("「調整圖層」開著（左鍵是拿來搬圖層的）");
+        }
+        if self.show_mask && self.pro && self.view_layer && !self.cur_mask().is_empty() {
+            why.push("遮罩檢視開著（畫面上那片紅不會出現在成品裡）");
+        }
+        if self.blend_changed() {
+            why.push("混合方式是「濾色」，不是預設的「加亮」");
+        }
+        format!("還在編輯：\n· {}", why.join("\n· "))
+    }
+
+    /// 結束編輯：工具與遮罩檢視收起來，畫面回到疊圖結果；混合方式那個提醒
+    /// 也一起收下。
+    ///
+    /// **混合方式本身不動**——選了濾色就是要用濾色出圖，程式不能替使用者
+    /// 改回加亮。收的只是提醒，再動一次混合方式它就會回來
+    fn end_editing(&mut self) {
+        self.tool = None;
+        self.show_mask = false;
+        self.move_mode = false;
+        self.view_layer = false;
+        self.blend_noted = true;
+    }
+
+    /// 半透明疊圖這個功能現在有沒有開著（不代表這一幀就會畫）。
+    /// 前後對照時不做：那時 tex_raw 讓給左半邊的地景原圖了
+    fn ghost_enabled(&self) -> bool {
+        self.move_mode && self.move_ghost && !self.view_layer && !self.compare && self.can_move_cur()
+    }
+
+    /// 這一幀該不該真的把那一層半透明疊上去。
+    ///
+    /// **只在調整的當下疊**：一直疊著的話，畫面上看到的就不是真正的疊圖結果了
+    /// （那一層的煙火會加倍亮、地景被壓暗一半），要判斷成品好不好看反而沒依據。
+    /// 手一放開就回到真實的結果，框線則一直留著標示這一層在哪
+    fn ghost_now(&self, dragging: bool) -> bool {
+        self.ghost_enabled()
+            && (dragging
+                || self
+                    .ghost_at
+                    .is_some_and(|t| t.elapsed() < GHOST_LINGER))
+    }
+
+    /// 記一筆「剛剛動過這一層」，讓半透明再留一下下（滑桿與滾輪也走這裡）
+    fn touch_ghost(&mut self) {
+        self.ghost_at = Some(Instant::now());
+    }
+
+    /// 目前選著那張的遮色片
+    fn cur_mask(&self) -> &[dehaze::Shape] {
+        self.current().map(|p| self.mask_of(p)).unwrap_or(&[])
+    }
+
+    /// 改寫目前選著那張的遮色片
+    fn set_cur_mask(&mut self, shapes: Vec<dehaze::Shape>) {
+        let Some(p) = self.current().cloned() else { return };
+        if shapes.is_empty() {
+            self.masks.remove(&p);
+        } else {
+            self.masks.insert(p, shapes);
+        }
+        self.dirty = true;
+    }
+
+    /// 目前這一組設定。與 applied 比對就知道要不要重疊
+    fn key(&self) -> StackKey {
+        StackKey {
+            photos: self.photos.clone(),
+            ground: self.ground,
+            // 簡易模式一律加亮、也不套遮色片：切回簡易時畫面要跟著回到
+            // 「只是把煙火疊起來」的樣子，不能還留著專業模式調的東西
+            // （調過的仍存在 masks 裡，切回專業就回來了）
+            mode: if self.pro { self.mode } else { BlendMode::Lighten },
+            feather: self.feather,
+            density: self.mask_density,
+            masks: self
+                .photos
+                .iter()
+                .map(|p| if self.pro { self.mask_of(p).to_vec() } else { Vec::new() })
+                .collect(),
+            inverts: self
+                .photos
+                .iter()
+                .map(|p| self.pro && self.mask_inverted(p))
+                .collect(),
+            // 自動對齊兩種模式都做（那是機位的位移，與模式無關）；
+            // **自己搬／縮／轉是專業模式限定**，切回簡易就不套用
+            // （調好的仍留著，切回專業就回來了）
+            xforms: self
+                .photos
+                .iter()
+                .map(|p| if self.pro { self.effective_xform(p) } else { self.auto_xform(p) })
+                .collect(),
+            // 每一層自己的調色**兩種模式都套用**：簡易模式除了整張的調色之外，
+            // 就是多這一項（各層各自調亮一點、換個色溫，疊起來才勻）
+            grades: self.photos.iter().map(|p| self.grade_of(p).grade_only()).collect(),
+            skip: self.photos.iter().map(|p| self.unaligned(p)).collect(),
+            protect_land: self.protect_land,
+        }
+    }
+
+    /// 預覽底圖整批要共用的縮小比例：照**最大那張**縮到長邊
+    /// [`SMOKE_PREVIEW_MAX`]，其餘照同一個比例跟著縮。
+    ///
+    /// 各縮各的會把「一個像素對一個像素」的關係破壞掉——尺寸不同的兩張
+    /// 各自縮到同樣長邊之後，彼此的相對大小就變了，預覽疊出來與原尺寸
+    /// 存檔的構圖對不起來，自動對齊也會算在錯的尺度上。
+    /// 讀檔頭就拿得到尺寸，不必真的解一次圖
+    fn common_scale(&self) -> f32 {
+        let max_long = self
+            .photos
+            .iter()
+            .filter_map(|p| image::image_dimensions(p).ok())
+            .map(|(w, h)| w.max(h))
+            .max()
+            .unwrap_or(SMOKE_PREVIEW_MAX);
+        // 本來就比預覽小的就別放大了
+        (SMOKE_PREVIEW_MAX as f32 / max_long.max(1) as f32).min(1.0)
+    }
+
+    /// 精細底圖是跟著這批照片與比例走的，清單一動就整份丟掉，
+    /// 下次放大時再重載（見 [`stack_fine_target`]）
+    fn drop_fine(&mut self) {
+        self.bases_fine.clear();
+        self.fine_pending.clear();
+        self.fine_long = 0;
+        self.fine_loading = None;
+        self.fine_rx = None;
+        self.applied_long = 0;
+    }
+
+    /// 精細底圖到齊了沒（每一層都要有才疊得起來）
+    fn fine_ready(&self) -> bool {
+        !self.photos.is_empty() && self.photos.iter().all(|p| self.bases_fine.contains_key(p))
+    }
+
+    /// 每一張的預覽底圖都到齊了（疊圖前要湊齊）
+    fn bases_ready(&self) -> bool {
+        !self.photos.is_empty() && self.photos.iter().all(|p| self.bases.contains_key(p))
+    }
+
+    /// 筆刷半徑（相對影像長邊）
+    fn brush_radius(&self) -> f32 {
+        self.brush_size as f32 / 200.0
+    }
+
+    /// 地景那張**原圖**的像素尺寸（成品就是這個尺寸，裁切面板照它顯示）。
+    /// 載入預覽底圖時順手記下來的，不必為了問尺寸再去讀一次檔
+    fn source_dims(&self) -> Option<(u32, u32)> {
+        self.src_dims.get(self.ground_path()?).copied()
+    }
+
+    /// 畫面上這一張的**原圖**尺寸：疊圖結果看地景（成品就是它的尺寸），
+    /// 單層檢視看那一層自己。顯示比例要照它算，100% 才是「照片的 1:1」——
+    /// 拿預覽底圖算的話 100% 其實只是縮圖的 1:1（照片的兩成多）
+    fn shown_dims(&self) -> Option<(u32, u32)> {
+        let p = if self.view_layer {
+            self.current()?
+        } else {
+            self.ground_path()?
+        };
+        self.src_dims.get(p).copied()
+    }
+
+    /// 預覽這一幀要照哪個裁切框顯示。調整裁切範圍時顯示整張**旋轉後的畫布**
+    /// （要看得到全部才拖得到框，旋轉則要留著才看得出拉直的效果）
+    fn shown_crop(&self) -> Crop {
+        let c = self.grade.crop.clamped();
+        if self.crop_editing {
+            Crop { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0, ..c }
+        } else {
+            c
+        }
+    }
+}
+
+/// 主體追蹤背景執行緒的回報
+enum TrackMsg {
+    /// 又處理完一張（純粹給進度條用）
+    Step,
+    /// 換到下一個階段了（例如「補上動態偵測看不見的 12 張…」），
+    /// 顯示在進度按鈕上，使用者才知道還在做事、在做什麼
+    Phase(String),
+    /// 一批算完了：每張照片的主體框（None＝這張沒框到）。
+    /// 一批一批送而不是一張一張送，是因為兩個手動框之間那一段要等整段
+    /// 跑完才能修正漂移（見 [`run_track`]）
+    Boxes(Vec<(usize, Option<Subject>)>),
+    /// 整批跑完（或中途取消）：附上「框到幾張」與「總共處理幾張」
+    Done(usize, usize),
+    /// 整批沒能開始（框太小、框在的那張讀不到…）
+    Failed(String),
+}
+
+/// 主體框是怎麼來的。決定誰蓋得過誰：**手動框永遠不會被自動框選或追蹤蓋掉**
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BoxSrc {
+    /// 使用者自己在照片上拖出來的
+    Manual,
+    /// 「自動框選」逐張找出來的（見 [`track::detect`]）
+    Auto,
+    /// 從手動框一路追過來的（見 [`run_track`]）
+    Tracked,
+}
+
+/// 一張照片上的主體框
+#[derive(Clone, Copy, Debug)]
+struct Subject {
+    /// x0, y0, x1, y1 相對座標，對著**旋轉後的畫布**算（與 [`Crop`] 同一套）
+    rect: [f32; 4],
+    src: BoxSrc,
+    /// 有多有把握（0~1）。手動框恆為 1，低於 [`TRACK_SURE`] 的會在縮圖上
+    /// 標成「要檢查」，也是「移除沒框到的照片」的對象
+    score: f32,
+}
+
+/// 低於這個把握程度就請使用者自己看一眼（縮圖標 ⚠）
+const TRACK_SURE: f32 = 0.45;
+
+/// 補洞時的樣板比對分數要到這裡，才算「確實找到同一個主體」。
+///
+/// 比對本身用比較鬆的門檻去跟（跟丟一兩張還能靠預測滑回來），但「可以不必
+/// 請使用者過目」是另一回事——一片綠葉上總是找得到「還算像」的地方，
+/// 那種勉強對上的要標成要檢查
+const TRACK_FILL_SURE: f32 = 0.55;
+
+impl Subject {
+    fn manual(rect: [f32; 4]) -> Subject {
+        Subject { rect: clamp_rect(rect), src: BoxSrc::Manual, score: 1.0 }
+    }
+
+    fn centre(&self) -> (f32, f32) {
+        ((self.rect[0] + self.rect[2]) / 2.0, (self.rect[1] + self.rect[3]) / 2.0)
+    }
+
+    fn size(&self) -> (f32, f32) {
+        (self.rect[2] - self.rect[0], self.rect[3] - self.rect[1])
+    }
+
+    /// 這張的框可以直接用，不必請使用者過目
+    fn sure(&self) -> bool {
+        self.score >= TRACK_SURE
+    }
+}
+
+/// 把拖出來（或從專案檔讀回來）的框整理成左上／右下、夾在畫面內
+fn clamp_rect(r: [f32; 4]) -> [f32; 4] {
+    [
+        r[0].min(r[2]).clamp(0.0, 1.0),
+        r[1].min(r[3]).clamp(0.0, 1.0),
+        r[0].max(r[2]).clamp(0.0, 1.0),
+        r[1].max(r[3]).clamp(0.0, 1.0),
+    ]
+}
+
+/// 背景正在跑哪一種工作（同時間只會有一件）
+#[derive(Clone, Copy, PartialEq)]
+enum TrackJob {
+    None,
+    /// 每張各自找一次主體
+    Auto,
+    /// 從手動框一路追過去
+    Follow,
+}
+
+/// 追蹤要不要中止（使用者按了取消，或照片清單被換掉）
+static TRACK_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// 鏡頭範圍的上下限（主體框的幾倍）。1 倍＝剛好貼著主體（看不出環境），
+/// 太大則等於沒裁到什麼、鏡頭幾乎不動
+const TRACK_ZOOM_MIN: f32 = 1.5;
+const TRACK_ZOOM_MAX: f32 = 8.0;
+
+/// 「主體追蹤」的狀態：每張照片的主體框、鏡頭怎麼跟。
+///
+/// 找主體與擺鏡頭是**兩件事**：框一次算好存著，之後拖動「鏡頭範圍」與
+/// 「平滑度」只是把同一組框換算成不同的裁切框（見 [`App::apply_track`]），
+/// 不必重跑
+#[derive(Default)]
+struct TrackTool {
+    /// 正在預覽上檢查／拖曳修改主體框
+    picking: bool,
+    /// 這一段拖曳中已經框到東西了（放開手時要據此跳到下一張要檢查的）
+    framed_during_drag: bool,
+    /// 進入檢查模式後「還有東西要檢查」。等它歸零就代表全部檢查完了，
+    /// 那一刻自動退出檢查模式（見 [`App::track_review_done`]）
+    was_reviewing: bool,
+    /// 縮圖列只顯示「要檢查」的那幾張（沒框到或沒把握），逐一處理時
+    /// 不必在上百張裡找它們
+    only_unsure: bool,
+    /// 每張照片的主體框。三種來源共用這一份（見 [`BoxSrc`]）：
+    /// 自動框選填滿它，使用者拖曳覆蓋其中幾張，追蹤則把手動框之間補起來
+    boxes: HashMap<PathBuf, Subject>,
+    /// 追蹤動到某張照片之前，它原本的個別調色（None＝原本沒有覆寫，
+    /// 跟著全域走）。「清除追蹤」照這份原樣還原；重算鏡頭時也以它為底，
+    /// 全域調色才推得到那些照片上
+    prev: HashMap<PathBuf, Option<Adjustments>>,
+    /// 鏡頭範圍：裁切框是主體框的幾倍
+    zoom: f32,
+    /// 平滑度 0~100：鏡頭跟得多穩（見 [`track::smooth`]）。
+    /// 預設偏低——這個功能的重點是「主體待在正中央」，平滑度愈高主體
+    /// 在畫面中央附近晃得愈多
+    smooth: i32,
+    /// 主體框已經套成每張照片的裁切框
+    applied: bool,
+    /// 上次套鏡頭時，有幾張因為主體太靠近照片邊緣而沒能擺到正中央
+    off_centre: usize,
+    /// 跑完之後程式自動幫忙調過的鏡頭範圍與平滑度（有值就在面板上說一聲）
+    fitted_zoom: Option<f32>,
+    fitted_smooth: Option<i32>,
+    /// 背景工作的接收端、種類與進度
+    rx: Option<Receiver<TrackMsg>>,
+    job: TrackJob,
+    /// 背景工作現在跑到哪個階段（顯示在進度按鈕上）
+    phase: Option<String>,
+    done: usize,
+    total: usize,
+    /// 上一次跑完的結果（框到幾張／共幾張），顯示在面板上
+    report: Option<(usize, usize)>,
+    error: Option<String>,
+}
+
+impl Default for TrackJob {
+    fn default() -> Self {
+        TrackJob::None
+    }
+}
+
+impl TrackTool {
+    fn new() -> Self {
+        Self { zoom: 3.0, smooth: 20, ..Default::default() }
+    }
+
+    /// 這張照片的主體框（沒有就是 None）
+    fn box_of(&self, photo: &Path) -> Option<Subject> {
+        self.boxes.get(photo).copied()
+    }
+
+    /// 有沒有任何框（有了才擺得出鏡頭）
+    fn has_boxes(&self) -> bool {
+        !self.boxes.is_empty()
+    }
+
+    /// 有沒有使用者自己框的（追蹤要從它出發）
+    fn manual_count(&self) -> usize {
+        self.boxes.values().filter(|s| s.src == BoxSrc::Manual).count()
+    }
+
+    /// 鏡頭要照多大的主體去切。
+    ///
+    /// 有手動框就以**手動框裡最大的那個**為準——那是使用者親自指定的大小；
+    /// 全是自動／追蹤來的框則取**中位數**，個別框歪掉、框到一大片的那幾張
+    /// 才不會把整支影片的鏡頭撐大
+    fn base_size(&self) -> (f32, f32) {
+        let manual: Vec<&Subject> =
+            self.boxes.values().filter(|s| s.src == BoxSrc::Manual).collect();
+        if !manual.is_empty() {
+            return manual.iter().fold((0.0f32, 0.0f32), |(w, h), s| {
+                let (sw, sh) = s.size();
+                (w.max(sw), h.max(sh))
+            });
+        }
+        let mut ws: Vec<f32> = self.boxes.values().map(|s| s.size().0).collect();
+        let mut hs: Vec<f32> = self.boxes.values().map(|s| s.size().1).collect();
+        if ws.is_empty() {
+            return (0.0, 0.0);
+        }
+        ws.sort_by(f32::total_cmp);
+        hs.sort_by(f32::total_cmp);
+        (ws[ws.len() / 2], hs[hs.len() / 2])
+    }
+
+    fn busy(&self) -> bool {
+        self.rx.is_some()
+    }
+
+    /// 丟掉自動框選與追蹤填出來的框，只留使用者自己框的
+    fn clear_derived(&mut self) {
+        self.boxes.retain(|_, s| s.src == BoxSrc::Manual);
+        self.report = None;
+        self.done = 0;
+        self.total = 0;
+    }
+}
+
+/// 影片去煙霧的輸出尺寸。
+///
+/// 以**短邊**為準（1080p＝短邊 1080），直拍的影片才會照它該有的方向縮——
+/// 用寬度或長邊當基準的話，同一個「1080p」在橫拍與直拍上會是兩種東西。
+/// 一律不放大：來源比選的還小就原樣輸出，放大只是讓檔案變大而已
+#[derive(Clone, Copy, PartialEq)]
+enum MovieSize {
+    /// 與來源相同（完全不縮）
+    Source,
+    /// 短邊縮到這麼多
+    Short(u32),
+}
+
+impl MovieSize {
+    const ALL: [MovieSize; 6] = [
+        MovieSize::Source,
+        MovieSize::Short(2160),
+        MovieSize::Short(1440),
+        MovieSize::Short(1080),
+        MovieSize::Short(720),
+        MovieSize::Short(480),
+    ];
+
+    fn label(self) -> String {
+        match self {
+            MovieSize::Source => "與來源相同".into(),
+            MovieSize::Short(2160) => "4K（2160p）".into(),
+            MovieSize::Short(1440) => "2K（1440p）".into(),
+            MovieSize::Short(1080) => "Full HD（1080p）".into(),
+            MovieSize::Short(n) => format!("{n}p"),
+        }
+    }
+
+    /// 套在來源尺寸上之後實際會輸出幾乘幾（取偶數：yuv420p 只吃偶數邊長）
+    fn apply(self, w: u32, h: u32) -> (u32, u32) {
+        let even = |a: u32, b: u32| ((a / 2 * 2).max(2), (b / 2 * 2).max(2));
+        let MovieSize::Short(target) = self else {
+            return even(w, h);
+        };
+        let short = w.min(h);
+        if short <= target {
+            return even(w, h);
+        }
+        let k = target as f64 / short as f64;
+        even(
+            (w as f64 * k).round() as u32,
+            (h as f64 * k).round() as u32,
+        )
+    }
+}
+
+/// 分區調色的三個區。一格畫面自己分成這三塊，各調各的
+/// （界線怎麼判見 [`edit::RegionMasks`]）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Region {
+    /// 天際線以下：城市、岸邊燈火與水面
+    Ground,
+    /// 天際線以上、煙火以外的那一片夜空（含還沒扣乾淨的煙）
+    Sky,
+    /// 天空裡亮起來的：煙火本身與它的光暈
+    Fire,
+}
+
+impl Region {
+    const ALL: [Region; 3] = [Region::Ground, Region::Sky, Region::Fire];
+
+    /// 在 [`RegionGrade`] 的陣列與權重裡排第幾（與 [`edit::RegionMasks`] 一致）
+    fn idx(self) -> usize {
+        match self {
+            Region::Ground => 0,
+            Region::Sky => 1,
+            Region::Fire => 2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Region::Ground => "地景",
+            Region::Sky => "天空",
+            Region::Fire => "煙火",
+        }
+    }
+
+    /// 滑鼠停在勾選框上時說明這一區是哪裡、通常拿來做什麼
+    fn hint(self) -> &'static str {
+        match self {
+            Region::Ground => {
+                "天際線以下那一片：城市、岸邊燈火與水面。\n\
+                 界線與「只處理天空」用的是同一條天際線。\n\
+                 常見的用法是壓暗一點、少一點黃，讓天空的煙火跳出來"
+            }
+            Region::Sky => {
+                "天際線以上、煙火以外的夜空（含去煙之後還留著的那一點煙）。\n\
+                 常見的用法是壓黑、降一點飽和，把殘煙與城市的光害壓下去"
+            }
+            Region::Fire => {
+                "天空裡亮起來的那些——煙火本身與周圍那圈光暈。\n\
+                 判準是亮度：去完煙的夜空是黑的，天上還亮著的就是煙火。\n\
+                 常見的用法是加鮮豔度與對比，讓線條的顏色更漂亮"
+            }
+        }
+    }
+}
+
+/// 影片去煙霧的分區調色：地景／天空／煙火各記一組滑桿，勾起來的才作用。
+///
+/// 整支影片共用一組（與去煙參數同一個道理，見 [`MovieTool`]）——逐格
+/// 各判各的會讓調色一格一格跳，看起來就是畫面在閃
+#[derive(Clone, PartialEq, Default)]
+struct RegionGrade {
+    /// 這一區要不要調（照 [`Region::idx`] 排）
+    on: [bool; 3],
+    /// 每一區自己的十二條滑桿
+    grade: [Adjustments; 3],
+}
+
+/// 分區調色實際會動到畫面的那幾區：哪一區、套哪一組滑桿。
+///
+/// 拿它當「畫面上那張套的是什麼」的比對依據：勾了但滑桿全歸零的區
+/// 不在裡面，光是勾一下不會害預覽白跑一趟
+type ActiveGrade = Vec<(Region, Adjustments)>;
+
+impl RegionGrade {
+    /// 真的會動到畫面的那幾區（勾了、而且那一區的滑桿有動過）。
+    /// 裁切不參與分區調色（一格只有一個畫框），所以一律取 `grade_only`
+    fn active(&self) -> ActiveGrade {
+        Region::ALL
+            .into_iter()
+            .filter_map(|r| {
+                let g = self.grade[r.idx()].clamped().grade_only();
+                (self.on[r.idx()] && !g.grade_is_neutral()).then_some((r, g))
+            })
+            .collect()
+    }
+
+    /// 有沒有哪一區真的會被調
+    fn is_active(&self) -> bool {
+        !self.active().is_empty()
+    }
+}
+
+/// 影片去煙霧目前在背景做的事（同時間只會有一件）
+#[derive(PartialEq, Clone, Copy)]
+enum MovieBusy {
+    Idle,
+    /// 正在從影片取預覽那一格
+    Grabbing,
+    /// 正在算預覽
+    Rendering,
+    /// 正在把整支影片跑完
+    Exporting,
+}
+
+/// 「影片去煙霧」模組的狀態：一支影片、一組參數，輸出成另一支影片。
+///
+/// 刻意不做「每一格自動判參數」——照片模組是一張一張各自量的，搬到影片上
+/// 每格量到的值都會差一點，扣掉的量跟著一格一格跳，看起來就是整片畫面在
+/// 忽明忽暗。整支共用一組反而穩
+struct MovieTool {
+    /// 來源影片
+    src: Option<PathBuf>,
+    /// 來源影片的基本資料（選檔時量一次）
+    info: Option<VideoInfo>,
+    /// 預覽停在第幾秒
+    at: f64,
+    /// 預覽底圖：`at` 那一格的原始畫面（已縮到 [`SMOKE_PREVIEW_MAX`]）
+    base: Option<Arc<image::RgbImage>>,
+    /// 去煙之後的預覽（**還沒調色**的那一張）。分區調色是拿它當底重算的，
+    /// 拖調色滑桿時才不必再去煙一次
+    after: Option<Arc<image::RgbImage>>,
+    base_tex: Option<egui::TextureHandle>,
+    after_tex: Option<egui::TextureHandle>,
+    /// 去煙參數（整支影片共用一組）
+    params: SmokeParams,
+    /// 分區調色：地景／天空／煙火各一組滑桿（整支影片共用一組）
+    grade: RegionGrade,
+    /// 調色區塊展開著沒（三區的滑桿佔掉一大截，預設收起來）
+    grade_open: bool,
+    /// 滑桿現在在調哪一區。三區各十二條一起排下來要捲上老半天，
+    /// 所以一次只顯示一區
+    grade_tab: Region,
+    /// 畫面上那張預覽套的是哪幾區的調色；與現在相同就不必重算。
+    /// 與去煙分開是刻意的——去煙要算上一秒，調色是零點幾秒的事，
+    /// 拖調色滑桿時只重跑調色那一段（與去煙霧模組同一個作法）
+    graded: ActiveGrade,
+    /// 預覽那一格的三區權重。天際線只跟去煙結果有關，拖調色滑桿時
+    /// 沿用同一份就好，不必每動一下重量一次
+    masks: Option<Arc<edit::RegionMasks>>,
+    /// 輸出尺寸
+    size: MovieSize,
+    /// 畫面上那張預覽是用哪一組參數、哪一個時間點算出來的；
+    /// 與現在相同就不必重算（與去煙霧模組同一個作法）
+    rendered: Option<(SmokeParams, f64)>,
+    /// 底圖是哪個時間點取回來的（含取失敗的那次）：與 `at` 不同就去取一格。
+    /// 拖時間軸時同時只會有一個在跑，拖到哪就從那裡續，不會排一長串
+    grabbed_at: Option<f64>,
+    /// 預覽顯示的是原始畫面（按著看前後對照）
+    show_before: bool,
+    busy: MovieBusy,
+    rx: Option<Receiver<MovieMsg>>,
+    /// 輸出進度：已經處理完幾格
+    done: u64,
+    /// 這次輸出是什麼時候開始的（用來估還要多久）
+    started: Option<Instant>,
+    /// 中止旗標：背景每處理完一批看一次
+    cancel: Arc<AtomicBool>,
+    /// 這次要寫出去的檔案（輸出中被中止或失敗時清掉）
+    out_path: Option<PathBuf>,
+    /// 最近一次成功輸出的成品（給「開啟資料夾」用）
+    finished: Option<PathBuf>,
+    error: Option<String>,
+    /// 排在後面、要用**同一組設定**一起處理的其他影片（不含正在預覽的那支）。
+    /// 同一場煙火拍的好幾段設定通常照搬，一支一支挑進來重調太蠢
+    queue: Vec<PathBuf>,
+    /// 輸出中：現在跑到第幾支（0 起算）、這一批共幾支、這一支有幾格
+    batch_at: usize,
+    batch_total: usize,
+    batch_frames: u64,
+    /// 現在正在處理的檔名（進度旁邊顯示）
+    batch_name: String,
+    /// 這一批裡失敗的那幾支（一支失敗不中斷其他支，最後一起說）
+    batch_errs: Vec<String>,
+    /// 排了好幾支時：接成一支輸出，而不是各存各的
+    merge: bool,
+}
+
+impl Default for MovieTool {
+    fn default() -> Self {
+        Self {
+            src: None,
+            info: None,
+            at: 0.0,
+            base: None,
+            after: None,
+            base_tex: None,
+            after_tex: None,
+            params: SmokeParams::default(),
+            grade: RegionGrade::default(),
+            grade_open: false,
+            grade_tab: Region::Fire,
+            graded: Vec::new(),
+            masks: None,
+            size: MovieSize::Source,
+            rendered: None,
+            grabbed_at: None,
+            show_before: false,
+            busy: MovieBusy::Idle,
+            rx: None,
+            done: 0,
+            started: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            out_path: None,
+            finished: None,
+            error: None,
+            queue: Vec::new(),
+            batch_at: 0,
+            batch_total: 0,
+            batch_frames: 0,
+            batch_name: String::new(),
+            batch_errs: Vec::new(),
+            merge: false,
+        }
+    }
+}
+
+impl MovieTool {
+    /// 換一支影片（或按了清除）時，除了參數以外全部歸零。
+    /// 參數留著是刻意的：同一場煙火拍的好幾段，設定通常照搬
+    fn reset_for(&mut self, src: Option<PathBuf>, info: Option<VideoInfo>) {
+        let at = info.as_ref().map(|i| i.secs * 0.5).unwrap_or(0.0);
+        self.src = src;
+        self.info = info;
+        self.at = at;
+        self.base = None;
+        self.after = None;
+        self.base_tex = None;
+        self.after_tex = None;
+        self.graded.clear();
+        self.masks = None;
+        self.rendered = None;
+        self.grabbed_at = None;
+        self.busy = MovieBusy::Idle;
+        self.rx = None;
+        self.done = 0;
+        self.started = None;
+        self.out_path = None;
+        self.finished = None;
+        self.error = None;
+        // 換片／清除是「重來一批」，排隊的那幾支跟著收掉
+        self.queue.clear();
+        self.batch_at = 0;
+        self.batch_total = 0;
+        self.batch_frames = 0;
+        self.batch_name.clear();
+        self.batch_errs.clear();
+    }
+
+    /// 這一批要處理的全部影片（正在預覽的那支排第一）
+    fn jobs(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self.src.iter().cloned().collect();
+        v.extend(self.queue.iter().cloned());
+        v
+    }
+
+    /// 這次會輸出幾乘幾（還沒選影片時為 None）
+    fn out_dims(&self) -> Option<(u32, u32)> {
+        self.info.as_ref().map(|i| self.size.apply(i.w, i.h))
+    }
+
+    /// 預覽需不需要重算（參數或時間點與畫面上那張不同）
+    fn needs_render(&self) -> bool {
+        match &self.rendered {
+            Some((p, t)) => *p != self.params || (*t - self.at).abs() > 1e-6,
+            None => true,
+        }
+    }
+
+    /// 預覽的調色要不要重跑（去煙結果沒變，只是換了調色）。
+    /// 去煙那一段照舊由 [`MovieTool::needs_render`] 顧
+    fn needs_grade(&self) -> bool {
+        self.after.is_some() && self.graded != self.grade.active()
+    }
+}
+
+/// 影片去煙霧要同時算幾格。
+///
+/// 去煙是「一格搬幾 GB 資料」的工作，瓶頸在記憶體頻寬而不是算力：實測在
+/// 16 核／32 緒的機器上，8 條就跑到 5.8 格/秒、16 條 6.7 格/秒，**32 條反而
+/// 掉回 5.4**——執行緒再多只是互相搶頻寬，還把整台機器佔滿。所以上限訂在 16。
+///
+/// 另外用一個記憶體預算夾住：同時攤開的是「送進去的一批」加上「算出來的一批」，
+/// 一格 4K 就要 25MB，核心多的機器才不會一次吃掉好幾 GB。
+///
+/// `graded` 是「有沒有勾分區調色」：調色那一段還要把整格攤成 f32、外加
+/// 模糊用的暫存與混色用的兩份備份（見 [`edit::apply_region_grade`]），
+/// 一格 4K 就多吃將近 200MB。不算進來的話，4K 開 16 條會直接吃掉三、四 GB
+fn movie_workers(w: u32, h: u32, graded: bool) -> usize {
+    const MAX_WORKERS: usize = 16;
+    let cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let px = w as u64 * h as u64;
+    // 進出兩份，加上調色期間多攤開的那幾份（每像素約 30 位元組）
+    let per_frame = (px * 3 * 2 + if graded { px * 30 } else { 0 }).max(1);
+    // 總共不超過約 1.5GB
+    let by_mem = (1_500_000_000u64 / per_frame).max(1) as usize;
+    cores.min(by_mem).min(MAX_WORKERS).max(1)
+}
+
+// ---------- 優化影像 ----------
+
+/// 優化影像目前在背景做的事（同時間只會有一件）
+#[derive(PartialEq, Clone, Copy)]
+enum EnhanceBusy {
+    Idle,
+    /// 正在載入目前這張的預覽底圖
+    Loading,
+    /// 正在算預覽（調色 ＋ 主體強化）
+    Rendering,
+    /// 正在批次寫檔
+    Saving,
+}
+
+/// 背景執行緒回報給優化影像模組的訊息
+enum EnhanceMsg {
+    /// 預覽底圖載好了（附原圖長邊，裁切面板要拿它推回原尺寸）
+    Loaded(PathBuf, Result<(image::RgbImage, u32), String>),
+    /// 預覽算好了；附上當時用的那一組設定，用來判斷要不要再算一次
+    Preview(EnhanceKey, image::RgbImage),
+    /// 批次輸出進度（已完成張數）
+    SaveProgress(usize),
+    /// 批次輸出結束：成功張數、錯誤訊息、第一張成品的路徑
+    SaveDone(usize, Vec<String>, Option<PathBuf>),
+}
+
+/// 決定預覽長什麼樣的那一組設定。拿它跟「上次算出來用的那一組」比對，
+/// 相同就不必重算（與去煙霧拿 [`SmokeParams`] 比對是同一個作法）
+#[derive(Clone, PartialEq)]
+struct EnhanceKey {
+    grade: Adjustments,
+    preset: enhance::Preset,
+    local: enhance::Local,
+    /// 預覽改顯示主體範圍（診斷用的畫面，不是成品）
+    show_mask: bool,
+}
+
+/// 一張照片實際要套用的設定。
+///
+/// 兩半的來源完全不同，所以覆寫也是分開存的（見 [`EnhanceTool::grade_overrides`]
+/// 與 [`EnhanceTool::local_overrides`]）：
+///
+/// - `grade` 是**逐張量出來的**，每張的值本來就不一樣，動它只可能是在改這一張。
+/// - `local` 是「你想要多少」，量不出來，預設就該整批一起走。
+#[derive(Clone, Copy, PartialEq)]
+struct EnhanceParams {
+    /// 十二條調色滑桿 ＋ 裁切
+    grade: Adjustments,
+    /// 主體強化與柔膚
+    local: enhance::Local,
+}
+
+impl EnhanceParams {
+    /// 沒量到自動值時的退路：調色完全不動，強化照類型給起點
+    fn neutral(preset: enhance::Preset) -> Self {
+        Self {
+            grade: Adjustments::default(),
+            local: enhance::Local {
+                subject: preset.default_subject(),
+                skin: preset.default_skin(),
+            },
+        }
+    }
+}
+
+/// 「優化影像」模組的狀態：整批照片各自量、各自調，最後整批另存新檔。
+/// 切到別的模組時整份留著，切回來就是剛才離開的樣子
+struct EnhanceTool {
+    /// 待處理的照片；可一次選多張或整個資料夾，逐張切換預覽
+    photos: Vec<PathBuf>,
+    /// 目前預覽的是第幾張
+    cur: usize,
+    /// 優化的類型（鳥類／一般風景／風景人像）。**整批共用**：
+    /// 一次挑進來的照片通常是同一場拍的，逐張選類型只是折磨人。
+    /// 換類型會把每張的自動值全部重量一次（目標值不同，量出來當然不同）
+    preset: enhance::Preset,
+    /// 使用者**替某一張單獨挑過**的類型。一批照片裡混著鳥、風景與人像是
+    /// 常事，類型講的又是「這張裡面是什麼」（不像強化滑桿是「你想要多少」），
+    /// 所以挑過就跟著那張走；切回那張時類型列自動顯示它自己的那一個
+    preset_overrides: HashMap<PathBuf, enhance::Preset>,
+    /// 每張照片自動量出來的建議（背景逐張量，見 [`App::spawn_enhance_auto`]）。
+    ///
+    /// 一併記下「是用哪個類型量的」：類型換了，量出來的建議當然也不同，
+    /// 靠它分辨手上這份還算不算數（見 [`EnhanceTool::auto_for`]）
+    auto: HashMap<PathBuf, (enhance::Preset, enhance::Auto)>,
+    /// 自動調色的開關。關掉就整批回到「完全不動」，只留手動調的部分
+    auto_on: bool,
+    /// 自動建議的採用強度（百分比，100＝照建議值）。
+    /// 一鍵調完覺得太重或太淡時，這一條比十二條各拉一次快得多
+    auto_amount: i32,
+    /// 還沒量完的張數（顯示進度用）
+    auto_left: usize,
+    /// 背景量測的結果通道；量完最後一張就收掉
+    auto_rx: Option<Receiver<(PathBuf, enhance::Preset, Option<enhance::Auto>)>>,
+    /// 背景量測的待辦佇列（連同要用哪個類型量）。
+    /// 切張時把那一張插到最前面，眼前的先算
+    auto_jobs: Option<Arc<Mutex<VecDeque<(PathBuf, enhance::Preset)>>>>,
+    /// 叫上一批量測收工的旗標（重選照片或換類型時換一支新的）
+    auto_cancel: Arc<AtomicBool>,
+    /// 共用設定：`local` 是整批一起走的那一份，
+    /// `grade` 只在「這張沒量到自動值」（沒量到或自動調色關著）時當底
+    params: EnhanceParams,
+    /// 個別照片的**調色**覆寫。自動值是逐張的，所以動十二條滑桿一律
+    /// 寫進這裡（見 [`EnhanceTool::set_grade`]）
+    grade_overrides: HashMap<PathBuf, Adjustments>,
+    /// 個別照片的**強化**覆寫。只有勾了「只調整這張」才會寫進來，
+    /// 平常那兩條滑桿是整批共用的
+    local_overrides: HashMap<PathBuf, enhance::Local>,
+    /// 開著時強化滑桿也只改目前這張（寫進 local_overrides），否則改共用設定
+    per_photo: bool,
+    /// 預覽底圖（目前這張的原圖等比縮到 [`SMOKE_PREVIEW_MAX`]）
+    base: Option<Arc<image::RgbImage>>,
+    /// 目前這張**原圖**的長邊（裁切面板要拿它推回原尺寸）
+    base_long: u32,
+    /// tex_after 反映的那一組設定；與目前這張的有效設定不同就重算
+    applied: Option<EnhanceKey>,
+    tex_before: Option<egui::TextureHandle>,
+    tex_after: Option<egui::TextureHandle>,
+    rx: Option<Receiver<EnhanceMsg>>,
+    busy: EnhanceBusy,
+    error: Option<String>,
+    /// 批次輸出的進度（已完成張數）與取消旗標
+    save_done: usize,
+    save_cancel: Arc<AtomicBool>,
+    /// 最近一次批次輸出的結果與時間（視窗內短暫顯示提示）
+    saved: Option<(String, Instant)>,
+    /// 最近一次輸出的第一張成品路徑；有值才顯示「開啟圖片」
+    saved_path: Option<PathBuf>,
+    /// 預覽改顯示主體範圍（主體以外壓暗染藍）。
+    /// 「自動判斷主體」講得再好聽，看得到才算數
+    show_mask: bool,
+    /// 「調色」區塊是否展開
+    grade_open: bool,
+    /// 正在調整裁切範圍：預覽改顯示整張照片並畫出可拖曳的裁切框
+    crop_editing: bool,
+    /// 裁切要固定成哪個長寬比
+    crop_aspect: CropAspect,
+    /// 預覽是否左右並排顯示編輯前／編輯後（快捷鍵 Y）
+    compare: bool,
+    /// 預覽的顯示比例；None＝縮到剛好塞滿畫面
+    zoom: Option<f32>,
+    /// 空白鍵跳到 1:1 之前是哪個比例，再按一次就回到它
+    zoom_back: Option<Option<f32>>,
+    /// 放大後畫面中央對到照片的哪個位置（相對座標 0~1）
+    pan: egui::Pos2,
+    /// 縮圖列的貼圖快取（解碼工作池與別的模組共用，只有快取是分開的）
+    thumbs: HashMap<PathBuf, Thumb>,
+    /// 縮圖列目前畫出來的索引範圍，用來決定要解碼哪幾張
+    vis_range: Option<(usize, usize)>,
+    /// 縮圖列要捲到目前這張（切張後才捲一次）
+    scroll_to_cur: bool,
+    /// 上一幀量到的比例列、設定區與存檔列高度（預覽高度照它們留位）
+    zoom_h: f32,
+    settings_h: Option<f32>,
+    save_h: f32,
+    /// 使用者拖分隔線調過的預覽高度增減
+    img_extra: f32,
+    /// 這批照片調整過、還沒存成檔案。照片一選進來就算數——
+    /// 自動判斷已經替每張調好，直接丟掉就是白做
+    dirty: bool,
+}
+
+impl Default for EnhanceTool {
+    fn default() -> Self {
+        // 預設「一般風景」：三種裡最不挑照片的一種，選錯的代價最小
+        let preset = enhance::Preset::Landscape;
+        Self {
+            photos: Vec::new(),
+            cur: 0,
+            preset,
+            preset_overrides: HashMap::new(),
+            auto: HashMap::new(),
+            auto_on: true,
+            auto_amount: 100,
+            auto_left: 0,
+            auto_rx: None,
+            auto_jobs: None,
+            auto_cancel: Arc::new(AtomicBool::new(false)),
+            params: EnhanceParams::neutral(preset),
+            grade_overrides: HashMap::new(),
+            local_overrides: HashMap::new(),
+            per_photo: false,
+            base: None,
+            base_long: 0,
+            applied: None,
+            tex_before: None,
+            tex_after: None,
+            rx: None,
+            busy: EnhanceBusy::Idle,
+            error: None,
+            save_done: 0,
+            save_cancel: Arc::new(AtomicBool::new(false)),
+            saved: None,
+            saved_path: None,
+            show_mask: false,
+            grade_open: true,
+            crop_editing: false,
+            crop_aspect: CropAspect::Free,
+            compare: false,
+            zoom: None,
+            zoom_back: None,
+            pan: egui::pos2(0.5, 0.5),
+            thumbs: HashMap::new(),
+            vis_range: None,
+            scroll_to_cur: false,
+            zoom_h: 26.0,
+            settings_h: None,
+            save_h: 28.0,
+            img_extra: 0.0,
+            dirty: false,
+        }
+    }
+}
+
+impl EnhanceTool {
+    /// 目前預覽的照片
+    fn current(&self) -> Option<&PathBuf> {
+        self.photos.get(self.cur)
+    }
+
+    /// 某張照片要用哪個類型：自己挑過就用它自己的，否則跟著整批那一個
+    fn preset_for(&self, p: &Path) -> enhance::Preset {
+        self.preset_overrides.get(p).copied().unwrap_or(self.preset)
+    }
+
+    /// 目前這張要用的類型（沒有照片時就是整批那一個）。
+    /// 類型列顯示的、預覽算圖用的都是它
+    fn cur_preset(&self) -> enhance::Preset {
+        self.current()
+            .map(|p| self.preset_for(p))
+            .unwrap_or(self.preset)
+    }
+
+    /// 這張量到的自動值，**且是用它現在該用的類型量的**。
+    /// 類型換過、還沒重量完的那段期間回 None，畫面不會顯示對不上的建議值
+    fn measured(&self, p: &Path) -> Option<&enhance::Auto> {
+        match self.auto.get(p) {
+            Some((used, a)) if *used == self.preset_for(p) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// 這張照片正在生效的自動值；沒量到、量的類型不對、或自動調色關著就沒有
+    fn auto_for(&self, p: &Path) -> Option<&enhance::Auto> {
+        self.auto_on.then(|| self.measured(p)).flatten()
+    }
+
+    /// 某張照片實際要套用的設定。兩半各自的優先序：
+    ///
+    /// - 調色：個別覆寫 → 自動值（照 `auto_amount` 折算）→ 共用設定
+    /// - 強化：個別覆寫 → 共用設定（量不出來的東西沒有自動值）
+    fn params_for(&self, p: &Path) -> EnhanceParams {
+        let grade = if let Some(g) = self.grade_overrides.get(p) {
+            *g
+        } else if let Some(a) = self.auto_for(p) {
+            let mut g = scale_grade(a.grade, self.auto_amount);
+            // 裁切不是自動值的一部分（它是構圖，不是調色），沿用共用那一份
+            g.crop = self.params.grade.crop;
+            g
+        } else {
+            self.params.grade
+        };
+        let local = self
+            .local_overrides
+            .get(p)
+            .copied()
+            .unwrap_or(self.params.local);
+        EnhanceParams { grade, local }
+    }
+
+    /// 目前這張的有效設定
+    fn effective(&self) -> EnhanceParams {
+        self.current()
+            .map(|p| self.params_for(p))
+            .unwrap_or(self.params)
+    }
+
+    /// 寫回調色。
+    ///
+    /// 這張正在用自動值時只能寫成個別設定——自動值是逐張的，寫進共用設定
+    /// 會被它蓋回去，看起來就像滑桿沒反應。自動調色關著（整批沒有自動值）
+    /// 時才是整批共用，那時十二條滑桿本來就是一組手動的批次調色
+    fn set_grade(&mut self, g: Adjustments) {
+        self.dirty = true;
+        let mine = self.per_photo
+            || self
+                .current()
+                .is_some_and(|p| self.auto_for(p).is_some() || self.grade_overrides.contains_key(p));
+        if mine {
+            if let Some(p) = self.current().cloned() {
+                self.grade_overrides.insert(p, g);
+                return;
+            }
+        }
+        self.params.grade = g;
+    }
+
+    /// 寫回強化設定（主體強化與柔膚）。
+    ///
+    /// 只有勾了「只調整這張」才寫成個別設定：這兩條講的是「你想要多少」，
+    /// 一批照片多半要同一個力道，逐張各拉一次只是折磨人。
+    /// 已經有個別設定的那張則一律寫回它自己，否則滑桿顯示的是覆寫的值、
+    /// 改動卻寫進共用那一份，看起來就像滑桿拉不動
+    fn set_local(&mut self, l: enhance::Local) {
+        self.dirty = true;
+        let mine = self.per_photo
+            || self
+                .current()
+                .is_some_and(|p| self.local_overrides.contains_key(p));
+        if mine {
+            if let Some(p) = self.current().cloned() {
+                self.local_overrides.insert(p, l);
+                return;
+            }
+        }
+        self.params.local = l;
+    }
+
+    /// 寫回類型。
+    ///
+    /// 與另外兩組設定同一套規則（見 [`EnhanceTool::set_local`]）：勾了
+    /// 「只調整這張」、或這張本來就自己挑過，就只改這張；否則改整批那一個
+    /// ——四百張都是拍鳥時，總不能一張一張點過去。
+    ///
+    /// 回傳 true＝真的換了（呼叫端才知道要不要重新量）
+    fn set_preset(&mut self, p: enhance::Preset) -> bool {
+        if self.cur_preset() == p {
+            return false;
+        }
+        let mine = self.per_photo
+            || self
+                .current()
+                .is_some_and(|q| self.preset_overrides.contains_key(q));
+        if mine {
+            if let Some(q) = self.current().cloned() {
+                self.preset_overrides.insert(q, p);
+                self.dirty = true;
+                return true;
+            }
+        }
+        self.preset = p;
+        if !self.photos.is_empty() {
+            self.dirty = true;
+        }
+        true
+    }
+
+    /// 這張照片有沒有自己的設定（縮圖上要標一個記號）
+    fn has_own(&self, p: &Path) -> bool {
+        self.grade_overrides.contains_key(p)
+            || self.local_overrides.contains_key(p)
+            || self.preset_overrides.contains_key(p)
+    }
+
+    /// 把這張的個別設定收掉，回到「自動值 ＋ 共用設定」。
+    /// 回傳有沒有真的收掉東西（沒有的話「清除這張的修改」不必算成改動過）
+    fn reset_current(&mut self) -> bool {
+        let Some(p) = self.current().cloned() else {
+            return false;
+        };
+        let a = self.grade_overrides.remove(&p).is_some();
+        let b = self.local_overrides.remove(&p).is_some();
+        let c = self.preset_overrides.remove(&p).is_some();
+        a || b || c
+    }
+
+    /// 目前這張量到的結果（畫面上要講一句「測到什麼」）。
+    /// **不看自動調色的開關**：關掉只是不套用建議值，量到的東西
+    /// （主體佔多少、膚色佔多少）照樣值得講。
+    /// 類型不符的那份不算——那是換類型前量的，講出來會對不上畫面
+    fn auto_here(&self) -> Option<&enhance::Auto> {
+        self.current().and_then(|p| self.measured(p))
+    }
+
+    /// 目前這張正在生效的自動值（自動調色關著時就沒有）。
+    /// 滑桿旁的說明與「自動」記號看的是它
+    fn auto_for_current(&self) -> Option<&enhance::Auto> {
+        self.current().and_then(|p| self.auto_for(p))
+    }
+
+    /// 目前這張**原圖**的像素尺寸（與 [`SmokeTool::source_dims`] 同一個推法）
+    fn source_dims(&self) -> Option<(u32, u32)> {
+        let b = self.base.as_ref()?;
+        let (bw, bh) = (b.width(), b.height());
+        if bw == 0 || bh == 0 {
+            return None;
+        }
+        let long = self.base_long.max(bw.max(bh));
+        let s = long as f32 / bw.max(bh) as f32;
+        Some((
+            ((bw as f32 * s).round() as u32).max(1),
+            ((bh as f32 * s).round() as u32).max(1),
+        ))
+    }
+
+    /// 預覽這一幀要照哪個裁切框顯示（與去煙霧同一套規則）。
+    /// 顯示主體範圍時退回沒轉也沒裁的原圖——那張是診斷用的畫面，
+    /// 要看的是「圈到哪裡」，不是成品構圖
+    fn shown_crop(&self) -> Crop {
+        let c = self.effective().grade.crop.clamped();
+        if self.show_mask {
+            Crop::default()
+        } else if self.crop_editing {
+            Crop { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0, ..c }
+        } else {
+            c
+        }
+    }
+
+    /// 這一幀該用哪一組設定算預覽
+    fn key(&self) -> EnhanceKey {
+        let v = self.effective();
+        EnhanceKey {
+            // 裁切不走這條管線（存檔時才真的切下去），拿掉才不會拖一下
+            // 裁切框就整張重算一次
+            grade: v.grade.grade_only(),
+            preset: self.cur_preset(),
+            local: v.local,
+            show_mask: self.show_mask,
+        }
+    }
+}
+
+/// 把一組自動建議照百分比折算。`amount` 是 0~200：
+/// 100＝照建議值、50＝一半、0＝完全不調。
+///
+/// 裁切不參與折算（它不是「強度」，沒有一半的裁切這回事）
+fn scale_grade(mut g: Adjustments, amount: i32) -> Adjustments {
+    let k = amount.clamp(0, ENHANCE_AMOUNT_MAX) as f32 / 100.0;
+    for v in g.values_mut() {
+        *v = (*v as f32 * k).round() as i32;
+    }
+    g.clamped()
+}
+
+/// 自動建議強度的上限（%）。200 已經是「把建議值加倍」，
+/// 再高一律會撞到各滑桿自己的 ±100 上限，多給只是虛的
+const ENHANCE_AMOUNT_MAX: i32 = 200;
+
+/// 同時最多幾個執行緒在量。與去煙霧同一個道理：量本身很快，
+/// 瓶頸是解 JPEG，開太多只會跟預覽、縮圖搶 CPU
+const ENHANCE_AUTO_WORKERS: usize = 3;
+
 struct App {
+    /// 目前停在哪個功能模組（右上角的模組列切換）。各模組的狀態各自留著，
+    /// 切走再切回來就是離開時的樣子
+    module: Module,
+    /// 頂端的功能表列現在是不是展開著。去煙霧模組把它收起來、畫面多留給
+    /// 照片；游標移到視窗最頂端才把它叫回來（模組列一直都在）
+    menu_bar_visible: bool,
+    /// 上一輪畫出來時頂端那幾條列的底緣 y（螢幕座標）：游標離開這條線以上
+    /// 的範圍就把功能表列收回去
+    top_bars_bottom: f32,
+    /// 上一輪停在哪個模組，用來判斷「剛切進去煙霧」要先把功能表列收起來
+    menu_bar_module: Module,
     photos: Vec<PathBuf>,
     fps: u32,
+    /// 存檔尺寸（去煙霧與煙火疊圖共用，見 [`ExportSize`]）
+    export_size: ExportSize,
     format: OutputFormat,
     resolution: Resolution,
     state: ConvertState,
@@ -1089,6 +5246,11 @@ struct App {
     multi_sel: HashSet<PathBuf>,
     /// 多選調色時滑桿顯示的工作值；改動時寫入所有選取照片的覆寫
     sel_adj: Adjustments,
+    /// 正在調整裁切範圍：預覽改顯示整張照片並畫出可拖曳的裁切框。
+    /// 純粹是畫面狀態，不寫進專案（裁切框本身在 [`Adjustments::crop`] 裡）
+    crop_editing: bool,
+    /// 裁切要固定成哪個長寬比
+    crop_aspect: CropAspect,
     /// 「原始像素」解析度的快取（照片中最大寬高）；照片增減時清除重算
     native_res_cache: Option<Resolution>,
     /// 每張照片的尺寸快取（已套用 EXIF 方向；None＝讀取失敗不重試），
@@ -1114,12 +5276,19 @@ struct App {
     scroll_to_selected: bool,
     transition: Transition,
     ken_burns: bool,
+    /// 影片結尾淡出（畫面漸黑），與音樂的結尾淡出各自獨立
+    fade_out: bool,
     music_path: Option<PathBuf>,
     music_volume: i32,
     music_fade: bool,
     sec_adjust_open: bool,
     sec_sub_open: bool,
+    sec_track_open: bool,
     sec_fx_open: bool,
+    /// 展開「主體追蹤」之前，「調色」是不是開著的（收起追蹤時照這份還原）
+    adjust_open_before_track: bool,
+    /// 「主體追蹤」的狀態（框在哪、追到哪、鏡頭怎麼跟）
+    track: TrackTool,
     update_rx: Option<Receiver<UpdateMsg>>,
     update_status: UpdateStatus,
     update_banner_dismissed: bool,
@@ -1129,8 +5298,8 @@ struct App {
     about_open: bool,
     /// fps 最後一次變動的時間；拖動時不即時寫設定檔，停止變動後才寫
     fps_pending_save: Option<Instant>,
-    /// 上次執行留下的閃退紀錄（crash.log 內容）；有值時在底欄顯示回報橫幅
-    crash_report: Option<String>,
+    /// 上次執行留下的問題紀錄（閃退或畫面停止回應）；有值時在底欄顯示回報橫幅
+    crash_report: Option<LastRunReport>,
     /// 剛選的資料夾/檔案沒有找到任何照片；在空狀態顯示提示，避免使用者以為沒反應
     import_found_nothing: bool,
     /// 最近開啟/儲存的專案檔（新的在前），顯示在空狀態畫面供一鍵開啟
@@ -1152,8 +5321,14 @@ struct App {
     saved_snapshot: Option<String>,
     /// 使用者已在關閉確認中選擇「直接關閉」，放行後續關閉（避免困住使用者）
     allow_close: bool,
-    /// 「去煙霧」單張照片工具的狀態
+    /// 「去煙霧」工具的狀態
     smoke: SmokeTool,
+    /// 「煙火疊圖」工具的狀態
+    stack: StackTool,
+    /// 「影片去煙霧」工具的狀態
+    movie: MovieTool,
+    /// 「優化影像」工具的狀態
+    enhance: EnhanceTool,
 }
 
 impl App {
@@ -1194,8 +5369,13 @@ impl App {
             });
         }
         let mut app = Self {
+            module: Module::Video,
+            menu_bar_visible: true,
+            top_bars_bottom: 0.0,
+            menu_bar_module: Module::Video,
             photos: Vec::new(),
             fps: load_saved_fps().unwrap_or(10),
+            export_size: load_export_size(),
             format: OutputFormat::Mp4,
             resolution: Resolution { w: 1920, h: 1080 },
             state: ConvertState::Idle,
@@ -1204,6 +5384,8 @@ impl App {
             adj_overrides: HashMap::new(),
             multi_sel: HashSet::new(),
             sel_adj: Adjustments::default(),
+            crop_editing: false,
+            crop_aspect: CropAspect::Free,
             native_res_cache: None,
             dims_cache: HashMap::new(),
             sub_entries: Vec::new(),
@@ -1223,19 +5405,25 @@ impl App {
             scroll_to_selected: false,
             transition: Transition::None,
             ken_burns: false,
+            fade_out: true,
             music_path: None,
             music_volume: 100,
             music_fade: true,
+            // 起始畫面只展開「調色」，其餘三區收合：側欄一眼看得完，
+            // 要用哪一區點它的標題就展開（收合狀態不進專案檔，每次啟動都一樣）
             sec_adjust_open: true,
-            sec_sub_open: true,
-            sec_fx_open: true,
+            sec_sub_open: false,
+            sec_track_open: false,
+            sec_fx_open: false,
+            adjust_open_before_track: true,
+            track: TrackTool::new(),
             update_rx: None,
             update_status: UpdateStatus::Idle,
             update_banner_dismissed: false,
             update_download_error: None,
             about_open: false,
             fps_pending_save: None,
-            crash_report: take_crash_report(),
+            crash_report: take_last_run_report(),
             import_found_nothing: false,
             recent_projects: load_recent_projects(),
             convert_output: None,
@@ -1245,7 +5433,21 @@ impl App {
             saved_snapshot: None,
             allow_close: false,
             smoke: SmokeTool::default(),
+            stack: StackTool::default(),
+            movie: MovieTool::default(),
+            enhance: {
+                let mut e = EnhanceTool::default();
+                // 上次挑的類型記在設定檔裡：拍鳥的人每次開程式都是拍鳥，
+                // 不該每次都先切一次
+                if let Some(p) = load_enhance_preset() {
+                    e.preset = p;
+                    e.params = EnhanceParams::neutral(p);
+                }
+                e
+            },
         };
+        // 監看 UI 執行緒有沒有卡住（見 spawn_ui_watchdog）
+        spawn_ui_watchdog(&cc.egui_ctx);
         // 啟動時在背景檢查是否有新版本（失敗不影響使用）
         app.spawn_update_check(&cc.egui_ctx);
         // 背景預熱：先確認 ffmpeg 可用並偵測硬體編碼器（最多要跑 3 個測試編碼、
@@ -1271,6 +5473,511 @@ impl App {
         app
     }
 
+    /// 在預覽上拖出來的裁切框寫回目前編輯的那一份調色。
+    /// 範圍與調色面板一致：多選時只改那批照片的覆寫，否則改全域
+    fn set_scoped_crop(&mut self, crop: Crop) {
+        if self.multi_sel.is_empty() {
+            self.adj.crop = crop;
+        } else {
+            self.sel_adj.crop = crop;
+            let targets: Vec<PathBuf> = self.multi_sel.iter().cloned().collect();
+            for p in targets {
+                let mut a = self.effective_adj(&p);
+                a.crop = crop;
+                self.adj_overrides.insert(p, a);
+            }
+        }
+        // 調整裁切範圍時預覽本來就顯示整張（裁切框是 egui 畫在上面的），
+        // 拖一下就重跑一次 ffmpeg 只是白花力氣；放開、離開調整狀態時才重算
+        if !self.crop_editing {
+            self.mark_preview_dirty();
+        }
+    }
+
+    /// 某張照片（已套 EXIF 方向）的像素尺寸，順手記進快取。
+    ///
+    /// `dims_cache` 本來只有在解析度選「原始像素」時才會被填滿
+    /// （見 [`App::resolved_resolution`]），追蹤卻在任何解析度下都要知道
+    /// 原圖多大才算得出鏡頭要切多少，所以這裡自己補讀一次檔頭
+    fn photo_dims(&mut self, photo: &Path) -> Option<(u32, u32)> {
+        if let Some(d) = self.dims_cache.get(photo) {
+            return *d;
+        }
+        let d = oriented_dimensions(photo);
+        self.dims_cache.insert(photo.to_path_buf(), d);
+        d
+    }
+
+    /// 使用者自己框過的照片是清單裡的第幾張（照片順序，追蹤要照這個順序分段）
+    fn track_manual_idx(&self) -> Vec<(usize, [f32; 4])> {
+        let mut v: Vec<(usize, [f32; 4])> = self
+            .photos
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                self.track
+                    .box_of(p)
+                    .filter(|s| s.src == BoxSrc::Manual)
+                    .map(|s| (i, s.rect))
+            })
+            .collect();
+        v.sort_by_key(|(i, _)| *i);
+        v
+    }
+
+    /// 還沒框到、或框得沒把握的照片（照片順序）。逐一檢查與「整批移除」
+    /// 都以這一份為準
+    fn track_unsure(&self) -> Vec<usize> {
+        (0..self.photos.len())
+            .filter(|&i| !self.track.box_of(&self.photos[i]).is_some_and(|s| s.sure()))
+            .collect()
+    }
+
+    /// 追蹤的鏡頭要切多大一塊（相對座標的寬與高）。
+    ///
+    /// 大小全程固定，只有位置跟著主體跑：每張各自照量到的主體大小去切，
+    /// 影片就會一直忽遠忽近。長寬比配合輸出解析度，成品才不會左右補黑邊
+    fn track_crop_size(&mut self, res: Resolution) -> Option<(f32, f32)> {
+        let base = self.track_base_photo()?;
+        let (pw, ph) = self.photo_dims(&base)?;
+        // 裁切框的座標是對著「旋轉後的畫布」算的，主體框也是
+        let canvas = self.effective_adj(&base).crop.canvas(pw as f32, ph as f32);
+        let size = self.track.base_size();
+        if size.0 <= 0.0 || size.1 <= 0.0 {
+            return None;
+        }
+        Some(track_crop_box(
+            size,
+            self.track.zoom,
+            canvas,
+            res.w as f32 / res.h as f32,
+        ))
+    }
+
+    /// 拿哪一張當「原圖多大」的代表（有框的第一張）
+    fn track_base_photo(&self) -> Option<PathBuf> {
+        self.photos
+            .iter()
+            .find(|p| self.track.boxes.contains_key(*p))
+            .cloned()
+    }
+
+    /// 挑一個「主體幾乎都待得在正中央」的鏡頭範圍。
+    ///
+    /// 鏡頭切下來的那塊愈大，能挪動的空間就愈小——大到某個程度，主體一往邊緣
+    /// 去鏡頭就頂到照片邊界不能再跟，主體於是在畫面裡飄來飄去（看起來就是在抖）。
+    /// 這裡反過來算：要讓某一張的主體剛好在正中央，鏡頭最大能開多大？取所有
+    /// 照片的第 5 百分位（容許最極端的 5% 貼邊，不讓一兩張把整支影片逼得很窄），
+    /// 就是「幾乎每一張都置中」的最大範圍
+    fn track_fit_zoom(&mut self) -> Option<f32> {
+        let res = self.resolved_resolution();
+        let base = self.track_base_photo()?;
+        let (pw, ph) = self.photo_dims(&base)?;
+        let canvas = self.effective_adj(&base).crop.canvas(pw as f32, ph as f32);
+        let size = self.track.base_size();
+        if size.0 <= 0.0 || size.1 <= 0.0 {
+            return None;
+        }
+        // 鏡頭大小與倍率成正比，所以先算「1 倍時多大」，再回推每張容得下的倍率
+        let unit = track_crop_box(size, 1.0, canvas, res.w as f32 / res.h as f32);
+        if unit.0 <= 0.0 || unit.1 <= 0.0 {
+            return None;
+        }
+        let known: Vec<Option<(f32, f32)>> = self
+            .photos
+            .iter()
+            .map(|p| self.track.box_of(p).map(|s| s.centre()))
+            .collect();
+        if known.iter().all(|c| c.is_none()) {
+            return None;
+        }
+        let mut pts = fill_gaps(&known);
+        track::despike(&mut pts);
+        track::smooth(&mut pts, self.track.smooth as f32 / 100.0);
+        let mut room: Vec<f32> = pts
+            .iter()
+            .map(|(cx, cy)| {
+                let x = 2.0 * cx.min(1.0 - cx) / unit.0;
+                let y = 2.0 * cy.min(1.0 - cy) / unit.1;
+                x.min(y)
+            })
+            .collect();
+        room.sort_by(f32::total_cmp);
+        let pick = room[room.len() / 20];
+        // 取到小數一位，滑桿上的數字才好讀
+        Some((pick * 10.0).floor() / 10.0)
+    }
+
+    /// 挑一個最適當的平滑度（見 [`fit_smooth`]）：讓「主體偏離中央」與
+    /// 「鏡頭自己晃」的總和最小
+    fn track_fit_smooth(&mut self) -> Option<i32> {
+        let res = self.resolved_resolution();
+        let crop = self.track_crop_size(res)?;
+        let known: Vec<Option<(f32, f32)>> = self
+            .photos
+            .iter()
+            .map(|p| self.track.box_of(p).map(|s| s.centre()))
+            .collect();
+        if known.iter().all(|c| c.is_none()) {
+            return None;
+        }
+        let mut raw = fill_gaps(&known);
+        track::despike(&mut raw);
+        Some(fit_smooth(&raw, crop))
+    }
+
+    /// 把每張的主體框換算成裁切框，寫進個別照片的設定。
+    ///
+    /// 主體**一律擺在畫面正中央**；只有主體太靠近照片邊緣、鏡頭再往外就會
+    /// 切到照片外面時，鏡頭才停在邊界上（不然那一塊會是黑的）。
+    ///
+    /// 沒框到的照片用前後有框的那兩張**內插**補一個位置：鏡頭照樣順順地
+    /// 滑過去，不會為了一張沒框到就卡住不動。
+    ///
+    /// 框一次算好存著，之後拖「鏡頭範圍」「平滑度」都只是重算一次裁切框
+    /// （純算術，上千張也是一瞬間）
+    fn apply_track(&mut self) {
+        let res = self.resolved_resolution();
+        let Some((cw, ch)) = self.track_crop_size(res) else { return };
+        // 每張照片的主體位置（照拍攝順序；沒框到的先留空）
+        let known: Vec<Option<(f32, f32)>> = self
+            .photos
+            .iter()
+            .map(|p| self.track.box_of(p).map(|s| s.centre()))
+            .collect();
+        if known.iter().all(|c| c.is_none()) {
+            return;
+        }
+        let mut pts = fill_gaps(&known);
+        // 先把單張暴衝的離群值換掉，再磨順：平滑對付的是連續的小抖動，
+        // 遇到一張跳很遠的只會把它抹成一段搖晃（見 track::despike）
+        track::despike(&mut pts);
+        track::smooth(&mut pts, self.track.smooth as f32 / 100.0);
+        // 主體貼近照片邊緣、鏡頭再往外就會切到照片外面的那幾張：
+        // 那時鏡頭只能停在邊界上，主體就不在正中央了。數出來讓使用者知道
+        // （想讓那幾張也置中，就把「鏡頭範圍」調小一點）
+        self.track.off_centre = 0;
+        for (i, (cx, cy)) in pts.iter().copied().enumerate() {
+            let photo = self.photos[i].clone();
+            // 第一次動到這張時記下它原本的樣子（清除追蹤要還原回去）
+            let before = self.adj_overrides.get(&photo).copied();
+            let prev = *self.track.prev.entry(photo.clone()).or_insert(before);
+            // 沒有個別調色的照片以全域調色為底：之後拖全域滑桿才推得動它
+            let mut a = prev.unwrap_or(self.adj);
+            // 主體擺正中央；只有貼邊時才夾回照片內
+            let want = (cx - cw / 2.0, cy - ch / 2.0);
+            let x0 = want.0.clamp(0.0, 1.0 - cw);
+            let y0 = want.1.clamp(0.0, 1.0 - ch);
+            if (x0 - want.0).abs() > 1e-4 || (y0 - want.1).abs() > 1e-4 {
+                self.track.off_centre += 1;
+            }
+            a.crop = Crop { x0, y0, x1: x0 + cw, y1: y0 + ch, ..a.crop }.clamped();
+            self.adj_overrides.insert(photo, a);
+        }
+        self.track.applied = true;
+        self.sync_sel_adj();
+        self.mark_preview_dirty();
+    }
+
+    /// 使用者親手調了某張追蹤中照片的調色：把它記成那張「原本的設定」，
+    /// 重算鏡頭時就以這份為底。裁切維持追蹤前的那個框——記進去的若是追蹤
+    /// 算出來的框，清除追蹤後照片會停在半路的構圖上
+    fn track_absorb_manual(&mut self, photo: &Path, a: Adjustments) {
+        if !self.track.applied {
+            return;
+        }
+        let Some(slot) = self.track.prev.get_mut(photo) else { return };
+        let crop = slot.map(|old| old.crop).unwrap_or(self.adj.crop);
+        *slot = Some(Adjustments { crop, ..a });
+    }
+
+    /// 把追蹤動過的照片還原成它們原本的個別設定（主體框本身不動）
+    fn track_restore_crops(&mut self) {
+        if self.track.prev.is_empty() {
+            return;
+        }
+        for (photo, before) in std::mem::take(&mut self.track.prev) {
+            match before {
+                Some(a) => {
+                    self.adj_overrides.insert(photo, a);
+                }
+                None => {
+                    self.adj_overrides.remove(&photo);
+                }
+            }
+        }
+        self.track.applied = false;
+        self.sync_sel_adj();
+        self.mark_preview_dirty();
+    }
+
+    /// 清除追蹤：每張照片的裁切原樣還原，框、結果與參數一併忘掉
+    fn track_clear(&mut self) {
+        self.track_cancel();
+        self.track_restore_crops();
+        self.track = TrackTool::new();
+        self.mark_preview_dirty();
+    }
+
+    /// 使用者在某一張上自己框了主體（自動框選找不到、或找錯了的那幾張）。
+    /// 手動框優先權最高，之後重跑自動框選或追蹤都不會蓋掉它
+    fn track_set_subject(&mut self, photo: PathBuf, rect: [f32; 4]) {
+        let next = Subject::manual(rect);
+        if self.track.box_of(&photo).is_some_and(|s| s.src == BoxSrc::Manual && s.rect == next.rect)
+        {
+            return;
+        }
+        // 背景還在跑的話，它算出來的框會蓋掉使用者剛畫的，先叫停
+        self.track_cancel();
+        self.track.boxes.insert(photo, next);
+        self.track.error = None;
+        // 已經套上鏡頭了就順手重算：改完框立刻看得到新的構圖
+        if self.track.applied {
+            self.apply_track();
+        }
+    }
+
+    /// 拿掉某一張的主體框（框錯了、或那張根本沒有主體）
+    fn track_remove_box(&mut self, photo: &Path) {
+        if self.track.boxes.remove(photo).is_none() {
+            return;
+        }
+        if self.track.applied {
+            self.apply_track();
+        }
+    }
+
+    /// 中止背景工作（使用者按取消、照片換掉、關程式）
+    fn track_cancel(&mut self) {
+        if self.track.rx.is_some() {
+            TRACK_CANCEL.store(true, Ordering::Relaxed);
+            self.track.rx = None;
+            self.track.job = TrackJob::None;
+        }
+    }
+
+    /// 某張照片被移出清單：把它的主體框忘掉。
+    /// 其餘照片的框仍然有效（框是綁在照片上的，不是綁在編號上）
+    fn track_forget(&mut self, photo: &Path) {
+        // 背景那一輪是照「第幾張」回報的，清單一動編號就對不上，先叫停
+        self.track_cancel();
+        self.track.boxes.remove(photo);
+        self.track.prev.remove(photo);
+    }
+
+    /// 自動框選：每張照片各自找一次主體，找到的框直接填進去供使用者檢查。
+    /// 使用者自己框過的那幾張跳過不動
+    fn spawn_auto_boxes(&mut self, ctx: &egui::Context) {
+        if self.photos.len() < 2 {
+            self.track.error = Some("至少要兩張照片才看得出誰在動".into());
+            return;
+        }
+        self.track_cancel();
+        TRACK_CANCEL.store(false, Ordering::Relaxed);
+        self.track.error = None;
+        self.track.clear_derived();
+        self.track.job = TrackJob::Auto;
+        self.track.phase = None;
+        self.track.total = self.photos.len();
+        self.track.done = 0;
+        let photos = self.photos.clone();
+        // 追蹤的座標與裁切框同一個畫布，所以解出來的圖要先照使用者的旋轉轉正
+        let crop = self.effective_adj(&photos[0]).crop;
+        // 使用者自己框過的那幾張原樣留著，還兼作「補洞」時的可靠起點
+        let manual: Vec<Option<[f32; 4]>> = photos
+            .iter()
+            .map(|p| {
+                self.track
+                    .box_of(p)
+                    .filter(|s| s.src == BoxSrc::Manual)
+                    .map(|s| s.rect)
+            })
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.track.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            run_auto_boxes(&photos, &manual, crop, &|m| {
+                let _ = tx.send(m);
+                ctx.request_repaint();
+            });
+        });
+    }
+
+    /// 從手動框追蹤：把手動框之間（與前後）沒框到的照片一路補起來
+    /// （見 [`run_track`]）
+    fn spawn_track(&mut self, ctx: &egui::Context) {
+        let marks = self.track_manual_idx();
+        if marks.is_empty() {
+            self.track.error = Some("請先自己框一張主體，追蹤要從它出發".into());
+            return;
+        }
+        if self.photos.len() < 2 {
+            self.track.error = Some("只有一張照片，沒有東西可以追".into());
+            return;
+        }
+        self.track_cancel();
+        TRACK_CANCEL.store(false, Ordering::Relaxed);
+        self.track.error = None;
+        self.track.clear_derived();
+        self.track.job = TrackJob::Follow;
+        self.track.phase = None;
+        self.track.total = self.photos.len();
+        self.track.done = 0;
+        let photos = self.photos.clone();
+        let crop = self.effective_adj(&photos[marks[0].0]).crop;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.track.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            run_track(&photos, &marks, crop, &|m| {
+                let _ = tx.send(m);
+                ctx.request_repaint();
+            });
+        });
+    }
+
+    fn poll_track(&mut self, ctx: &egui::Context) {
+        let mut msgs = Vec::new();
+        if let Some(rx) = &self.track.rx {
+            while let Ok(m) = rx.try_recv() {
+                msgs.push(m);
+            }
+        }
+        let mut finished = false;
+        for m in msgs {
+            match m {
+                TrackMsg::Step => self.track.done += 1,
+                TrackMsg::Phase(t) => self.track.phase = Some(t),
+                TrackMsg::Boxes(list) => {
+                    for (i, found) in list {
+                        // 使用者可能在跑的中途自己框了一張，那份最大
+                        if let (Some(p), Some(s)) = (self.photos.get(i), found) {
+                            if !self.track.box_of(p).is_some_and(|b| b.src == BoxSrc::Manual) {
+                                self.track.boxes.insert(p.clone(), s);
+                            }
+                        }
+                    }
+                }
+                TrackMsg::Done(found, total) => {
+                    self.track.report = Some((found, total));
+                    finished = true;
+                }
+                TrackMsg::Failed(e) => {
+                    self.track.error = Some(e);
+                    finished = true;
+                }
+            }
+        }
+        if finished {
+            self.track.rx = None;
+            self.track.job = TrackJob::None;
+            // 跑完就直接把鏡頭擺上去：使用者等的就是看到結果。
+            // 先把框統一成同一個大小，等一下要手動微調時才好抓
+            if self.track.has_boxes() {
+                self.track_uniform_boxes();
+                self.apply_track();
+                // 鏡頭範圍太大會讓主體一直頂在邊界（那正是「主體在抖」的元凶），
+                // 貼邊超過四分之一就自動改成「幾乎每張都置中」的那個範圍，
+                // 並在結果那一行說一聲——使用者仍可自己再調
+                if self.track.off_centre * 4 > self.photos.len() {
+                    if let Some(z) = self.track_fit_zoom() {
+                        let z = z.clamp(TRACK_ZOOM_MIN, TRACK_ZOOM_MAX);
+                        if z < self.track.zoom {
+                            self.track.zoom = z;
+                            self.track.fitted_zoom = Some(z);
+                            self.apply_track();
+                        }
+                    }
+                }
+                // 跑完一輪就算一次「檢查告一段落」：如果這時已經沒有要檢查的，
+                // 檢查模式的那兩個勾選會在下一幀自動關掉（見 track_review_done）
+                self.track.was_reviewing = true;
+                // 平滑度也自動挑一個：置中與穩定的平衡點（見 fit_smooth）。
+                // 鏡頭範圍定了才算得準，所以排在它後面
+                if let Some(s) = self.track_fit_smooth() {
+                    if s != self.track.smooth {
+                        self.track.smooth = s;
+                        self.track.fitted_smooth = Some(s);
+                        self.apply_track();
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    /// 自動框選出來的框統一成同一個大小（各自維持中心，手動框不動）。
+    ///
+    /// 偵測到的框是「這一團在動的像素」的外接框：翅膀張開時大、收起來時小，
+    /// 每張都不一樣。鏡頭本來就只看框的**中心**（切多大是「鏡頭範圍」決定的），
+    /// 所以大小不統一對成品沒影響——但要手動微調時，小到只有幾個像素的框
+    /// 連抓都抓不到。統一成中位數大小、並保證不會小於 [`TRACK_BOX_UNIFORM_MIN`]，
+    /// 每一張就都一樣好抓
+    fn track_uniform_boxes(&mut self) {
+        let (mut ws, mut hs): (Vec<f32>, Vec<f32>) = self
+            .track
+            .boxes
+            .values()
+            .filter(|s| s.src != BoxSrc::Manual)
+            .map(|s| s.size())
+            .unzip();
+        if ws.is_empty() {
+            return;
+        }
+        ws.sort_by(f32::total_cmp);
+        hs.sort_by(f32::total_cmp);
+        let w = ws[ws.len() / 2].clamp(TRACK_BOX_UNIFORM_MIN, 0.5);
+        let h = hs[hs.len() / 2].clamp(TRACK_BOX_UNIFORM_MIN, 0.5);
+        for s in self.track.boxes.values_mut() {
+            if s.src == BoxSrc::Manual {
+                continue;
+            }
+            // 中心不動（鏡頭看的就是它）；貼著邊緣的才夾回畫面內，
+            // 那幾張的鏡頭本來就頂在邊界，夾這一點看不出來
+            let (cx, cy) = s.centre();
+            let cx = cx.clamp(w / 2.0, 1.0 - w / 2.0);
+            let cy = cy.clamp(h / 2.0, 1.0 - h / 2.0);
+            s.rect = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0];
+        }
+    }
+
+    /// 全部檢查完的那一刻，自動退出檢查模式：關掉「🔍 檢查主體框」與
+    /// 「🔽 只顯示要檢查的」。
+    ///
+    /// 只在「本來還有東西要檢查、現在歸零」的那一刻做——不能看到 0 就關，
+    /// 否則使用者為了微調某張已經框好的照片而打開檢查模式，會馬上被踢出來
+    fn track_review_done(&mut self) {
+        if self.track.busy() {
+            return;
+        }
+        if !(self.track.picking || self.track.only_unsure) {
+            // 不在檢查模式就不記帳，免得下次一打開就被判定「檢查完了」
+            self.track.was_reviewing = false;
+            return;
+        }
+        let left = self.track_unsure().len();
+        if left == 0 && self.track.was_reviewing {
+            self.track.picking = false;
+            self.track.only_unsure = false;
+            self.mark_preview_dirty();
+        }
+        self.track.was_reviewing = left > 0;
+    }
+
+    /// 一次移除好幾張照片（索引不必排序）。逐張走 [`App::remove_photo`]，
+    /// 文字段落的編號、選取、快取都跟著正確調整；由大到小刪，前面的索引
+    /// 才不會被前一次的移除弄歪
+    fn remove_photos(&mut self, mut which: Vec<usize>) {
+        which.sort_unstable();
+        which.dedup();
+        for i in which.into_iter().rev() {
+            if i < self.photos.len() {
+                self.remove_photo(i);
+            }
+        }
+    }
+
     fn mark_preview_dirty(&mut self) {
         self.preview_dirty = true;
         self.preview_error = None;
@@ -1283,7 +5990,13 @@ impl App {
     fn spawn_preview(&mut self, ctx: &egui::Context) {
         let Some(idx) = self.preview_selected else { return };
         let Some(photo) = self.photos.get(idx).cloned() else { return };
-        let adj = self.effective_adj(&photo);
+        let mut adj = self.effective_adj(&photo);
+        // 正在調整裁切範圍（或框選主體）時，預覽要顯示**整張旋轉後的畫布**，
+        // 才有東西可以框；旋轉要留著，否則拉直了卻看不出效果。關掉之後才看得到
+        // 裁切後的樣子
+        if self.crop_editing || self.track.picking {
+            adj.crop = Crop { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0, ..adj.crop };
+        }
         let res = self.resolved_resolution();
         let (tx, rx) = std::sync::mpsc::channel();
         self.preview_rx = Some(rx);
@@ -1367,10 +6080,16 @@ impl App {
             // 只收還在等待中（Loading）的結果：照片已被清空/移除時，
             // 解碼中的工作仍會遲到送回，若照收會留下淘汰掃描
             // （只走訪目前照片清單）永遠釋放不到的貼圖。
-            // 去煙工具共用這組解碼工作池但快取分開，依 Loading 標記在哪決定收去哪
+            //
+            // 去煙霧、煙火疊圖與優化影像共用這組解碼工作池但快取分開，
+            // 依 Loading 標記在哪決定收去哪。**加新模組時這裡要一起補**——
+            // 漏掉的話那個模組的縮圖會全部停在佔位框，因為結果在下面
+            // 那個 `continue` 就被丟掉了
             let main_wants = matches!(self.thumbs.get(&path), Some(Thumb::Loading));
             let smoke_wants = matches!(self.smoke.thumbs.get(&path), Some(Thumb::Loading));
-            if !main_wants && !smoke_wants {
+            let stack_wants = matches!(self.stack.thumbs.get(&path), Some(Thumb::Loading));
+            let enhance_wants = matches!(self.enhance.thumbs.get(&path), Some(Thumb::Loading));
+            if !main_wants && !smoke_wants && !stack_wants && !enhance_wants {
                 continue;
             }
             let state = match res {
@@ -1387,6 +6106,12 @@ impl App {
             };
             if smoke_wants {
                 self.smoke.thumbs.insert(path.clone(), state.clone());
+            }
+            if stack_wants {
+                self.stack.thumbs.insert(path.clone(), state.clone());
+            }
+            if enhance_wants {
+                self.enhance.thumbs.insert(path.clone(), state.clone());
             }
             if main_wants {
                 self.thumbs.insert(path, state);
@@ -1482,6 +6207,9 @@ impl App {
         if !files.is_empty() {
             self.import_found_nothing = false;
             self.clear_result_banner();
+            // 追蹤是照「第幾張」回報結果的，清單一動編號就對不上，
+            // 背景那一輪得作廢（已追到的照片仍留著，那是綁在照片上的）
+            self.track_cancel();
         }
         self.native_res_cache = None;
         // 加入前的照片順序：供下方把文字段落的編號對回排序後的新位置
@@ -1614,6 +6342,10 @@ impl App {
         self.thumbs.clear();
         self.adj_overrides.clear();
         self.multi_sel.clear();
+        // 主體框與追蹤結果都綁在照片上，照片沒了就整組作廢
+        // （背景還在追的話一併中止，別為已經不存在的清單白跑）
+        self.track_cancel();
+        self.track = TrackTool::new();
         // 文字段落以照片編號綁定，照片全沒了段落就沒有依附對象；
         // 與 remove_photo 一致（段落綁定的照片全移除時段落一併刪除），
         // 否則清空後加入另一批照片，舊文字會靜默套在不相干的新照片上
@@ -1648,6 +6380,7 @@ impl App {
         let removed = self.photos.remove(i);
         self.thumbs.remove(&removed);
         self.adj_overrides.remove(&removed);
+        self.track_forget(&removed);
         let was_multi = self.multi_sel.remove(&removed);
         self.clear_result_banner();
         self.dims_cache.remove(&removed);
@@ -1701,10 +6434,11 @@ impl App {
     }
 
     fn pick_folder(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new()
+        if let Some(dir) = folder_dialog(LastDir::VideoPhotos)
             .set_title("選擇照片資料夾")
             .pick_folder()
         {
+            remember_dir(LastDir::VideoPhotos, &dir);
             let files = collect_images_in_dir(&dir);
             // 掃不到照片（空資料夾，或照片都在子資料夾）就標記，於空狀態提示
             self.import_found_nothing = files.is_empty();
@@ -1713,11 +6447,14 @@ impl App {
     }
 
     fn pick_files(&mut self) {
-        if let Some(files) = rfd::FileDialog::new()
+        if let Some(files) = dir_dialog(LastDir::VideoPhotos)
             .set_title("選擇照片")
             .add_filter("圖片檔", IMAGE_EXTS)
             .pick_files()
         {
+            if let Some(f) = files.first() {
+                remember_dir(LastDir::VideoPhotos, f);
+            }
             // 使用者可切「所有檔案」選到不支援格式（如 HEIC）：全部不支援時
             // add_photos 會靜默過濾掉，與拖放一致地提示（見 update 的拖放處理）
             if !files.is_empty() && !files.iter().any(|p| is_image(p)) {
@@ -1754,8 +6491,31 @@ impl App {
             sub_outline_w: self.sub_style.outline_w,
             sub_outline_color: self.sub_style.outline_color.to_array(),
             sub_boxed: self.sub_style.boxed,
+            // 框依照片順序輸出，同一份專案每次存檔的內容才穩定（同 adj_overrides）
+            track_boxes: self
+                .photos
+                .iter()
+                .filter_map(|p| {
+                    self.track.box_of(p).map(|s| {
+                        let src = match s.src {
+                            BoxSrc::Manual => 0,
+                            BoxSrc::Auto => 1,
+                            BoxSrc::Tracked => 2,
+                        };
+                        (p.clone(), s.rect, src, s.score)
+                    })
+                })
+                .collect(),
+            track_prev: self
+                .photos
+                .iter()
+                .filter_map(|p| self.track.prev.get(p).map(|a| (p.clone(), *a)))
+                .collect(),
+            track_zoom: self.track.zoom,
+            track_smooth: self.track.smooth,
             transition: self.transition.id().into(),
             ken_burns: self.ken_burns,
+            fade_out: self.fade_out,
             music_path: self.music_path.clone(),
             music_volume: self.music_volume,
             music_fade: self.music_fade,
@@ -1788,14 +6548,20 @@ impl App {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| format!("我的專案.{PROJECT_EXT}"));
-        let Some(mut path) = rfd::FileDialog::new()
+        // 已經有專案檔就從它自己的資料夾開始（比「上次存專案的地方」更貼近
+        // 使用者正在做的事），沒有才用記下來的位置
+        let mut dialog = match self.current_project.as_ref().and_then(|p| p.parent()) {
+            Some(dir) if dir.is_dir() => file_dialog().set_directory(dir),
+            _ => dir_dialog(LastDir::VideoProject),
+        };
+        dialog = dialog
             .set_title("儲存專案")
             .add_filter("Photo2Video 專案", &[PROJECT_EXT])
-            .set_file_name(default_name)
-            .save_file()
-        else {
+            .set_file_name(default_name);
+        let Some(mut path) = dialog.save_file() else {
             return;
         };
+        remember_dir(LastDir::VideoProject, &path);
         // 使用者改掉或拿掉副檔名時補回來，之後開啟對話框的過濾器才找得到
         if path
             .extension()
@@ -1807,6 +6573,10 @@ impl App {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             path.set_file_name(format!("{name}.{PROJECT_EXT}"));
+            // 補完副檔名之後才成立的檔名，存檔對話框沒問過使用者
+            if !confirm_overwrite(&path) {
+                return;
+            }
         }
         self.save_project_to(&path);
     }
@@ -1816,7 +6586,7 @@ impl App {
         let json = match serde_json::to_string_pretty(&self.project_data()) {
             Ok(j) => j,
             Err(e) => {
-                rfd::MessageDialog::new()
+                message_dialog()
                     .set_level(rfd::MessageLevel::Error)
                     .set_title("儲存專案失敗")
                     .set_description(format!("無法產生專案內容：\n{e}"))
@@ -1841,7 +6611,7 @@ impl App {
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp); // 失敗時不留臨時檔
-                rfd::MessageDialog::new()
+                message_dialog()
                     .set_level(rfd::MessageLevel::Error)
                     .set_title("儲存專案失敗")
                     .set_description(format!("無法寫入檔案：\n{e}"))
@@ -1892,11 +6662,12 @@ impl App {
     }
 
     fn open_project_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
+        if let Some(path) = dir_dialog(LastDir::VideoProject)
             .set_title("開啟專案")
             .add_filter("Photo2Video 專案", &[PROJECT_EXT])
             .pick_file()
         {
+            remember_dir(LastDir::VideoProject, &path);
             self.load_project(&path);
         }
     }
@@ -1911,15 +6682,13 @@ impl App {
         // 先確認再取代，否則開啟/拖入其他專案會默默清掉現有工作。
         // 啟動參數與空狀態的最近清單此時照片為空，維持一鍵直開不多問
         if !self.photos.is_empty() {
-            let r = rfd::MessageDialog::new()
-                .set_level(rfd::MessageLevel::Warning)
-                .set_title("開啟專案")
-                .set_description(
-                    "將以開啟的專案取代目前的照片與所有設定，尚未儲存的變更會遺失。",
-                )
-                .set_buttons(rfd::MessageButtons::OkCancel)
-                .show();
-            if r != rfd::MessageDialogResult::Ok {
+            if !ask2(
+                rfd::MessageLevel::Warning,
+                "開啟專案",
+                "將以開啟的專案取代目前的照片與所有設定，尚未儲存的變更會遺失。",
+                "開啟專案",
+                "取消",
+            ) {
                 return;
             }
         }
@@ -1932,7 +6701,7 @@ impl App {
                 // 開不起來的檔案從最近清單移除，之後不再顯示
                 self.recent_projects.retain(|p| !same_path_ci(p, path));
                 save_recent_projects(&self.recent_projects);
-                rfd::MessageDialog::new()
+                message_dialog()
                     .set_level(rfd::MessageLevel::Error)
                     .set_title("開啟專案失敗")
                     .set_description(format!("無法讀取專案檔：\n{e}"))
@@ -1990,6 +6759,43 @@ impl App {
             .filter(|(p, _)| photo_set.contains(p))
             .map(|(p, a)| (p, a.clamped()))
             .collect();
+        // 主體框：照片還在的才留。裁切框已經在 adj_overrides 裡原樣載回來了，
+        // 所以開檔後是「框都在、鏡頭也在」的狀態，接著檢查或改參數都可以
+        // （改了會重算，見 apply_track）
+        self.track = TrackTool {
+            boxes: pf
+                .track_boxes
+                .into_iter()
+                .filter(|(p, ..)| photo_set.contains(p))
+                .map(|(p, r, src, score)| {
+                    let src = match src {
+                        0 => BoxSrc::Manual,
+                        1 => BoxSrc::Auto,
+                        _ => BoxSrc::Tracked,
+                    };
+                    let score = if score.is_finite() { score.clamp(0.0, 1.0) } else { 0.0 };
+                    (p, Subject { rect: clamp_rect(r), src, score })
+                })
+                .collect(),
+            zoom: if pf.track_zoom.is_finite() {
+                pf.track_zoom.clamp(TRACK_ZOOM_MIN, TRACK_ZOOM_MAX)
+            } else {
+                3.0
+            },
+            smooth: pf.track_smooth.clamp(0, 100),
+            prev: pf
+                .track_prev
+                .into_iter()
+                .filter(|(p, _)| photo_set.contains(p))
+                .map(|(p, a)| (p, a.map(|a| a.clamped())))
+                .collect(),
+            ..TrackTool::default()
+        };
+        // 有「追蹤前的原樣」就代表鏡頭已經套上去了（載回來的裁切框就是它）：
+        // 標成已套用，拖動鏡頭範圍／平滑度才會重算，清除追蹤也還原得回去
+        self.track.applied = !self.track.prev.is_empty();
+        // 各區塊的收合維持起始畫面的樣子（只有「調色」展開），
+        // 開專案不會突然多長出兩三區把側欄撐長
         self.sub_entries = pf
             .sub_entries
             .into_iter()
@@ -2022,6 +6828,7 @@ impl App {
         self.sel_text = None;
         self.transition = Transition::from_id(&pf.transition).unwrap_or(Transition::None);
         self.ken_burns = pf.ken_burns;
+        self.fade_out = pf.fade_out;
         // 音樂檔遺失就整組略過（照片少幾張還能用，音樂缺檔設定就沒意義）
         let music_missing = matches!(&pf.music_path, Some(p) if !p.is_file());
         self.music_path = pf.music_path.filter(|p| p.is_file());
@@ -2042,7 +6849,7 @@ impl App {
             if music_missing {
                 lines.push("背景音樂檔已不在原路徑，已清除音樂設定。".into());
             }
-            rfd::MessageDialog::new()
+            message_dialog()
                 .set_level(rfd::MessageLevel::Warning)
                 .set_title("專案已開啟，但部分檔案遺失")
                 .set_description(lines.join("\n"))
@@ -2062,7 +6869,16 @@ impl App {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "output".into());
-        let Some(output) = rfd::FileDialog::new()
+        // 還沒輸出過就先指到第一張照片所在的資料夾——其他三個模組都是這樣，
+        // 不指定的話對話框會開在作業系統自己挑的地方
+        let dialog = match load_last_dir(LastDir::VideoOutput) {
+            Some(_) => dir_dialog(LastDir::VideoOutput),
+            None => match self.photos.first().and_then(|p| p.parent()) {
+                Some(d) => file_dialog().set_directory(d),
+                None => file_dialog(),
+            },
+        };
+        let Some(output) = dialog
             .set_title("選擇影片儲存位置")
             .add_filter(format!("{} 影片", ext.to_uppercase()), &[ext])
             .set_file_name(format!("{stem}.{ext}"))
@@ -2070,9 +6886,15 @@ impl App {
         else {
             return;
         };
+        remember_dir(LastDir::VideoOutput, &output);
 
         // 確保輸出副檔名與所選格式一致（GUI／CLI 共用邏輯，見 finalize_output_extension）
-        let output = finalize_output_extension(output, ext);
+        let fixed = finalize_output_extension(output.clone(), ext);
+        // 副檔名被改過的話，最後這個檔名存檔對話框沒問過，得自己補問一次
+        if fixed != output && !confirm_overwrite(&fixed) {
+            return;
+        }
+        let output = fixed;
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
@@ -2116,6 +6938,7 @@ impl App {
         let fx = OutputFx {
             transition: self.transition,
             ken_burns: self.ken_burns,
+            fade_out: self.fade_out,
             music: self.music_path.clone().map(|path| MusicJob {
                 path,
                 volume: self.music_volume,
@@ -2190,7 +7013,9 @@ impl App {
 
     /// 在背景下載新版並替換執行檔，完成後自動重新啟動
     fn spawn_self_update(&mut self, ctx: &egui::Context, tag: String) {
-        if matches!(self.update_status, UpdateStatus::Downloading(_)) {
+        // 非 Windows 沒有可下載的執行檔（見 SELF_UPDATE_SUPPORTED），UI 不會
+        // 給出觸發點，這裡再擋一次避免日後改 UI 時漏掉
+        if !SELF_UPDATE_SUPPORTED || matches!(self.update_status, UpdateStatus::Downloading(_)) {
             return;
         }
         self.update_status = UpdateStatus::Downloading(0.0);
@@ -2277,17 +7102,15 @@ impl App {
         // 重啟等同關閉：有未儲存的專案變更先確認，否則更新一重啟就把辛苦
         // 設定的照片/調色/文字/音樂沖掉（與關閉視窗的保護一致）
         if self.has_unsaved_changes() {
-            let restart_now = rfd::MessageDialog::new()
-                .set_level(rfd::MessageLevel::Warning)
-                .set_title("重新啟動以完成更新")
-                .set_description(
-                    "有尚未儲存的專案變更，重新啟動後會遺失。\n\
-                     現在就重新啟動嗎？\n\n\
-                     （按「否」可先用 Ctrl+S 儲存，再從底部「重新啟動完成更新」重啟）",
-                )
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show();
-            if restart_now != rfd::MessageDialogResult::Yes {
+            if !ask2(
+                rfd::MessageLevel::Warning,
+                "重新啟動以完成更新",
+                "有尚未儲存的專案變更，重新啟動後會遺失。\n\n\
+                 想保留就先選「稍後再說」，用 Ctrl+S 儲存，\n\
+                 再從底部的「重新啟動完成更新」重啟。",
+                "立即重新啟動",
+                "稍後再說",
+            ) {
                 // 延後重啟：維持 ReadyToRestart，讓「重新啟動」按鈕還在
                 self.update_status = UpdateStatus::ReadyToRestart;
                 return;
@@ -2362,7 +7185,501 @@ impl App {
 
     // ---------- UI ----------
 
+    // ---------- 主畫面骨架（比照 Lightroom：功能表列 → 模組列 → 模組內容） ----------
+
+    /// 最上面的功能表列。所有「一次性的動作」都收在這裡，
+    /// 模組內容區就只留跟當下工作有關的東西
+    fn ui_menu_bar(&mut self, ctx: &egui::Context) {
+        // 動作先記下來、跑完選單再執行：檔案／訊息對話框會擋住 UI 執行緒，
+        // 在選單的 closure 裡直接呼叫等於邊借用 self 邊開對話框
+        let mut act: Option<MenuAction> = None;
+        let working = self.is_working();
+        egui::TopBottomPanel::top("menubar")
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(8, 3)),
+            )
+            .show(ctx, |ui| {
+                // 功能表列的標題是平的字（比照 Windows／Lightroom），
+                // 不是一排有底色的按鈕；指過去或展開時才透出底色
+                {
+                    let w = &mut ui.style_mut().visuals.widgets;
+                    w.inactive.bg_fill = egui::Color32::TRANSPARENT;
+                    w.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                }
+                ui.style_mut().spacing.button_padding = egui::vec2(9.0, 5.0);
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("檔案(F)", |ui| {
+                        if ui.add_enabled(!working, egui::Button::new("🆕  新專案")).clicked() {
+                            act = Some(MenuAction::NewProject);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(!working, egui::Button::new("📂  開啟專案…        Ctrl+O"))
+                            .clicked()
+                        {
+                            act = Some(MenuAction::OpenProject);
+                            ui.close_menu();
+                        }
+                        let has_photos = !self.photos.is_empty();
+                        if ui
+                            .add_enabled(
+                                has_photos && !working,
+                                egui::Button::new("💾  儲存專案        Ctrl+S"),
+                            )
+                            .clicked()
+                        {
+                            act = Some(MenuAction::SaveProject);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(has_photos && !working, egui::Button::new("💾  另存新檔…"))
+                            .clicked()
+                        {
+                            act = Some(MenuAction::SaveProjectAs);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(!working, egui::Button::new("📁  加入資料夾…"))
+                            .clicked()
+                        {
+                            act = Some(MenuAction::AddFolder);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(!working, egui::Button::new("🖼  加入照片…"))
+                            .clicked()
+                        {
+                            act = Some(MenuAction::AddPhotos);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.add_enabled_ui(!working && !self.recent_projects.is_empty(), |ui| {
+                            ui.menu_button("🕘  最近的專案", |ui| {
+                                // 不在這裡檢查檔案還在不在（每幀摸磁碟太浪費）；
+                                // 開不起來時 load_project 會提示並把它移出清單
+                                let recent: Vec<PathBuf> =
+                                    self.recent_projects.iter().take(8).cloned().collect();
+                                for p in recent {
+                                    let name = p
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                                    if ui
+                                        .button(name)
+                                        .on_hover_text(p.to_string_lossy())
+                                        .clicked()
+                                    {
+                                        act = Some(MenuAction::OpenRecent(p.clone()));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        });
+                        ui.separator();
+                        if ui.button("結束").clicked() {
+                            act = Some(MenuAction::Quit);
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.menu_button("編輯(E)", |ui| {
+                        match self.module {
+                            Module::Video => {
+                                if ui
+                                    .add_enabled(
+                                        !self.photos.is_empty() && !working,
+                                        egui::Button::new("🗑  清空照片"),
+                                    )
+                                    .clicked()
+                                {
+                                    act = Some(MenuAction::ClearPhotos);
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .add_enabled(!working, egui::Button::new("↺  調色全部歸零"))
+                                    .on_hover_text("把全域調色與每張照片的個別調色一起還原")
+                                    .clicked()
+                                {
+                                    act = Some(MenuAction::ResetAdjustments);
+                                    ui.close_menu();
+                                }
+                            }
+                            Module::Dehaze => {
+                                if ui
+                                    .add_enabled(
+                                        !self.smoke.photos.is_empty()
+                                            && self.smoke.busy == SmokeBusy::Idle,
+                                        egui::Button::new("🗑  清除去煙霧的照片"),
+                                    )
+                                    .clicked()
+                                {
+                                    act = Some(MenuAction::ClearDehaze);
+                                    ui.close_menu();
+                                }
+                            }
+                            Module::Stack => {
+                                if ui
+                                    .add_enabled(
+                                        !self.stack.photos.is_empty()
+                                            && self.stack.busy != StackBusy::Saving,
+                                        egui::Button::new("🗑  清除疊圖的照片"),
+                                    )
+                                    .clicked()
+                                {
+                                    act = Some(MenuAction::ClearStack);
+                                    ui.close_menu();
+                                }
+                            }
+                            Module::Movie => {
+                                if ui
+                                    .add_enabled(
+                                        self.movie.src.is_some()
+                                            && self.movie.busy != MovieBusy::Exporting,
+                                        egui::Button::new("🗑  清除影片"),
+                                    )
+                                    .clicked()
+                                {
+                                    act = Some(MenuAction::ClearMovie);
+                                    ui.close_menu();
+                                }
+                            }
+                            Module::Enhance => {
+                                if ui
+                                    .add_enabled(
+                                        !self.enhance.photos.is_empty()
+                                            && self.enhance.busy != EnhanceBusy::Saving,
+                                        egui::Button::new("🗑  清除優化的照片"),
+                                    )
+                                    .clicked()
+                                {
+                                    act = Some(MenuAction::ClearEnhance);
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                    });
+
+                    ui.menu_button("模組(M)", |ui| {
+                        for m in Module::ALL {
+                            let on = self.module == m;
+                            if check_label(ui, on, format!("{}  {}", m.icon(), m.label()))
+                                .on_hover_text(m.hint())
+                                .clicked()
+                            {
+                                act = Some(MenuAction::Switch(m));
+                                ui.close_menu();
+                            }
+                        }
+                    });
+
+                    ui.menu_button("輔助說明(H)", |ui| {
+                        if ui.button("📖  使用說明").clicked() {
+                            act = Some(MenuAction::OpenUrl(format!(
+                                "https://github.com/{GITHUB_REPO}/blob/master/%E4%BD%BF%E7%94%A8%E8%AA%AA%E6%98%8E.md"
+                            )));
+                            ui.close_menu();
+                        }
+                        if ui.button("🔄  檢查更新").clicked() {
+                            act = Some(MenuAction::CheckUpdate);
+                            ui.close_menu();
+                        }
+                        if ui.button("🔗  回報問題").clicked() {
+                            act = Some(MenuAction::OpenUrl(format!(
+                                "https://github.com/{GITHUB_REPO}/issues/new"
+                            )));
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("ℹ  關於 Photo2Video").clicked() {
+                            act = Some(MenuAction::About);
+                            ui.close_menu();
+                        }
+                    });
+
+                    // 版本號靠右：兼作「關於／檢查更新」的入口（原本在底欄）
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(concat!("ℹ v", env!("CARGO_PKG_VERSION")))
+                                        .size(12.0)
+                                        .color(theme::TEXT_WEAK),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("關於與檢查更新")
+                            .clicked()
+                        {
+                            act = Some(MenuAction::About);
+                        }
+                        // 有新版時在版本號旁邊點一下，選單沒展開也看得到
+                        if matches!(self.update_status, UpdateStatus::Available(_)) {
+                            ui.label(
+                                egui::RichText::new("⬆ 有新版")
+                                    .size(11.5)
+                                    .strong()
+                                    .color(theme::SUCCESS),
+                            );
+                        }
+                    });
+                });
+            });
+        if let Some(a) = act {
+            self.run_menu_action(a, ctx);
+        }
+    }
+
+    fn run_menu_action(&mut self, act: MenuAction, ctx: &egui::Context) {
+        // 「檔案」裡的動作都是影片專案的事；從別的模組按下去就順便切過去，
+        // 否則畫面毫無變化，使用者會以為沒反應
+        if matches!(
+            act,
+            MenuAction::NewProject
+                | MenuAction::OpenProject
+                | MenuAction::OpenRecent(_)
+                | MenuAction::SaveProject
+                | MenuAction::SaveProjectAs
+                | MenuAction::AddFolder
+                | MenuAction::AddPhotos
+        ) {
+            self.module = Module::Video;
+        }
+        match act {
+            MenuAction::NewProject => {
+                // 誤點會失去所有未存檔的編輯，先確認
+                if ask2(
+                    rfd::MessageLevel::Warning,
+                    "開新專案",
+                    "將清空目前的照片與所有設定，尚未儲存的變更會遺失。",
+                    "開新專案",
+                    "取消",
+                ) {
+                    self.new_project();
+                }
+            }
+            MenuAction::OpenProject => self.open_project_dialog(),
+            MenuAction::OpenRecent(p) => self.load_project(&p),
+            MenuAction::SaveProject => self.quick_save_project(),
+            MenuAction::SaveProjectAs => self.save_project_dialog(),
+            MenuAction::AddFolder => self.pick_folder(),
+            MenuAction::AddPhotos => self.pick_files(),
+            MenuAction::ClearPhotos => self.clear_photos(),
+            MenuAction::ResetAdjustments => {
+                self.adj = Adjustments::default();
+                self.adj_overrides.clear();
+                self.sync_sel_adj();
+                self.mark_preview_dirty();
+            }
+            MenuAction::ClearDehaze => self.smoke_clear_confirmed(),
+            MenuAction::ClearStack => self.stack_clear_confirmed(),
+            MenuAction::ClearMovie => self.movie.reset_for(None, None),
+            MenuAction::ClearEnhance => self.enhance_clear_confirmed(),
+            MenuAction::Switch(m) => self.module = m,
+            MenuAction::CheckUpdate => {
+                // 手動重新檢查時，讓新版通知條可以再次出現
+                self.update_banner_dismissed = false;
+                self.spawn_update_check(ctx);
+                self.about_open = true;
+            }
+            MenuAction::About => self.about_open = !self.about_open,
+            MenuAction::OpenUrl(u) => ctx.open_url(egui::OpenUrl::new_tab(u)),
+            MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    /// 功能表列下面的模組列：左邊是程式identity，右邊是模組切換。
+    /// 版面完全由 [`Module::ALL`] 決定，加模組不必動這裡
+    fn ui_module_bar(&mut self, ctx: &egui::Context) {
+        let mut switch_to: Option<Module> = None;
+        egui::TopBottomPanel::top("modulebar")
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin {
+                        left: 16,
+                        right: 16,
+                        top: 6,
+                        bottom: 0,
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // 模組切換擺在最左邊：視線一進畫面就落在這裡，
+                    // 一眼看出現在在哪個功能，也和上面的功能表列對齊
+                    let mut first = true;
+                    for m in Module::ALL {
+                        if !first {
+                            ui.label(egui::RichText::new("|").size(13.0).color(theme::BORDER));
+                        }
+                        first = false;
+                        if module_tab(ui, m, self.module == m).clicked() {
+                            switch_to = Some(m);
+                        }
+                    }
+                    // 影片正在轉、人卻跑到別的模組工作：轉換的橫幅留在影片
+                    // 模組裡，這裡用一顆小標記讓它仍看得見進度（點一下回去看）。
+                    // 只在「進行中」顯示——轉完的結果等切回去再看就好，
+                    // 不必一直掛在別的模組畫面上
+                    if self.module != Module::Video {
+                        if let ConvertState::Working { progress, .. } = &self.state {
+                            let pct = (progress * 100.0).round() as i32;
+                            ui.add_space(10.0);
+                            let r = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("⏳ 轉換中 {pct}%"))
+                                            .size(11.5)
+                                            .color(theme::ACCENT),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("影片正在背景轉換，點一下回到照片轉影片看進度");
+                            if r.clicked() {
+                                switch_to = Some(Module::Video);
+                            }
+                            if r.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                        }
+                    }
+
+                    // 程式名稱與目前專案挪到右邊（由右往左畫：先加的在最右邊，
+                    // 所以文字先、圖示後，看起來才是「🎬 Photo2Video」）
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 這裡要用 top_down(Align::Max) 不能用 ui.vertical()：
+                        // vertical 是 top_down(Align::Min)，它拿到的可用區域是
+                        // 「左邊剩下的一整條」，於是兩行字會靠到那條的最左邊
+                        // ——也就是緊貼在模組名稱旁邊，圖示還會疊上去。
+                        // 靠右對齊才會真的貼在視窗右緣
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                            ui.add_space(1.0);
+                            ui.label(
+                                egui::RichText::new("Photo2Video")
+                                    .size(13.5)
+                                    .strong()
+                                    .color(theme::TEXT),
+                            );
+                            // 目前編輯的專案；沒有就講一句這個模組在做什麼
+                            let sub = match &self.current_project {
+                                Some(p) => p
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                                None => self.module.hint().to_string(),
+                            };
+                            ui.label(
+                                egui::RichText::new(sub).size(11.0).color(theme::TEXT_WEAK),
+                            );
+                        });
+                        ui.label(egui::RichText::new("🎬").size(19.0));
+                    });
+                });
+                ui.add_space(4.0);
+            });
+        if let Some(m) = switch_to {
+            self.module = m;
+        }
+    }
+
+    /// 頂端功能表列的自動收合（四個模組一致）。
+    ///
+    /// 每個模組都是「盯著預覽看」的畫面，能省的高度都要省；一進畫面就先把
+    /// 功能表列收起來，游標移到視窗最頂端那幾個 pixel 才展開，離開就再收
+    /// 回去。下面的模組列不收——切模組是隨時要按的，藏起來反而礙事
+    fn update_menu_bar_visibility(&mut self, ctx: &egui::Context) {
+        // 頂端的觸發帶：游標進到這裡就展開
+        const HOT_ZONE: f32 = 6.0;
+
+        // 剛換模組：新畫面一進去先收起來，游標自己移上來再展開
+        if self.menu_bar_module != self.module {
+            self.menu_bar_module = self.module;
+            self.menu_bar_visible = false;
+        }
+        // 游標不在視窗裡就維持現狀：滑出視窗不該讓工具列自己跳掉
+        let Some(p) = ctx.input(|i| i.pointer.hover_pos()) else {
+            return;
+        };
+        let top = ctx.screen_rect().top();
+        if self.menu_bar_visible {
+            // 展開中：游標還壓在頂端這幾條列上就別收（含底下的模組列，
+            // 這樣從功能表滑到模組名稱時版面不會跳）。展開的功能表選單是浮在
+            // 上層的 Area（不是背景那層的面板），游標移進選單裡也要留著，
+            // 否則選單會連著整條列一起消失
+            let on_bars = p.y <= self.top_bars_bottom.max(top + HOT_ZONE);
+            let on_popup = ctx
+                .layer_id_at(p)
+                .is_some_and(|l| l.order != egui::Order::Background);
+            self.menu_bar_visible = on_bars || on_popup;
+        } else {
+            self.menu_bar_visible = p.y <= top + HOT_ZONE;
+        }
+    }
+
+    /// 功能表列收起來時，在畫面最上緣中間畫一條小把手，
+    /// 讓人知道「這裡往上還有東西」
+    fn ui_menu_bar_hint(&self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(screen.center().x, screen.top() + 3.0),
+            egui::vec2(46.0, 3.0),
+        );
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("menu_bar_hint"),
+        ))
+        .rect_filled(rect, egui::CornerRadius::same(2), theme::BORDER);
+    }
+
+    /// 底欄目前有沒有**跨模組**的通知要顯示。只算程式層級的事（閃退回報、
+    /// 版本更新）——轉換進度、轉換結果與專案存檔提示都屬於影片模組，
+    /// 在別的模組不畫，這裡也就不能拿它們把底欄撐出來
+    fn has_bottom_notice(&self) -> bool {
+        self.crash_report.is_some()
+            || self.update_download_error.is_some()
+            || matches!(
+                self.update_status,
+                UpdateStatus::Downloading(_) | UpdateStatus::ReadyToRestart
+            )
+            || (matches!(self.update_status, UpdateStatus::Available(_))
+                && !self.update_banner_dismissed)
+    }
+
+    /// 依目前模組畫內容面板。加新模組時在這裡多一條分支
+    fn ui_module_body(&mut self, ctx: &egui::Context) {
+        match self.module {
+            Module::Video => {
+                self.ui_bottom_bar(ctx);
+                self.ui_side_panel(ctx);
+                self.ui_central(ctx);
+            }
+            Module::Dehaze => {
+                self.ui_bottom_bar(ctx);
+                self.ui_dehaze_module(ctx);
+            }
+            Module::Stack => {
+                self.ui_bottom_bar(ctx);
+                self.ui_stack_module(ctx);
+            }
+            Module::Movie => {
+                self.ui_bottom_bar(ctx);
+                self.ui_movie_module(ctx);
+            }
+            Module::Enhance => {
+                self.ui_bottom_bar(ctx);
+                self.ui_enhance_module(ctx);
+            }
+        }
+    }
+
     fn ui_bottom_bar(&mut self, ctx: &egui::Context) {
+        // 影片模組永遠要有底欄（輸出設定與轉換鈕在裡面）；其他模組只有
+        // 真的有話要說時才佔一條——否則模組自己的操作列下面會多出一條空白
+        if self.module != Module::Video && !self.has_bottom_notice() {
+            return;
+        }
         egui::TopBottomPanel::bottom("footer")
             .frame(
                 egui::Frame::default()
@@ -2370,18 +7687,24 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
-                // 上次執行閃退：顯示回報橫幅（開 GitHub 回報頁／關閉）。
+                // 上次執行閃退或畫面停止回應：顯示回報橫幅（開 GitHub 回報頁／關閉）。
                 // 不在這裡 clone 內容：報告含 backtrace 可達數十 KB，
                 // 橫幅顯示期間每幀複製一次是純浪費；只在點擊時借用組網址
-                if self.crash_report.is_some() {
+                if let Some(hang) = self.crash_report.as_ref().map(|r| r.hang) {
                     let mut open_report = false;
+                    let mut copy_report = false;
+                    let mut open_folder = false;
                     let mut dismiss = false;
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("⚠ 程式上次異常關閉")
-                                .size(12.0)
-                                .strong()
-                                .color(theme::ERROR),
+                            egui::RichText::new(if hang {
+                                "⚠ 程式上次畫面停止回應"
+                            } else {
+                                "⚠ 程式上次異常關閉"
+                            })
+                            .size(12.0)
+                            .strong()
+                            .color(theme::ERROR),
                         );
                         if ui
                             .small_button("🔗 回報問題")
@@ -2390,10 +7713,29 @@ impl App {
                         {
                             open_report = true;
                         }
+                        // 不是每個人都要開 GitHub：想貼給別人看、想自己留著，
+                        // 這兩顆才是最短的路
+                        if ui
+                            .small_button("📋 複製內容")
+                            .on_hover_text("把完整紀錄（含 backtrace）複製到剪貼簿")
+                            .clicked()
+                        {
+                            copy_report = true;
+                        }
+                        if ui
+                            .small_button("📂 開啟紀錄資料夾")
+                            .on_hover_text(
+                                "歷次的閃退與停止回應都留在這裡的 problem-history.log，\n\
+                                 這個通知關掉之後照樣查得到",
+                            )
+                            .clicked()
+                        {
+                            open_folder = true;
+                        }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if ui.small_button("✕").on_hover_text("隱藏通知").clicked() {
+                                if ui.small_button("×").on_hover_text("隱藏通知").clicked() {
                                     dismiss = true;
                                 }
                             },
@@ -2404,18 +7746,31 @@ impl App {
                         if let Some(report) = &self.crash_report {
                             // panic 訊息與位置在最前面一定保得住，
                             // 截掉的只有 backtrace 尾段（strip 後僅剩位址，價值不高）
-                            let excerpt = truncate_for_url(report, 1500);
+                            let excerpt = truncate_for_url(&report.text, 1500);
+                            let kind = if hang { "停止回應紀錄" } else { "閃退紀錄" };
                             let body = format!(
-                                "版本：v{}\n作業系統：Windows\n\n閃退紀錄：\n{excerpt}\n\n（發生了什麼、當時在做哪個操作，可補充於此）",
+                                "版本：v{}\n作業系統：Windows\n\n{kind}：\n{excerpt}\n\n（發生了什麼、當時在做哪個操作，可補充於此）",
                                 env!("CARGO_PKG_VERSION")
                             );
                             let url = format!(
                                 "https://github.com/{GITHUB_REPO}/issues/new?title={}&body={}",
-                                urlencode("程式閃退回報"),
+                                urlencode(if hang {
+                                    "畫面停止回應回報"
+                                } else {
+                                    "程式閃退回報"
+                                }),
                                 urlencode(&body)
                             );
                             ctx.open_url(egui::OpenUrl::new_tab(url));
                         }
+                    }
+                    if copy_report {
+                        if let Some(report) = &self.crash_report {
+                            ctx.copy_text(report.text.clone());
+                        }
+                    }
+                    if open_folder {
+                        open_in_explorer(&history_log_path());
                     }
                     if dismiss {
                         self.crash_report = None;
@@ -2437,13 +7792,20 @@ impl App {
                                 .strong()
                                 .color(theme::SUCCESS),
                         );
-                        if ui.small_button("立即更新").clicked() {
-                            self.spawn_self_update(ctx, tag.clone());
+                        if SELF_UPDATE_SUPPORTED {
+                            if ui.small_button("立即更新").clicked() {
+                                self.spawn_self_update(ctx, tag.clone());
+                            }
+                        } else {
+                            ui.hyperlink_to(
+                                egui::RichText::new("前往下載頁").size(12.0),
+                                format!("https://github.com/{GITHUB_REPO}/releases/latest"),
+                            );
                         }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if ui.small_button("✕").on_hover_text("隱藏通知").clicked() {
+                                if ui.small_button("×").on_hover_text("隱藏通知").clicked() {
                                     self.update_banner_dismissed = true;
                                 }
                             },
@@ -2506,7 +7868,7 @@ impl App {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if ui.small_button("✕").on_hover_text("隱藏通知").clicked() {
+                                if ui.small_button("×").on_hover_text("隱藏通知").clicked() {
                                     self.update_download_error = None;
                                 }
                             },
@@ -2515,10 +7877,17 @@ impl App {
                     ui.add_space(8.0);
                 }
 
-                // Ctrl+S 直接覆寫不開對話框，短暫顯示已儲存供使用者確認
+                // 以下是影片模組自己的訊息（存檔提示、轉換進度與結果）：
+                // 只在影片模組畫。切到別的模組還掛著「轉換完成」那類橫幅，
+                // 講的是另一個模組的事，只會干擾眼前的工作
+                let video_here = self.module == Module::Video;
+
+                // Ctrl+S 直接覆寫不開對話框，短暫顯示已儲存供使用者確認。
+                // 不在影片模組時不畫，但時間到了照樣把它收掉——否則等一下切
+                // 回來，兩分鐘前存的檔又冒出一次「已儲存」
                 if let Some(t) = self.project_saved_at {
                     let elapsed = t.elapsed();
-                    if elapsed < Duration::from_millis(2500) {
+                    if video_here && elapsed < Duration::from_millis(2500) {
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("✔ 專案已儲存")
@@ -2545,9 +7914,10 @@ impl App {
                     }
                 }
 
-                // 狀態列
+                // 狀態列（轉換進度與結果）
                 let mut cancel_convert = false;
                 match &self.state {
+                    _ if !video_here => {}
                     ConvertState::Idle => {}
                     ConvertState::Working { progress, status } => {
                         let (progress, status) = (*progress, status.clone());
@@ -2562,7 +7932,7 @@ impl App {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .small_button("✕ 取消")
+                                        .small_button("取消")
                                         .on_hover_text("停止轉換並刪除未完成的影片")
                                         .clicked()
                                     {
@@ -2667,12 +8037,22 @@ impl App {
                     self.cancel_convert();
                 }
 
+                // 輸出設定與「開始轉換」只屬於影片模組；別的模組時這個底欄
+                // 只用來顯示上面那些跨模組的通知（更新、閃退回報、轉換進度）
+                if self.module != Module::Video {
+                    return;
+                }
+
                 let working = self.is_working();
                 let res_before = self.resolution;
                 let fps_before = self.fps;
+                // 還沒加照片時整排輸出設定一起變灰：這些是「轉這批照片」的
+                // 設定，沒有照片就無從談起，跟旁邊已經停用的「開始轉換」一致，
+                // 起始畫面才不會擺著一排看似可用、按了也沒下文的控制項
+                let has_photos = !self.photos.is_empty();
 
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!working, |ui| {
+                    ui.add_enabled_ui(!working && has_photos, |ui| {
                         ui.label(egui::RichText::new("每秒張數").color(theme::TEXT_WEAK));
                         ui.add(
                             egui::DragValue::new(&mut self.fps)
@@ -2687,7 +8067,7 @@ impl App {
                             .width(130.0)
                             .show_ui(ui, |ui| {
                                 for f in OutputFormat::ALL {
-                                    ui.selectable_value(&mut self.format, f, f.label());
+                                    check_value(ui, &mut self.format, f, f.label());
                                 }
                             });
                         ui.add_space(12.0);
@@ -2697,13 +8077,13 @@ impl App {
                             .width(170.0)
                             .show_ui(ui, |ui| {
                                 for r in Resolution::ALL {
-                                    ui.selectable_value(&mut self.resolution, r, r.label());
+                                    check_value(ui, &mut self.resolution, r, r.label());
                                 }
                             });
                         // 預計影片長度。讓使用者一眼知道成品多長，好搭配背景音樂
                         // 或抓節奏，不必等轉完才發現太長／太短。與成品一致地考慮
                         // Ken Burns 的時長對齊（見 estimated_video_secs）
-                        if !self.photos.is_empty() {
+                        if has_photos {
                             ui.add_space(12.0);
                             let secs = self.estimated_video_secs();
                             ui.label(
@@ -2727,24 +8107,19 @@ impl App {
                                 h
                             });
                         }
+                    })
+                    // 變灰的原因講清楚，不然使用者只會覺得程式壞了
+                    .response
+                    .on_disabled_hover_text(if working {
+                        "轉換進行中，設定暫時不能改"
+                    } else {
+                        "先加入照片，才需要設定輸出"
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can_convert = !self.photos.is_empty() && !working;
+                        let can_convert = has_photos && !working;
                         if primary_button(ui, "▶  開始轉換", can_convert).clicked() {
                             self.start_convert(ctx);
-                        }
-                        ui.add_space(6.0);
-                        if ui
-                            .button(
-                                egui::RichText::new(concat!("ℹ v", env!("CARGO_PKG_VERSION")))
-                                    .size(12.0)
-                                    .color(theme::TEXT_WEAK),
-                            )
-                            .on_hover_text("關於與檢查更新")
-                            .clicked()
-                        {
-                            self.about_open = !self.about_open;
                         }
                     });
                 });
@@ -2777,6 +8152,10 @@ impl App {
                         ui.add_space(14.0);
                         ui.separator();
                         ui.add_space(10.0);
+                        self.ui_track_section(ui);
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(10.0);
                         self.ui_text_section(ui);
                         ui.add_space(14.0);
                         ui.separator();
@@ -2801,21 +8180,65 @@ impl App {
         } else {
             "調色".to_string()
         };
+        // 按下去只記旗標，畫完這一列才跳確認框：確認框會擋住 UI 執行緒，
+        // 在 closure 裡直接開等於邊借用 ui 邊停住整個畫面
+        let mut ask_clear = false;
+        let neutral = work.is_neutral();
+        let clear_btn = |ui: &mut egui::Ui, ask: &mut bool| {
+            if !neutral
+                && ui
+                    .small_button("↺ 清除所有修改內容")
+                    .on_hover_text("把十二條調色滑桿一次全部歸零，並取消裁切")
+                    .clicked()
+            {
+                *ask = true;
+            }
+        };
         ui.horizontal(|ui| {
             section_toggle(ui, &title, &mut self.sec_adjust_open);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !work.is_neutral() && ui.small_button("↺ 重設").clicked() {
-                    work = Adjustments::default();
-                    changed = true;
-                    reset_all = true;
-                }
-                if scoped && ui.small_button("取消個別調色").clicked() {
-                    unpin = true;
-                }
-            });
+            // 多選時標題變長、又多一顆「取消個別調色」，三個東西擠同一列會
+            // 把標題蓋掉；那時把按鈕移到下一列，標題才看得完整
+            if !scoped {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    clear_btn(ui, &mut ask_clear);
+                });
+            }
         });
+        if scoped {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    clear_btn(ui, &mut ask_clear);
+                    if ui.small_button("取消個別調色").clicked() {
+                        unpin = true;
+                    }
+                });
+            });
+        }
+        if ask_clear {
+            let what = if scoped {
+                format!("將清除選取的 {} 張照片的調色（十二條滑桿全部歸零、裁切取消）。", self.multi_sel.len())
+            } else {
+                "將清除目前的調色（十二條滑桿全部歸零、裁切取消）。".to_string()
+            };
+            if ask2(
+                rfd::MessageLevel::Warning,
+                "清除所有修改內容",
+                &format!("{what}\n\n確定要清除嗎？"),
+                "清除",
+                "取消",
+            ) {
+                work = Adjustments::default();
+                changed = true;
+                reset_all = true;
+            }
+        }
 
         if self.sec_adjust_open {
+            // 十二條滑桿在側欄裡佔掉一大截，下面的區塊常常要捲動才看得到。
+            // 這一段把列距收緊（結束時還原，別的區塊維持原本的呼吸感），
+            // 整區高度約收到原本的四分之三
+            let keep_gap = ui.spacing().item_spacing.y;
+            ui.spacing_mut().item_spacing.y = ADJ_ROW_GAP;
             let hint = if scoped {
                 "只套用到選取的照片；Ctrl+點縮圖增減選取，直接點縮圖離開多選"
             } else {
@@ -2826,48 +8249,35 @@ impl App {
                     .size(11.0)
                     .color(theme::TEXT_WEAK),
             );
-            ui.add_space(10.0);
 
             let before = work;
-            group_label(ui, "白平衡");
-            // 滑桿方向與濾鏡一致：色溫 + 偏暖（黃）、色調 + 偏洋紅
-            adj_slider_rail(
-                ui,
-                &mut work.temp,
-                "色溫",
-                Some((
-                    egui::Color32::from_rgb(0x50, 0x78, 0xE0),
-                    egui::Color32::from_rgb(0xE0, 0xC8, 0x46),
-                )),
-            );
-            adj_slider_rail(
-                ui,
-                &mut work.tint,
-                "色調",
-                Some((
-                    egui::Color32::from_rgb(0x55, 0xC0, 0x50),
-                    egui::Color32::from_rgb(0xD8, 0x5C, 0xC8),
-                )),
-            );
-            ui.add_space(10.0);
+            adj_sliders(ui, &mut work);
 
-            group_label(ui, "光線");
-            adj_slider(ui, &mut work.exposure, "曝光度");
-            adj_slider(ui, &mut work.contrast, "對比");
-            adj_slider(ui, &mut work.brightness, "亮度");
-            adj_slider(ui, &mut work.shadows, "陰影");
-            adj_slider(ui, &mut work.whites, "白色");
-            adj_slider(ui, &mut work.blacks, "黑色");
-            ui.add_space(10.0);
-
-            group_label(ui, "質感與色彩");
-            adj_slider(ui, &mut work.clarity, "清晰度");
-            adj_slider(ui, &mut work.vibrance, "鮮豔度");
-            adj_slider(ui, &mut work.saturation, "飽和度");
+            // 裁切：與調色同一組設定（個別照片覆寫、專案存檔都跟著走）。
+            // 原圖尺寸取目前預覽那張，用來算「原圖」比例與裁切後的像素數
+            let src = self
+                .preview_selected
+                .and_then(|i| self.photos.get(i))
+                .and_then(|p| self.dims_cache.get(p).copied().flatten());
+            let was_editing = self.crop_editing;
+            ui_crop_block(
+                ui,
+                &mut work.crop,
+                &mut self.crop_editing,
+                &mut self.crop_aspect,
+                src,
+                !self.photos.is_empty(),
+            );
+            // 進出「調整裁切範圍」會換一種預覽（整張／裁切後），得重算一次
+            if self.crop_editing != was_editing {
+                self.preview_dirty = true;
+            }
 
             if work != before {
                 changed = true;
             }
+            // 列距還原：下面的「主體追蹤」「文字」「轉場與音樂」維持原本的疏密
+            ui.spacing_mut().item_spacing.y = keep_gap;
         }
 
         if unpin {
@@ -2884,11 +8294,14 @@ impl App {
                 // 只把這次實際改動的欄位套進每張照片自己的調色；
                 // 「重設」才是明確要求整組歸零，維持全部覆蓋
                 self.sel_adj = work;
-                for p in &self.multi_sel {
+                // 先把目標列出來：迴圈裡要回頭改 track 的紀錄（&mut self），
+                // 不能同時借著 multi_sel 走訪
+                let targets: Vec<PathBuf> = self.multi_sel.iter().cloned().collect();
+                for p in targets {
                     let mut a = if reset_all {
                         Adjustments::default()
                     } else {
-                        self.effective_adj(p)
+                        self.effective_adj(&p)
                     };
                     if !reset_all {
                         for ((dst, o), n) in a
@@ -2901,13 +8314,480 @@ impl App {
                                 *dst = n;
                             }
                         }
+                        // 裁切不在 values() 那十二條裡，同樣「有動到才套」
+                        if work.crop != orig.crop {
+                            a.crop = work.crop;
+                        }
                     }
                     self.adj_overrides.insert(p.clone(), a);
+                    // 追蹤套用中的照片，覆寫本來是追蹤自己寫的；使用者親手
+                    // 調了色就把這份記成「他自己的設定」，重算鏡頭時只換裁切
+                    // 框、清除追蹤時也還原成這一份
+                    self.track_absorb_manual(&p, a);
                 }
             } else {
                 self.adj = work;
             }
             self.mark_preview_dirty();
+            // 全域調色動到時，追蹤產生的覆寫要跟著換一份新的調色，
+            // 否則「所有照片都在追蹤」時十二條滑桿看起來像是壞了
+            if self.track.applied {
+                self.apply_track();
+            }
+        }
+    }
+
+    /// 「主體追蹤」面板。流程照使用者實際做的順序排：
+    ///
+    /// 1.「⚡ 自動框選全部」先替每張各找一次主體
+    /// 2.「🔍 檢查主體框」逐張看過去，不對的直接在預覽上重畫（手動框最大）
+    /// 3. 沒框到又不要的照片，一鍵整批移除
+    ///
+    /// 找主體與擺鏡頭是分開的：框好之後拖「鏡頭範圍」「平滑度」都是即時重算，
+    /// 不必重跑（見 [`App::apply_track`]）
+    fn ui_track_section(&mut self, ui: &mut egui::Ui) {
+        let mut clear = false;
+        ui.horizontal(|ui| {
+            // 展開追蹤時把調色收起來讓出版面（兩區都展開的話側欄要一直捲），
+            // 收起追蹤再把它放回原本的樣子
+            let was_open = self.sec_track_open;
+            section_toggle(ui, "主體追蹤", &mut self.sec_track_open);
+            if self.sec_track_open != was_open {
+                if self.sec_track_open {
+                    self.adjust_open_before_track = self.sec_adjust_open;
+                    self.sec_adjust_open = false;
+                } else if !self.sec_adjust_open {
+                    // 中途自己把調色打開的話就維持開著，別再關掉他
+                    self.sec_adjust_open = self.adjust_open_before_track;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if (self.track.has_boxes() || self.track.applied)
+                    && ui
+                        .small_button("↺ 清除追蹤")
+                        .on_hover_text("忘掉所有主體框，每張照片的裁切還原成追蹤前的樣子")
+                        .clicked()
+                {
+                    clear = true;
+                }
+            });
+        });
+        if clear {
+            self.track_clear();
+        }
+        if !self.sec_track_open {
+            return;
+        }
+        ui.label(
+            egui::RichText::new(
+                "連拍裡有快速移動的主體（飛鳥、跑動的人、疾駛的車）時，程式可以\
+                 自動找出牠在每一張的位置，替每張各裁下一塊以牠為中心的畫面——\
+                 主體就一直待在畫面正中央，鏡頭像跟拍一樣跟著牠走",
+            )
+            .size(11.0)
+            .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(8.0);
+
+        let busy = self.track.busy();
+        let has_photos = !self.photos.is_empty();
+        let n = self.photos.len();
+        let boxed = self.track.boxes.len();
+        // 正在跑的時候框還沒送回來，這時算「要檢查幾張」會得到「全部」——
+        // 那是還沒算完，不是真的沒框到，別拿它嚇人也別讓它變成可按的動作
+        let unsure = if busy { Vec::new() } else { self.track_unsure() };
+        let manual = self.track.manual_count();
+
+        // ① 自動框選（整批重來一次；手動框留著）
+        if busy {
+            let progress = if self.track.total > 0 {
+                self.track.done as f32 / self.track.total as f32
+            } else {
+                0.0
+            };
+            let what = match &self.track.phase {
+                // 進到補洞那一階段就顯示它在做什麼，數字不動時才不像當掉
+                Some(p) => p.clone(),
+                None => {
+                    let job = if self.track.job == TrackJob::Auto { "自動框選" } else { "追蹤" };
+                    format!("{job}中… {} / {}", self.track.done, self.track.total)
+                }
+            };
+            ui.horizontal(|ui| {
+                saving_button(ui, &what, progress);
+                if ui.button("取消").clicked() {
+                    self.track_cancel();
+                }
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                let resp = primary_button(ui, "⚡ 自動框選主體", has_photos && n >= 2);
+                if resp
+                    .on_hover_text(
+                        "比對每張與前後兩張的差異，找出「自己在動」的那一團，\n\
+                         替每一張各框一次主體。你自己框過的那幾張不會被蓋掉",
+                    )
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.spawn_auto_boxes(&ctx);
+                }
+                // 追蹤：從手動框補齊。自動框選漏掉一整段時用這個最有效
+                let can_follow = has_photos && manual > 0;
+                let resp = ui.add_enabled(can_follow, egui::Button::new("▶ 從手動框追蹤"));
+                if resp
+                    .on_hover_text(
+                        "從你自己框的那幾張出發，一路比對過去把其餘的照片補起來。\n\
+                         自動框選整段都找不到（主體停住、背景太亂）時改用這個；\n\
+                         多框幾張、每段各給一個起點會更準",
+                    )
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.spawn_track(&ctx);
+                }
+            });
+        }
+
+        // ② 檢查與修正
+        ui.add_space(6.0);
+        ui.add_enabled_ui(has_photos && !busy, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                // 還沒有任何框時，這顆就是「自己框第一張」的入口
+                let label = if boxed > 0 { "🔍 檢查主體框" } else { "🎯 自己框主體" };
+                if check_label(ui, self.track.picking, label)
+                    .on_hover_text(
+                        "開著時預覽顯示整張照片並畫出這張的主體框，滾輪或 ← → 一張張看過去。\n\
+                         框錯或沒框到就直接在照片上拖一個新的（那張就成了手動框，\n\
+                         之後重跑自動框選也不會被蓋掉）。\n\
+                         看完在照片上連點兩下（或再按這顆）就收工",
+                    )
+                    .clicked()
+                {
+                    self.track.picking = !self.track.picking;
+                    self.mark_preview_dirty();
+                }
+                // 只留要檢查的那幾張在縮圖列上，逐一處理不必大海撈針。
+                //
+                // 這顆**只要在用追蹤就一直顯示**：把它藏在「還有要檢查的」條件裡
+                // 會出事——最後一張處理完的瞬間它就消失，縮圖列卻還空著，
+                // 使用者看得到一片空白卻找不到地方取消
+                if self.track.has_boxes() || self.track.only_unsure {
+                    let label = if unsure.is_empty() {
+                        "🔽 只顯示要檢查的（已無）".to_string()
+                    } else {
+                        format!("🔽 只顯示要檢查的（{}）", unsure.len())
+                    };
+                    if check_label(ui, self.track.only_unsure, label)
+                        .on_hover_text(
+                            "下面的縮圖列只排「沒框到／沒把握」的照片。\n\
+                             一張一張看過去、該框的框、不要的直接多選刪掉，\n\
+                             處理完的會自動從這一排消失",
+                        )
+                        .clicked()
+                    {
+                        self.track.only_unsure = !self.track.only_unsure;
+                        self.scroll_to_selected = true;
+                    }
+                }
+                if !unsure.is_empty() {
+                    if ui
+                        .button(format!("⏭ 下一張要檢查的（{}）", unsure.len()))
+                        .on_hover_text("跳到下一張沒框到、或框得沒把握的照片")
+                        .clicked()
+                    {
+                        let cur = self.preview_selected.unwrap_or(0);
+                        let next = unsure
+                            .iter()
+                            .copied()
+                            .find(|&i| i > cur)
+                            .or_else(|| unsure.first().copied());
+                        if let Some(i) = next {
+                            self.multi_sel.clear();
+                            self.select_photo(Some(i));
+                            self.scroll_to_selected = true;
+                            self.track.picking = true;
+                            self.mark_preview_dirty();
+                        }
+                    }
+                }
+            });
+            // 目前這張的狀態與「移除這張的框」
+            let here = self
+                .preview_selected
+                .and_then(|i| self.photos.get(i).map(|p| (i, p.clone())));
+            if let Some((i, p)) = here {
+                let (state, color) = match self.track.box_of(&p) {
+                    Some(s) if s.src == BoxSrc::Manual => ("✋ 你自己框的", theme::TRACK),
+                    Some(s) if s.sure() && s.src == BoxSrc::Auto => ("⚡ 自動框好了", theme::SUCCESS),
+                    Some(s) if s.sure() => ("🔗 追蹤補上的", theme::SUCCESS),
+                    Some(_) => ("⚠ 沒把握，請看一下", theme::ERROR),
+                    None => ("⚠ 沒框到主體，可以自己框", theme::ERROR),
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("第 {} 張：{state}", i + 1))
+                            .size(11.0)
+                            .color(color),
+                    );
+                    if self.track.box_of(&p).is_some()
+                        && ui
+                            .small_button("✕ 移除這張的框")
+                            .on_hover_text("這張沒有主體、或框錯了。移掉之後鏡頭會用前後兩張內插過去")
+                            .clicked()
+                    {
+                        self.track_remove_box(&p);
+                    }
+                });
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "{n} 張裡框到 {boxed} 張（{manual} 張是你自己框的）· {}",
+                    if busy {
+                        "計算中…".to_string()
+                    } else {
+                        format!("{} 張要檢查", unsure.len())
+                    }
+                ))
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+
+            // ③ 不要的照片：整批移除
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if !unsure.is_empty()
+                    && ui
+                        .button(format!("🗑 移除沒框到的 {} 張", unsure.len()))
+                        .on_hover_text(
+                            "主體沒入鏡、或糊到認不出來的那幾張，通常也不值得留在影片裡。\n\
+                             按下去會先列出張數確認",
+                        )
+                        .clicked()
+                {
+                    let list = unsure.clone();
+                    if ask2(
+                        rfd::MessageLevel::Warning,
+                        "移除沒框到的照片",
+                        &format!(
+                            "將從影片中移除 {} 張沒框到主體（或框得沒把握）的照片。\n\
+                             照片本身不會被刪除，只是不放進這支影片。",
+                            list.len()
+                        ),
+                        "移除",
+                        "取消",
+                    ) {
+                        self.remove_photos(list);
+                    }
+                }
+                let sel = self.multi_sel.len();
+                if sel > 0
+                    && ui
+                        .button(format!("🗑 移除選取的 {sel} 張"))
+                        .on_hover_text("縮圖列 Ctrl+點可加選、Shift+點連選一段（也可以按 Delete 鍵）")
+                        .clicked()
+                {
+                    self.remove_selected_photos();
+                }
+            });
+        });
+
+        // ④ 鏡頭怎麼跟
+        ui.add_space(8.0);
+        group_label(ui, "鏡頭");
+        ui.add_enabled_ui(has_photos && !busy, |ui| {
+            let mut recompute = false;
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("鏡頭範圍")
+                        .size(12.5)
+                        .color(theme::TEXT_WEAK),
+                )
+                .on_hover_text(
+                    "裁切框是主體框的幾倍。倍數小＝主體大、鏡頭跟得明顯，\n\
+                     倍數大＝留下較多環境、鏡頭移動較少（連點兩下回到 3 倍）",
+                );
+                ui.spacing_mut().slider_width = (ui.available_width() - NUM_BOX_ROOM - 6.0).max(60.0);
+                let mut z = self.track.zoom;
+                if drop_slider(ui, &mut z, TRACK_ZOOM_MIN, TRACK_ZOOM_MAX).double_clicked() {
+                    z = 3.0;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    let txt = format!("{z:.1}×");
+                    num_box(ui, "track_zoom", &mut z, TRACK_ZOOM_MIN, TRACK_ZOOM_MAX, &txt, theme::TEXT);
+                });
+                if (z - self.track.zoom).abs() > 1e-4 {
+                    self.track.zoom = z;
+                    self.track.fitted_zoom = None;
+                    recompute = true;
+                }
+            });
+            // 一鍵挑一個「主體幾乎都在正中央」的範圍：鏡頭開太大時主體會一直
+            // 頂在邊界，看起來就像在抖
+            if self.track.has_boxes()
+                && ui
+                    .small_button("⤢ 自動選範圍（讓主體都置中）")
+                    .on_hover_text(
+                        "反算每一張「主體要落在正中央的話，鏡頭最大能開多大」，\n\
+                         取幾乎每張都滿足的那個值",
+                    )
+                    .clicked()
+            {
+                if let Some(z) = self.track_fit_zoom() {
+                    self.track.zoom = z.clamp(TRACK_ZOOM_MIN, TRACK_ZOOM_MAX);
+                    self.track.fitted_zoom = Some(self.track.zoom);
+                    recompute = true;
+                }
+            }
+            let before_smooth = self.track.smooth;
+            slider_row(ui, &mut self.track.smooth, 0, 100, "平滑度");
+            if self.track.smooth != before_smooth {
+                self.track.fitted_smooth = None;
+                recompute = true;
+            }
+            if self.track.has_boxes()
+                && ui
+                    .small_button("⤢ 自動選平滑度（置中與穩定的平衡點）")
+                    .on_hover_text(
+                        "把「主體偏離中央多少」與「鏡頭自己晃多少」換算成同一把尺\n\
+                         （都以成品畫面為單位），取兩者相加最小的那個值",
+                    )
+                    .clicked()
+            {
+                if let Some(s) = self.track_fit_smooth() {
+                    self.track.smooth = s;
+                    self.track.fitted_smooth = Some(s);
+                    recompute = true;
+                }
+            }
+            ui.label(
+                egui::RichText::new(
+                    "主體一律擺在畫面正中央。平滑度 0＝一格都不差地釘在正中央\
+                     （逐張比對的抖動也會跟著上畫面）；調高則鏡頭走得更順，\
+                     但主體會在中央附近小幅移動",
+                )
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+            if recompute && self.track.applied {
+                self.apply_track();
+            }
+        });
+
+        // 結果與提醒
+        if let Some((found, total)) = self.track.report {
+            let missed = total.saturating_sub(found);
+            let text = if missed == 0 {
+                format!("跑完 {total} 張，每一張都框到了")
+            } else {
+                format!("跑完 {total} 張，有 {missed} 張沒框到（可以自己框，或整批移除）")
+            };
+            let color = if missed * 4 > total { theme::ERROR } else { theme::SUCCESS };
+            ui.label(egui::RichText::new(text).size(11.0).color(color));
+        }
+        if self.track.applied {
+            let res = self.resolved_resolution();
+            let base = self.track_base_photo();
+            if let (Some((w, h)), Some(base)) = (self.track_crop_size(res), base) {
+                if let Some((pw, ph)) = self.photo_dims(&base) {
+                    let (cw, ch) = self.effective_adj(&base).crop.canvas(pw as f32, ph as f32);
+                    let (px, py) = ((w * cw).round() as u32, (h * ch).round() as u32);
+                    // 切下來比輸出還小就要放大，畫質會軟一點——講清楚，
+                    // 使用者才知道要把鏡頭範圍調大還是把輸出解析度調小
+                    let note = if px < res.w {
+                        format!("，比輸出的 {} 小，會被放大", res.w)
+                    } else {
+                        String::new()
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "鏡頭每張切下 {px} × {py} 像素（原圖的 {:.0}%{note}）",
+                            w * h * 100.0
+                        ))
+                        .size(11.0)
+                        .color(if px < res.w { theme::ERROR } else { theme::TEXT_WEAK }),
+                    );
+                }
+            }
+            match (self.track.fitted_zoom, self.track.fitted_smooth) {
+                (Some(z), Some(s)) => ui.label(
+                    egui::RichText::new(format!(
+                        "已自動調成鏡頭範圍 {z:.1} 倍、平滑度 {s}：主體幾乎每張都在\
+                         正中央，鏡頭也不會晃（兩條滑桿都可以自己再調）"
+                    ))
+                    .size(11.0)
+                    .color(theme::SUCCESS),
+                ),
+                (Some(z), None) => ui.label(
+                    egui::RichText::new(format!(
+                        "鏡頭範圍已自動調成 {z:.1} 倍，讓主體幾乎每張都待在正中央\
+                         （想拍得寬一點就自己把它調大，代價是主體會在畫面裡跑動）"
+                    ))
+                    .size(11.0)
+                    .color(theme::SUCCESS),
+                ),
+                (None, Some(s)) => ui.label(
+                    egui::RichText::new(format!(
+                        "平滑度已自動調成 {s}：置中與穩定的平衡點"
+                    ))
+                    .size(11.0)
+                    .color(theme::SUCCESS),
+                ),
+                (None, None) => ui.label(""),
+            };
+            let off = self.track.off_centre;
+            if off > 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "有 {off} 張的主體太靠近照片邊緣，鏡頭只能停在邊界（那幾張\
+                         主體不在正中央）——想讓它們也置中，把「鏡頭範圍」調小一點",
+                    ))
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("每一張的主體都擺在畫面正中央")
+                        .size(11.0)
+                        .color(theme::SUCCESS),
+                );
+            }
+            ui.label(
+                egui::RichText::new(
+                    "追蹤套用中：每張照片的裁切框由主體框決定，上面「裁切」區的框\
+                     不會再套到它們身上（旋轉、拉直照樣有效）",
+                )
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+        }
+        if let Some(e) = self.track.error.clone() {
+            ui.label(egui::RichText::new(e).size(11.0).color(theme::ERROR));
+        }
+    }
+
+    /// 移除縮圖列上多選起來的那幾張（先確認）。「不要的照片一次刪掉」用的
+    fn remove_selected_photos(&mut self) {
+        let which: Vec<usize> = (0..self.photos.len())
+            .filter(|&i| self.multi_sel.contains(&self.photos[i]))
+            .collect();
+        if which.is_empty() {
+            return;
+        }
+        if ask2(
+            rfd::MessageLevel::Warning,
+            "移除選取的照片",
+            &format!(
+                "將從影片中移除選取的 {} 張照片（連同它們的個別調色與主體框）。\n\
+                 照片本身不會被刪除，只是不放進這支影片。",
+                which.len()
+            ),
+            "移除",
+            "取消",
+        ) {
+            self.remove_photos(which);
+            self.multi_sel.clear();
         }
     }
 
@@ -3001,45 +8881,7 @@ impl App {
                         select_entry = Some(k);
                     }
                     slider_row(ui, &mut entry.size, 8, 300, "大小");
-                    // 旋轉（f32 度數）：連點兩下歸零
-                    ui.horizontal(|ui| {
-                        let (rect, _) = ui
-                            .allocate_exact_size(egui::vec2(30.0, 18.0), egui::Sense::hover());
-                        ui.painter().text(
-                            rect.left_center(),
-                            egui::Align2::LEFT_CENTER,
-                            "旋轉",
-                            egui::FontId::proportional(12.5),
-                            theme::TEXT_WEAK,
-                        );
-                        ui.spacing_mut().slider_width =
-                            (ui.available_width() - 44.0).max(60.0);
-                        let resp = drop_slider(ui, &mut entry.rot, -180.0, 180.0);
-                        if resp.hovered()
-                            && ui.input(|i| {
-                                i.pointer
-                                    .button_double_clicked(egui::PointerButton::Primary)
-                            })
-                        {
-                            entry.rot = 0.0;
-                        }
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.add_space(8.0);
-                                let color = if entry.rot.abs() > 0.01 {
-                                    theme::ACCENT
-                                } else {
-                                    theme::TEXT_WEAK
-                                };
-                                ui.label(
-                                    egui::RichText::new(format!("{:.0}°", entry.rot))
-                                        .size(11.5)
-                                        .color(color),
-                                );
-                            },
-                        );
-                    });
+                    rot_slider_row(ui, "旋轉", &mut entry.rot);
                 });
             ui.add_space(6.0);
         }
@@ -3085,11 +8927,7 @@ impl App {
                             .width(ui.available_width() - 8.0)
                             .show_ui(ui, |ui| {
                                 for (i, (name, _)) in self.fonts.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut self.sub_style.font_idx,
-                                        i,
-                                        name,
-                                    );
+                                    check_value(ui, &mut self.sub_style.font_idx, i, name);
                                 }
                             });
                     });
@@ -3126,11 +8964,16 @@ impl App {
                 .width(160.0)
                 .show_ui(ui, |ui| {
                     for t in Transition::ALL {
-                        ui.selectable_value(&mut self.transition, t, t.label());
+                        check_value(ui, &mut self.transition, t, t.label());
                     }
                 });
         });
         ui.checkbox(&mut self.ken_burns, "動態縮放（Ken Burns 緩慢推近）");
+        ui.checkbox(&mut self.fade_out, "結尾淡出（影片最後畫面漸漸變黑）")
+            .on_hover_text(
+                "最後一秒把整個畫面（含文字）漸漸壓到全黑，影片有個收尾、\n\
+                 不會播到最後一張就硬生生斷掉。影片很短時淡出會跟著縮短",
+            );
         ui.add_space(10.0);
 
         group_label(ui, "背景音樂");
@@ -3144,11 +8987,12 @@ impl App {
                 match &self.music_path {
                     None => {
                         if ui.button("🎵  選擇音樂檔").clicked() {
-                            if let Some(f) = rfd::FileDialog::new()
+                            if let Some(f) = dir_dialog(LastDir::VideoMusic)
                                 .set_title("選擇背景音樂")
                                 .add_filter("音訊檔", AUDIO_EXTS)
                                 .pick_file()
                             {
+                                remember_dir(LastDir::VideoMusic, &f);
                                 self.music_path = Some(f);
                             }
                         }
@@ -3175,7 +9019,7 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.small_button("✕").on_hover_text("移除音樂").clicked()
+                                    if ui.small_button("×").on_hover_text("移除音樂").clicked()
                                     {
                                         remove_music = true;
                                     }
@@ -3279,18 +9123,6 @@ impl App {
         {
             self.open_project_dialog();
         }
-        child.add_space(4.0);
-        if child
-            .add(egui::Button::new(
-                egui::RichText::new("💨  去煙霧（單張照片）…")
-                    .size(12.5)
-                    .color(theme::TEXT_WEAK),
-            ))
-            .on_hover_text("去掉煙火照片裡的煙霧、保留煙火線條，處理後另存新檔")
-            .clicked()
-        {
-            self.smoke.open = true;
-        }
         // 最近的專案：點檔名直接開啟，不用再走檔案對話框。
         // 不在這裡檢查檔案是否存在（每幀摸磁碟太浪費），
         // 開啟失敗時 load_project 會提示並將它從清單移除
@@ -3346,7 +9178,8 @@ impl App {
     fn ui_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let working = self.is_working();
 
-        // 工具列
+        // 工具列：只留跟「這批照片」有關的常用動作。
+        // 專案的開新／開啟／儲存都收進上面的「檔案」功能表，不再重複一份
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!working, |ui| {
                 if ui.button("📁  加入資料夾").clicked() {
@@ -3359,35 +9192,12 @@ impl App {
                     self.clear_photos();
                 }
                 ui.separator();
-                if ui.button("🆕  新專案").clicked() {
-                    // 誤點會失去所有未存檔的編輯，先確認
-                    let r = rfd::MessageDialog::new()
-                        .set_level(rfd::MessageLevel::Warning)
-                        .set_title("開新專案")
-                        .set_description("將清空目前的照片與所有設定，尚未儲存的變更會遺失。")
-                        .set_buttons(rfd::MessageButtons::OkCancel)
-                        .show();
-                    if r == rfd::MessageDialogResult::Ok {
-                        self.new_project();
-                    }
-                }
-                if ui.button("📂  開啟專案").clicked() {
-                    self.open_project_dialog();
-                }
                 if ui
                     .button("💾  儲存專案")
                     .on_hover_text("選擇位置儲存（另存新檔）；Ctrl+S 可直接覆寫目前專案")
                     .clicked()
                 {
                     self.save_project_dialog();
-                }
-                ui.separator();
-                if ui
-                    .button("💨  去煙霧")
-                    .on_hover_text("單張照片工具：去掉煙火的煙霧、保留煙火線條，處理後另存新檔")
-                    .clicked()
-                {
-                    self.smoke.open = true;
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3425,10 +9235,15 @@ impl App {
         // 預覽卡片
         let film_h = 96.0;
         let preview_h = (ui.available_height() - film_h - 14.0).max(160.0);
-        // Sense::click：點擊預覽空白處可取消文字選取
+        // Sense::click：點擊預覽空白處可取消文字選取。
+        // 調整裁切範圍時還要收得到拖曳（拖四角、四邊與整個框）
         let (rect, bg_resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), preview_h),
-            egui::Sense::click(),
+            if self.crop_editing || self.track.picking {
+                egui::Sense::click_and_drag()
+            } else {
+                egui::Sense::click()
+            },
         );
         let p = ui.painter().clone();
         p.rect_filled(rect, 10, theme::PREVIEW_BG);
@@ -3549,19 +9364,112 @@ impl App {
             );
         }
 
-        // 文字即時繪製與互動編輯（拖曳移動、角落縮放、旋轉把手）
-        if let Some(ir) = img_rect_opt {
-            self.ui_text_overlay(ui, rect, ir);
-        }
-        if bg_resp.clicked() {
-            self.sel_text = None;
+        // 裁切框：只在「調整裁切範圍」時畫，而且畫在**旋轉後那張畫布**那一塊上，
+        // 不是整個輸出畫布——輸出畫布左右（或上下）那圈黑邊是補邊補出來的，
+        // 不屬於照片，裁切的相對座標是對著轉完的畫布算的
+        if self.crop_editing {
+            if let Some(ir) = img_rect_opt {
+                let src = self
+                    .preview_selected
+                    .and_then(|i| self.photos.get(i))
+                    .and_then(|p| self.dims_cache.get(p).copied().flatten());
+                // 與調色面板同一個範圍：多選時改的是那批照片的覆寫
+                let cur = if self.multi_sel.is_empty() {
+                    self.adj
+                } else {
+                    self.sel_adj
+                }
+                .crop;
+                // 轉過之後照片在輸出畫面裡佔的是外接框那一塊，比原本大
+                let canvas = src.map(|(w, h)| {
+                    let (cw, ch) = cur.canvas(w as f32, h as f32);
+                    (cw.round().max(1.0) as u32, ch.round().max(1.0) as u32)
+                });
+                let photo_rect = match canvas {
+                    Some((w, h)) if w > 0 && h > 0 => {
+                        fit_rect(egui::vec2(w as f32, h as f32), ir)
+                    }
+                    _ => ir,
+                };
+                let (next, done) =
+                    crop_overlay(ui, &bg_resp, photo_rect, cur, self.crop_aspect.ratio(canvas));
+                if next != cur {
+                    self.set_scoped_crop(next);
+                }
+                // 照片上連點兩下＝裁好了：關掉調整狀態，預覽換成裁切後的樣子
+                if done {
+                    self.crop_editing = false;
+                    self.mark_preview_dirty();
+                }
+            }
+        } else if self.track.picking {
+            // 檢查／修改主體框：與裁切框同一塊畫布（旋轉後那張），
+            // 拖出來的框才對得上
+            if let (Some(ir), Some(idx)) = (img_rect_opt, self.preview_selected) {
+                let photo = self.photos[idx].clone();
+                let src = self.dims_cache.get(&photo).copied().flatten();
+                let cur = self.effective_adj(&photo).crop;
+                let photo_rect = match src.map(|(w, h)| cur.canvas(w as f32, h as f32)) {
+                    Some((w, h)) if w > 0.0 && h > 0.0 => fit_rect(egui::vec2(w, h), ir),
+                    _ => ir,
+                };
+                // 每張各自記自己的框：切到別張看到的就是那張的框
+                let shown = self.track.box_of(&photo);
+                let (next, done) = track_overlay(
+                    ui,
+                    &bg_resp,
+                    photo_rect,
+                    shown.map(|s| s.rect),
+                    shown.map(|s| s.src),
+                );
+                if let Some(r) = next {
+                    self.track_set_subject(photo, r);
+                }
+                // 逐一處理模式（只顯示要檢查的）下，框好放開手就自動跳到下一張
+                // 要檢查的——不然畫面停在剛修好的那張，還要自己去找下一張。
+                //
+                // 「有框到東西」與「放開手」**不會在同一幀發生**：拖曳中
+                // dragged() 為真、drag_stopped() 為假；放開的那一幀反過來。
+                // 所以得先記一筆，等放開手再跳（拖到一半就跳走等於框被搶走）
+                if next.is_some() {
+                    self.track.framed_during_drag = true;
+                }
+                if bg_resp.drag_stopped()
+                    && std::mem::take(&mut self.track.framed_during_drag)
+                    && self.track.only_unsure
+                {
+                    let left = self.track_unsure();
+                    let cur = self.preview_selected.unwrap_or(0);
+                    // 先找後面的，沒有就回頭找前面的（剩最後幾張時常在前面）
+                    if let Some(i) = left.iter().copied().find(|&i| i > cur).or(left.first().copied())
+                    {
+                        self.multi_sel.clear();
+                        self.select_photo(Some(i));
+                        self.scroll_to_selected = true;
+                        self.mark_preview_dirty();
+                    }
+                }
+                if done {
+                    self.track.picking = false;
+                    self.mark_preview_dirty();
+                }
+            }
+        } else {
+            // 文字即時繪製與互動編輯（拖曳移動、角落縮放、旋轉把手）。
+            // 裁切中不畫：兩者都靠同一片畫布的左鍵，拖起來會互相搶
+            if let Some(ir) = img_rect_opt {
+                self.ui_text_overlay(ui, rect, ir);
+            }
+            if bg_resp.clicked() {
+                self.sel_text = None;
+            }
         }
 
         ui.add_space(10.0);
 
-        // 滾輪在預覽區或縮圖列上：切換上一張／下一張
-        let strip_rect = ui.available_rect_before_wrap();
-        if ui.rect_contains_pointer(rect) || ui.rect_contains_pointer(strip_rect) {
+        // 滾輪在預覽區上：切換上一張／下一張。
+        // 縮圖列不走這裡——那邊的滾輪是左右捲整排（見下面的膠卷）
+        if ui.rect_contains_pointer(rect) {
             self.wheel_accum += ctx.input(|i| i.raw_scroll_delta.y + i.raw_scroll_delta.x);
             const STEP: f32 = 40.0;
             while self.wheel_accum >= STEP {
@@ -3589,114 +9497,180 @@ impl App {
         let mut toggle_idx: Option<usize> = None; // Ctrl+點：加入/移出多選
         let mut range_idx: Option<usize> = None; // Shift+點：從目前選取連選到這張
         let mut remove_idx: Option<usize> = None;
+        let mut remove_sel = false;
         let mut clear_all = false;
         let mut vis_range: Option<(usize, usize)> = None;
+        // 有在用主體追蹤才在縮圖上標框的狀態（沒用到的人畫面維持乾淨）。
+        // 正在跑的時候不標也不過濾：那時框是整批算完才一起送回來的，
+        // 中途每一張都還「沒框到」，標出來只會誤導
+        let track_on = self.track.has_boxes() && !self.track.busy();
         // 縮圖尺寸固定，可虛擬化：只渲染捲動範圍內的縮圖、前後以空白撐出總寬，
         // 照片數量再多每一幀的繪製成本也不變
         let thumb_size = egui::vec2(132.0, 84.0);
-        let n = self.photos.len();
-        egui::ScrollArea::horizontal().show_viewport(ui, |ui, viewport| {
-            ui.set_min_height(thumb_size.y);
-            ui.horizontal(|ui| {
-                let spacing = ui.spacing().item_spacing.x;
-                let stride = thumb_size.x + spacing;
-                let origin = ui.next_widget_position();
-                // 對虛擬位置捲動，不需要選取的縮圖真的被渲染出來
-                if self.scroll_to_selected {
-                    if let Some(sel) = self.preview_selected {
-                        let r = egui::Rect::from_min_size(
-                            egui::pos2(origin.x + sel as f32 * stride, origin.y),
-                            thumb_size,
-                        );
-                        ui.scroll_to_rect(r, Some(egui::Align::Center));
-                    }
-                }
-                let first = (((viewport.min.x / stride).floor() as isize) - 1).max(0) as usize;
-                let last = ((((viewport.max.x / stride).ceil() as isize) + 1).max(0) as usize).min(n);
-                let first = first.min(last);
-                vis_range = Some((first, last));
-                if first > 0 {
-                    ui.add_space(first as f32 * stride);
-                }
-                // 讓每張縮圖的自動 ID 與索引繫結，捲動時 hover／右鍵選單狀態才不會錯位
-                ui.skip_ahead_auto_ids(first);
-                for i in first..last {
-                    let photo = &self.photos[i];
-                    let (tex, failed) = match self.thumbs.get(photo) {
-                        Some(Thumb::Ready(t)) => (Some(t.clone()), false),
-                        Some(Thumb::Failed) => (None, true),
-                        _ => (None, false),
-                    };
-                    let selected = self.preview_selected == Some(i);
-                    let has_caption = self.sub_entries.iter().any(|e| {
-                        (e.start..=e.end).contains(&(i + 1)) && !e.text.trim().is_empty()
-                    });
-                    let multi = self.multi_sel.contains(photo);
-                    let has_adj = self.adj_overrides.contains_key(photo);
-                    let mut resp = thumb_item(
-                        ui, tex.as_ref(), i, selected, has_caption, multi, has_adj, failed,
-                    );
-                    if failed {
-                        resp = resp.on_hover_text("這張照片無法讀取（檔案損毀或格式不支援）");
-                    }
-                    if resp.clicked() {
-                        let mods = ui.input(|inp| inp.modifiers);
-                        if mods.ctrl {
-                            toggle_idx = Some(i);
-                        } else if mods.shift {
-                            range_idx = Some(i);
-                        } else {
-                            click_idx = Some(i);
+        // 「只顯示要檢查的」：膠卷改成只排那幾張，逐一處理時不必在上百張裡
+        // 大海撈針。view[slot] 是那一格對應的照片編號（沒過濾時就是它自己）
+        let all: Vec<usize> = (0..self.photos.len()).collect();
+        let unsure_view = (self.track.only_unsure && track_on).then(|| self.track_unsure());
+        // 沒有要檢查的了就自動回到「全部照片、原來的順序」——留一排空白在那裡
+        // 只會讓人以為照片不見了（過濾的勾選維持原狀，之後再有要檢查的會自己排出來）
+        let nothing_left = unsure_view.as_ref().is_some_and(|v| v.is_empty());
+        let view: Vec<usize> = match unsure_view {
+            Some(v) if !v.is_empty() => v,
+            _ => all,
+        };
+        let n = view.len();
+        if nothing_left && !self.photos.is_empty() {
+            ui.label(
+                egui::RichText::new("✔ 每一張都框好了，沒有要檢查的——下面照原來的順序顯示全部照片")
+                    .size(11.0)
+                    .color(theme::SUCCESS),
+            );
+        }
+        // 這一列只捲得動左右，所以直接把滾輪當成左右捲——
+        // 游標停在縮圖上轉滾輪就能把整排移過去，不必去按 Shift 或拖捲軸。
+        // 只改這個 scope 裡的樣式，別處的捲動維持原樣。
+        ui.scope(|ui| {
+            ui.style_mut().always_scroll_the_only_direction = true;
+            egui::ScrollArea::horizontal().show_viewport(ui, |ui, viewport| {
+                ui.set_min_height(thumb_size.y);
+                ui.horizontal(|ui| {
+                    let spacing = ui.spacing().item_spacing.x;
+                    let stride = thumb_size.x + spacing;
+                    let origin = ui.next_widget_position();
+                    // 對虛擬位置捲動，不需要選取的縮圖真的被渲染出來
+                    if self.scroll_to_selected {
+                        // 過濾時要捲到它在這一排裡的位置，不是它的照片編號
+                        if let Some(slot) =
+                            self.preview_selected.and_then(|sel| view.iter().position(|&i| i == sel))
+                        {
+                            let r = egui::Rect::from_min_size(
+                                egui::pos2(origin.x + slot as f32 * stride, origin.y),
+                                thumb_size,
+                            );
+                            ui.scroll_to_rect(r, Some(egui::Align::Center));
                         }
                     }
-                    resp.context_menu(|ui| {
-                        // 轉檔中要與工具列一致地「明確禁用」：照常可點但被
-                        // 後面的 !working 守門擋掉的話，點了毫無反應也沒有
-                        // 回饋，使用者會以為程式壞了
-                        ui.add_enabled_ui(!working, |ui| {
-                            if ui.button("移除這張照片").clicked() {
-                                remove_idx = Some(i);
-                                ui.close_menu();
+                    let first = (((viewport.min.x / stride).floor() as isize) - 1).max(0) as usize;
+                    let last =
+                        ((((viewport.max.x / stride).ceil() as isize) + 1).max(0) as usize).min(n);
+                    let first = first.min(last);
+                    vis_range = Some((first, last));
+                    if first > 0 {
+                        ui.add_space(first as f32 * stride);
+                    }
+                    // 讓每張縮圖的自動 ID 與索引繫結，捲動時 hover／右鍵選單狀態才不會錯位
+                    ui.skip_ahead_auto_ids(first);
+                    for slot in first..last {
+                        let i = view[slot];
+                        let photo = &self.photos[i];
+                        let (tex, failed) = match self.thumbs.get(photo) {
+                            Some(Thumb::Ready(t)) => (Some(t.clone()), false),
+                            Some(Thumb::Failed) => (None, true),
+                            _ => (None, false),
+                        };
+                        let selected = self.preview_selected == Some(i);
+                        let has_caption = self.sub_entries.iter().any(|e| {
+                            (e.start..=e.end).contains(&(i + 1)) && !e.text.trim().is_empty()
+                        });
+                        let multi = self.multi_sel.contains(photo);
+                        let has_adj = self.adj_overrides.contains_key(photo);
+                        let mut resp = thumb_item(
+                            ui,
+                            tex.as_ref(),
+                            Some(i),
+                            selected,
+                            has_caption,
+                            multi,
+                            has_adj,
+                            failed,
+                        );
+                        if failed {
+                            resp = resp.on_hover_text("這張照片無法讀取（檔案損毀或格式不支援）");
+                        }
+                        // 主體框的狀態標在縮圖上：一整排看過去就知道哪幾張要處理
+                        // （只在有在用追蹤時才標，沒用到的人畫面不會多東西）
+                        if track_on {
+                            match self.track.box_of(photo) {
+                                Some(s) if s.src == BoxSrc::Manual => {
+                                    thumb_badge_colored(ui, resp.rect, "✋ 手動", theme::TRACK)
+                                }
+                                Some(s) if !s.sure() => {
+                                    thumb_badge_warn(ui, resp.rect, "⚠ 要檢查")
+                                }
+                                Some(_) => {}
+                                None => thumb_badge_warn(ui, resp.rect, "⚠ 沒框到"),
                             }
-                            if ui.button("清空全部").clicked() {
-                                ui.close_menu();
-                                // 與工具列「開新專案」一致：清空全部照片會連同各段
-                                // 文字與個別調色一次移除、無法復原，先確認再執行，
-                                // 避免右鍵選單誤點就把整批工作清掉
-                                let ok = rfd::MessageDialog::new()
-                                    .set_level(rfd::MessageLevel::Warning)
-                                    .set_title("清空全部")
-                                    .set_description(
+                        }
+                        if resp.clicked() {
+                            let mods = ui.input(|inp| inp.modifiers);
+                            if mods.ctrl {
+                                toggle_idx = Some(i);
+                            } else if mods.shift {
+                                range_idx = Some(i);
+                            } else {
+                                click_idx = Some(i);
+                            }
+                        }
+                        resp.context_menu(|ui| {
+                            // 轉檔中要與工具列一致地「明確禁用」：照常可點但被
+                            // 後面的 !working 守門擋掉的話，點了毫無反應也沒有
+                            // 回饋，使用者會以為程式壞了
+                            ui.add_enabled_ui(!working, |ui| {
+                                if ui.button("移除這張照片").clicked() {
+                                    remove_idx = Some(i);
+                                    ui.close_menu();
+                                }
+                                // 多選起來的一次移除：挑掉不要的那幾張時，
+                                // 一張一張右鍵刪太慢（Delete 鍵也走同一條路）
+                                let sel = self.multi_sel.len();
+                                if sel > 0
+                                    && ui.button(format!("移除選取的 {sel} 張照片")).clicked()
+                                {
+                                    ui.close_menu();
+                                    remove_sel = true;
+                                }
+                                if ui.button("清空全部").clicked() {
+                                    ui.close_menu();
+                                    // 與工具列「開新專案」一致：清空全部照片會連同各段
+                                    // 文字與個別調色一次移除、無法復原，先確認再執行，
+                                    // 避免右鍵選單誤點就把整批工作清掉
+                                    if ask2(
+                                        rfd::MessageLevel::Warning,
+                                        "清空全部",
                                         "將移除所有照片，連同各段文字與個別調色。\n\
                                          此動作無法復原（尚未儲存的變更會遺失）。",
-                                    )
-                                    .set_buttons(rfd::MessageButtons::OkCancel)
-                                    .show();
-                                if ok == rfd::MessageDialogResult::Ok {
-                                    clear_all = true;
+                                        "清空全部",
+                                        "取消",
+                                    ) {
+                                        clear_all = true;
+                                    }
                                 }
+                            });
+                            if working {
+                                ui.label(
+                                    egui::RichText::new("轉換中無法修改照片")
+                                        .size(11.0)
+                                        .color(theme::TEXT_WEAK),
+                                );
                             }
                         });
-                        if working {
-                            ui.label(
-                                egui::RichText::new("轉換中無法修改照片")
-                                    .size(11.0)
-                                    .color(theme::TEXT_WEAK),
-                            );
-                        }
-                    });
-                }
-                if last < n {
-                    ui.add_space((n - last) as f32 * stride - spacing);
-                }
+                    }
+                    if last < n {
+                        ui.add_space((n - last) as f32 * stride - spacing);
+                    }
+                });
             });
         });
 
         self.scroll_to_selected = false;
 
-        // 依這一幀的可視範圍按需載入／淘汰縮圖
+        // 依這一幀的可視範圍按需載入／淘汰縮圖。
+        // 過濾時看得到的照片編號是散的，就拿它們的涵蓋範圍去要
         if let Some((first, last)) = vis_range {
-            self.manage_thumbs(first, last);
+            match (view.get(first), view.get(last.saturating_sub(1))) {
+                (Some(&lo), Some(&hi)) => self.manage_thumbs(lo, hi + 1),
+                _ => self.manage_thumbs(0, 0),
+            }
         }
 
         if let Some(i) = click_idx {
@@ -3725,7 +9699,20 @@ impl App {
                 self.clear_photos();
             } else if let Some(i) = remove_idx {
                 self.remove_photo(i);
+            } else if remove_sel {
+                self.remove_selected_photos();
             }
+        }
+
+        // Delete 鍵＝把多選起來的那幾張一次移除（挑照片時手不必離開鍵盤）。
+        // 有東西正在輸入時不搶（檔名、字幕、數值輸入格都靠鍵盤）
+        let typing = ui.ctx().memory(|m| m.focused().is_some());
+        if !working
+            && !typing
+            && !self.multi_sel.is_empty()
+            && ui.ctx().input(|i| i.key_pressed(egui::Key::Delete))
+        {
+            self.remove_selected_photos();
         }
     }
 
@@ -3988,8 +9975,15 @@ impl App {
                                     .color(theme::SUCCESS),
                             );
                             ui.add_space(2.0);
-                            if ui.button("⬇ 立即更新").clicked() {
-                                start_update = Some(tag.clone());
+                            if SELF_UPDATE_SUPPORTED {
+                                if ui.button("⬇ 立即更新").clicked() {
+                                    start_update = Some(tag.clone());
+                                }
+                            } else {
+                                ui.hyperlink_to(
+                                    egui::RichText::new("前往下載頁").size(12.0),
+                                    format!("https://github.com/{GITHUB_REPO}/releases/latest"),
+                                );
                             }
                         }
                         UpdateStatus::Downloading(p) => {
@@ -4075,35 +10069,300 @@ impl App {
 
     // ---------- 去煙霧工具 ----------
 
-    /// 選一張照片載入去煙工具（在背景解碼並縮成預覽底圖）
-    /// 選照片（可多選）載入去煙工具
+    /// 選照片（可多選）載入去煙工具。
+    ///
+    /// 這是**整批換掉**：不在新清單裡的那幾張，調好的參數與筆跡就沒了。
+    /// 還沒存檔就先問一次，別讓一次誤點把半小時的修圖丟掉
     fn smoke_pick_photo(&mut self, ctx: &egui::Context) {
-        let Some(paths) = rfd::FileDialog::new()
+        if !self.smoke_confirm_replace() {
+            return;
+        }
+        let Some(paths) = dir_dialog(LastDir::DehazePhotos)
             .add_filter("照片", IMAGE_EXTS)
             .set_title("選擇要去煙霧的照片（可多選）")
             .pick_files()
         else {
             return;
         };
+        if let Some(p) = paths.first() {
+            remember_dir(LastDir::DehazePhotos, p);
+        }
         let paths: Vec<PathBuf> = paths.into_iter().filter(|p| is_image(p)).collect();
-        if paths.is_empty() {
+        self.smoke_set_photos(paths, ctx);
+    }
+
+    /// **追加**照片到現有這批後面（「➕ 加入照片」）。
+    ///
+    /// 與「選擇照片」不同：那顆是整批換掉（還沒存檔會先問一次），這顆只是
+    /// 加進來——同一場煙火挑著挑著又想起「那張也該一起處理」是常事，
+    /// 不該逼人把全部重選一遍。已經調好的參數、筆跡與正在看的那一張都留著
+    fn smoke_add_photos(&mut self, ctx: &egui::Context) {
+        let Some(picked) = dir_dialog(LastDir::DehazePhotos)
+            .add_filter("照片", IMAGE_EXTS)
+            .set_title("加入要一起去煙霧的照片（可多選）")
+            .pick_files()
+        else {
+            return;
+        };
+        if let Some(p) = picked.first() {
+            remember_dir(LastDir::DehazePhotos, p);
+        }
+        let picked: Vec<PathBuf> = picked.into_iter().filter(|p| is_image(p)).collect();
+        self.smoke_append(picked, ctx);
+    }
+
+    /// 把 `picked` 併到現有這批後面。已經在清單裡的略過，
+    /// 不會出現兩張一樣的（縮圖與個別設定都以路徑當鍵，重複會互相打架）
+    fn smoke_append(&mut self, picked: Vec<PathBuf>, ctx: &egui::Context) {
+        // 還沒有照片就等於重新選一批（走原本那條路，該做的初始化都在那裡）
+        if self.smoke.photos.is_empty() {
+            self.smoke_set_photos(picked, ctx);
             return;
         }
-        // 仍在新清單裡的照片，保留它的個別設定與已解好的縮圖；
-        // 重選時多半只是增減幾張，全部清掉會白白丟失調好的設定
-        let keep: HashSet<&PathBuf> = paths.iter().collect();
-        self.smoke.overrides.retain(|k, _| keep.contains(k));
-        self.smoke.thumbs.retain(|k, _| keep.contains(k));
-        self.smoke.photos = paths;
-        self.smoke.cur = 0;
+        let before = self.smoke.photos.len();
+        for p in picked {
+            if !self.smoke.photos.contains(&p) {
+                self.smoke.photos.push(p);
+            }
+        }
+        if self.smoke.photos.len() == before {
+            return;
+        }
+        // 縮圖列變長了，可視範圍下一幀重新量；正在看的那一張不動
+        self.smoke.vis_range = None;
         self.smoke.error = None;
-        self.smoke.saved = None;
+        // 新加進來的還沒存過，關程式或清除前要問一次
+        self.smoke.dirty = true;
+        // 只算還沒判過的那幾張（見 spawn_smoke_auto 的 filter）
+        self.spawn_smoke_auto(ctx);
+        self.request_smoke_thumbs();
+    }
+
+    /// 換掉整批照片之前先問一次（選檔與拖曳都走這裡）。回傳 true＝可以換。
+    ///
+    /// 去煙霧的存檔分「存檔」與「另存新檔」兩種，該用哪一種是使用者的決定，
+    /// 不好替他選——所以這裡只擋下來，讓他自己回去按（疊圖那邊只有一種存法，
+    /// 就直接問要不要順便存，見 [`App::stack_confirm_replace`]）
+    fn smoke_confirm_replace(&mut self) -> bool {
+        if !self.smoke.dirty || self.smoke.photos.is_empty() {
+            return true;
+        }
+        let n = self.smoke.photos.len();
+        ask2(
+            rfd::MessageLevel::Warning,
+            "尚未存檔",
+            &format!(
+                "有 {n} 張照片處理過還沒存檔，換一批照片就要重來一次。\n\n\
+                 想先存起來就選「回去存檔」，再按下面的「💾 存檔」或「📁 另存新檔」。"
+            ),
+            "不存檔，直接換",
+            "回去存檔",
+        )
+    }
+
+    /// 從縮圖列移除第 `i` 張（右鍵選單或 Delete 鍵）。先問一次再移除；
+    /// 剩下那幾張調好的個別設定與筆跡都留著（比照 [`App::stack_remove_photo`]）
+    fn smoke_remove_photo(&mut self, i: usize, ctx: &egui::Context) {
+        if self.smoke.busy != SmokeBusy::Idle || i >= self.smoke.photos.len() {
+            return;
+        }
+        let name = self.smoke.photos[i]
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !ask2(
+            rfd::MessageLevel::Warning,
+            "移除照片",
+            &format!(
+                "要把「{name}」從這批裡移掉嗎？\n\n（原始照片不會被刪除，只是不再處理它）"
+            ),
+            "移除",
+            "取消",
+        ) {
+            return;
+        }
+        let gone = self.smoke.photos.remove(i);
+        // 這張的個別設定與筆跡跟著走，別張的都留著
+        self.smoke.overrides.remove(&gone);
+        self.smoke.finish_overrides.remove(&gone);
+        self.smoke.wipes.remove(&gone);
+        self.smoke.thumbs.remove(&gone);
+        self.smoke.auto.remove(&gone);
+        self.smoke.multi_sel.remove(&gone);
+        self.smoke.vis_range = None;
+        if self.smoke.photos.is_empty() {
+            self.smoke_clear_photos();
+            return;
+        }
+        self.smoke.cur = self.smoke.cur.min(self.smoke.photos.len() - 1);
+        self.smoke.dirty = true;
         self.smoke_load_current(ctx);
         self.request_smoke_thumbs();
     }
 
+    /// 換掉去煙工具的照片清單（選檔對話框與拖曳進來都走這裡）
+    fn smoke_set_photos(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if paths.is_empty() {
+            return;
+        }
+        // 真的換了一批照片時，共用那一份裡「對著上一批的畫面才成立」的東西
+        // 要跟著收掉（見 [`SmokeTool::drop_batch_settings`]）；只是增減幾張
+        // 就什麼都不動
+        if self.smoke.is_new_batch(&paths) {
+            self.smoke.drop_batch_settings();
+        }
+
+        // 仍在新清單裡的照片，保留它的個別設定與已解好的縮圖；
+        // 重選時多半只是增減幾張，全部清掉會白白丟失調好的設定
+        let keep: HashSet<&PathBuf> = paths.iter().collect();
+        self.smoke.overrides.retain(|k, _| keep.contains(k));
+        self.smoke.finish_overrides.retain(|k, _| keep.contains(k));
+        self.smoke.wipes.retain(|k, _| keep.contains(k));
+        self.smoke.thumbs.retain(|k, _| keep.contains(k));
+        self.smoke.auto.retain(|k, _| keep.contains(k));
+        self.smoke.multi_sel.retain(|k| keep.contains(k));
+        self.smoke.photos = paths;
+        self.smoke.cur = 0;
+        // 上一批的可視範圍對這一批不成立（換成比較少的張數時會指到清單外），
+        // 收掉讓縮圖列下一幀重新量
+        self.smoke.vis_range = None;
+        self.smoke.error = None;
+        self.smoke.saved = None;
+        self.smoke.saved_path = None;
+        // 選進來就有東西可存（自動判參數會替每張調好），清掉或關程式前要問一次
+        self.smoke.dirty = true;
+        self.smoke_load_current(ctx);
+        self.spawn_smoke_auto(ctx);
+        self.request_smoke_thumbs();
+    }
+
+    /// 使用者主動清掉這批照片（模組操作列的「🗑 清除照片」與功能表列）。
+    /// 還沒存檔就先問一次，免得調了半天一鍵沒了
+    fn smoke_clear_confirmed(&mut self) {
+        // 正在存檔：清掉會讓寫檔中的那批失去依據，等它跑完再說
+        if self.smoke.busy == SmokeBusy::Saving {
+            return;
+        }
+        if self.smoke.dirty && !self.smoke.photos.is_empty() {
+            let n = self.smoke.photos.len();
+            if !ask2(
+                rfd::MessageLevel::Warning,
+                "尚未存檔",
+                &format!("有 {n} 張照片處理過還沒存檔，清掉就要重來一次。"),
+                "清除",
+                "取消",
+            ) {
+                return;
+            }
+        }
+        self.smoke_clear_photos();
+    }
+
+    /// 回到「選擇照片」的起始狀態：清掉照片清單、預覽、縮圖與這一批的個別設定。
+    /// 個別設定（overrides / finish_overrides / wipes）與量好的自動值留著，
+    /// 同一批照片再選回來時不用重調、也不用重量
+    fn smoke_clear_photos(&mut self) {
+        self.smoke.auto_cancel.store(true, Ordering::Relaxed);
+        self.smoke.auto_rx = None;
+        self.smoke.auto_jobs = None;
+        self.smoke.auto_left = 0;
+        self.smoke.photos.clear();
+        self.smoke.cur = 0;
+        self.smoke.multi_sel.clear();
+        // 「清除」是回到起始狀態，**這一批調過的每一樣都要跟著不見**：
+        // 個別的去煙參數、手動清除的筆跡，以及調色與文字（共用的那份與
+        // 個別覆寫都算）。
+        //
+        // 個別設定是以檔案路徑為鍵存的，留著的話下一批只要有同名檔案就會
+        // 悄悄套回去；調色與文字則是不管換哪一批都照套，上一批拉到底的
+        // 去朦朧、擺好的落款會直接出現在新照片上（疊圖那邊同一個道理，
+        // 見 [`App::stack_clear_photos`]）。
+        // 想留著設定就別按「清除」，直接用「選擇照片」重選
+        self.smoke.overrides.clear();
+        self.smoke.finish_overrides.clear();
+        self.smoke.wipes.clear();
+        self.smoke.finish = Finish::default();
+        self.smoke.params = SmokeParams::default();
+        self.smoke.base = None;
+        self.smoke.base_long = 0;
+        self.smoke.tex_before = None;
+        self.smoke.tex_after = None;
+        self.smoke.after = None;
+        self.smoke.applied = None;
+        self.smoke.graded = None;
+        self.smoke.wiped = None;
+        self.smoke.wipe_cache = None;
+        self.smoke.wipe_cache_of.clear();
+        self.smoke.draft = None;
+        self.smoke.moving = None;
+        self.smoke.wipe_draft = None;
+        self.smoke.sel_text = None;
+        self.smoke.sel_image = None;
+        // 疊圖片的貼圖快取跟著這批照片走，換一批就放掉
+        self.smoke.image_tex.clear();
+        self.smoke.rx = None;
+        self.smoke.busy = SmokeBusy::Idle;
+        self.smoke.error = None;
+        self.smoke.saved = None;
+        self.smoke.saved_path = None;
+        // 縮圖是純快取，留著只是白佔貼圖記憶體
+        self.smoke.thumbs.clear();
+        self.smoke.vis_range = None;
+        self.smoke.zoom = None;
+        self.smoke.zoom_back = None;
+        self.smoke.pan = egui::pos2(0.5, 0.5);
+        self.smoke.dirty = false;
+    }
+
+    /// 開檔後在背景替每張照片量一次建議值（見 [`dehaze::auto_params`]）。
+    /// 量好一張就送回來一張，滑桿會自己跳到那一張該有的位置；
+    /// 重選照片時上一批會被叫停，已經量過的則沿用不重算
+    fn spawn_smoke_auto(&mut self, ctx: &egui::Context) {
+        self.smoke.auto_cancel.store(true, Ordering::Relaxed);
+        let todo: VecDeque<PathBuf> = self
+            .smoke
+            .photos
+            .iter()
+            .filter(|p| !self.smoke.auto.contains_key(*p))
+            .cloned()
+            .collect();
+        self.smoke.auto_left = todo.len();
+        if todo.is_empty() {
+            self.smoke.auto_rx = None;
+            self.smoke.auto_jobs = None;
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.smoke.auto_cancel = Arc::clone(&cancel);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.smoke.auto_rx = Some(rx);
+        let jobs = Arc::new(Mutex::new(todo));
+        self.smoke.auto_jobs = Some(Arc::clone(&jobs));
+        for _ in 0..SMOKE_AUTO_WORKERS {
+            let jobs = Arc::clone(&jobs);
+            let cancel = Arc::clone(&cancel);
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Some(path) = jobs.lock().unwrap().pop_front() else {
+                    return;
+                };
+                // 讀不到的照片也要回報，否則進度永遠差那一張
+                let got = decode_for_auto(&path).map(|(img, long)| dehaze::auto_params(&img, long));
+                if tx.send((path, got)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            });
+        }
+    }
+
     /// 依縮圖列的可視範圍請求縮圖，並淘汰離得夠遠的貼圖。
-    /// 解碼共用主畫面那組常駐工作池，只有貼圖快取是分開的
+    /// 解碼共用主畫面那組常駐工作池，只有貼圖快取是分開的。
+    /// 範圍先夾回清單長度（見 [`clamp_vis_range`]）
     fn request_smoke_thumbs(&mut self) {
         /// 可視範圍外先預先解碼的張數（單側）
         const PREFETCH: usize = 32;
@@ -4114,11 +10373,7 @@ impl App {
         if n < 2 {
             return;
         }
-        // 還沒開始畫縮圖列時先抓開頭一段，視窗一開就有東西看
-        let (first, last) = self
-            .smoke
-            .vis_range
-            .unwrap_or((0, n.min(PREFETCH)));
+        let (first, last) = clamp_vis_range(self.smoke.vis_range, n, PREFETCH);
         let lo = first.saturating_sub(PREFETCH);
         let hi = (last + PREFETCH).min(n);
         // 可視範圍優先，其次右側預取、再左側預取
@@ -4156,10 +10411,25 @@ impl App {
             return;
         };
         self.smoke.base = None;
+        // 精細底圖是跟著這張照片的，換張就放掉（見 [`SMOKE_FINE_CAP`]）
+        self.smoke.base_fine = None;
+        self.smoke.fine_long = 0;
+        self.smoke.fine_loading = None;
+        self.smoke.fine_rx = None;
+        self.smoke.fine_failed = false;
+        self.smoke.applied_long = 0;
+        self.smoke.before_long = 0;
         self.smoke.tex_before = None;
         self.smoke.tex_after = None;
         self.smoke.applied = None;
-        self.smoke.drag_from = None;
+        self.smoke.after = None;
+        self.smoke.graded = None;
+        self.smoke.wiped = None;
+        self.smoke.wipe_cache = None;
+        self.smoke.wipe_cache_of.clear();
+        self.smoke.draft = None;
+        self.smoke.moving = None;
+        self.smoke.wipe_draft = None;
         self.smoke.busy = SmokeBusy::Loading;
         let (tx, rx) = std::sync::mpsc::channel();
         self.smoke.rx = Some(rx);
@@ -4170,16 +10440,7 @@ impl App {
                 .map(|img| {
                     let img = img.to_rgb8();
                     let long = img.width().max(img.height());
-                    if long <= SMOKE_PREVIEW_MAX {
-                        return img;
-                    }
-                    let s = SMOKE_PREVIEW_MAX as f32 / long as f32;
-                    image::imageops::resize(
-                        &img,
-                        ((img.width() as f32 * s).round() as u32).max(1),
-                        ((img.height() as f32 * s).round() as u32).max(1),
-                        image::imageops::FilterType::Triangle,
-                    )
+                    (shrink_to_preview(img), long)
                 });
             let _ = tx.send(SmokeMsg::Loaded(path, r));
             ctx.request_repaint();
@@ -4193,63 +10454,267 @@ impl App {
         }
         self.smoke.cur = i;
         self.smoke.scroll_to_cur = true;
+        // 換了照片，選取中的文字與圖片未必還存在（個別設定是逐張的）
+        self.smoke.sel_text = None;
+        self.smoke.sel_image = None;
         self.smoke_load_current(ctx);
+        // 還沒量到這張就把它插到待辦最前面：眼前這張的滑桿要最先就位
+        if let (Some(jobs), Some(p)) = (&self.smoke.auto_jobs, self.smoke.current()) {
+            let mut q = jobs.lock().unwrap();
+            if let Some(at) = q.iter().position(|x| x == p) {
+                let p = q.remove(at).expect("position 保證這個索引存在");
+                q.push_front(p);
+            }
+        }
     }
 
-    /// 以目前參數重算預覽
-    fn spawn_smoke_render(&mut self, ctx: &egui::Context) {
-        let Some(base) = self.smoke.base.clone() else {
+    /// 排一次背景解碼，把目前這張解成 `long` 長邊的精細底圖
+    /// （見 [`SMOKE_FINE_CAP`]）。走自己的通道，不佔 `rx`／`busy`——
+    /// 解的過程中預覽照樣用工作縮圖重算
+    fn spawn_smoke_fine_base(&mut self, ctx: &egui::Context, long: u32) {
+        let Some(path) = self.smoke.current().cloned() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.smoke.fine_rx = Some(rx);
+        self.smoke.fine_loading = Some(long);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let img = image::open(&path).ok().map(|img| shrink_long(img.to_rgb8(), long));
+            let _ = tx.send((path, img));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 以目前參數重算預覽。`fine`＝改用精細底圖（見 [`SMOKE_FINE_CAP`]）
+    fn spawn_smoke_render(&mut self, ctx: &egui::Context, fine: bool) {
+        let fine = fine && self.smoke.base_fine.is_some();
+        let src = if fine {
+            self.smoke.base_fine.clone()
+        } else {
+            self.smoke.base.clone()
+        };
+        let Some(base) = src else {
             return;
         };
         let params = self.smoke.effective();
+        // 預覽底圖是縮圖，估煙霧層時少了原尺寸的最小值池化，同樣的強度會扣得比
+        // 成品乾淨。畫之前先把強度折算回去，滑桿上的數字才一律代表成品的程度。
+        // 回報時仍附原本那一份：拿折算過的去比對「參數有沒有變」會每幀都不相等
+        let mut draw = params.clone();
+        draw.strength = dehaze::preview_strength(
+            params.strength,
+            self.smoke.base_long,
+            base.width().max(base.height()),
+        );
+        // 「只處理天空」的範圍也要照原圖換算，否則縮圖上量到的紋理不是同一件事，
+        // 煙火簇那幾欄會被判成地景、整條擋到畫面上緣——預覽看得到一根不去煙的
+        // 「柱子」，存出來的成品卻沒有（見 [`dehaze::SmokeParams::preview_of`]）
+        draw.preview_of = Some(self.smoke.base_long);
         let mask = self.smoke.show_mask;
+        // 遮色片檢視是診斷用的畫面，手動清除與調色套上去只會看不清楚哪裡被蓋住
+        let (grade, wipes) = if mask {
+            (Adjustments::default(), Vec::new())
+        } else {
+            (self.smoke.effective_grade().grade_only(), self.smoke.cur_wipes().to_vec())
+        };
+        let used_long = base.width().max(base.height());
         self.smoke.busy = SmokeBusy::Rendering;
         let (tx, rx) = std::sync::mpsc::channel();
         self.smoke.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
             let out = if mask {
-                dehaze::mask_overlay(&base, params)
+                dehaze::mask_overlay(&base, &draw)
             } else {
-                dehaze::remove_smoke(&base, params)
+                dehaze::remove_smoke(&base, &draw)
             };
-            let _ = tx.send(SmokeMsg::Preview(params, out));
+            // 手動清除與調色順手在同一趟做完：分兩次來回，
+            // 畫面會先閃一下沒清、沒調色的樣子
+            let mut shown = out.clone();
+            edit::apply_wipe(&mut shown, &wipes);
+            // 清完、還沒調色的這一份留著當下一筆的起點（見 SmokeTool::wipe_cache）
+            let cache = (!wipes.is_empty()).then(|| Arc::new(shown.clone()));
+            edit::apply_grade(&mut shown, &grade);
+            let _ = tx.send(SmokeMsg::Preview(params, grade, wipes, cache, out, shown, used_long));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 去煙結果沿用快取，只重算手動清除與調色
+    /// （拖動調色滑桿、塗清除筆刷時走這一條）
+    fn spawn_smoke_finish(&mut self, ctx: &egui::Context) {
+        let Some(after) = self.smoke.after.clone() else {
+            return;
+        };
+        let grade = self.smoke.effective_grade().grade_only();
+        let wipes = self.smoke.cur_wipes().to_vec();
+        // 剛塗上去的那一筆只要接著上次的結果算：筆跡開頭與快取相同就從那裡續，
+        // 否則（還原一筆、清空、換了勾選）才從去煙結果整串重跑
+        let (base, from) = match &self.smoke.wipe_cache {
+            Some(c) if wipes.starts_with(&self.smoke.wipe_cache_of) => {
+                (c.clone(), self.smoke.wipe_cache_of.len())
+            }
+            _ => (after, 0),
+        };
+        self.smoke.busy = SmokeBusy::Rendering;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.smoke.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let mut out = (*base).clone();
+            // 清除塗在去煙結果上、調色再疊上去，順序與存檔時一致
+            edit::apply_wipe(&mut out, &wipes[from..]);
+            let cache = (!wipes.is_empty()).then(|| Arc::new(out.clone()));
+            edit::apply_grade(&mut out, &grade);
+            let _ = tx.send(SmokeMsg::Graded(grade, wipes, cache, out));
             ctx.request_repaint();
         });
     }
 
     /// 對每張照片以各自的有效參數去煙，全部存進指定資料夾
-    fn smoke_save_all(&mut self, ctx: &egui::Context) {
-        if self.smoke.photos.is_empty() {
-            return;
-        }
-        let mut dialog = rfd::FileDialog::new().set_title("選擇要存放去煙照片的資料夾");
-        if let Some(dir) = self.smoke.current().and_then(|p| p.parent()) {
-            dialog = dialog.set_directory(dir);
-        }
-        let Some(out_dir) = dialog.pick_folder() else {
-            return;
-        };
-        // 每張照片連同它自己的參數一起交給背景執行緒
-        let jobs: Vec<(PathBuf, SmokeParams)> = self
+    /// 批次輸出去煙成品。`here` 為真就直接存回每張照片自己的原始資料夾，
+    /// 否則跳資料夾對話框讓使用者自己挑
+    fn smoke_save_all(&mut self, ctx: &egui::Context, here: bool) {
+        // 縮圖列挑過就只存挑到的那幾張，沒挑就整批（見 [`SmokeTool::multi_sel`]）。
+        // 順序照縮圖列的順序，不照挑選的先後——存檔訊息與縮圖看起來才是同一件事
+        let todo: Vec<PathBuf> = self
             .smoke
             .photos
             .iter()
-            .map(|p| (p.clone(), self.smoke.params_for(p)))
+            .filter(|p| self.smoke.multi_sel.is_empty() || self.smoke.multi_sel.contains(*p))
+            .cloned()
             .collect();
+        if todo.is_empty() {
+            return;
+        }
+        // None＝各自存回來源資料夾
+        let out_dir: Option<PathBuf> = if here {
+            None
+        } else {
+            // 上次另存到哪就從那裡開始（folder_dialog 會開在它的上一層並把
+            // 名字填好，要存回同一個資料夾直接按確定即可）；還沒存過才退回
+            // 照片自己所在的資料夾
+            let dialog = if load_last_dir(LastDir::DehazeOutput).is_some() {
+                folder_dialog(LastDir::DehazeOutput)
+            } else {
+                match self.smoke.current().and_then(|p| p.parent()) {
+                    Some(dir) => file_dialog().set_directory(dir),
+                    None => file_dialog(),
+                }
+            };
+            let Some(d) = dialog
+                .set_title("選擇要存放去煙照片的資料夾")
+                .pick_folder()
+            else {
+                return;
+            };
+            remember_dir(LastDir::DehazeOutput, &d);
+            Some(d)
+        };
+        // 輸出檔名先在這裡決定好，不留到背景執行緒——已經存在的要先問過
+        // 使用者才寫下去（這一批是自動命名、沒有存檔對話框可以問）
+        let out_of = |src: &Path| -> PathBuf {
+            let stem = src
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "photo".into());
+            // 沒指定輸出資料夾就存回照片自己的資料夾（沒有上層目錄的極端
+            // 情況才退回工作目錄，總比整批失敗好）
+            let dir = match &out_dir {
+                Some(d) => d.clone(),
+                None => src.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+            };
+            let out = dir.join(format!("{stem}_去煙.jpg"));
+            // 輸出到來源資料夾時，別讓成品覆蓋掉同名的原始照片
+            if same_path_ci(&out, src) {
+                dir.join(format!("{stem}_去煙(1).jpg"))
+            } else {
+                out
+            }
+        };
+        let mut outs: Vec<PathBuf> = todo.iter().map(|p| out_of(p)).collect();
+        // 一張一張問會問到天荒地老，整批只問一次
+        let exist = outs.iter().filter(|p| p.exists()).count();
+        if exist > 0 {
+            let sample = outs
+                .iter()
+                .find(|p| p.exists())
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match ask3(
+                rfd::MessageLevel::Warning,
+                "成品檔已存在",
+                &format!(
+                    "有 {exist} 張的成品檔已經存在（例如「{sample}」）。\n\n\
+                     「全部覆蓋」：舊檔直接被蓋掉\n\
+                     「另取新檔名」：保留舊檔，這批自動改成不重複的檔名\n\
+                     「取消」：不存檔"
+                ),
+                "全部覆蓋",
+                "另取新檔名",
+                "取消",
+            ) {
+                Ask3::First => {}
+                Ask3::Second => {
+                    for p in &mut outs {
+                        *p = next_free_path(p);
+                    }
+                }
+                Ask3::Cancel => return,
+            }
+        }
+        // 每張照片連同它自己的參數與輸出位置一起交給背景執行緒
+        let jobs: Vec<(PathBuf, PathBuf, SmokeParams, Finish)> = todo
+            .iter()
+            .zip(outs)
+            .map(|(p, out)| {
+                (
+                    p.clone(),
+                    out,
+                    self.smoke.params_for(p),
+                    self.smoke.finish_for(p),
+                )
+            })
+            .collect();
+        // 字型只有主執行緒查得到清單，先解析成路徑；真正讀檔留給背景執行緒，
+        // 而且只有真的有文字要畫時才讀（20MB 的中文字型不該白讀一次）
+        let font_path = jobs
+            .iter()
+            .any(|(_, _, _, f)| f.texts.iter().any(TextItem::visible))
+            .then(|| {
+                self.fonts
+                    .get(self.smoke.text_style.font_idx)
+                    .or(self.fonts.first())
+                    .map(|(_, p)| p.clone())
+            })
+            .flatten();
+        let text_style = self.smoke.text_style.clone();
         let cancel = Arc::new(AtomicBool::new(false));
+        // 存檔尺寸在按下去的當下定案，寫檔途中改滑桿不影響這一批
+        let export = self.export_size;
         self.smoke.save_cancel = cancel.clone();
         self.smoke.save_done = 0;
+        self.smoke.save_total = jobs.len();
         self.smoke.busy = SmokeBusy::Saving;
         self.smoke.error = None;
         self.smoke.saved = None;
+        self.smoke.saved_path = None;
         let (tx, rx) = std::sync::mpsc::channel();
         self.smoke.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
             let mut ok = 0usize;
             let mut errs: Vec<String> = Vec::new();
-            for (src, params) in jobs {
+            // 第一張存成功的路徑，之後「開啟圖片」直接用它
+            let mut first_out: Option<PathBuf> = None;
+            // 整批共用同一個字型，讀一次就好
+            let font = font_path.as_deref().and_then(edit::load_font);
+            if font.is_none() && font_path.is_some() {
+                errs.push("字型讀取失敗，這次輸出沒有畫上文字".into());
+            }
+            for (src, out, params, finish) in jobs {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
@@ -4257,33 +10722,39 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let stem = src
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "photo".into());
-                let out = out_dir.join(format!("{stem}_去煙.jpg"));
-                // 輸出到來源資料夾時，別讓成品覆蓋掉同名的原始照片
-                let out = if same_path_ci(&out, &src) {
-                    out_dir.join(format!("{stem}_去煙(1).jpg"))
-                } else {
-                    out
-                };
                 // 重讀原檔跑完整解析度，不是把預覽縮圖放大
                 let r = image::open(&src)
                     .map_err(|e| format!("{name}：無法讀取（{e}）")
                     )
                     .and_then(|img| {
-                        let done = dehaze::remove_smoke(&img.to_rgb8(), params);
+                        // 順序與預覽相同：去煙 → 手動清除 → 調色 → 旋轉 → 圖片
+                        // → 文字 → 裁切。遮色片與筆跡的座標是對**原圖**算的，
+                        // 所以排在旋轉之前；圖片與文字則是對著「旋轉後的畫布」
+                        // 拖的（預覽上那塊就是轉完的畫布），所以排在旋轉之後
+                        let mut done = dehaze::remove_smoke(&img.to_rgb8(), &params);
+                        edit::apply_wipe(&mut done, &finish.wipes);
+                        edit::apply_grade(&mut done, &finish.grade);
+                        let mut done = edit::apply_rotate(done, finish.grade.crop);
+                        edit::draw_images(&mut done, &finish.images);
+                        if let Some(font) = &font {
+                            edit::draw_texts(&mut done, &finish.texts, &text_style, font);
+                        }
+                        let done = edit::apply_crop(done, finish.grade.crop);
+                        // 最後才縮到指定尺寸：前面每一步都是對原尺寸算的
+                        let done = fit_export(done, export);
                         done.save(&out).map_err(|e| format!("{name}：存檔失敗（{e}）"))
                     });
                 match r {
-                    Ok(()) => ok += 1,
+                    Ok(()) => {
+                        ok += 1;
+                        first_out.get_or_insert(out);
+                    }
                     Err(e) => errs.push(e),
                 }
                 let _ = tx.send(SmokeMsg::SaveProgress(ok + errs.len()));
                 ctx.request_repaint();
             }
-            let _ = tx.send(SmokeMsg::SaveDone(ok, errs));
+            let _ = tx.send(SmokeMsg::SaveDone(ok, errs, first_out));
             ctx.request_repaint();
         });
     }
@@ -4302,29 +10773,67 @@ impl App {
                                 continue;
                             }
                             match res {
-                                Ok(img) => {
+                                Ok((img, long)) => {
                                     self.smoke.tex_before =
                                         Some(load_rgb_texture(ctx, "smoke_before", &img));
                                     self.smoke.base = Some(Arc::new(img));
+                                    self.smoke.base_long = long;
                                     // applied 為 None，下面的重算判斷會立刻排一次預覽
                                 }
                                 Err(e) => self.smoke.error = Some(e),
                             }
                         }
-                        SmokeMsg::Preview(params, img) => {
+                        SmokeMsg::Preview(params, grade, wipes, cache, raw, shown, used_long) => {
+                            self.smoke.rx = None;
+                            self.smoke.busy = SmokeBusy::Idle;
+                            self.smoke.tex_after =
+                                Some(load_rgb_texture(ctx, "smoke_after", &shown));
+                            // 對照時左右兩邊要一樣細，否則看起來像是去煙把線條糊掉了
+                            if used_long != self.smoke.before_long {
+                                let src = if used_long == self.smoke.fine_long {
+                                    self.smoke.base_fine.as_ref()
+                                } else {
+                                    self.smoke.base.as_ref()
+                                };
+                                if let Some(b) = src {
+                                    self.smoke.tex_before =
+                                        Some(load_rgb_texture(ctx, "smoke_before", b));
+                                    self.smoke.before_long = used_long;
+                                }
+                            }
+                            self.smoke.after = Some(Arc::new(raw));
+                            self.smoke.applied = Some(params);
+                            self.smoke.applied_long = used_long;
+                            self.smoke.graded = Some(grade);
+                            // 快取與 after 是同一趟算出來的，接得上
+                            self.smoke.wipe_cache = cache;
+                            self.smoke.wipe_cache_of = wipes.clone();
+                            self.smoke.wiped = Some(wipes);
+                        }
+                        SmokeMsg::Graded(grade, wipes, cache, img) => {
                             self.smoke.rx = None;
                             self.smoke.busy = SmokeBusy::Idle;
                             self.smoke.tex_after =
                                 Some(load_rgb_texture(ctx, "smoke_after", &img));
-                            self.smoke.applied = Some(params);
+                            self.smoke.graded = Some(grade);
+                            self.smoke.wipe_cache = cache;
+                            self.smoke.wipe_cache_of = wipes.clone();
+                            self.smoke.wiped = Some(wipes);
                         }
                         // 批次輸出中：只更新進度，通道要留著繼續收
                         SmokeMsg::SaveProgress(n) => self.smoke.save_done = n,
-                        SmokeMsg::SaveDone(ok, errs) => {
+                        SmokeMsg::SaveDone(ok, errs, first_out) => {
                             self.smoke.rx = None;
                             self.smoke.busy = SmokeBusy::Idle;
                             self.smoke.saved =
                                 Some((format!("已完成 {ok} 張"), Instant::now()));
+                            self.smoke.saved_path = first_out;
+                            // 中途按取消的那次不算存完，剩下的張數還在等著存。
+                            // 只挑幾張存的也一樣——沒挑到的那些還沒存，
+                            // 「尚未存檔」要繼續亮著，清除或關程式前才會再問一次
+                            let cancelled = self.smoke.save_cancel.load(Ordering::Relaxed);
+                            let partial = self.smoke.save_total < self.smoke.photos.len();
+                            self.smoke.dirty = cancelled || partial || !errs.is_empty();
                             if !errs.is_empty() {
                                 // 只列前幾筆，其餘用數量帶過，免得訊息長到蓋住畫面
                                 let shown: Vec<String> = errs.iter().take(3).cloned().collect();
@@ -4348,23 +10857,1266 @@ impl App {
                 }
             }
         }
-        // 參數變動且沒有工作在跑就重算；同時間最多一個，拖動滑桿時自然限流
-        if self.smoke.open
+        // 自動判參數的結果：一張一張進來。量到目前這張時 effective() 跟著變，
+        // 下面的重算判斷就會把預覽更新成新參數的樣子
+        let mut measured = Vec::new();
+        if let Some(rx) = &self.smoke.auto_rx {
+            while let Ok(m) = rx.try_recv() {
+                measured.push(m);
+            }
+        }
+        for (path, got) in measured {
+            self.smoke.auto_left = self.smoke.auto_left.saturating_sub(1);
+            if let Some(a) = got {
+                self.smoke.auto.insert(path, a);
+            }
+        }
+        if self.smoke.auto_left == 0 && self.smoke.auto_rx.is_some() {
+            self.smoke.auto_rx = None;
+            self.smoke.auto_jobs = None;
+        }
+
+        // 精細底圖：放大到工作縮圖不夠細時才解（見 [`fine_target`]）
+        if let Some(rx) = &self.smoke.fine_rx {
+            if let Ok((path, img)) = rx.try_recv() {
+                self.smoke.fine_loading = None;
+                self.smoke.fine_rx = None;
+                // 解的過程中切走了就丟掉，別把上一張的底圖套到這一張
+                if self.smoke.current() == Some(&path) {
+                    match img {
+                        Some(img) => {
+                            self.smoke.fine_long = img.width().max(img.height());
+                            self.smoke.base_fine = Some(Arc::new(img));
+                        }
+                        // 讀不出來就別再試了，否則每一幀都會再排一次
+                        None => self.smoke.fine_failed = true,
+                    }
+                }
+            }
+        }
+        // 這一幀需要多細的底圖（None＝工作縮圖就夠了）
+        let fine_want = fine_target(
+            self.smoke.want_long,
+            self.smoke.source_dims().map_or(0, |(w, h)| w.max(h)),
+        );
+        if self.module == Module::Dehaze
+            && self.smoke.fine_loading.is_none()
+            && !self.smoke.fine_failed
+            && self.smoke.base.is_some()
+        {
+            // 已經有一樣細（或更細）的就不必再解
+            if fine_want.is_some_and(|want| want > self.smoke.fine_long) {
+                self.spawn_smoke_fine_base(ctx, fine_want.expect("剛判斷過有值"));
+            }
+        }
+
+        // 參數變動且沒有工作在跑就重算；同時間最多一個，拖動滑桿時自然限流。
+        // 去煙與調色分兩段：只改調色時沿用去煙的快取，不必再等一次去煙
+        if self.module == Module::Dehaze
             && self.smoke.busy == SmokeBusy::Idle
             && self.smoke.base.is_some()
-            && self.smoke.applied != Some(self.smoke.effective())
         {
-            self.spawn_smoke_render(ctx);
+            // 精細那一趟要等參數先停下來：拉滑桿的每一步都先用工作縮圖回一張，
+            // 停手之後才補算精細版換上去（見 [`SMOKE_FINE_CAP`]）
+            let settled = self.smoke.applied.as_ref() == Some(&self.smoke.effective());
+            // 手上最細的那份夠不夠這一幀用；不夠就先照舊，等更細的解好再說
+            let fine_ready = fine_want.is_some_and(|want| self.smoke.fine_long >= want);
+            if !settled {
+                self.spawn_smoke_render(ctx, false);
+            } else if fine_ready && self.smoke.applied_long != self.smoke.fine_long {
+                self.spawn_smoke_render(ctx, true);
+            } else if !self.smoke.show_mask
+                && self.smoke.after.is_some()
+                && (self.smoke.graded != Some(self.smoke.effective_grade().grade_only())
+                    || self.smoke.wiped.as_deref() != Some(self.smoke.cur_wipes()))
+            {
+                self.spawn_smoke_finish(ctx);
+            }
         }
     }
 
-    /// 預覽圖上的框選與吸色互動；`img` 為照片實際畫出來的矩形
+    /// 預覽圖上的遮色片繪製與吸色互動；`img` 為照片實際畫出來的矩形
+    /// 空白鍵：在 100%（1:1）與「按之前的比例」之間來回。
+    ///
+    /// 第一次按記住現在的比例、跳到 100% 看細節；再按一次回到剛才那個。
+    /// 中間若自己用比例列或滾輪改過，那筆記錄就作廢——回不去一個
+    /// 早就不是「剛才」的比例
+    fn smoke_toggle_actual_size(&mut self) {
+        let at_one = self.smoke.zoom.is_some_and(|z| (z - 1.0).abs() < 0.001);
+        if at_one {
+            // 沒有記錄（例如本來就停在 100%）就回符合視窗
+            self.smoke.zoom = self.smoke.zoom_back.take().flatten();
+            if self.smoke.zoom.is_none() {
+                self.smoke.pan = egui::pos2(0.5, 0.5);
+            }
+        } else {
+            self.smoke.zoom_back = Some(self.smoke.zoom);
+            // 從「符合視窗」放大時本來看的是整張，從中心開始最合理；
+            // 本來就放大著就維持現在看的位置
+            if self.smoke.zoom.is_none() {
+                self.smoke.pan = egui::pos2(0.5, 0.5);
+            }
+            self.smoke.zoom = Some(1.0);
+        }
+    }
+
+    /// 預覽下方的顯示比例列：符合視窗與幾個常用倍率，另可滾輪縮放、中鍵拖曳平移
+    /// `zoom` 是（符合視窗時的倍率, 目前倍率），載入中還算不出來就給 None
+    fn ui_smoke_zoom_bar(&mut self, ui: &mut egui::Ui, zoom: Option<(f32, f32)>) {
+        ui.horizontal(|ui| {
+            // 單張／前後對照：對照時左邊是原圖、右邊是去煙結果，
+            // 兩張共用同一組縮放與平移，比對的是同一個位置
+            let cmp = self.smoke.compare;
+            if check_label(ui, !cmp, "單張")
+                .on_hover_text("只看處理後的結果（Y 鍵切換）")
+                .clicked()
+            {
+                self.smoke.compare = false;
+            }
+            if check_label(ui, cmp, "編輯前／後")
+                .on_hover_text("左右並排比對原圖與處理後（Y 鍵切換）")
+                .clicked()
+            {
+                self.smoke.compare = true;
+            }
+            ui.separator();
+            let fit = self.smoke.zoom.is_none();
+            if check_label(ui, fit, "符合視窗")
+                .on_hover_text("整張塞進畫面（空白鍵可在 100% 與這裡之間來回）")
+                .clicked()
+            {
+                self.smoke.zoom = None;
+                self.smoke.zoom_back = None;
+            }
+            for z in [0.5f32, 1.0, 2.0] {
+                let on = self.smoke.zoom.is_some_and(|v| (v - z).abs() < 0.001);
+                let mut b = check_label(ui, on, format!("{:.0}%", z * 100.0));
+                if z == 1.0 {
+                    b = b.on_hover_text("原尺寸（空白鍵：跳到 100%，再按一次回原本的比例）");
+                }
+                if b.clicked() {
+                    // 換倍率時維持目前看的位置，剛從符合視窗放大則從中心開始
+                    if fit {
+                        self.smoke.pan = egui::pos2(0.5, 0.5);
+                    }
+                    self.smoke.zoom = Some(z);
+                    // 自己按過比例，空白鍵就從這裡重新算「上一次」
+                    self.smoke.zoom_back = None;
+                }
+            }
+            let r = ui.label(
+                egui::RichText::new(match zoom {
+                    Some((_, pct)) if fit => format!("目前 {pct:.0}%（符合視窗）"),
+                    Some((_, pct)) => format!("目前 {pct:.0}%"),
+                    // 換照片那幾幀還沒有底圖，算不出比例
+                    None => "照片載入中…".to_string(),
+                })
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+            if let Some((fit_scale, _)) = zoom {
+                r.on_hover_text(format!(
+                    "100% ＝ 照片 1 像素對螢幕 1 個實體像素\n\
+                     （不隨 Windows 的顯示縮放變動），\n\
+                     符合視窗時是 {:.0}%。\n\
+                     平常用長邊 {SMOKE_PREVIEW_MAX} px 的工作縮圖算，放大到它不夠細時\n\
+                     會自動換成比較細的底圖（最多 {SMOKE_FINE_CAP} px）重算一次，\n\
+                     停手幾秒後換上去，看到的才與存檔一致。\n\
+                     滾輪縮放（開著筆刷時 Ctrl＋滾輪改筆刷粗細）；\n\
+                     沒選遮色片工具時左鍵可直接拖曳平移，\n\
+                     選了工具就改用中鍵或右鍵拖曳。",
+                    fit_scale * 100.0
+                ));
+            }
+        });
+    }
+
+    /// 讓去煙預覽的文字用上使用者挑的字型。egui 預設只認得介面用的那幾套，
+    /// 要另外把字型檔灌進去；換字型才重灌一次（重建字型圖集不便宜）。
+    /// 讀不到字型檔也照樣建立這個家族（內容退回介面字型），
+    /// 呼叫端才不必分兩種情況處理
+    fn ensure_smoke_font(&mut self, ctx: &egui::Context) {
+        let idx = self.smoke.text_style.font_idx;
+        if self.smoke.font_loaded == Some(idx) {
+            return;
+        }
+        self.smoke.font_loaded = Some(idx);
+        let bytes = self
+            .fonts
+            .get(idx)
+            .and_then(|(_, path)| std::fs::read(path).ok());
+
+        let mut fonts = egui::FontDefinitions::default();
+        if let Some(cjk) = CJK_FONT.get() {
+            fonts.font_data.insert("cjk".into(), cjk.clone());
+            for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts.families.entry(fam).or_default().push("cjk".into());
+            }
+        }
+        // 挑的字型排第一，缺的字（例如只有拉丁字母的字型碰到中文）再退回
+        // 中文字型與 egui 內建字型，預覽才不會出現一排方框
+        let mut family = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(bytes) = bytes {
+            fonts
+                .font_data
+                .insert(SMOKE_FONT.into(), egui::FontData::from_owned(bytes).into());
+            family.insert(0, SMOKE_FONT.into());
+        }
+        fonts
+            .families
+            .insert(egui::FontFamily::Name(SMOKE_FONT.into()), family);
+        ctx.set_fonts(fonts);
+    }
+
+    /// 預覽文字要用的字體（字型還沒灌進去時退回介面字型）
+    fn smoke_text_font(&self, px: f32) -> egui::FontId {
+        if self.smoke.font_loaded.is_some() {
+            egui::FontId::new(px, egui::FontFamily::Name(SMOKE_FONT.into()))
+        } else {
+            egui::FontId::proportional(px)
+        }
+    }
+
+    /// 預覽上的疊圖片：與文字同一套操作（拖曳＝移動、角落＝縮放、
+    /// 頂部圓形把手＝旋轉），只是畫的是一張貼圖。畫在文字之前，
+    /// 所以文字永遠在最上面——與存檔時的順序一致
+    fn ui_smoke_image_overlay(&mut self, ui: &mut egui::Ui, view: egui::Rect, img: egui::Rect) {
+        let cur = self.smoke.effective_finish();
+        if cur.images.is_empty() {
+            self.smoke.image_busy = false;
+            self.smoke.sel_image = None;
+            return;
+        }
+        let mut f = cur.clone();
+        // 遮色片工具、吸色與清除筆刷都要用左鍵在照片上作業，這時圖片讓開
+        let interactive = self.smoke.mask_tool.is_none()
+            && self.smoke.picking.is_none()
+            && !self.smoke.wipe_on
+            && self.smoke.busy != SmokeBusy::Saving;
+        let p = ui.painter().with_clip_rect(view.intersect(img));
+        let chrome = ui.painter().with_clip_rect(view);
+        let mut busy = false;
+        let mut select: Option<usize> = None;
+        let mut drop_at: Option<usize> = None;
+
+        for k in 0..f.images.len() {
+            let it = f.images[k].clone();
+            if !it.visible() {
+                continue;
+            }
+            // 貼圖第一次畫到才載（logo 通常很小，直接在 UI 執行緒讀就好）
+            let tex = match self.smoke.image_tex.get(&it.path) {
+                Some(t) => t.clone(),
+                None => {
+                    let Some(src) = edit::load_overlay(&it.path) else {
+                        // 檔案不見了：把這一張收掉，不然每幀都重試一次
+                        drop_at = Some(k);
+                        continue;
+                    };
+                    let size = [src.width() as usize, src.height() as usize];
+                    let color = egui::ColorImage::from_rgba_unmultiplied(size, src.as_raw());
+                    let t = ui.ctx().load_texture("smoke_overlay", color, Default::default());
+                    self.smoke.image_tex.insert(it.path.clone(), t.clone());
+                    t
+                }
+            };
+            let aspect = tex.size_vec2().y / tex.size_vec2().x.max(1.0);
+            let half = egui::vec2(it.scale * img.width(), it.scale * img.width() * aspect) / 2.0;
+            let center = img.min + egui::vec2(it.x * img.width(), it.y * img.height());
+            let angle = it.rot.to_radians();
+            let corner = |v: egui::Vec2| center + rot_vec(v, angle);
+            let quad = [
+                corner(egui::vec2(-half.x, -half.y)),
+                corner(egui::vec2(half.x, -half.y)),
+                corner(egui::vec2(half.x, half.y)),
+                corner(egui::vec2(-half.x, half.y)),
+            ];
+            // 旋轉過的貼圖：egui 沒有現成的 API，直接送四個頂點
+            let uv = [
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1.0, 0.0),
+                egui::pos2(1.0, 1.0),
+                egui::pos2(0.0, 1.0),
+            ];
+            let tint = egui::Color32::from_white_alpha((it.opacity.clamp(0.0, 1.0) * 255.0) as u8);
+            let mut mesh = egui::Mesh::with_texture(tex.id());
+            for i in 0..4 {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: quad[i],
+                    uv: uv[i],
+                    color: tint,
+                });
+            }
+            mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+            p.add(egui::Shape::mesh(mesh));
+
+            if !interactive {
+                continue;
+            }
+            // 主體互動：以旋轉後的外接矩形當點擊/拖曳範圍
+            let bb = egui::vec2(
+                half.x * angle.cos().abs() + half.y * angle.sin().abs(),
+                half.x * angle.sin().abs() + half.y * angle.cos().abs(),
+            );
+            let id = ui.id().with(("smoke_image", k));
+            let resp = ui.interact(
+                egui::Rect::from_center_size(center, bb * 2.0),
+                id,
+                egui::Sense::click_and_drag(),
+            );
+            busy |= resp.hovered() || resp.dragged();
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            }
+            if resp.clicked() || resp.drag_started() {
+                select = Some(k);
+            }
+            if resp.dragged() {
+                let d = resp.drag_delta();
+                let e = &mut f.images[k];
+                e.x = (e.x + d.x / img.width()).clamp(0.0, 1.0);
+                e.y = (e.y + d.y / img.height()).clamp(0.0, 1.0);
+            }
+            if self.smoke.sel_image != Some(k) {
+                continue;
+            }
+            // 選取框與把手（畫法與文字那邊相同）
+            let ext = half + egui::vec2(6.0, 6.0);
+            let corners: Vec<egui::Pos2> = [
+                egui::vec2(-ext.x, -ext.y),
+                egui::vec2(ext.x, -ext.y),
+                egui::vec2(ext.x, ext.y),
+                egui::vec2(-ext.x, ext.y),
+            ]
+            .into_iter()
+            .map(corner)
+            .collect();
+            for i in 0..4 {
+                chrome.line_segment(
+                    [corners[i], corners[(i + 1) % 4]],
+                    egui::Stroke::new(1.5, theme::ACCENT),
+                );
+            }
+            for (ci, c) in corners.iter().enumerate() {
+                let vis = egui::Rect::from_center_size(*c, egui::vec2(9.0, 9.0));
+                chrome.rect_filled(vis, 2, egui::Color32::WHITE);
+                chrome.rect_stroke(
+                    vis,
+                    2,
+                    egui::Stroke::new(1.5, theme::ACCENT),
+                    egui::StrokeKind::Inside,
+                );
+                let hr = ui.interact(
+                    egui::Rect::from_center_size(*c, egui::vec2(14.0, 14.0)),
+                    id.with(("corner", ci)),
+                    egui::Sense::drag(),
+                );
+                busy |= hr.hovered() || hr.dragged();
+                if hr.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                }
+                if hr.dragged() {
+                    if let Some(ptr) = hr.interact_pointer_pos() {
+                        let prev = ptr - hr.drag_delta();
+                        let d0 = (prev - center).length();
+                        let d1 = (ptr - center).length();
+                        if d0 > 4.0 {
+                            let e = &mut f.images[k];
+                            e.scale = (e.scale * d1 / d0).clamp(0.01, 3.0);
+                        }
+                    }
+                }
+            }
+            // 旋轉把手
+            let top_mid = corner(egui::vec2(0.0, -ext.y));
+            let handle = corner(egui::vec2(0.0, -ext.y - 22.0));
+            chrome.line_segment([top_mid, handle], egui::Stroke::new(1.5, theme::ACCENT));
+            chrome.circle_filled(handle, 5.5, theme::ACCENT);
+            chrome.circle_stroke(handle, 5.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
+            let rr = ui.interact(
+                egui::Rect::from_center_size(handle, egui::vec2(16.0, 16.0)),
+                id.with("rotate"),
+                egui::Sense::drag(),
+            );
+            busy |= rr.hovered() || rr.dragged();
+            if rr.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            if rr.dragged() {
+                if let Some(ptr) = rr.interact_pointer_pos() {
+                    let v = ptr - center;
+                    if v.length() > 4.0 {
+                        let mut deg = v.y.atan2(v.x).to_degrees() + 90.0;
+                        if deg > 180.0 {
+                            deg -= 360.0;
+                        }
+                        if deg < -180.0 {
+                            deg += 360.0;
+                        }
+                        for s in [-180.0f32, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0] {
+                            if (deg - s).abs() < 4.0 {
+                                deg = s;
+                                break;
+                            }
+                        }
+                        f.images[k].rot = deg;
+                    }
+                }
+            }
+        }
+
+        self.smoke.image_busy = busy;
+        if let Some(k) = select {
+            self.smoke.sel_image = Some(k);
+        }
+        if let Some(k) = drop_at {
+            f.images.remove(k);
+            self.smoke.sel_image = None;
+            self.smoke.error = Some("疊上去的圖片檔不見了，已經移除那一張".into());
+        }
+        if f != cur {
+            self.smoke.set_finish(f);
+        }
+    }
+
+    /// 預覽上的文字：直接由 egui 畫，拖曳＝移動、角落把手＝縮放、
+    /// 頂部圓形把手＝旋轉，全部零延遲（存檔時才用同一套字型真正燒進照片）。
+    /// `view` 是預覽可視範圍、`img` 是照片實際畫出來的矩形（含縮放與平移）
+    fn ui_smoke_text_overlay(&mut self, ui: &mut egui::Ui, view: egui::Rect, img: egui::Rect) {
+        let cur = self.smoke.effective_finish();
+        if cur.texts.is_empty() {
+            self.smoke.text_busy = false;
+            self.smoke.sel_text = None;
+            return;
+        }
+        let mut f = cur.clone();
+        let style = self.smoke.text_style.clone();
+        // 遮色片工具、吸色與清除筆刷都要用左鍵在照片上作業，
+        // 這時文字讓開不接受操作
+        let interactive = self.smoke.mask_tool.is_none()
+            && self.smoke.picking.is_none()
+            && !self.smoke.wipe_on
+            && self.smoke.busy != SmokeBusy::Saving;
+        // 文字裁到照片範圍（存檔也只畫在照片上），選取框與把手裁到可視範圍，
+        // 文字靠邊時把手才不會跟著被切掉
+        let p = ui.painter().with_clip_rect(view.intersect(img));
+        let chrome = ui.painter().with_clip_rect(view);
+        // 字級與外框以 1080p 高度為基準縮放，與存檔時的算法一致
+        let scale = img.height() / 1080.0;
+        let ow_screen = style.outline_w as f32 * scale;
+        let mut busy = false;
+        let mut select: Option<usize> = None;
+
+        for k in 0..f.texts.len() {
+            let t = f.texts[k].clone();
+            if !t.visible() {
+                continue;
+            }
+            let font_px = (t.size as f32 * scale).max(2.0);
+            let galley = p.layout(
+                t.text.trim_end().to_string(),
+                self.smoke_text_font(font_px),
+                style.color,
+                f32::INFINITY,
+            );
+            let half = galley.size() / 2.0;
+            let center = img.min + egui::vec2(t.x * img.width(), t.y * img.height());
+            let angle = t.rot.to_radians();
+
+            // 半透明底框（近似存檔時畫的那一塊）
+            if style.boxed {
+                let pad = (font_px * 0.25).max(4.0 * scale);
+                let ext = half + egui::vec2(pad, pad);
+                let corners: Vec<egui::Pos2> = [
+                    egui::vec2(-ext.x, -ext.y),
+                    egui::vec2(ext.x, -ext.y),
+                    egui::vec2(ext.x, ext.y),
+                    egui::vec2(-ext.x, ext.y),
+                ]
+                .into_iter()
+                .map(|v| center + rot_vec(v, angle))
+                .collect();
+                p.add(egui::Shape::convex_polygon(
+                    corners,
+                    egui::Color32::from_black_alpha(102),
+                    egui::Stroke::NONE,
+                ));
+            }
+
+            // 外框（八個方向偏移重繪）＋本體，與存檔時的畫法相同
+            let mk = |off: egui::Vec2, override_color: Option<egui::Color32>| {
+                let pos = center + rot_vec(-half + off, angle);
+                let mut ts = egui::epaint::TextShape::new(pos.round(), galley.clone(), style.color);
+                ts.angle = angle;
+                ts.override_text_color = override_color;
+                egui::Shape::Text(ts)
+            };
+            if ow_screen > 0.05 {
+                for (dx, dy) in [
+                    (-1.0, 0.0),
+                    (1.0, 0.0),
+                    (0.0, -1.0),
+                    (0.0, 1.0),
+                    (-0.7, -0.7),
+                    (0.7, -0.7),
+                    (-0.7, 0.7),
+                    (0.7, 0.7),
+                ] {
+                    p.add(mk(
+                        egui::vec2(dx, dy) * ow_screen,
+                        Some(style.outline_color),
+                    ));
+                }
+            }
+            p.add(mk(egui::Vec2::ZERO, None));
+
+            if !interactive {
+                continue;
+            }
+
+            // 主體互動：以旋轉後的外接矩形當點擊/拖曳範圍
+            let bb = egui::vec2(
+                half.x * angle.cos().abs() + half.y * angle.sin().abs(),
+                half.x * angle.sin().abs() + half.y * angle.cos().abs(),
+            ) + egui::vec2(6.0, 6.0);
+            let id = ui.id().with(("smoke_text", k));
+            let resp = ui.interact(
+                egui::Rect::from_center_size(center, bb * 2.0),
+                id,
+                egui::Sense::click_and_drag(),
+            );
+            // 滑鼠壓在文字上時左鍵歸文字用，不要同時把預覽也拖著跑
+            busy |= resp.hovered() || resp.dragged();
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            }
+            if resp.clicked() || resp.drag_started() {
+                select = Some(k);
+            }
+            if resp.dragged() {
+                let d = resp.drag_delta();
+                let e = &mut f.texts[k];
+                e.x = (e.x + d.x / img.width()).clamp(0.0, 1.0);
+                e.y = (e.y + d.y / img.height()).clamp(0.0, 1.0);
+            }
+
+            if self.smoke.sel_text != Some(k) {
+                continue;
+            }
+            // 選取框與把手
+            let ext = half + egui::vec2(8.0, 8.0);
+            let corners: Vec<egui::Pos2> = [
+                egui::vec2(-ext.x, -ext.y),
+                egui::vec2(ext.x, -ext.y),
+                egui::vec2(ext.x, ext.y),
+                egui::vec2(-ext.x, ext.y),
+            ]
+            .into_iter()
+            .map(|v| center + rot_vec(v, angle))
+            .collect();
+            for i in 0..4 {
+                chrome.line_segment(
+                    [corners[i], corners[(i + 1) % 4]],
+                    egui::Stroke::new(1.5, theme::ACCENT),
+                );
+            }
+            // 角落縮放把手
+            for (ci, c) in corners.iter().enumerate() {
+                let vis = egui::Rect::from_center_size(*c, egui::vec2(9.0, 9.0));
+                chrome.rect_filled(vis, 2, egui::Color32::WHITE);
+                chrome.rect_stroke(
+                    vis,
+                    2,
+                    egui::Stroke::new(1.5, theme::ACCENT),
+                    egui::StrokeKind::Inside,
+                );
+                let hr = ui.interact(
+                    egui::Rect::from_center_size(*c, egui::vec2(14.0, 14.0)),
+                    id.with(("corner", ci)),
+                    egui::Sense::drag(),
+                );
+                busy |= hr.hovered() || hr.dragged();
+                if hr.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                }
+                if hr.dragged() {
+                    if let Some(ptr) = hr.interact_pointer_pos() {
+                        let prev = ptr - hr.drag_delta();
+                        let d0 = (prev - center).length();
+                        let d1 = (ptr - center).length();
+                        if d0 > 4.0 {
+                            let e = &mut f.texts[k];
+                            e.size = (e.size as f32 * d1 / d0).round().clamp(8.0, 300.0) as i32;
+                        }
+                    }
+                }
+            }
+            // 旋轉把手（頂邊中點向外延伸的圓形）
+            let top_mid = center + rot_vec(egui::vec2(0.0, -ext.y), angle);
+            let handle = center + rot_vec(egui::vec2(0.0, -ext.y - 22.0), angle);
+            chrome.line_segment([top_mid, handle], egui::Stroke::new(1.5, theme::ACCENT));
+            chrome.circle_filled(handle, 5.5, theme::ACCENT);
+            chrome.circle_stroke(handle, 5.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
+            let rr = ui.interact(
+                egui::Rect::from_center_size(handle, egui::vec2(16.0, 16.0)),
+                id.with("rotate"),
+                egui::Sense::drag(),
+            );
+            busy |= rr.hovered() || rr.dragged();
+            if rr.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            if rr.dragged() {
+                if let Some(ptr) = rr.interact_pointer_pos() {
+                    let v = ptr - center;
+                    if v.length() > 4.0 {
+                        let mut deg = v.y.atan2(v.x).to_degrees() + 90.0;
+                        if deg > 180.0 {
+                            deg -= 360.0;
+                        }
+                        if deg < -180.0 {
+                            deg += 360.0;
+                        }
+                        // 靠近 45° 倍數時吸附
+                        for s in [-180.0f32, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0] {
+                            if (deg - s).abs() < 4.0 {
+                                deg = s;
+                                break;
+                            }
+                        }
+                        f.texts[k].rot = deg;
+                    }
+                }
+            }
+        }
+
+        self.smoke.text_busy = busy;
+        if let Some(k) = select {
+            self.smoke.sel_text = Some(k);
+        }
+        if f != cur {
+            self.smoke.set_finish(f);
+        }
+    }
+
+    /// 去煙霧模組的「調色」區塊。滑桿與影片模組完全相同（見 [`App::ui_adjust_section`]），
+    /// 差別只在這裡調的是照片本身，存下去就是調好的成品
+    fn ui_smoke_grade(&mut self, ui: &mut egui::Ui, busy: SmokeBusy) {
+        // 按下去只記旗標，畫完這一列才跳確認框（見 ui_adjust_section 的說明）
+        let mut ask_clear = false;
+        ui.horizontal(|ui| {
+            section_toggle(ui, "調色", &mut self.smoke.grade_open);
+            let neutral = self.smoke.effective_grade().is_neutral();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !neutral
+                    && ui
+                        .small_button("↺ 清除所有修改內容")
+                        .on_hover_text("把十二條調色滑桿一次全部歸零並取消裁切（不動去煙、遮色片與文字）")
+                        .clicked()
+                {
+                    ask_clear = true;
+                }
+            });
+        });
+        if ask_clear {
+            if ask2(
+                rfd::MessageLevel::Warning,
+                "清除所有修改內容",
+                "將清除這裡的調色（十二條滑桿全部歸零，裁切一併取消）。\n\
+                 去煙參數、遮色片、文字與手動清除的筆跡不受影響。",
+                "清除",
+                "取消",
+            ) {
+                let mut f = self.smoke.effective_finish();
+                f.grade = Adjustments::default();
+                self.smoke.set_finish(f);
+            }
+        }
+        if !self.smoke.grade_open {
+            return;
+        }
+        let cur = self.smoke.effective_finish();
+        let mut f = cur.clone();
+        // 列距收緊到與照片轉影片的調色面板相同（畫完裁切再還原，
+        // 下面的區塊維持原本的呼吸感）
+        let keep_gap = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = ADJ_ROW_GAP;
+        ui.label(
+            egui::RichText::new("去煙之後才套用，滑桿連點兩下可歸零")
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
+            adj_sliders(ui, &mut f.grade);
+        });
+        // 裁切：與調色同一份設定，跟著「只調整這張」走
+        let src = self.smoke.source_dims();
+        ui_crop_block(
+            ui,
+            &mut f.grade.crop,
+            &mut self.smoke.crop_editing,
+            &mut self.smoke.crop_aspect,
+            src,
+            busy != SmokeBusy::Saving && self.smoke.base.is_some(),
+        );
+        ui.spacing_mut().item_spacing.y = keep_gap;
+        if f != cur {
+            self.smoke.set_finish(f);
+        }
+        ui.add_space(6.0);
+    }
+
+    /// 去煙霧模組的「手動清除」區塊。滑桿是整張一起算的，零星幾塊沒清乾淨
+    /// 的煙再拉重只會傷到煙火；這裡改用筆刷指哪塗哪，塗過的地方用四周的
+    /// 夜空補起來（見 [`edit::apply_wipe`]）。筆跡逐張存，不會套到別張去
+    fn ui_smoke_wipe(&mut self, ui: &mut egui::Ui, busy: SmokeBusy) {
+        let n = self.smoke.cur_wipes().len();
+        // 按下去只記旗標，畫完這一列才跳確認框（見 ui_adjust_section 的說明）
+        let mut ask_clear_wipes = false;
+        ui.horizontal(|ui| {
+            section_toggle(ui, "手動清除", &mut self.smoke.wipe_open);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if n > 0 {
+                    if ui
+                        .small_button("↺ 清除所有修改內容")
+                        .on_hover_text("清掉這張塗過的所有筆跡")
+                        .clicked()
+                    {
+                        ask_clear_wipes = true;
+                    }
+                    if ui
+                        .small_button("↩ 還原一筆")
+                        .on_hover_text("拿掉最後塗上去的那一筆")
+                        .clicked()
+                    {
+                        let mut v = self.smoke.cur_wipes().to_vec();
+                        v.pop();
+                        self.smoke.set_wipes(v);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("（{n} 筆）"))
+                            .size(11.0)
+                            .color(theme::TEXT_WEAK),
+                    );
+                }
+            });
+        });
+        if ask_clear_wipes {
+            if ask2(
+                rfd::MessageLevel::Warning,
+                "清除所有修改內容",
+                &format!(
+                    "將清除這張照片手動清除的 {n} 筆筆跡，塗掉的煙會全部回來。\n\
+                     去煙參數、遮色片、調色與文字不受影響。"
+                ),
+                "清除",
+                "取消",
+            ) {
+                self.smoke.set_wipes(Vec::new());
+            }
+        }
+        if !self.smoke.wipe_open {
+            return;
+        }
+        ui.label(
+            egui::RichText::new("在預覽上塗過沒清乾淨的煙，會用四周的夜空補起來（只影響這一張）")
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(4.0);
+        ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
+            // 「大小」被前面那顆按鈕推到偏右，底下三條若從最左邊起跑就對不齊，
+            // 四個名稱歪成兩落。量出「大小」實際落在哪，其餘照它縮排
+            let mut label_x = ui.min_rect().left();
+            ui.horizontal(|ui| {
+                // 這一個用真正的勾選框（不是 check_label）：沒開時也要看得到
+                // 一個空的方框，才知道那裡可以勾——與下面的「保留煙火紋路」、
+                // 左欄的「補回煙裡的軌跡」同一種樣子
+                let mut on = self.smoke.wipe_on;
+                if ui
+                    .checkbox(&mut on, "清除筆刷")
+                    .on_hover_text(
+                        "勾起來再到預覽上塗；\n\
+                         塗到的地方會被四周的夜空蓋掉，放開滑鼠就看得到結果。\n\
+                         在照片上按住 Ctrl 滾輪可改變筆刷大小。\n\
+                         取消勾選，左鍵回到拖曳平移",
+                    )
+                    .changed()
+                {
+                    self.smoke.wipe_on = on;
+                    // 遮色片工具、吸色與清除都靠同一片畫布的左鍵，不能同時開著
+                    if self.smoke.wipe_on {
+                        self.smoke.mask_tool = None;
+                        self.smoke.picking = None;
+                        self.smoke.sel_text = None;
+                    } else {
+                        self.smoke.wipe_draft = None;
+                    }
+                }
+                ui.separator();
+                label_x = ui.next_widget_position().x;
+                ui.label(
+                    egui::RichText::new("大小")
+                        .size(12.5)
+                        .color(theme::TEXT_WEAK),
+                )
+                .on_hover_text("也可以在照片上按住 Ctrl 滾輪改變筆刷大小，手不必離開要塗的地方");
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - NUM_BOX_ROOM - 6.0).max(60.0);
+                let mut size = self.smoke.wipe_size;
+                drop_slider_i32(ui, &mut size, 1, 40)
+                    .on_hover_text("也可以在照片上按住 Ctrl 滾輪改變筆刷大小，手不必離開要塗的地方");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    let txt = size.to_string();
+                    num_box_i32(ui, "wipe_size", &mut size, 1, 40, &txt, theme::TEXT);
+                });
+                self.smoke.wipe_size = size;
+            });
+            // 羽化／流暢度／濃度：與 Lightroom 的筆刷同名同義。
+            // 和「保留煙火紋路」一樣只影響之後才塗的筆跡，已經塗好的各自
+            // 記著自己當時的設定，改這裡不會回頭動到它們
+            let indent = (label_x - ui.min_rect().left()).max(0.0);
+            let inner_w = (ui.available_width() - indent).max(140.0);
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                ui.vertical(|ui| {
+                    ui.set_width(inner_w);
+                    slider_row(ui, &mut self.smoke.wipe_feather, 0, 100, "羽化");
+                    slider_row(ui, &mut self.smoke.wipe_flow, 1, 100, "流暢度");
+                    slider_row(ui, &mut self.smoke.wipe_density, 1, 100, "濃度");
+                });
+            });
+            ui.label(
+                egui::RichText::new(
+                    "羽化＝邊緣多柔 · 流暢度＝一次上多少（低的要多刷幾次）· 濃度＝最多清到多乾淨",
+                )
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+            // 這個勾選只決定「接下來塗的那幾筆」怎麼算：
+            // 已經塗好的筆跡各自記著自己當時的設定，改這裡不會動到它們
+            ui.checkbox(&mut self.smoke.wipe_keep, "保留煙火紋路")
+                .on_hover_text(
+                    "煙是一整片平順的，煙火線條是高出來的那一點；\n\
+                     勾著就只把煙那一層扣掉，塗到的線條原樣留著。\n\
+                     取消勾選則整塊換成補起來的夜空（線條也一起清掉）。\n\
+                     只對之後才塗的筆跡生效，已經塗好的不受影響",
+                );
+        });
+        ui.add_space(6.0);
+    }
+
+    /// 去煙霧模組的「圖片」區塊：把 logo、標題圖疊到照片上。
+    /// 位置、大小與旋轉直接在預覽上拖曳最快（見 [`App::ui_smoke_image_overlay`]），
+    /// 這裡放的是加／刪與精修用的滑桿
+    /// 疊一張圖片上去（工具列的「🖼 疊圖片」「📋 貼上圖片」都走這裡）。
+    /// 加進來就選起來，接著在預覽上拖就能擺位置
+    fn smoke_add_overlay(&mut self, path: PathBuf) {
+        let mut f = self.smoke.effective_finish();
+        // 連續加好幾張若都落在正中央會完全疊住，依現有張數往右下錯開
+        let n = f.images.len() as f32;
+        f.images.push(edit::ImageItem {
+            path,
+            x: (0.5 + n * 0.04).clamp(0.1, 0.9),
+            y: (0.5 + n * 0.04).clamp(0.1, 0.9),
+            ..edit::ImageItem::default()
+        });
+        self.smoke.sel_image = Some(f.images.len() - 1);
+        self.smoke.set_finish(f);
+        self.smoke.image_open = true; // 收合著加圖片 → 自動展開，看得到滑桿
+        self.smoke.error = None;
+    }
+
+    /// 「📋 貼上圖片」：剪貼簿裡的圖片直接疊上去
+    fn smoke_paste_overlay(&mut self) {
+        match clipboard_image_to_temp() {
+            Ok(p) => self.smoke_add_overlay(p),
+            Err(e) => self.smoke.error = Some(e),
+        }
+    }
+
+    fn ui_smoke_image(&mut self, ui: &mut egui::Ui, busy: SmokeBusy) {
+        // 加圖片的兩顆按鈕在最上面的工具列（見 [`App::smoke_add_overlay`]）：
+        // 右側面板窄，兩顆按鈕擠在標題旁邊會把區塊名稱推掉
+        ui.horizontal(|ui| {
+            section_toggle(ui, "圖片", &mut self.smoke.image_open);
+        });
+        if !self.smoke.image_open {
+            return;
+        }
+        ui.label(
+            egui::RichText::new("在上面的預覽直接拖曳圖片調整位置；點選圖片可縮放與旋轉")
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(4.0);
+        let cur = self.smoke.effective_finish();
+        if cur.images.is_empty() {
+            ui.label(
+                egui::RichText::new("尚未疊上圖片，用最上面工具列的「🖼 疊圖片」或「📋 貼上圖片」加一張")
+                    .size(11.5)
+                    .color(theme::TEXT_WEAK),
+            );
+            ui.add_space(6.0);
+            return;
+        }
+        let mut f = cur.clone();
+        let mut drop_at: Option<usize> = None;
+        let mut select: Option<usize> = None;
+        ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
+            for (k, it) in f.images.iter_mut().enumerate() {
+                let sel = self.smoke.sel_image == Some(k);
+                egui::Frame::default()
+                    .fill(if sel { theme::CARD_HOVER } else { theme::CARD })
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let name = it
+                                .path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            if ui
+                                .selectable_label(sel, egui::RichText::new(name).size(11.5))
+                                .on_hover_text("點一下選起來，預覽上就會出現縮放與旋轉的把手")
+                                .clicked()
+                            {
+                                select = Some(k);
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("🗑").on_hover_text("移除這一張").clicked() {
+                                        drop_at = Some(k);
+                                    }
+                                },
+                            );
+                        });
+                        // 大小以「寬度佔照片寬度的百分比」表示，與存檔時同一把尺
+                        let mut pct = (it.scale * 100.0).round() as i32;
+                        slider_row(ui, &mut pct, 1, 200, "大小");
+                        it.scale = pct as f32 / 100.0;
+                        let mut rot = it.rot.round() as i32;
+                        slider_row(ui, &mut rot, -180, 180, "旋轉");
+                        it.rot = rot as f32;
+                        let mut op = (it.opacity * 100.0).round() as i32;
+                        slider_row(ui, &mut op, 0, 100, "不透明度");
+                        it.opacity = op as f32 / 100.0;
+                    });
+                ui.add_space(4.0);
+            }
+        });
+        if let Some(k) = select {
+            self.smoke.sel_image = Some(k);
+        }
+        if let Some(k) = drop_at {
+            f.images.remove(k);
+            self.smoke.sel_image = None;
+        }
+        if f != cur {
+            self.smoke.set_finish(f);
+        }
+        ui.add_space(6.0);
+    }
+
+    /// 去煙霧模組的「文字」區塊。文字疊在調色之後，存檔時才真正燒進照片；
+    /// 位置、大小與旋轉直接在預覽上拖曳最快（見 [`App::ui_smoke_text_overlay`]）
+    fn ui_smoke_text(&mut self, ui: &mut egui::Ui, busy: SmokeBusy) {
+        let mut add = false;
+        ui.horizontal(|ui| {
+            section_toggle(ui, "文字", &mut self.smoke.text_open);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 沒有字型就畫不出字，讓它加一段只會加出一段永遠不會出現的文字
+                let ok = !self.fonts.is_empty();
+                if ui
+                    .add_enabled(ok, egui::Button::new("＋ 新增文字").small())
+                    .on_disabled_hover_text("找不到可用的系統字型")
+                    .clicked()
+                {
+                    add = true;
+                }
+            });
+        });
+        if add {
+            let mut f = self.smoke.effective_finish();
+            let mut t = TextItem::default();
+            // 連續新增若都落在底部中央會完全疊住，依現有段數往上錯開
+            t.y = (0.85 - (f.texts.len() % 5) as f32 * 0.08).clamp(0.1, 0.85);
+            f.texts.push(t);
+            self.smoke.sel_text = Some(f.texts.len() - 1);
+            self.smoke.set_finish(f);
+            self.smoke.text_open = true; // 收合時新增 → 自動展開
+        }
+        if !self.smoke.text_open {
+            return;
+        }
+        if self.fonts.is_empty() {
+            ui.colored_label(theme::ERROR, "找不到可用的系統字型，文字功能無法使用");
+            ui.add_space(6.0);
+            return;
+        }
+        ui.label(
+            egui::RichText::new("在上面的預覽直接拖曳文字調整位置；點選文字可縮放與旋轉")
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(4.0);
+
+        let cur = self.smoke.effective_finish();
+        let mut f = cur.clone();
+        let mut remove: Option<usize> = None;
+        let mut select: Option<usize> = None;
+        ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
+            for (k, t) in f.texts.iter_mut().enumerate() {
+                let selected = self.smoke.sel_text == Some(k);
+                egui::Frame::default()
+                    .fill(theme::CARD)
+                    .corner_radius(8)
+                    .stroke(if selected {
+                        egui::Stroke::new(1.5, theme::ACCENT)
+                    } else {
+                        egui::Stroke::NONE
+                    })
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("文字 {}", k + 1))
+                                            .strong()
+                                            .size(12.5)
+                                            .color(theme::ACCENT),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text("點擊可在預覽中選取這段文字")
+                                .clicked()
+                            {
+                                select = Some(k);
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("🗑")
+                                        .on_hover_text("刪除這段文字")
+                                        .clicked()
+                                    {
+                                        remove = Some(k);
+                                    }
+                                },
+                            );
+                        });
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut t.text)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("要疊在照片上的文字（可多行）"),
+                        );
+                        if resp.gained_focus() {
+                            select = Some(k);
+                        }
+                        slider_row(ui, &mut t.size, 8, 300, "大小");
+                        rot_slider_row(ui, "旋轉", &mut t.rot);
+                    });
+                ui.add_space(6.0);
+            }
+        });
+        if let Some(k) = remove {
+            f.texts.remove(k);
+            self.smoke.sel_text = match self.smoke.sel_text {
+                Some(s) if s == k => None,
+                Some(s) if s > k => Some(s - 1),
+                other => other,
+            };
+        }
+        if let Some(k) = select {
+            self.smoke.sel_text = Some(k);
+        }
+        if f.texts.is_empty() {
+            ui.label(
+                egui::RichText::new("尚未加入文字，點右上「＋ 新增文字」開始")
+                    .size(11.5)
+                    .color(theme::TEXT_WEAK),
+            );
+            ui.add_space(6.0);
+        }
+        if f != cur {
+            self.smoke.set_finish(f);
+        }
+
+        group_label(ui, "文字樣式（全部共用）");
+        ui.add_space(2.0);
+        // 樣式是直接改欄位的（不經過 set_finish），改了要自己記上「還沒存檔」
+        let style_before = self.smoke.text_style.clone();
+        egui::Frame::default()
+            .fill(theme::CARD)
+            .corner_radius(8)
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("字型").color(theme::TEXT_WEAK));
+                    let cur = self
+                        .fonts
+                        .get(self.smoke.text_style.font_idx)
+                        .map(|(n, _)| n.as_str())
+                        .unwrap_or("？");
+                    egui::ComboBox::from_id_salt("smoke_font")
+                        .selected_text(cur)
+                        .width(ui.available_width() - 8.0)
+                        .show_ui(ui, |ui| {
+                            for (i, (name, _)) in self.fonts.iter().enumerate() {
+                                check_value(ui, &mut self.smoke.text_style.font_idx, i, name);
+                            }
+                        });
+                });
+                slider_row(ui, &mut self.smoke.text_style.outline_w, 0, 8, "外框");
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("文字").color(theme::TEXT_WEAK));
+                    ui.color_edit_button_srgba(&mut self.smoke.text_style.color);
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("外框").color(theme::TEXT_WEAK));
+                    ui.color_edit_button_srgba(&mut self.smoke.text_style.outline_color);
+                    ui.add_space(10.0);
+                    ui.checkbox(&mut self.smoke.text_style.boxed, "半透明底框");
+                });
+            });
+        if self.smoke.text_style != style_before {
+            self.smoke.dirty = true;
+        }
+        ui.add_space(6.0);
+    }
+
+    /// 清除筆刷在預覽上的塗抹。押著左鍵一路收筆跡、放開才寫進這張的筆跡
+    /// 清單觸發重算（拖曳過程每幀重算會塞爆背景那條線）；點一下不拖也算
+    /// 一筆——零星的小煙點就是點掉最快。
+    ///
+    /// 筆跡只在還押著的時候畫出來，放開就只剩結果：塗過的地方本來就看得出
+    /// 東西不見了，留著記號反而擋住要看的畫面。
+    ///
+    /// `img` 是照片畫出來的矩形（放大後會超出可視範圍），
+    /// `hit` 是可以動手的範圍（前後對照時就是右邊那半格）
+    fn smoke_wipe_paint(&mut self, ui: &mut egui::Ui, img: egui::Rect, hit: egui::Rect) {
+        let to_norm = |p: egui::Pos2| {
+            egui::pos2(
+                ((p.x - img.left()) / img.width()).clamp(0.0, 1.0),
+                ((p.y - img.top()) / img.height()).clamp(0.0, 1.0),
+            )
+        };
+        let inside = |p: &egui::Pos2| img.contains(*p) && hit.contains(*p);
+        // 筆刷粗細看的是「螢幕上多大一圈」，不是「照片的百分之幾」：
+        // 放大到 200% 時同一圈只蓋到四分之一的照片面積，正好拿來修細節——
+        // 這也是放大來塗的意義。基準取「符合視窗」時照片的長邊，
+        // 所以在符合視窗下與原本的手感完全一樣
+        let aspect = img.width() / img.height();
+        let fit = if hit.width() / hit.height() > aspect {
+            egui::vec2(hit.height() * aspect, hit.height())
+        } else {
+            egui::vec2(hit.width(), hit.width() / aspect)
+        };
+        let screen_r = self.smoke.wipe_radius() * fit.x.max(fit.y);
+        // 存進筆跡的半徑一律換算成佔照片長邊的比例（縮圖與原尺寸才刷得一樣）
+        let radius = screen_r / img.width().max(img.height());
+
+        // 正在塗的那一筆才畫出來，放開就收掉
+        if let Some(pts) = &self.smoke.wipe_draft {
+            let paint = ui.painter().with_clip_rect(hit.intersect(img));
+            paint_wipe(&paint, img, pts, screen_r, theme::WIPE.gamma_multiply(0.35));
+        }
+
+        // 直接讀指標狀態，不靠 Response 的拖曳判定：放大之後預覽會超出格子，
+        // 押著左鍵塗到一半跑出可視範圍是常態，拖曳判定在那裡會斷掉
+        let (pressed, down, pos) = ui.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.interact_pos(),
+            )
+        });
+        // 起筆要落在照片上；之後跟著游標走，拖出照片外會被夾回邊界
+        if pressed {
+            self.smoke.wipe_draft = pos.filter(inside).map(to_norm).map(|p| vec![[p.x, p.y]]);
+        }
+        if let (Some(pts), true, Some(now)) =
+            (self.smoke.wipe_draft.as_mut(), down, pos.map(to_norm))
+        {
+            // 取樣點太密只是把資料撐大，補起來的結果一模一樣
+            let far = pts.last().is_none_or(|l| {
+                let (dx, dy) = (now.x - l[0], now.y - l[1]);
+                dx * dx + dy * dy > BRUSH_STEP * BRUSH_STEP
+            });
+            if pts.len() < MAX_BRUSH_PTS && far {
+                pts.push([now.x, now.y]);
+            }
+        }
+        // 放開就收工。點一下不拖也會走到這裡（只有一個點＝一個圓）
+        if !down {
+            if let Some(mut pts) = self.smoke.wipe_draft.take() {
+                // 放開的那一下不論離上一點多近都要收進來，筆跡才不會短一截
+                if let Some(now) = pos.map(to_norm) {
+                    if pts.last() != Some(&[now.x, now.y]) && pts.len() < MAX_BRUSH_PTS {
+                        pts.push([now.x, now.y]);
+                    }
+                }
+                let w = edit::Wipe {
+                    pts,
+                    radius,
+                    keep_detail: self.smoke.wipe_keep,
+                    feather: self.smoke.wipe_feather as f32 / 100.0,
+                    flow: self.smoke.wipe_flow as f32 / 100.0,
+                    density: self.smoke.wipe_density as f32 / 100.0,
+                };
+                if w.is_usable() {
+                    // 筆數不設上限：塗新的一筆只接著上一筆的結果算
+                    // （見 [`App::spawn_smoke_finish`] 的中間結果快取），
+                    // 塗到幾百筆也不會越塗越慢
+                    let mut v = self.smoke.cur_wipes().to_vec();
+                    v.push(w);
+                    self.smoke.set_wipes(v);
+                }
+            }
+        }
+
+        // 筆刷游標：先看得到會塗多大一圈，才不會塗完才發現蓋掉了煙火。
+        // 只在照片上才換游標——移到面板、滑桿那些地方還跟著是十字，
+        // 會讓人以為那裡也能塗（不設就是系統原本的箭頭）
+        if let Some(p) = pos.filter(inside) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            let painter = ui.painter();
+            // 內圈＝實心核心的邊界（與 edit::wipe_one 的 inner 同一個算法），
+            // 兩圈之間那一圈就是羽化過渡的寬度——拉羽化時看得到它張開或收合，
+            // 不必塗一筆才知道邊緣多柔（比照 Lightroom 的筆刷游標）。
+            //
+            // 粗細分工：內圈畫粗，因為「這一筆實際清得掉多大一塊」看的是它；
+            // 外圈只是效果淡到 0 的最外緣，細細一條帶過就好，不搶注意力
+            let strong = egui::Stroke::new(1.4, theme::WIPE);
+            let faint = egui::Stroke::new(1.0, theme::WIPE.gamma_multiply(0.55));
+            let inner = screen_r * (1.0 - self.smoke.wipe_feather as f32 / 100.0);
+            // 羽化拉到 0 時兩圈會重疊，只畫外圈——這時它就是核心，要畫粗的
+            let show_inner = inner > 1.0 && screen_r - inner > 1.5;
+            painter.circle_stroke(p, screen_r, if show_inner { faint } else { strong });
+            if show_inner {
+                painter.circle_stroke(p, inner, strong);
+            }
+        }
+    }
+
     fn ui_smoke_canvas_interaction(
         &mut self,
         ui: &mut egui::Ui,
         resp: &egui::Response,
         img: egui::Rect,
     ) {
+        // 可以動手的範圍＝這個 ui 的裁切區（前後對照時就是右邊「編輯後」那半格）。
+        // 放大後照片會超出格子，只看 img 的話會讓人從隔壁那半格開始畫
+        let hit = ui.clip_rect();
         // 畫面座標→照片的相對座標（0~1）：照片是等比置中的，
         // 用相對座標存才能同時套用在預覽縮圖與原尺寸照片上
         let to_norm = |p: egui::Pos2| {
@@ -4377,62 +12129,279 @@ impl App {
             egui::pos2(img.left() + p.x * img.width(), img.top() + p.y * img.height())
         };
 
-        if self.smoke.picking {
-            // 吸色模式：點一下取該點顏色，取完就離開吸色模式
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-            if resp.clicked() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    if img.contains(p) {
-                        if let Some(c) = self.smoke_color_at(to_norm(p)) {
-                            let mut v = self.smoke.effective();
-                            if v.add_protect(c) {
-                                self.smoke.set_params(v);
-                            } else {
-                                self.smoke.error =
-                                    Some(format!("保護色最多 {} 個，請先移除再加", dehaze::MAX_PROTECT));
-                            }
-                        }
-                    }
+        // 已經畫上去的形狀先畫，正在拖的那個才蓋在上面。
+        // 只有一個框時沿用原本「框外壓暗」的畫法，一眼看得出哪塊會被處理；
+        // 疊了好幾個形狀、或正在畫下一個時各自壓暗只會糊成一片，改成只畫輪廓
+        //
+        // 「顯示遮色片」說了算（與煙火疊圖同一個規則）。輪廓是檢查用的東西，
+        // 一直蓋在照片上會擋住看成品；原本只要選著工具就一律畫，
+        // 那顆開關對輪廓等於沒作用。正在拖的那一筆仍有即時回饋
+        let outlines = self.smoke.show_mask;
+        if outlines {
+            let eff = self.smoke.effective();
+            // 搬移中的那一個畫在暫時的位置，放開才真的寫回去
+            let shifted = |i: usize, s: &dehaze::Shape| match self.smoke.moving {
+                Some((mi, d)) if mi == i => shape_moved(s, d),
+                _ => s.clone(),
+            };
+            match eff.shapes.as_slice() {
+                [dehaze::Shape::Rect(r)]
+                    if self.smoke.draft.is_none() && self.smoke.moving.is_none() =>
+                {
+                    paint_selection(
+                        ui,
+                        img,
+                        egui::Rect::from_two_pos(
+                            to_screen(egui::pos2(r.x0, r.y0)),
+                            to_screen(egui::pos2(r.x1, r.y1)),
+                        ),
+                    )
                 }
-                self.smoke.picking = false;
-            }
-        } else {
-            // 框選：拖曳過程只畫框，放開才寫進參數觸發重算
-            if resp.drag_started() {
-                self.smoke.drag_from = resp
-                    .interact_pointer_pos()
-                    .filter(|p| img.contains(*p))
-                    .map(to_norm);
-            }
-            if let (Some(from), Some(now)) = (
-                self.smoke.drag_from,
-                resp.interact_pointer_pos().map(to_norm),
-            ) {
-                let sel = egui::Rect::from_two_pos(to_screen(from), to_screen(now));
-                paint_selection(ui, img, sel);
-                if resp.drag_stopped() {
-                    let mut v = self.smoke.effective();
-                    v.region = Some(dehaze::Region {
-                        x0: from.x,
-                        y0: from.y,
-                        x1: now.x,
-                        y1: now.y,
-                    });
-                    self.smoke.set_params(v);
-                    self.smoke.drag_from = None;
+                shapes => {
+                    for (i, s) in shapes.iter().enumerate() {
+                        paint_shape(ui, img, &shifted(i, s), eff.feather);
+                    }
                 }
             }
         }
 
-        // 已設定的框：沒有在拖曳時持續顯示，讓使用者知道範圍在哪
-        if self.smoke.drag_from.is_none() {
-            if let Some(r) = self.smoke.effective().region {
-                let sel = egui::Rect::from_two_pos(
-                    to_screen(egui::pos2(r.x0, r.y0)),
-                    to_screen(egui::pos2(r.x1, r.y1)),
-                );
-                paint_selection(ui, img, sel);
+        if self.smoke.wipe_on {
+            // 清除筆刷開著時左鍵專門拿來塗，遮色片與吸色都不會同時開著
+            self.smoke_wipe_paint(ui, img, hit);
+            self.smoke.draft = None;
+            self.smoke.moving = None;
+        } else if let Some(target) = self.smoke.picking {
+            // 吸色模式：點一下取該點顏色，取完就離開吸色模式。
+            // 游標只在照片上才換成十字（與清除筆刷一致）
+            if resp
+                .hover_pos()
+                .is_some_and(|p| img.contains(p) && hit.contains(p))
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             }
+            if resp.clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    if img.contains(p) && hit.contains(p) {
+                        if let Some(c) = self.smoke_color_at(to_norm(p)) {
+                            let mut v = self.smoke.effective();
+                            let (ok, full) = match target {
+                                PickTarget::Protect => (
+                                    v.add_protect(c),
+                                    format!("保護色最多 {} 個，請先移除再加", dehaze::MAX_PROTECT),
+                                ),
+                                PickTarget::Cloud => {
+                                    let ok = v.add_cloud(c);
+                                    // 吸了雲色卻沒開清雲等於白吸，直接給一個看得出效果的起點
+                                    if ok && v.sky_clean == 0 {
+                                        v.sky_clean = 80;
+                                    }
+                                    (
+                                        ok,
+                                        format!("雲色最多 {} 個，請先移除再加", dehaze::MAX_CLOUD),
+                                    )
+                                }
+                            };
+                            if ok {
+                                self.smoke.set_params(v);
+                            } else {
+                                self.smoke.error = Some(full);
+                            }
+                        }
+                    }
+                }
+                self.smoke.picking = None;
+            }
+            // 吸色途中不留半截筆跡
+            self.smoke.draft = None;
+            self.smoke.moving = None;
+        } else {
+            let tool = self.smoke.mask_tool;
+            let radius = self.smoke.brush_radius();
+            // 拖曳過程只畫形狀，放開才寫進參數觸發重算。
+            // 沒選工具時左鍵是拿來平移放大後的預覽的，不畫東西。
+            // 物件也是用拖的——框住要選的東西，放開才去算框裡那個東西的輪廓
+            if tool == Some(MaskTool::Object)
+                && resp
+                    .hover_pos()
+                    .is_some_and(|p| img.contains(p) && hit.contains(p))
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            // 按在已經畫好的形狀上＝把它整個搬走，不是再畫一個。
+            // 想在既有形狀裡面再畫一個，就從它外面開始拖
+            if resp.drag_started() && outlines {
+                let eff = self.smoke.effective();
+                self.smoke.moving = resp
+                    .interact_pointer_pos()
+                    .filter(|p| hit.contains(*p))
+                    .and_then(|p| shape_at(&eff.shapes, p, img))
+                    .filter(|&i| shape_movable(&eff.shapes[i]))
+                    .map(|i| (i, egui::Vec2::ZERO));
+            }
+            // 拖到一半視窗失焦之類的情況不會送 drag_stopped，
+            // 沒有這道保險就會永遠卡在搬移狀態
+            if self.smoke.moving.is_some() && !resp.dragged() && !resp.drag_stopped() {
+                self.smoke.moving = None;
+            }
+            if self.smoke.moving.is_some() {
+                let d = resp.drag_delta();
+                if let Some((_, acc)) = self.smoke.moving.as_mut() {
+                    *acc += egui::vec2(d.x / img.width(), d.y / img.height());
+                }
+                if resp.drag_stopped() {
+                    if let Some((i, acc)) = self.smoke.moving.take() {
+                        let mut v = self.smoke.effective();
+                        if let Some(s) = v.shapes.get(i) {
+                            v.shapes[i] = shape_moved(s, acc);
+                            self.smoke.set_params(v);
+                        }
+                    }
+                }
+                // 搬移中不再開新的 draft，也不處理下面那一整段
+                self.smoke.draft = None;
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                return;
+            }
+            if resp.drag_started() {
+                self.smoke.draft = tool.and_then(|tool| {
+                    resp.interact_pointer_pos()
+                        .filter(|p| img.contains(*p) && hit.contains(*p))
+                        .map(to_norm)
+                        .and_then(|p| match tool {
+                            MaskTool::Rect => Some(Draft::Rect(p, p)),
+                            MaskTool::Linear => Some(Draft::Linear(p, p)),
+                            MaskTool::Radial => Some(Draft::Radial(p, p)),
+                            MaskTool::Brush => Some(Draft::Brush(vec![[p.x, p.y]])),
+                            MaskTool::Object => Some(Draft::Object(p, p)),
+                        })
+                });
+            }
+            // 游標停在既有形狀上時先講清楚「這個抓得動」
+            if self.smoke.draft.is_none() && outlines {
+                if let Some(p) = resp.hover_pos().filter(|p| hit.contains(*p)) {
+                    let eff = self.smoke.effective();
+                    if shape_at(&eff.shapes, p, img)
+                        .is_some_and(|i| shape_movable(&eff.shapes[i]))
+                    {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                }
+            }
+            let now = resp.interact_pointer_pos().map(to_norm);
+            if let (Some(d), Some(now)) = (self.smoke.draft.as_mut(), now) {
+                let stopped = resp.drag_stopped();
+                match d {
+                    Draft::Rect(_, b)
+                    | Draft::Linear(_, b)
+                    | Draft::Radial(_, b)
+                    | Draft::Object(_, b) => *b = now,
+                    Draft::Brush(pts) => {
+                        // 取樣點太密只是把資料撐大，畫出來一模一樣；
+                        // 放開的那一下不論多近都要收進來，筆跡才不會短一截
+                        let far = pts.last().is_none_or(|l| {
+                            let (dx, dy) = (now.x - l[0], now.y - l[1]);
+                            dx * dx + dy * dy > BRUSH_STEP * BRUSH_STEP
+                        });
+                        if pts.len() < MAX_BRUSH_PTS && (far || stopped) {
+                            pts.push([now.x, now.y]);
+                        }
+                    }
+                }
+            }
+            let invert = self.smoke.radial_invert;
+            if let Some(d) = &self.smoke.draft {
+                match d {
+                    // 框選沿用原本「框外壓暗」的即時回饋；物件也是拉一個框，
+                    // 拉的當下畫的就是同一個東西（放開才知道裡面選到什麼）
+                    Draft::Rect(a, b) | Draft::Object(a, b) => paint_selection(
+                        ui,
+                        img,
+                        egui::Rect::from_two_pos(to_screen(*a), to_screen(*b)),
+                    ),
+                    d => {
+                        if let Some(s) = d.to_shape(radius, invert) {
+                            paint_shape(ui, img, &s, self.smoke.feather())
+                        }
+                    }
+                }
+            }
+            if resp.drag_stopped() {
+                match self.smoke.draft.take() {
+                    // 物件：框只講「東西在這一塊裡」，輪廓要從照片內容算出來
+                    Some(Draft::Object(a, b)) => self.smoke_pick_object(a, b),
+                    Some(d) => {
+                        if let Some(shape) = d.to_shape(radius, invert).and_then(|s| s.cleaned()) {
+                            let mut v = self.smoke.effective();
+                            if v.add_shape(shape) {
+                                self.smoke.set_params(v);
+                            } else {
+                                self.smoke.error = Some(format!(
+                                    "遮色片最多 {} 個形狀，請先清除再畫",
+                                    dehaze::MAX_SHAPES
+                                ));
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            // 筆刷游標：先看得到會刷多粗，才不會塗完才發現不對。
+            // 一樣只在照片上才換游標，移出去就回到箭頭
+            if tool == Some(MaskTool::Brush) {
+                if let Some(p) = resp
+                    .hover_pos()
+                    .filter(|p| img.contains(*p) && hit.contains(*p))
+                {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    let r = radius * img.width().max(img.height());
+                    ui.painter().circle_stroke(
+                        p,
+                        r,
+                        egui::Stroke::new(1.2, theme::ACCENT),
+                    );
+                }
+            }
+        }
+    }
+
+    /// 「物件」工具：在預覽底圖上找出框住的那一塊裡面那個東西的輪廓，
+    /// 圈成一個遮色片形狀
+    fn smoke_pick_object(&mut self, a: egui::Pos2, b: egui::Pos2) {
+        let Some(base) = self.smoke.base.clone() else {
+            return;
+        };
+        // 手滑點了一下就當作沒這回事（見 [`OBJECT_MIN_BOX`]）
+        if (b.x - a.x).abs() < OBJECT_MIN_BOX || (b.y - a.y).abs() < OBJECT_MIN_BOX {
+            return;
+        }
+        let sel = Draft::region(a, b);
+        let (f, e) = (self.smoke.object_feather, self.smoke.object_edge);
+        match dehaze::select_object(&base, sel, f, e) {
+            Some(o) => {
+                let mut v = self.smoke.effective();
+                if v.add_shape(dehaze::Shape::Object(o)) {
+                    self.smoke.error = None;
+                    self.smoke.set_params(v);
+                } else {
+                    self.smoke.error =
+                        Some(format!("遮色片最多疊 {} 個形狀", dehaze::MAX_SHAPES));
+                }
+            }
+            // 框裡與框外長得一樣就分不出東西：與其默默沒反應，講清楚怎麼辦
+            None => {
+                self.smoke.error =
+                    Some("這個框裡分不出東西——把框拉得貼近要選的那個東西再框一次".into())
+            }
+        }
+    }
+
+    /// 就地改剛選好的那個物件的羽化／邊緣（不重跑分割，見 [`dehaze::Object::refined`]）。
+    /// 剛框完就想調鬆一點是最常見的用法，不必刪掉重框
+    fn smoke_refine_object(&mut self, feather: i32, edge: i32) {
+        let mut v = self.smoke.effective();
+        if let Some(dehaze::Shape::Object(o)) = v.last_shape_mut() {
+            *o = o.refined(feather, edge);
+            self.smoke.set_params(v);
         }
     }
 
@@ -4444,43 +12413,4640 @@ impl App {
         Some(base.get_pixel(x, y).0)
     }
 
-    /// 「去煙霧」工具視窗：單張照片去除煙火的煙霧、保留煙火細節
-    fn ui_smoke_window(&mut self, ctx: &egui::Context) {
-        if !self.smoke.open {
+    // ---------- 影片去煙霧工具 ----------
+
+    /// 挑要去煙霧的影片（可多選）。
+    ///
+    /// 「選擇」是**換一批**：挑到的第一支當成要預覽的那支（movie_set_src 會
+    /// 把上一批收掉），其餘照挑選順序排進佇列，全部套同一組設定一起跑。
+    /// 要在現有的這批上再加幾支請用「➕ 加入影片」
+    fn movie_pick(&mut self, ctx: &egui::Context) {
+        let Some(picked) = dir_dialog(LastDir::MovieSource)
+            .add_filter("影片", VIDEO_EXTS)
+            .set_title("選擇要去煙霧的影片（可多選）")
+            .pick_files()
+        else {
+            return;
+        };
+        let mut it = picked.into_iter();
+        // 第一支不先過 is_video：副檔名沒認出來時交給 movie_set_src 去試，
+        // 讀不到才好把 ffprobe 的原因寫出來（其餘幾支由 movie_append 篩掉）
+        let Some(first) = it.next() else {
+            return;
+        };
+        remember_dir(LastDir::MovieSource, &first);
+        self.movie_set_src(first, ctx);
+        // 第一支就讀不到時已經整個歸零，剩下的不必再排
+        if self.movie.src.is_some() {
+            self.movie_append(it.collect(), ctx);
+        }
+    }
+
+    /// 「➕ 加入影片」：把更多影片排進這一批，全部用同一組設定輸出。
+    ///
+    /// 還沒選影片時，第一支就當成要預覽的那支、其餘排進佇列
+    fn movie_add(&mut self, ctx: &egui::Context) {
+        let Some(picked) = dir_dialog(LastDir::MovieSource)
+            .add_filter("影片", VIDEO_EXTS)
+            .set_title("加入要一起去煙霧的影片（可多選）")
+            .pick_files()
+        else {
+            return;
+        };
+        if let Some(p) = picked.first() {
+            remember_dir(LastDir::MovieSource, p);
+        }
+        self.movie_append(picked, ctx);
+    }
+
+    /// 拖曳排序：把整批清單的第 `from` 支搬到第 `to` 個位置。
+    ///
+    /// 清單的第一支同時是「正在預覽的那支」，所以搬到／搬離第一位時
+    /// 要順便換預覽（會重新取一格畫面）
+    fn movie_reorder(&mut self, from: usize, to: usize, ctx: &egui::Context) {
+        let mut list = self.movie.jobs();
+        if from >= list.len() || to >= list.len() || from == to {
             return;
         }
-        let mut open = self.smoke.open;
+        let p = list.remove(from);
+        list.insert(to, p);
+        // 第一支換人了才需要重新取畫面，其餘只是順序變了
+        let head_changed = self.movie.src.as_ref() != list.first();
+        self.movie.queue = list[1..].to_vec();
+        if head_changed {
+            let head = list[0].clone();
+            let rest = std::mem::take(&mut self.movie.queue);
+            self.movie_set_src(head, ctx);
+            if self.movie.src.is_some() {
+                self.movie.queue = rest;
+            }
+        }
+    }
+
+    /// 改成預覽佇列裡的第 `i` 支。
+    ///
+    /// 預覽哪一支，輸出時就先跑哪一支，所以換預覽＝把它調到最前面；
+    /// 其餘的相對順序不動（原本 A|B,C 選 C 之後是 C|A,B）。
+    /// 設定（去煙參數、尺寸）完全不變——那本來就是整批共用的
+    fn movie_show_queued(&mut self, i: usize, ctx: &egui::Context) {
+        if i >= self.movie.queue.len() {
+            return;
+        }
+        let pick = self.movie.queue.remove(i);
+        // reset_for 會把佇列清掉（換片＝重來一批），所以先接住、換完再放回去
+        let mut rest = std::mem::take(&mut self.movie.queue);
+        if let Some(old) = self.movie.src.clone() {
+            rest.insert(0, old);
+        }
+        self.movie_set_src(pick, ctx);
+        // 讀不到那一支時 movie_set_src 已經整個歸零，這時佇列也不必留
+        if self.movie.src.is_some() {
+            self.movie.queue = rest;
+        }
+    }
+
+    /// 把 `picked` 併進這一批（拖曳進來、已經有影片時也走這裡）
+    fn movie_append(&mut self, picked: Vec<PathBuf>, ctx: &egui::Context) {
+        let mut it = picked.into_iter().filter(|p| is_video(p));
+        if self.movie.src.is_none() {
+            let Some(first) = it.next() else { return };
+            self.movie_set_src(first, ctx);
+        }
+        let before = self.movie.queue.len();
+        for p in it {
+            // 同一支不重複排（正在預覽的那支已經在這一批裡了）
+            if Some(&p) != self.movie.src.as_ref() && !self.movie.queue.contains(&p) {
+                self.movie.queue.push(p);
+            }
+        }
+        if self.movie.queue.len() > before {
+            self.movie.error = None;
+        }
+    }
+
+    /// 換一支來源影片：先量出它的寬高、長度、影格率與有沒有聲音，
+    /// 之後的預覽與輸出都照這一份走
+    fn movie_set_src(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if let Err(e) = ensure_ffmpeg(|| {}) {
+            self.movie.error = Some(e);
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match movie::probe(&path) {
+            Ok(info) => {
+                self.movie.reset_for(Some(path), Some(info));
+                ctx.request_repaint();
+            }
+            Err(e) => {
+                self.movie.reset_for(None, None);
+                self.movie.error = Some(format!("讀不到影片「{name}」：{e}"));
+            }
+        }
+    }
+
+    /// 從影片取 `at` 那一格當預覽底圖
+    fn spawn_movie_grab(&mut self, ctx: &egui::Context) {
+        let (Some(src), Some(info)) = (self.movie.src.clone(), self.movie.info.clone()) else {
+            return;
+        };
+        // 最後一格之後沒有畫面可取，時間軸拉到底時退開一點
+        let at = self.movie.at.clamp(0.0, (info.secs - 0.05).max(0.0));
+        // 4K 影片整格拿來畫預覽只是慢，縮到與照片模組同一個尺規；
+        // 強度之後會照這個縮放折算回去（見 dehaze::preview_strength）。
+        //
+        // 選了比較小的輸出尺寸時，預覽也不該比成品還大——去煙的結果本來就
+        // 跟尺寸有關（見 dehaze 的工作解析度），預覽比成品細就會看到成品沒有的東西
+        let (ow, oh) = self.movie.out_dims().unwrap_or((info.w, info.h));
+        let cap = SMOKE_PREVIEW_MAX.min(ow.max(oh));
+        let max_long = (info.long() > cap).then_some(cap);
+        self.movie.busy = MovieBusy::Grabbing;
+        self.movie.grabbed_at = Some(self.movie.at);
+        let want = self.movie.at;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.movie.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let r = movie::preview_frame(&src, at, max_long);
+            let _ = tx.send(MovieMsg::Grabbed(want, r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 對預覽底圖跑一次去煙（與輸出走的是同一支 [`dehaze::remove_smoke`]）
+    fn spawn_movie_render(&mut self, ctx: &egui::Context) {
+        let (Some(base), Some(info)) = (self.movie.base.clone(), self.movie.info.clone()) else {
+            return;
+        };
+        let params = self.movie.params.clone();
+        let at = self.movie.at;
+        // 預覽是縮圖，估煙霧層時少了原尺寸的最小值池化，同樣的強度會去得比
+        // 成品乾淨；畫之前先折算回去，滑桿上的數字才代表成品的程度
+        //
+        // 折算的基準是**成品**的長邊而不是來源的：縮小是在去煙之前做的，
+        // 真正被去煙的那一格就是成品尺寸
+        let (ow, oh) = self.movie.out_dims().unwrap_or((info.w, info.h));
+        let mut draw = params.clone();
+        draw.strength = dehaze::preview_strength(
+            params.strength,
+            ow.max(oh),
+            base.width().max(base.height()),
+        );
+        // 天空範圍的尺度同樣照成品的那一格換算（見 SmokeParams::preview_of）
+        draw.preview_of = Some(ow.max(oh));
+        self.movie.busy = MovieBusy::Rendering;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.movie.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let out = dehaze::remove_smoke(&base, &draw);
+            let _ = tx.send(MovieMsg::Preview(params, at, out));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 整支影片跑完並輸出成新檔。排了好幾支時就一支接一支跑完，
+    /// 全部套同一組參數（見 [`MovieTool::queue`]）
+    fn movie_export(&mut self, ctx: &egui::Context) {
+        let (Some(src), Some(info)) = (self.movie.src.clone(), self.movie.info.clone()) else {
+            return;
+        };
+        let jobs = self.movie.jobs();
+        let stem = |p: &Path| {
+            p.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "影片".into())
+        };
+        // 合併：好幾支接成一支，所以照「一支」那條路問一個檔名
+        let merging = jobs.len() > 1 && self.movie.merge;
+        // 一支就照舊讓人自己命名；好幾支則改挑資料夾，每支各自取
+        // 「原檔名_去煙.mp4」——一支一支問名字太煩，而且中途還要顧著回來按
+        let outs: Vec<PathBuf> = if jobs.len() > 1 && !merging {
+            // 選資料夾要用 folder_dialog：直接開在上次那個資料夾裡面，
+            // 底下沒有子資料夾時畫面會只剩一句「沒有符合搜尋條件的項目」
+            // （見 folder_dialog 的說明）
+            let dialog = match load_last_dir(LastDir::MovieOutput) {
+                Some(_) => folder_dialog(LastDir::MovieOutput),
+                None => match src.parent() {
+                    Some(d) => file_dialog().set_directory(d),
+                    None => file_dialog(),
+                },
+            };
+            let Some(dir) = dialog
+                .set_title(format!("這 {} 支影片要存到哪個資料夾", jobs.len()))
+                .pick_folder()
+            else {
+                return;
+            };
+            remember_dir(LastDir::MovieOutput, &dir);
+            jobs.iter()
+                .map(|p| next_free_path(&dir.join(format!("{}_去煙.mp4", stem(p)))))
+                .collect()
+        } else {
+            let dialog = match load_last_dir(LastDir::MovieOutput) {
+                Some(_) => dir_dialog(LastDir::MovieOutput),
+                // 還沒輸出過就先指到來源影片自己的資料夾
+                None => match src.parent() {
+                    Some(d) => file_dialog().set_directory(d),
+                    None => file_dialog(),
+                },
+            };
+            let Some(mut out) = dialog
+                .add_filter("MP4 影片", &["mp4"])
+                .set_file_name(if merging {
+                    format!("{}_去煙_合併.mp4", stem(&src))
+                } else {
+                    format!("{}_去煙.mp4", stem(&src))
+                })
+                .set_title(if merging {
+                    "合併後的影片要存成"
+                } else {
+                    "影片要存成"
+                })
+                .save_file()
+            else {
+                return;
+            };
+            // 對話框可能回一個沒有副檔名的名字；補完之後那個名字使用者沒被問過，
+            // 所以要自己再確認一次會不會蓋到別的檔
+            if out.extension().is_none() {
+                out.set_extension("mp4");
+                if !confirm_overwrite(&out) {
+                    return;
+                }
+            }
+            remember_dir(LastDir::MovieOutput, &out);
+            vec![out]
+        };
+        // 寫回自己會邊讀邊蓋，來源直接毀掉
+        if let Some(i) = outs.iter().position(|o| jobs.iter().any(|s| same_path_ci(o, s))) {
+            self.movie.error = Some(format!(
+                "「{}」會蓋掉來源影片，請換一個檔名或資料夾",
+                outs[i].file_name().unwrap_or_default().to_string_lossy()
+            ));
+            return;
+        }
+
+        // 合併時每一段先寫進暫存資料夾，全部跑完再接成一支（見 [`movie::concat`]）
+        let final_out = outs[0].clone();
+        let parts: Vec<PathBuf> = if merging {
+            let dir = match merge_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    self.movie.error = Some(format!("建立暫存資料夾失敗：{e}"));
+                    return;
+                }
+            };
+            jobs.iter()
+                .enumerate()
+                .map(|(i, p)| dir.join(format!("{i:03}_{}.mp4", stem(p))))
+                .collect()
+        } else {
+            outs.clone()
+        };
+
+        let params = self.movie.params.clone();
+        // 分區調色與去煙參數一樣，整批共用一組
+        let grade = self.movie.grade.clone();
+        let size = self.movie.size;
+        self.movie.cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&self.movie.cancel);
+        self.movie.busy = MovieBusy::Exporting;
+        self.movie.done = 0;
+        self.movie.started = Some(Instant::now());
+        self.movie.out_path = Some(outs[0].clone());
+        self.movie.finished = None;
+        self.movie.error = None;
+        self.movie.batch_at = 0;
+        self.movie.batch_total = jobs.len();
+        self.movie.batch_frames = info.frames();
+        self.movie.batch_name = jobs[0]
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.movie.batch_errs.clear();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.movie.rx = Some(rx);
+        let ctx = ctx.clone();
+        let first_info = info;
+        thread::spawn(move || {
+            // 與照片轉影片用同一組編碼器（有硬體就走硬體）
+            let codec = detect_h264_encoder().codec_args();
+            let report = {
+                let tx = tx.clone();
+                let ctx = ctx.clone();
+                move |done: u64| {
+                    let _ = tx.send(MovieMsg::Progress(done));
+                    ctx.request_repaint();
+                }
+            };
+            let mut last_ok: Option<PathBuf> = None;
+            // 合併時：成功跑完的那幾段（等一下要照順序接起來）
+            let mut done_parts: Vec<PathBuf> = Vec::new();
+            let mut aborted = false;
+            for (i, (src, out)) in jobs.iter().zip(parts.iter()).enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    aborted = true;
+                    break;
+                }
+                let name = src
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                // 第一支的資料在選檔時就量過了，其餘的到這裡才量
+                let info = if i == 0 {
+                    Ok(first_info.clone())
+                } else {
+                    movie::probe(src)
+                };
+                let info = match info {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx.send(MovieMsg::Failed(format!("{name}：讀不到（{e}）")));
+                        continue;
+                    }
+                };
+                let _ = tx.send(MovieMsg::Started(i, name.clone(), info.frames()));
+                ctx.request_repaint();
+                // 尺寸、工作執行緒數都照**這一支**自己的來：一批裡混著
+                // 4K 與 1080p 時，記憶體預算不能拿第一支的去套全部
+                let (ow, oh) = size.apply(info.w, info.h);
+                let scale = ((ow, oh) != (info.w, info.h)).then_some((ow, oh));
+                let workers = movie_workers(ow, oh, grade.is_active());
+                match movie::export(
+                    src, out, &info, &params, &grade, scale, &codec, workers, &cancel,
+                    &report,
+                ) {
+                    Ok(()) => {
+                        last_ok = Some(out.clone());
+                        done_parts.push(out.clone());
+                    }
+                    // 空訊息＝使用者按了中止，不是這一支的問題
+                    Err(e) if e.is_empty() => {
+                        aborted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(MovieMsg::Failed(format!("{name}：{e}")));
+                    }
+                }
+            }
+            // 合併：把跑好的那幾段接成一支。接不起來（各段規格不同）時
+            // 不能把使用者剛才等的那幾十分鐘丟掉——改成把各段搬到成品旁邊
+            if merging && !aborted && !done_parts.is_empty() {
+                match movie::concat(&done_parts, &final_out) {
+                    Ok(()) => last_ok = Some(final_out.clone()),
+                    Err(e) => {
+                        let dir = final_out.parent().unwrap_or(Path::new("."));
+                        let mut moved = 0;
+                        for p in &done_parts {
+                            // 暫存檔名前面有排序用的編號，搬出去時拿掉
+                            let name = p
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let name = name.split_once('_').map_or(name.clone(), |(_, r)| r.into());
+                            let to = next_free_path(&dir.join(format!("{name}_去煙.mp4")));
+                            if std::fs::rename(p, &to).is_ok() || std::fs::copy(p, &to).is_ok() {
+                                moved += 1;
+                                last_ok = Some(to);
+                            }
+                        }
+                        let _ = tx.send(MovieMsg::Failed(format!(
+                            "合併失敗（各段的尺寸或影格率不一致時接不起來）：{e}。\
+                             已改成分開輸出 {moved} 支到同一個資料夾"
+                        )));
+                    }
+                }
+            }
+            // 暫存的片段清掉（合併成功、或搬走之後都不必留）
+            if merging {
+                if let Some(d) = parts.first().and_then(|p| p.parent()) {
+                    let _ = std::fs::remove_dir_all(d);
+                }
+            }
+            let r = match last_ok {
+                Some(p) => Ok(p),
+                None => Err(String::new()),
+            };
+            let _ = tx.send(MovieMsg::Done(r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 收背景執行緒的回報，並在閒下來時把還缺的那一步排下去
+    fn poll_movie(&mut self, ctx: &egui::Context) {
+        // 輸出時進度會一直來，一輪收乾淨再處理
+        let msgs: Vec<MovieMsg> = match &self.movie.rx {
+            Some(rx) => rx.try_iter().collect(),
+            None => Vec::new(),
+        };
+        for m in msgs {
+            match m {
+                MovieMsg::Grabbed(at, res) => {
+                    // 拖時間軸拖過頭了：這一格已經沒人要看
+                    if (at - self.movie.at).abs() > 1e-6 {
+                        self.movie.busy = MovieBusy::Idle;
+                        continue;
+                    }
+                    match res {
+                        Ok(img) => {
+                            self.movie.base_tex =
+                                Some(load_rgb_texture(ctx, "movie_base", &img));
+                            self.movie.base = Some(Arc::new(img));
+                            self.movie.after = None;
+                            self.movie.after_tex = None;
+                            self.movie.rendered = None;
+                            // 換了一格：調色與天際線都要照新的那一格重算
+                            self.movie.graded.clear();
+                            self.movie.masks = None;
+                            self.movie.error = None;
+                        }
+                        Err(e) => self.movie.error = Some(e),
+                    }
+                    self.movie.busy = MovieBusy::Idle;
+                }
+                MovieMsg::Preview(params, at, img) => {
+                    // 算的過程中又動了滑桿：這張已經過期，等下一輪
+                    if params == self.movie.params && (at - self.movie.at).abs() <= 1e-6 {
+                        // 先把去煙的結果貼上去，調色接著在下一輪自己補上
+                        // （勾了調色時會再換一張，見 [`App::movie_regrade`]）
+                        self.movie.after_tex =
+                            Some(load_rgb_texture(ctx, "movie_after", &img));
+                        self.movie.after = Some(Arc::new(img));
+                        self.movie.rendered = Some((params, at));
+                        self.movie.graded.clear();
+                        self.movie.masks = None;
+                    }
+                    self.movie.busy = MovieBusy::Idle;
+                }
+                MovieMsg::Graded(grade, at, img, masks) => {
+                    // 這一格的天際線與去煙結果綁在一起，只要還停在同一格
+                    // 就留著（就算調色本身已經過期，權重仍然算數）
+                    if (at - self.movie.at).abs() <= 1e-6 && !self.movie.needs_render() {
+                        self.movie.masks = Some(masks);
+                        if grade == self.movie.grade.active() {
+                            self.movie.after_tex =
+                                Some(load_rgb_texture(ctx, "movie_after", &img));
+                            self.movie.graded = grade;
+                        }
+                    }
+                    self.movie.busy = MovieBusy::Idle;
+                }
+                MovieMsg::Progress(done) => self.movie.done = done,
+                MovieMsg::Started(i, name, frames) => {
+                    // 換下一支了：進度歸零，進度條照這一支的長度算
+                    self.movie.batch_at = i;
+                    self.movie.batch_name = name;
+                    self.movie.batch_frames = frames;
+                    self.movie.done = 0;
+                    self.movie.started = Some(Instant::now());
+                }
+                MovieMsg::Failed(e) => self.movie.batch_errs.push(e),
+                MovieMsg::Done(res) => {
+                    self.movie.busy = MovieBusy::Idle;
+                    self.movie.started = None;
+                    self.movie.out_path = None;
+                    match res {
+                        Ok(p) => self.movie.finished = Some(p),
+                        // 空訊息＝使用者自己按了中止，不是出事
+                        Err(e) if e.is_empty() => {}
+                        Err(e) => self.movie.error = Some(e),
+                    }
+                    // 有幾支失敗就一起說（成功的那幾支照樣留著）
+                    if !self.movie.batch_errs.is_empty() {
+                        let shown: Vec<String> =
+                            self.movie.batch_errs.iter().take(3).cloned().collect();
+                        let more = self.movie.batch_errs.len().saturating_sub(shown.len());
+                        let mut m =
+                            format!("{} 支沒有輸出：{}", self.movie.batch_errs.len(), shown.join("；"));
+                        if more > 0 {
+                            m.push_str(&format!("…等另外 {more} 支"));
+                        }
+                        self.movie.error = Some(m);
+                    }
+                }
+            }
+        }
+        // 閒著就把還缺的那一步排下去：先取格，再算去煙，最後才調色。
+        // 輸出期間不動預覽——CPU 全給輸出，預覽也不會有人看
+        if self.movie.busy != MovieBusy::Idle || self.movie.src.is_none() {
+            return;
+        }
+        if self.movie.grabbed_at != Some(self.movie.at) {
+            self.spawn_movie_grab(ctx);
+        } else if self.movie.base.is_some() && self.movie.needs_render() {
+            self.spawn_movie_render(ctx);
+        } else if self.movie.needs_grade() {
+            self.movie_regrade(ctx);
+        }
+    }
+
+    /// 預覽的分區調色：去煙結果沿用快取，只重跑調色那一段
+    /// （拖調色滑桿、勾選三區時走這一條，見 [`edit::apply_region_grade`]）
+    fn movie_regrade(&mut self, ctx: &egui::Context) {
+        let Some(after) = self.movie.after.clone() else {
+            return;
+        };
+        let want = self.movie.grade.active();
+        // 三區全部取消了：去煙的結果本來就在手上，直接貼回畫面，
+        // 不必為了「什麼都不調」再開一條執行緒
+        if want.is_empty() {
+            self.movie.after_tex = Some(load_rgb_texture(ctx, "movie_after", &after));
+            self.movie.graded.clear();
+            return;
+        }
+        let grade = self.movie.grade.clone();
+        let at = self.movie.at;
+        // 天際線只跟去煙結果有關：同一格拖滑桿時沿用上次量好的那一份
+        let masks = self.movie.masks.clone();
+        self.movie.busy = MovieBusy::Rendering;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.movie.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let masks = masks.unwrap_or_else(|| Arc::new(edit::RegionMasks::new(&after)));
+            let mut out = (*after).clone();
+            edit::apply_region_grade(&mut out, &grade, &masks);
+            let _ = tx.send(MovieMsg::Graded(want, at, out, masks));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 「影片去煙霧」模組：整支影片逐格套上同一組去煙參數，輸出成新影片
+    fn ui_movie_module(&mut self, ctx: &egui::Context) {
         let mut pick = false;
-        let mut save = false;
-        let mut reset = false;
-        let mut goto: Option<usize> = None;
-        // 尺寸依螢幕換算並設上限：預覽圖若照 available_height 展開，
-        // 視窗會被撐到螢幕外、底下的滑桿與另存按鈕就看不到了
-        let screen = ctx.screen_rect();
-        let win_w = (screen.width() * 0.72).clamp(640.0, 1180.0);
-        let img_max_h = (screen.height() * 0.60).max(200.0);
-        egui::Window::new("💨  去煙霧")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(win_w)
-            .min_width(560.0)
-            .max_height(screen.height() * 0.92)
-            // pivot + default_pos 只決定「開啟時置中」，之後仍可自由拖動；
-            // 用 anchor 會把視窗永久釘死在畫面中央
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(screen.center())
+        // 「➕ 加入影片」：排進這一批，全部套同一組設定
+        let mut add = false;
+        // 從佇列裡拿掉第幾支
+        let mut drop_queued: Option<usize> = None;
+        // 改成預覽佇列裡的第幾支
+        let mut show_queued: Option<usize> = None;
+        // 移除正在預覽的那一支（清單第一顆的 ✕）
+        let mut drop_first = false;
+        // 拖曳排序：把第幾支搬到第幾個位置（都是整批清單的索引）
+        let mut move_to: Option<(usize, usize)> = None;
+        let mut clear = false;
+        let mut export = false;
+        let mut stop = false;
+        let busy = self.movie.busy;
+        let exporting = busy == MovieBusy::Exporting;
+        let side_frame = egui::Frame::default()
+            .fill(theme::PANEL)
+            // 內距與照片轉影片的調色面板相同，四個模組的側欄一樣寬鬆
+            .inner_margin(egui::Margin::symmetric(14, 12));
+        let center_frame = egui::Frame::default()
+            .fill(theme::BG)
+            .inner_margin(egui::Margin::same(12));
+
+        if self.movie.src.is_some() {
+            egui::SidePanel::right("movie_side")
+                .frame(side_frame)
+                .resizable(true)
+                .default_width(330.0)
+                .width_range(300.0..=430.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("movie_side_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let (e, s) = self.ui_movie_side(ui);
+                            export |= e;
+                            stop |= s;
+                        });
+                });
+        }
+
+        egui::CentralPanel::default()
+            .frame(center_frame)
             .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!exporting, egui::Button::new("🎥  選擇影片"))
+                        .on_hover_text(
+                            "挑要去煙霧的影片（可多選）：第一支先拿來預覽、其餘排進這一批，\n\
+                             這會換掉目前這一批；也可以直接把影片拖曳進來",
+                        )
+                        .clicked()
+                    {
+                        pick = true;
+                    }
+                    // 同一場煙火拍的好幾段設定通常照搬：排進來一起跑，
+                    // 不必一支跑完再回來挑下一支、重調一次
+                    if ui
+                        .add_enabled(!exporting, egui::Button::new("➕  加入影片"))
+                        .on_hover_text(
+                            "再排幾支影片進來，**全部套同一組設定**一次跑完（可多選）。\n\
+                             輸出時改成挑一個資料夾，每支各存成「原檔名_去煙.mp4」",
+                        )
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                    if self.movie.src.is_some()
+                        && ui
+                            .add_enabled(!exporting, egui::Button::new("🗑  清除"))
+                            .on_hover_text("放掉這批影片，回到選擇影片的畫面")
+                            .clicked()
+                    {
+                        clear = true;
+                    }
+                    if let (Some(src), Some(info)) = (&self.movie.src, &self.movie.info) {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(
+                                src.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                            )
+                            .size(12.0)
+                            .color(theme::TEXT),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}×{} · {} · {:.0} fps · {}",
+                                info.w,
+                                info.h,
+                                fmt_video_len(info.secs),
+                                info.fps,
+                                if info.audio.is_some() {
+                                    "有聲音"
+                                } else {
+                                    "沒有聲音"
+                                }
+                            ))
+                            .size(11.5)
+                            .color(theme::TEXT_WEAK),
+                        );
+                    }
+                });
+                // 這一批有哪幾支：點檔名換預覽、拖曳調順序、點 ✕ 拿掉。
+                // 清單的順序就是輸出（與合併）的順序，第一支同時是預覽中的那支
+                if !self.movie.queue.is_empty() {
+                    ui.add_space(4.0);
+                    let jobs = self.movie.jobs();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "這一批 {} 支（同一組設定 · 點檔名切換預覽 · 拖曳調順序）",
+                                jobs.len()
+                            ))
+                            .size(11.5)
+                            .color(theme::TEXT_WEAK),
+                        );
+                        for (i, p) in jobs.iter().enumerate() {
+                            let name = p
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let (hit, dropped) = movie_chip(ui, &name, i == 0, !exporting, i);
+                            match hit {
+                                // 索引 0 是正在預覽的那支，佇列的編號要減一
+                                ChipHit::Name if i > 0 => show_queued = Some(i - 1),
+                                ChipHit::Remove if i > 0 => drop_queued = Some(i - 1),
+                                // 移除正在預覽的那支：改成預覽下一支（清單順序遞補）
+                                ChipHit::Remove => drop_first = true,
+                                _ => {}
+                            }
+                            if let Some(from) = dropped {
+                                move_to = Some((from, i));
+                            }
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+
+                if let Some(e) = &self.movie.error {
+                    ui.label(
+                        egui::RichText::new(format!("✖ {e}"))
+                            .size(12.0)
+                            .color(theme::ERROR),
+                    );
+                    ui.add_space(6.0);
+                }
+
+                if self.movie.src.is_none() {
+                    if movie_empty_state(ui) {
+                        pick = true;
+                    }
+                    return;
+                }
+                self.ui_movie_preview(ui);
+            });
+
+        if pick {
+            self.movie_pick(ctx);
+        }
+        if add {
+            self.movie_add(ctx);
+        }
+        if let Some((from, to)) = move_to {
+            self.movie_reorder(from, to, ctx);
+        }
+        if let Some(i) = show_queued {
+            self.movie_show_queued(i, ctx);
+        }
+        if let Some(i) = drop_queued {
+            if i < self.movie.queue.len() {
+                self.movie.queue.remove(i);
+            }
+        }
+        // 移除正在預覽的那支：下一支遞補上來預覽；沒有下一支就整個清空
+        if drop_first {
+            if self.movie.queue.is_empty() {
+                self.movie.reset_for(None, None);
+            } else {
+                self.movie_show_queued(0, ctx);
+                // 換上來之後，原本那支被排到佇列開頭，拿掉它
+                if !self.movie.queue.is_empty() {
+                    self.movie.queue.remove(0);
+                }
+            }
+        }
+        if clear {
+            self.movie.reset_for(None, None);
+        }
+        if export {
+            self.movie_export(ctx);
+        }
+        if stop {
+            self.movie.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 「影片去煙霧」的分區調色：地景／天空／煙火各記一組滑桿，勾起來的
+    /// 那幾區才會被調（界線怎麼判見 [`edit::RegionMasks`]）。
+    ///
+    /// 滑桿與另外三個模組完全相同（[`adj_sliders`]），差別只在它作用的
+    /// 範圍是自動分出來的那一區，而不是整張畫面
+    fn ui_movie_grade(&mut self, ui: &mut egui::Ui, exporting: bool) {
+        // 按下去只記旗標，畫完這一列才跳確認框（見 ui_adjust_section 的說明）
+        let mut ask_clear = false;
+        ui.horizontal(|ui| {
+            section_toggle(ui, "調色", &mut self.movie.grade_open);
+            let dirty = self.movie.grade != RegionGrade::default();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 輸出中一律鎖住，與這個模組其他設定一樣
+                if dirty
+                    && ui
+                        .add_enabled(!exporting, egui::Button::new("↺ 清除調色").small())
+                        .on_hover_text("三區的勾選與滑桿一次全部歸零（去煙的設定不受影響）")
+                        .clicked()
+                {
+                    ask_clear = true;
+                }
+            });
+        });
+        if ask_clear
+            && ask2(
+                rfd::MessageLevel::Warning,
+                "清除調色",
+                "將清除分區調色（三區的勾選取消、滑桿全部歸零）。\n\
+                 去煙的設定不受影響。",
+                "清除",
+                "取消",
+            )
+        {
+            self.movie.grade = RegionGrade::default();
+        }
+        if !self.movie.grade_open {
+            return;
+        }
+        ui.label(
+            egui::RichText::new(
+                "去煙之後才套用。三區是每一格自己分的：天際線以上算天空、\
+                 天空裡亮起來的算煙火，其餘是地景",
+            )
+            .size(11.0)
+            .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(4.0);
+        ui.add_enabled_ui(!exporting, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for r in Region::ALL {
+                    ui.checkbox(&mut self.movie.grade.on[r.idx()], r.label())
+                        .on_hover_text(r.hint());
+                }
+            });
+            let on: Vec<Region> = Region::ALL
+                .into_iter()
+                .filter(|r| self.movie.grade.on[r.idx()])
+                .collect();
+            let Some(&first) = on.first() else {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("勾一區才有滑桿可以調")
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+                return;
+            };
+            // 三區各十二條一起排下來要捲上老半天，所以一次只顯示一區的滑桿。
+            // 沒顯示的那幾區照樣記著自己的數字，切回去就在
+            if !on.contains(&self.movie.grade_tab) {
+                self.movie.grade_tab = first;
+            }
+            if on.len() > 1 {
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("調哪一區")
+                            .size(12.5)
+                            .color(theme::TEXT_WEAK),
+                    );
+                    for r in on {
+                        // 動過的那幾區標一下，才不會以為別區的設定不見了
+                        let touched = !self.movie.grade.grade[r.idx()].grade_is_neutral();
+                        let text = if touched {
+                            format!("{}（已調）", r.label())
+                        } else {
+                            r.label().to_string()
+                        };
+                        if check_label(ui, self.movie.grade_tab == r, text).clicked() {
+                            self.movie.grade_tab = r;
+                        }
+                    }
+                });
+            }
+            let tab = self.movie.grade_tab;
+            // 列距收緊到與另外三個模組的調色面板相同（畫完再還原）
+            let keep_gap = ui.spacing().item_spacing.y;
+            ui.spacing_mut().item_spacing.y = ADJ_ROW_GAP;
+            adj_sliders(ui, &mut self.movie.grade.grade[tab.idx()]);
+            ui.spacing_mut().item_spacing.y = keep_gap;
+            ui.add_space(4.0);
+            if !self.movie.grade.grade[tab.idx()].grade_is_neutral()
+                && ui
+                    .small_button(format!("↺ {} 歸零", tab.label()))
+                    .on_hover_text("只把這一區的滑桿歸零，另外兩區不動")
+                    .clicked()
+            {
+                self.movie.grade.grade[tab.idx()] = Adjustments::default();
+            }
+        });
+    }
+
+    /// 右邊那條面板：去煙的四項核心參數、分區調色與輸出。
+    /// 回傳（按了輸出, 按了中止）
+    fn ui_movie_side(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
+        let (mut export, mut stop) = (false, false);
+        let exporting = self.movie.busy == MovieBusy::Exporting;
+
+        ui.label(
+            egui::RichText::new("去煙霧")
+                .size(SECTION_FONT)
+                .strong()
+                .color(theme::TEXT),
+        );
+        ui.add_space(4.0);
+        ui.add_enabled_ui(!exporting, |ui| {
+            let mut p = self.movie.params.clone();
+            slider_row(ui, &mut p.strength, 0, 100, "去除煙霧");
+            slider_row(ui, &mut p.detail, 0, 100, "細節");
+            ui.label(
+                egui::RichText::new("去除煙霧＝煙霧扣掉多少 · 細節＝煙火線條的保留程度")
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
+            );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut p.restore_trails, "補回煙裡的軌跡")
+                    .on_hover_text(
+                        "濃煙很亮時，估出來的煙霧層會比煙裡的軌跡還高，\n\
+                         相減把兩者一起扣成全黑——畫面上就是煙火被咬掉一塊。\n\
+                         勾著就把「比周圍高出來」的那一截撈回來",
+                    );
+                ui.checkbox(&mut p.sky_only, "只處理天空")
+                    .on_hover_text(
+                        "作用範圍自動限在天際線以上。\n\
+                         煙只飄在天空，但岸邊燈火與水面倒影又亮又連續，\n\
+                         估起來也像一層煙，扣下去整片會被壓暗",
+                    );
+            });
+            if p != self.movie.params {
+                self.movie.params = p;
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "整支影片套同一組設定。每一格自己判會讓扣掉的量一格一格跳，\
+                 看起來像畫面在閃",
+            )
+            .size(11.0)
+            .color(theme::TEXT_WEAK),
+        );
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+        self.ui_movie_grade(ui, exporting);
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("輸出")
+                .size(SECTION_FONT)
+                .strong()
+                .color(theme::TEXT),
+        );
+        ui.add_space(4.0);
+
+        // 輸出尺寸。縮小是在去煙**之前**做的，所以選小一號不只檔案小，
+        // 速度也直接跟著快——這件事要讓使用者看得到，不然不會知道可以這樣省時間
+        ui.add_enabled_ui(!exporting, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("尺寸").size(12.5).color(theme::TEXT_WEAK));
+                let before = self.movie.size;
+                egui::ComboBox::from_id_salt("movie_size")
+                    .selected_text(self.movie.size.label())
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        for s in MovieSize::ALL {
+                            check_value(ui, &mut self.movie.size, s, s.label());
+                        }
+                    });
+                if self.movie.size != before {
+                    // 預覽底圖的大小跟著輸出尺寸走，換了就要重取一格
+                    self.movie.grabbed_at = None;
+                }
+                if let (Some((ow, oh)), Some(i)) = (self.movie.out_dims(), self.movie.info.as_ref())
+                {
+                    let same = (ow, oh) == (i.w, i.h);
+                    ui.label(
+                        egui::RichText::new(format!("{ow}×{oh}"))
+                            .size(11.5)
+                            .color(if same { theme::TEXT_WEAK } else { theme::ACCENT }),
+                    )
+                    .on_hover_text(if same {
+                        "與來源同尺寸，不縮"
+                    } else {
+                        "縮小在去煙之前做，所以畫面愈小跑得愈快\n\
+                         （像素少一半，時間大約也少一半）"
+                    });
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        // 品質／速度：一支片子有上萬格，多花的時間是以「分鐘」計的，
+        // 所以這個取捨值得放在輸出旁邊讓人自己決定
+        ui.add_enabled_ui(!exporting, |ui| {
+            ui.horizontal(|ui| {
+                let fast = self.movie.params.fast;
+                if check_label(ui, !fast, "品質優先")
+                    .on_hover_text("與「去煙霧」模組處理照片時完全相同的算法")
+                    .clicked()
+                {
+                    self.movie.params.fast = false;
+                }
+                if check_label(ui, fast, "速度優先")
+                    .on_hover_text(
+                        "煙霧層改用比較小的解析度去估，**大約快一倍**。\n\
+                         滑桿的數字會自動折算，扣掉的量不變；\n\
+                         差別在煙霧層的細節少一階，煙火線條邊緣附近的\n\
+                         殘留會略有不同——縮圖看不太出來，\n\
+                         100% 檢視細看得到。預覽會照著改，先比一比再決定",
+                    )
+                    .clicked()
+                {
+                    self.movie.params.fast = true;
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        let Some(info) = self.movie.info.clone() else {
+            return (export, stop);
+        };
+        let total = info.frames();
+        let (ow, oh) = self.movie.size.apply(info.w, info.h);
+        let workers = movie_workers(ow, oh, self.movie.grade.is_active());
+
+        if exporting {
+            let done = self.movie.done;
+            // 進度照**正在跑的那一支**算（一批裡每支長度不同）
+            let total = if self.movie.batch_frames > 0 {
+                self.movie.batch_frames
+            } else {
+                total
+            };
+            let frac = (done as f32 / total.max(1) as f32).clamp(0.0, 1.0);
+            if self.movie.batch_total > 1 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "第 {} / {} 支：{}",
+                        self.movie.batch_at + 1,
+                        self.movie.batch_total,
+                        self.movie.batch_name
+                    ))
+                    .size(12.0)
+                    .color(theme::TEXT),
+                );
+                ui.add_space(2.0);
+            }
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .desired_height(10.0)
+                    .fill(theme::ACCENT),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "已處理 {done} / {total} 格（{:.0}%）",
+                    frac * 100.0
+                ))
+                .size(12.0)
+                .color(theme::TEXT),
+            );
+            // 還要多久：用目前的速度往前推，跑得愈久估得愈準
+            if let Some(t0) = self.movie.started {
+                let elapsed = t0.elapsed().as_secs_f64();
+                if done > 0 && elapsed > 1.0 {
+                    let left = elapsed * (total.saturating_sub(done)) as f64 / done as f64;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "已經跑了 {}，大約還要 {}",
+                            fmt_video_len(elapsed),
+                            fmt_video_len(left)
+                        ))
+                        .size(11.5)
+                        .color(theme::TEXT_WEAK),
+                    );
+                }
+            }
+            ui.add_space(8.0);
+            if ui
+                .button("✖  中止")
+                .on_hover_text("停下來，並把寫到一半的影片刪掉")
+                .clicked()
+            {
+                stop = true;
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(300));
+        } else {
+            // 勾了調色的話，每一格在去煙之後還要照勾了幾區各跑一趟調色，
+            // 一萬格乘下來不是小數目，先講在前面
+            let graded = self.movie.grade.active().len();
+            let extra = match graded {
+                0 => String::new(),
+                n => format!("調色有 {n} 區，每一格去完煙還要再跑 {n} 趟調色。"),
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "共 {total} 格，同時處理 {workers} 格。{extra}\
+                     一格的去煙比照片快不了多少，整支跑完要花不少時間，\
+                     可以先用時間軸挑幾個時間點確認設定"
+                ))
+                .size(11.5)
+                .color(theme::TEXT_WEAK),
+            );
+            ui.add_space(8.0);
+            let n = self.movie.jobs().len();
+            if n > 1 {
+                ui.checkbox(&mut self.movie.merge, "合併成一支")
+                    .on_hover_text(
+                        "這幾支照清單順序接成**一支**影片再存出來\n\
+                         （不勾就是各存各的，一支一個檔）。\n\
+                         接的時候不重新編碼，所以很快、也不會再掉一次畫質；\n\
+                         各段的尺寸或影格率不一致時接不起來，\n\
+                         那時會自動改成分開輸出，跑好的不會白費",
+                    );
+                ui.add_space(4.0);
+            }
+            let label = if n > 1 && self.movie.merge {
+                format!("🎬  合併輸出（{n} 支接成一支）")
+            } else if n > 1 {
+                format!("🎬  全部輸出（{n} 支）")
+            } else {
+                "🎬  輸出影片".to_string()
+            };
+            if primary_button(ui, &label, self.movie.base.is_some()).clicked() {
+                export = true;
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(if info.audio.is_some() {
+                    "聲音原樣搬過去，畫面重新編碼成 H.264 MP4"
+                } else {
+                    "這支影片沒有聲音；畫面重新編碼成 H.264 MP4"
+                })
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+        }
+
+        if let Some(p) = self.movie.finished.clone() {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new("✔ 輸出完成")
+                    .size(12.5)
+                    .color(theme::ACCENT),
+            );
+            ui.label(
+                egui::RichText::new(
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+                .size(11.5)
+                .color(theme::TEXT_WEAK),
+            );
+            ui.horizontal(|ui| {
+                // 播放擺前面：跑了幾十分鐘，第一件想做的事是看成品，
+                // 不是去檔案總管找它
+                if ui
+                    .small_button("▶ 播放")
+                    .on_hover_text("用預設播放器開啟剛輸出的影片")
+                    .clicked()
+                {
+                    open_file(&p);
+                }
+                if ui
+                    .small_button("開啟資料夾")
+                    .on_hover_text("在檔案總管中顯示這個檔案")
+                    .clicked()
+                {
+                    open_in_explorer(&p);
+                }
+            });
+        }
+        (export, stop)
+    }
+
+    /// 中央的預覽：一格畫面加下面那條時間軸
+    fn ui_movie_preview(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_size();
+        // 底下留給時間軸那一列
+        let img_h = (avail.y - 40.0).max(100.0);
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(avail.x, img_h),
+            egui::Sense::click_and_drag(),
+        );
+        ui.painter().rect_filled(rect, 8, theme::PREVIEW_BG);
+
+        // 壓著看原圖：與去煙霧模組的習慣一致（放開就回到處理後的樣子）
+        self.movie.show_before = resp.is_pointer_button_down_on();
+        let showing_before = self.movie.show_before || self.movie.after_tex.is_none();
+        let tex = if showing_before {
+            self.movie.base_tex.as_ref()
+        } else {
+            self.movie.after_tex.as_ref()
+        };
+        if let Some(t) = tex {
+            let r = fit_rect(t.size_vec2(), rect.shrink(6.0));
+            ui.painter().image(
+                t.id(),
+                r,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            // 勾了調色就講清楚畫面上這張已經連調色一起套過了
+            let tag = match (showing_before, self.movie.grade.is_active()) {
+                (true, _) => "原始畫面",
+                (false, true) => "去煙霧＋調色後",
+                (false, false) => "去煙霧後",
+            };
+            pane_label(ui, r, tag);
+        }
+        // 還在忙就講一句，不然畫面停著不動像當掉
+        let note = match self.movie.busy {
+            MovieBusy::Grabbing => Some("讀取畫面…"),
+            MovieBusy::Rendering => Some("計算中…"),
+            MovieBusy::Exporting => Some("輸出中，預覽暫停更新"),
+            MovieBusy::Idle if self.movie.after_tex.is_some() => {
+                Some("按住畫面看原本的樣子")
+            }
+            MovieBusy::Idle => None,
+        };
+        if let Some(n) = note {
+            ui.painter().text(
+                rect.center_bottom() - egui::vec2(0.0, 14.0),
+                egui::Align2::CENTER_CENTER,
+                n,
+                egui::FontId::proportional(12.0),
+                theme::TEXT_WEAK,
+            );
+        }
+        if matches!(self.movie.busy, MovieBusy::Grabbing | MovieBusy::Rendering) {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+
+        ui.add_space(6.0);
+        // 時間軸：挑一個時間點看設定的效果。輸出中不給動——那時候
+        // CPU 全給輸出了，拖了也不會有反應
+        let secs = self.movie.info.as_ref().map(|i| i.secs).unwrap_or(0.0);
+        ui.add_enabled_ui(self.movie.busy != MovieBusy::Exporting && secs > 0.0, |ui| {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(
+                    egui::vec2(SLIDER_LABEL_W, 18.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().text(
+                    r.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    "時間",
+                    egui::FontId::proportional(12.5),
+                    theme::TEXT_WEAK,
+                );
+                let mut t = self.movie.at;
+                ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(80.0);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut t, 0.0..=secs.max(0.001))
+                            .show_value(false)
+                            .trailing_fill(true),
+                    )
+                    .changed()
+                {
+                    self.movie.at = t;
+                }
+                ui.label(
+                    egui::RichText::new(format!("{:.1}s", self.movie.at))
+                        .size(12.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            });
+        });
+    }
+
+    // ---------- 煙火疊圖工具 ----------
+
+    /// 選要疊的照片。至少兩張才疊得起來
+    /// 「選擇照片」是**整批換掉**，等於把手上這批的編輯全部丟掉。
+    /// 還沒存檔就先問一次：存起來、直接換、或回去繼續編輯。
+    ///
+    /// 回傳 true＝可以繼續換。選了「存檔」時回 false（先讓存檔跑完），
+    /// 存好之後會自己接著開選檔對話框（見 [`StackTool::pick_after_save`]）
+    fn stack_confirm_replace(&mut self, ctx: &egui::Context) -> bool {
+        if !self.stack.dirty || self.stack.photos.is_empty() {
+            return true;
+        }
+        let n = self.stack.photos.len();
+        match ask3(
+            rfd::MessageLevel::Warning,
+            "尚未存檔",
+            &format!(
+                "手上這 {n} 張疊好的還沒存檔，換一批照片就要重來一次。\n\n\
+                 「先存檔」：存成一張，存好再接著選新照片\n\
+                 「不存檔，直接換」：這一批的編輯就沒了\n\
+                 「回去編輯」：什麼都不動"
+            ),
+            "先存檔",
+            "不存檔，直接換",
+            "回去編輯",
+        ) {
+            // 存檔要先挑檔名（可能被取消），真的開始存了才記著「存完接著換」
+            Ask3::First => {
+                self.stack.pick_after_save = self.stack_save(ctx);
+                false
+            }
+            Ask3::Second => true,
+            Ask3::Cancel => false,
+        }
+    }
+
+    fn stack_pick_photos(&mut self, ctx: &egui::Context) {
+        if !self.stack_confirm_replace(ctx) {
+            return;
+        }
+        let Some(paths) = dir_dialog(LastDir::StackPhotos)
+            .add_filter("照片", IMAGE_EXTS)
+            .set_title("選擇要疊的煙火照片（請選兩張以上）")
+            .pick_files()
+        else {
+            return;
+        };
+        if let Some(p) = paths.first() {
+            remember_dir(LastDir::StackPhotos, p);
+        }
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| is_image(p)).collect();
+        self.stack_set_photos(paths, ctx);
+    }
+
+    /// **追加**照片到現有清單後面（「➕ 加入照片」）。
+    ///
+    /// 與「選擇照片」不同：那顆是整批換掉，這顆是加進來。疊圖常常是先挑兩三張
+    /// 看看效果，再想起「那張也該疊進去」——每次都得把全部重選一遍太蠢。
+    ///
+    /// 地景、目前選著的那一張、以及**已經算好的對齊**都留著：地景沒換，
+    /// 舊的對齊結果就還是對的，只有新加進來的那幾張要算（見 [`App::spawn_stack_align`]）
+    fn stack_add_photos(&mut self, ctx: &egui::Context) {
+        let Some(picked) = dir_dialog(LastDir::StackPhotos)
+            .add_filter("照片", IMAGE_EXTS)
+            .set_title("加入要一起疊的煙火照片")
+            .pick_files()
+        else {
+            return;
+        };
+        if let Some(p) = picked.first() {
+            remember_dir(LastDir::StackPhotos, p);
+        }
+        let picked: Vec<PathBuf> = picked.into_iter().filter(|p| is_image(p)).collect();
+        self.stack_append(picked, ctx);
+    }
+
+    /// 把剪貼簿裡的圖片加成一層（「📋 貼上圖片」與 Ctrl+V）。
+    ///
+    /// 先落地成暫存 PNG 再照一般照片走（見 [`clipboard_image_to_temp`]）：
+    /// 疊圖的遮色片、位移、每層調色都是以路徑為主鍵的，這樣後面完全不必改。
+    /// 貼進來的那一層會直接選起來，接著就能拖位置、調縮放
+    fn stack_paste_image(&mut self, ctx: &egui::Context) {
+        match clipboard_image_to_temp() {
+            Ok(path) => {
+                self.stack.error = None;
+                if self.stack.photos.is_empty() {
+                    // 還沒有底圖時只貼一張圖沒東西可疊，但照樣收下：
+                    // 使用者可以接著把要疊的照片拖進來
+                    self.stack_set_photos(vec![path], ctx);
+                } else {
+                    self.stack_append(vec![path.clone()], ctx);
+                    if let Some(i) = self.stack.photos.iter().position(|p| *p == path) {
+                        self.stack.cur = i;
+                        self.stack.view_layer = false;
+                    }
+                }
+            }
+            Err(e) => self.stack.error = Some(e),
+        }
+    }
+
+    /// [`App::stack_add_photos`] 的實作：把 `picked` 併到現有清單後面。
+    /// 拖曳進來的照片（已經有一批時）也走這裡
+    fn stack_append(&mut self, picked: Vec<PathBuf>, ctx: &egui::Context) {
+        let mut list = self.stack.photos.clone();
+        let before = list.len();
+        for p in picked {
+            if !list.contains(&p) {
+                list.push(p);
+            }
+        }
+        if list.len() == before {
+            self.stack.error = Some("選到的照片都已經在清單裡了".into());
+            return;
+        }
+        let ground = self.stack.ground_path().cloned();
+        let cur = self.stack.current().cloned();
+        let offsets = std::mem::take(&mut self.stack.auto_offsets);
+        self.stack_set_photos(list, ctx);
+        // 地景還在（沒被上限切掉）就把它與舊的對齊結果擺回去
+        if let Some(i) = ground.and_then(|g| self.stack.photos.iter().position(|p| *p == g)) {
+            self.stack.ground = i;
+            let keep: HashSet<PathBuf> = self.stack.photos.iter().cloned().collect();
+            self.stack.auto_offsets = offsets;
+            self.stack.auto_offsets.retain(|k, _| keep.contains(k));
+        }
+        if let Some(i) = cur.and_then(|c| self.stack.photos.iter().position(|p| *p == c)) {
+            self.stack.cur = i;
+        }
+    }
+
+    /// 從縮圖列移除第 `i` 張（右鍵選單或 Delete 鍵）。先問一次再移除。
+    ///
+    /// 剩下那幾張畫好的遮色片、擺法與調色都留著；**移掉的如果是地景**，
+    /// 換第一張當地景，並把整批的自動對齊重算——對齊是相對於地景的，
+    /// 地景換了舊的位移就不算數（與 [`App::stack_set_ground`] 同一個道理）
+    fn stack_remove_photo(&mut self, i: usize, ctx: &egui::Context) {
+        if self.stack.busy == StackBusy::Saving || i >= self.stack.photos.len() {
+            return;
+        }
+        let name = self.stack.photos[i]
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let was_ground = i == self.stack.ground;
+        let extra = if was_ground {
+            "\n\n這張是**地景**，移掉之後會改用第一張當地景，並重新對齊整批。"
+        } else {
+            ""
+        };
+        if !ask2(
+            rfd::MessageLevel::Warning,
+            "移除照片",
+            &format!("要把「{name}」從這批裡移掉嗎？{extra}\n\n（原始照片不會被刪除，只是不再疊進來）"),
+            "移除",
+            "取消",
+        ) {
+            return;
+        }
+        let gone = self.stack.photos.remove(i);
+        // 這張的遮色片、擺法與調色跟著走（別張的都留著）
+        self.stack.masks.remove(&gone);
+        self.stack.mask_polarity.remove(&gone);
+        self.stack.xforms.remove(&gone);
+        self.stack.grades.remove(&gone);
+        self.stack.auto_offsets.remove(&gone);
+        self.stack.bases.remove(&gone);
+        self.stack.drop_fine();
+        self.stack.layer_previews.remove(&gone);
+        self.stack.src_dims.remove(&gone);
+        self.stack.thumbs.remove(&gone);
+        // 移掉的排在地景前面時，地景的索引整個往前挪一格
+        if was_ground {
+            self.stack.ground = 0;
+        } else if i < self.stack.ground {
+            self.stack.ground -= 1;
+        }
+        self.stack.cur = self.stack.cur.min(self.stack.photos.len().saturating_sub(1));
+        self.stack.vis_range = None;
+        self.stack.applied = None;
+        self.stack.stacked = None;
+        self.stack.graded = None;
+        self.stack.tex_out = None;
+        self.stack.tex_raw = None;
+        self.stack.tex_raw_of = None;
+        self.stack.draft = None;
+        self.stack.moving = None;
+        if self.stack.photos.is_empty() {
+            self.stack_clear_photos();
+            return;
+        }
+        self.stack.dirty = true;
+        if was_ground {
+            // 地景換人，整批重算對齊
+            self.stack_reset_align(ctx);
+        } else {
+            self.spawn_stack_align(ctx);
+        }
+        self.request_stack_thumbs();
+    }
+
+    /// 換掉要疊的照片清單（選檔對話框與拖曳進來都走這裡）
+    fn stack_set_photos(&mut self, mut paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if paths.is_empty() {
+            return;
+        }
+        // 每一張都要同時留在記憶體裡才疊得起來，超過就先擋下並講清楚
+        if paths.len() > MAX_STACK_PHOTOS {
+            paths.truncate(MAX_STACK_PHOTOS);
+            self.stack.error = Some(format!(
+                "一次最多疊 {MAX_STACK_PHOTOS} 張，只取了前 {MAX_STACK_PHOTOS} 張"
+            ));
+        } else {
+            self.stack.error = None;
+        }
+        // 仍在新清單裡的照片，留著它的遮色片、底圖與縮圖：重選時多半只是
+        // 增減一兩張，全部丟掉會讓已經畫好的遮色片白做
+        let keep: HashSet<&PathBuf> = paths.iter().collect();
+        self.stack.masks.retain(|k, _| keep.contains(k));
+        self.stack.mask_polarity.retain(|k, _| keep.contains(k));
+        self.stack.xforms.retain(|k, _| keep.contains(k));
+        self.stack.grades.retain(|k, _| keep.contains(k));
+        self.stack.layer_previews.clear();
+        // 對齊是相對於地景的，換一批照片就重挑地景，之前算的整批不算數
+        self.stack.auto_offsets.clear();
+        self.stack.bases.retain(|k, _| keep.contains(k));
+        self.stack.drop_fine();
+        self.stack.src_dims.retain(|k, _| keep.contains(k));
+        self.stack.thumbs.retain(|k, _| keep.contains(k));
+        self.stack.photos = paths;
+        self.stack.ground = 0;
+        self.stack.cur = 0;
+        self.stack.applied = None;
+        self.stack.stacked = None;
+        self.stack.graded = None;
+        self.stack.tex_out = None;
+        self.stack.tex_raw = None;
+        self.stack.tex_raw_of = None;
+        self.stack.draft = None;
+        self.stack.moving = None;
+        self.stack.saved = None;
+        self.stack.saved_path = None;
+        self.stack.zoom = None;
+        self.stack.zoom_back = None;
+        self.stack.pan = egui::pos2(0.5, 0.5);
+        // 選進來就有東西可存（不必再調什麼），清掉或關程式前要問一次
+        self.stack.dirty = true;
+        self.spawn_stack_load(ctx);
+        self.request_stack_thumbs();
+    }
+
+    /// 使用者主動清掉這批照片。還沒存檔就先問一次
+    fn stack_clear_confirmed(&mut self) {
+        if self.stack.busy == StackBusy::Saving {
+            return;
+        }
+        if self.stack.dirty && !self.stack.photos.is_empty() {
+            let n = self.stack.photos.len();
+            if !ask2(
+                rfd::MessageLevel::Warning,
+                "尚未存檔",
+                &format!("疊好的 {n} 張照片還沒存檔，清掉就要重來一次。"),
+                "清除",
+                "取消",
+            ) {
+                return;
+            }
+        }
+        self.stack_clear_photos();
+    }
+
+    /// 回到「選擇照片」的起始狀態
+    fn stack_clear_photos(&mut self) {
+        self.stack.load_cancel.store(true, Ordering::Relaxed);
+        self.stack.load_rx = None;
+        self.stack.load_left = 0;
+        self.stack.align_cancel.store(true, Ordering::Relaxed);
+        self.stack.align_rx = None;
+        self.stack.align_left = 0;
+        self.stack.auto_offsets.clear();
+        self.stack.photos.clear();
+        self.stack.ground = 0;
+        self.stack.cur = 0;
+        // 「清除」是回到起始狀態，**這一批調過的每一樣都要跟著不見**：
+        // 遮色片、每一層的擺法與調色、成品的調色與裁切。
+        //
+        // 這些是逐張以「檔案路徑」為鍵存的，留著的話——下一批只要有同名檔案
+        // （同一場煙火再選一次是常事）——上一批畫的遮色片、搬過的位置就會
+        // 悄悄套回去，畫面上只看得到縮圖角落一個小記號，根本不知道哪來的。
+        // 想留著設定就別按「清除」，直接用「選擇照片」重選：那條路才會
+        // 保留仍在清單裡那幾張的設定（見 [`App::stack_set_photos`]）
+        self.stack.masks.clear();
+        self.stack.mask_polarity.clear();
+        self.stack.xforms.clear();
+        self.stack.grades.clear();
+        self.stack.grade = Adjustments::default();
+        self.stack.grade_target = GradeTarget::Output;
+        self.stack.crop_editing = false;
+        // 底圖與縮圖都是純快取，留著只是白佔記憶體
+        self.stack.bases.clear();
+        self.stack.drop_fine();
+        self.stack.layer_previews.clear();
+        self.stack.base_scale = 0.0;
+        self.stack.src_dims.clear();
+        self.stack.thumbs.clear();
+        self.stack.vis_range = None;
+        self.stack.stacked = None;
+        self.stack.applied = None;
+        self.stack.graded = None;
+        self.stack.tex_out = None;
+        self.stack.tex_raw = None;
+        self.stack.tex_raw_of = None;
+        self.stack.draft = None;
+        self.stack.moving = None;
+        self.stack.rx = None;
+        self.stack.busy = StackBusy::Idle;
+        self.stack.error = None;
+        self.stack.saved = None;
+        self.stack.saved_path = None;
+        self.stack.view_layer = false;
+        self.stack.tool = None;
+        self.stack.zoom = None;
+        self.stack.zoom_back = None;
+        self.stack.pan = egui::pos2(0.5, 0.5);
+        self.stack.dirty = false;
+    }
+
+    /// 在背景把每張照片解成預覽底圖。疊圖要同時看到全部的層，所以不像
+    /// 去煙霧只載目前那一張——先到齊的先放進 bases，全部到齊才疊得起來
+    fn spawn_stack_load(&mut self, ctx: &egui::Context) {
+        self.stack.load_cancel.store(true, Ordering::Relaxed);
+        // 預覽底圖**整批共用同一個縮小比例**。
+        //
+        // 各縮各的（每張都縮到長邊 1600）會把「一個像素對一個像素」的關係
+        // 破壞掉：尺寸不同的兩張縮完之後彼此的相對大小就變了，預覽疊出來
+        // 與原尺寸存檔的構圖會對不起來，對齊也算不準。改成照**最大那張**
+        // 決定一個比例，全部照它縮
+        let k = self.stack.common_scale();
+        if (self.stack.base_scale - k).abs() > 1e-6 {
+            // 比例變了（多選了一張更大的），舊的底圖不能再混用
+            self.stack.bases.clear();
+            self.stack.drop_fine();
+            self.stack.base_scale = k;
+        }
+        let todo: VecDeque<PathBuf> = self
+            .stack
+            .photos
+            .iter()
+            .filter(|p| !self.stack.bases.contains_key(*p))
+            .cloned()
+            .collect();
+        self.stack.load_left = todo.len();
+        if todo.is_empty() {
+            self.stack.load_rx = None;
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.stack.load_cancel = Arc::clone(&cancel);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.stack.load_rx = Some(rx);
+        let jobs = Arc::new(Mutex::new(todo));
+        for _ in 0..SMOKE_AUTO_WORKERS {
+            let jobs = Arc::clone(&jobs);
+            let cancel = Arc::clone(&cancel);
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            let k = k;
+            thread::spawn(move || loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Some(path) = jobs.lock().unwrap().pop_front() else {
+                    return;
+                };
+                let r = image::open(&path)
+                    .map_err(|e| format!("無法讀取這張照片：{e}"))
+                    .map(|img| {
+                        let img = img.to_rgb8();
+                        let dims = img.dimensions();
+                        (shrink_by(img, k), dims)
+                    });
+                if tx.send((path, r)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// 請求縮圖列要用的縮圖（解碼共用主畫面那組常駐工作池）。
+    /// 疊圖最多 [`MAX_STACK_PHOTOS`] 張，整批一起要就好，不必像去煙霧那樣淘汰
+    fn request_stack_thumbs(&mut self) {
+        let need: Vec<PathBuf> = self
+            .stack
+            .photos
+            .iter()
+            .filter(|p| !self.stack.thumbs.contains_key(*p))
+            .cloned()
+            .collect();
+        if need.is_empty() {
+            return;
+        }
+        for p in &need {
+            self.stack.thumbs.insert(p.clone(), Thumb::Loading);
+        }
+        let (lock, cv) = &*self.thumb_jobs;
+        let mut q = lock.lock().unwrap();
+        for p in need.into_iter().rev() {
+            q.push_front(p);
+        }
+        cv.notify_all();
+    }
+
+    /// 把一張讀不到的照片從清單裡拿掉，並把地景與選取索引拉回範圍內
+    fn stack_drop_photo(&mut self, path: &Path) {
+        let Some(at) = self.stack.photos.iter().position(|p| p == path) else {
+            return;
+        };
+        self.stack.photos.remove(at);
+        self.stack.masks.remove(path);
+        self.stack.xforms.remove(path);
+        self.stack.auto_offsets.remove(path);
+        self.stack.bases.remove(path);
+        self.stack.drop_fine();
+        self.stack.src_dims.remove(path);
+        self.stack.thumbs.remove(path);
+        let last = self.stack.photos.len().saturating_sub(1);
+        // 被拿掉的是它前面那張時整排會往前遞補，索引要跟著往前挪一格
+        if self.stack.ground > at {
+            self.stack.ground -= 1;
+        }
+        if self.stack.cur > at {
+            self.stack.cur -= 1;
+        }
+        self.stack.ground = self.stack.ground.min(last);
+        self.stack.cur = self.stack.cur.min(last);
+        self.stack.tex_raw = None;
+        self.stack.tex_raw_of = None;
+    }
+
+    /// 在背景把每一層對準地景。地景換人、照片重選、或自動對齊剛被打開時都要重算
+    /// （對齊是「相對於地景」的，換了地景整批都不算數）。
+    /// 底圖還沒載完的先跳過，載完那一輪會再叫一次
+    fn spawn_stack_align(&mut self, ctx: &egui::Context) {
+        self.stack.align_cancel.store(true, Ordering::Relaxed);
+        self.stack.align_rx = None;
+        self.stack.align_left = 0;
+        if !self.stack.auto_align || !self.stack.bases_ready() {
+            return;
+        }
+        let Some(ground) = self
+            .stack
+            .ground_path()
+            .and_then(|p| self.stack.bases.get(p))
+            .cloned()
+        else {
+            return;
+        };
+        let todo: Vec<(PathBuf, Arc<image::RgbImage>)> = self
+            .stack
+            .photos
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != self.stack.ground)
+            .filter(|(_, p)| !self.stack.auto_offsets.contains_key(*p))
+            .filter_map(|(_, p)| self.stack.bases.get(p).map(|b| (p.clone(), b.clone())))
+            .collect();
+        self.stack.align_left = todo.len();
+        if todo.is_empty() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.stack.align_cancel = Arc::clone(&cancel);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.stack.align_rx = Some(rx);
+        let jobs = Arc::new(Mutex::new(VecDeque::from(todo)));
+        for _ in 0..SMOKE_AUTO_WORKERS {
+            let jobs = Arc::clone(&jobs);
+            let cancel = Arc::clone(&cancel);
+            let ground = ground.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Some((path, img)) = jobs.lock().unwrap().pop_front() else {
+                    return;
+                };
+                // 對不上就是 None，收的那一端據此記成「對不上」並略過那一層
+                let d = stack::align_offset(&ground, &img);
+                if tx.send((path, d)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// 地景換人或照片重選：之前算的對齊全部不算數（對齊是相對於地景的）
+    fn stack_reset_align(&mut self, ctx: &egui::Context) {
+        self.stack.auto_offsets.clear();
+        self.spawn_stack_align(ctx);
+    }
+
+    /// 切到縮圖列的第 i 張：預覽跟著換成那一張原圖（點縮圖就是要看它），
+    /// 專業模式下它同時也是接下來畫遮色片的目標
+    fn stack_select(&mut self, i: usize) {
+        if i >= self.stack.photos.len() {
+            return;
+        }
+        self.stack.cur = i;
+        self.stack.scroll_to_cur = true;
+        self.stack.draft = None;
+        self.stack.moving = None;
+        // 本來在看疊圖結果：點素材縮圖就切過去看那一張。
+        // **但「調整圖層」開著時不切**——那時要在疊圖結果上拖著對位，
+        // 切到單層就拖不動了，還得再點一次「疊圖結果」回來（那一層改用
+        // 半透明疊在成品上顯示，見 StackTool::move_ghost）
+        if !self.stack.move_mode {
+            self.stack.view_layer = true;
+        }
+        // 調色面板也跟著切到「這一層」：點某一張多半就是要對它做事
+        self.stack.grade_target = GradeTarget::Layer;
+    }
+
+    /// 把第 i 張改成地景
+    fn stack_set_ground(&mut self, i: usize, ctx: &egui::Context) {
+        if i >= self.stack.photos.len() || i == self.stack.ground {
+            return;
+        }
+        self.stack.ground = i;
+        self.stack.dirty = true;
+        // 對齊是「相對於地景」的，換了地景整批都要重算
+        self.stack_reset_align(ctx);
+    }
+
+    /// 以目前設定重疊一次預覽
+    /// 把整批照片照 `long`（最大那張的長邊）重載一次當精細底圖。
+    ///
+    /// 走自己的通道、收在 [`StackTool::fine_pending`] 裡，**全部到齊才換上去**
+    /// ——中途畫面照舊用工作縮圖疊出來的那份，不會空一段（見 [`stack_fine_target`]）
+    fn spawn_stack_fine_load(&mut self, ctx: &egui::Context, long: u32) {
+        let max_long = self
+            .stack
+            .photos
+            .iter()
+            .filter_map(|p| self.stack.src_dims.get(p))
+            .map(|(w, h)| (*w).max(*h))
+            .max()
+            .unwrap_or(0);
+        if max_long == 0 {
+            return;
+        }
+        let k = (long as f32 / max_long as f32).min(1.0);
+        self.stack.fine_pending.clear();
+        self.stack.fine_loading = Some(long);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.stack.fine_rx = Some(rx);
+        let jobs = Arc::new(Mutex::new(
+            self.stack.photos.iter().cloned().collect::<VecDeque<_>>(),
+        ));
+        for _ in 0..SMOKE_AUTO_WORKERS {
+            let jobs = Arc::clone(&jobs);
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || loop {
+                let Some(path) = jobs.lock().unwrap().pop_front() else {
+                    return;
+                };
+                let img = image::open(&path).ok().map(|i| shrink_by(i.to_rgb8(), k));
+                if tx.send((path, img)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// 疊一次預覽。`fine`＝改用精細底圖（見 [`stack_fine_target`]）
+    fn spawn_stack_compose(&mut self, ctx: &egui::Context, fine: bool) {
+        let key = self.stack.key();
+        let fine = fine && self.stack.fine_ready();
+        // 回報時附上「這一趟用的是多細的底圖」而不是一個是非題：使用者再往上
+        // 放大時會載一份更細的，光看是非題會以為已經是最新的、不再重疊
+        let used_long = if fine { self.stack.fine_long } else { 0 };
+        let src = if fine {
+            &self.stack.bases_fine
+        } else {
+            &self.stack.bases
+        };
+        let Some(ground) = self.stack.ground_path().and_then(|p| src.get(p)).cloned() else {
+            return;
+        };
+        // 地景以外的每一層，連同它自己的遮色片、擺法與調色一起帶走
+        type ComposeLayer = (
+            PathBuf,
+            Arc<image::RgbImage>,
+            Vec<dehaze::Shape>,
+            bool,
+            stack::Xform,
+            Adjustments,
+        );
+        let layers: Vec<ComposeLayer> = key
+            .photos
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != key.ground)
+            // 對不上地景的那幾層整個略過（見 StackTool::unaligned）
+            .filter(|(i, _)| !key.skip.get(*i).copied().unwrap_or(false))
+            .filter_map(|(i, p)| {
+                src.get(p).cloned().map(|img| {
+                    (
+                        p.clone(),
+                        img,
+                        key.masks.get(i).cloned().unwrap_or_default(),
+                        key.inverts.get(i).copied().unwrap_or(false),
+                        key.xforms.get(i).copied().unwrap_or_default(),
+                        key.grades.get(i).copied().unwrap_or_default(),
+                    )
+                })
+            })
+            .collect();
+        let protect = key.masks.get(key.ground).cloned().unwrap_or_default();
+        let protect_invert = key.inverts.get(key.ground).copied().unwrap_or(false);
+        let (mode, feather, density) = (key.mode, key.feather, key.density);
+        let protect_land = key.protect_land;
+        // 地景自己的調色與擺法：它是畫布，得先調好、擺好才輪到別層疊上來
+        let ground_path = self.stack.ground_path().cloned().unwrap_or_default();
+        let ground_xform = key.xforms.get(key.ground).copied().unwrap_or_default();
+        let ground_grade = key.grades.get(key.ground).copied().unwrap_or_default();
+        let grade = self.stack.grade.grade_only();
+        self.stack.busy = StackBusy::Composing;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.stack.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            // 每一層先各自調色再疊。調過的另存一份給「單層」檢視看——
+            // 不然調了半天只能從疊圖結果上猜自己到底調到哪裡
+            let mut previews: HashMap<PathBuf, (Adjustments, Arc<image::RgbImage>)> = HashMap::new();
+            let mut done: Vec<(Arc<image::RgbImage>, Vec<dehaze::Shape>, bool, stack::Xform)> =
+                Vec::with_capacity(layers.len());
+            for (p, img, mask, invert, xform, g) in layers {
+                let img = if g.grade_is_neutral() {
+                    img
+                } else {
+                    let mut c = (*img).clone();
+                    edit::apply_grade(&mut c, &g);
+                    let c = Arc::new(c);
+                    previews.insert(p, (g, c.clone()));
+                    c
+                };
+                done.push((img, mask, invert, xform));
+            }
+            // 地景：先調色再擺。反過來的話，擺開之後露出來的黑邊也會被調亮
+            let mut base = (*ground).clone();
+            if !ground_grade.grade_is_neutral() {
+                edit::apply_grade(&mut base, &ground_grade);
+                previews.insert(ground_path, (ground_grade, Arc::new(base.clone())));
+            }
+            stack::place(&mut base, ground_xform);
+            let refs: Vec<stack::Layer> = done
+                .iter()
+                .map(|(img, mask, invert, xform)| stack::Layer {
+                    img,
+                    mask,
+                    invert: *invert,
+                    xform: *xform,
+                })
+                .collect();
+            // 天際線在調好、擺好的地景上算一次就好；預覽底圖本來就縮過，很快
+            let gmap = protect_land.then(|| stack::GuardMap::new(&base));
+            let guard = gmap.as_ref().map(stack::GuardMap::guard);
+            let raw = stack::blend(
+                &base,
+                &protect,
+                protect_invert,
+                feather,
+                density,
+                &refs,
+                mode,
+                guard.as_ref(),
+            );
+            // 調色順手在同一趟做完：分兩次來回，畫面會先閃一下沒調色的樣子
+            let mut shown = raw.clone();
+            edit::apply_grade(&mut shown, &grade);
+            let _ = tx.send(StackMsg::Composed(key, grade, Arc::new(raw), shown, previews, used_long));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 疊圖結果沿用快取，只重算調色（拖動調色滑桿時走這一條）
+    fn spawn_stack_grade(&mut self, ctx: &egui::Context) {
+        let Some(base) = self.stack.stacked.clone() else {
+            return;
+        };
+        let grade = self.stack.grade.grade_only();
+        self.stack.busy = StackBusy::Composing;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.stack.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let mut out = (*base).clone();
+            edit::apply_grade(&mut out, &grade);
+            let _ = tx.send(StackMsg::Graded(grade, out));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 用原尺寸重疊一次並存成一張照片。`here` 為真就存回地景那張的資料夾，
+    /// 否則跳資料夾對話框讓使用者自己挑
+    /// 回傳 true＝**真的開始存了**（背景執行緒已經跑起來）。
+    /// 挑檔名時按取消、或檔名不能用而擋下來的，都回 false——
+    /// 呼叫端要靠它決定「存完之後」還要不要接著做別的事
+    fn stack_save(&mut self, ctx: &egui::Context) -> bool {
+        if self.stack.photos.len() < 2 {
+            return false;
+        }
+        let Some(ground) = self.stack.ground_path().cloned() else {
+            return false;
+        };
+        // 預設檔名**不用地景那張**：地景常常是還沒開始放的那一張（藍調時刻、
+        // 乾淨的城市夜景），拿它命名看不出這是疊出來的成品，也容易與原檔搞混。
+        // 改用目前選著的那一層；選到地景時退回第一張不是地景的
+        let name_src = self
+            .stack
+            .current()
+            .filter(|_| !self.stack.on_ground())
+            .or_else(|| {
+                self.stack
+                    .photos
+                    .iter()
+                    .enumerate()
+                    .find(|(i, _)| *i != self.stack.ground)
+                    .map(|(_, p)| p)
+            })
+            .unwrap_or(&ground)
+            .clone();
+        let stem = name_src
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "photo".into());
+        // 檔名交給存檔對話框，使用者可以自己改；檔案已存在時
+        // 系統的存檔對話框會先問要不要覆蓋
+        let start_dir = load_last_dir(LastDir::StackOutput)
+            .or_else(|| ground.parent().map(|p| p.to_path_buf()));
+        let dialog = match start_dir {
+            Some(d) => file_dialog().set_directory(d),
+            None => file_dialog(),
+        };
+        let Some(out) = dialog
+            .set_title("儲存疊圖成品")
+            .set_file_name(format!("{stem}_疊圖.jpg"))
+            .add_filter("JPEG 圖片", &["jpg", "jpeg"])
+            .save_file()
+        else {
+            return false;
+        };
+        // 對話框可能回一個沒有副檔名的路徑（使用者自己把它刪掉了）。
+        // 補上之後才成立的檔名，存檔對話框沒問過使用者，得自己補問一次
+        let out = if out.extension().is_none() {
+            let fixed = out.with_extension("jpg");
+            if !confirm_overwrite(&fixed) {
+                return false;
+            }
+            fixed
+        } else {
+            out
+        };
+        // 存成來源照片本身會把原檔毀掉，這個不能讓它過
+        if self.stack.photos.iter().any(|p| same_path_ci(&out, p)) {
+            self.stack.error =
+                Some("這個檔名就是來源照片之一，會把原檔蓋掉；請換一個名字".into());
+            return false;
+        }
+        remember_dir(LastDir::StackOutput, &out);
+        let key = self.stack.key();
+        let grade = self.stack.grade;
+        // 存檔尺寸在按下去的當下定案（與去煙霧一致）
+        let export = self.export_size;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.stack.save_cancel = cancel.clone();
+        self.stack.save_done = 0;
+        self.stack.busy = StackBusy::Saving;
+        self.stack.error = None;
+        self.stack.saved = None;
+        self.stack.saved_path = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.stack.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let r = stack_render_and_save(&key, &grade, export, &out, &cancel, |n| {
+                let _ = tx.send(StackMsg::SaveProgress(n));
+                ctx.request_repaint();
+            });
+            let _ = tx.send(StackMsg::SaveDone(r));
+            ctx.request_repaint();
+        });
+        true
+    }
+
+    fn poll_stack(&mut self, ctx: &egui::Context) {
+        // 預覽底圖：一張一張進來，全部到齊才疊得起來
+        let mut loaded = Vec::new();
+        if let Some(rx) = &self.stack.load_rx {
+            while let Ok(m) = rx.try_recv() {
+                loaded.push(m);
+            }
+        }
+        for (path, res) in loaded {
+            self.stack.load_left = self.stack.load_left.saturating_sub(1);
+            // 重選照片時舊的結果可能後到，不在清單裡的就丟掉
+            if !self.stack.photos.contains(&path) {
+                continue;
+            }
+            match res {
+                Ok((img, dims)) => {
+                    self.stack.src_dims.insert(path.clone(), dims);
+                    self.stack.bases.insert(path, Arc::new(img));
+                }
+                // 讀不到的那張直接從清單裡拿掉：留著的話 bases_ready() 永遠
+                // 不成立，預覽與存檔就一起卡死，使用者只看得到一行錯誤訊息
+                Err(e) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.stack.error = Some(format!("{name}：{e}（已從清單移除）"));
+                    self.stack_drop_photo(&path);
+                }
+            }
+        }
+        if self.stack.load_left == 0 {
+            self.stack.load_rx = None;
+            // 底圖到齊了才對得起來（要拿地景那張當基準）
+            if self.stack.auto_align
+                && self.stack.align_rx.is_none()
+                && self.stack.bases_ready()
+                && self
+                    .stack
+                    .photos
+                    .iter()
+                    .enumerate()
+                    .any(|(i, p)| i != self.stack.ground && !self.stack.auto_offsets.contains_key(p))
+            {
+                self.spawn_stack_align(ctx);
+            }
+        }
+
+        // 自動對齊的結果：一張一張進來
+        let mut aligned = Vec::new();
+        if let Some(rx) = &self.stack.align_rx {
+            while let Ok(m) = rx.try_recv() {
+                aligned.push(m);
+            }
+        }
+        for (path, d) in aligned {
+            self.stack.align_left = self.stack.align_left.saturating_sub(1);
+            if !self.stack.photos.contains(&path) {
+                continue;
+            }
+            // None＝對不上地景，那一層會被略過（見 StackTool::unaligned）
+            self.stack.auto_offsets.insert(path, d);
+        }
+        if self.stack.align_left == 0 {
+            self.stack.align_rx = None;
+        }
+
+        // 存好之後要不要接著開「選擇照片」。在迴圈裡不能直接呼叫——
+        // rx 還借著 self.stack，等收完訊息再做
+        let mut pick_next = false;
+        while self.stack.rx.is_some() {
+            let Some(rx) = &self.stack.rx else { break };
+            match rx.try_recv() {
+                Ok(StackMsg::Composed(key, grade, raw, shown, previews, used_long)) => {
+                    self.stack.rx = None;
+                    self.stack.busy = StackBusy::Idle;
+                    self.stack.tex_out = Some(load_rgb_texture(ctx, "stack_out", &shown));
+                    self.stack.stacked = Some(raw);
+                    self.stack.applied = Some(key);
+                    self.stack.applied_long = used_long;
+                    self.stack.graded = Some(grade);
+                    self.stack.layer_previews = previews;
+                }
+                Ok(StackMsg::Graded(grade, img)) => {
+                    self.stack.rx = None;
+                    self.stack.busy = StackBusy::Idle;
+                    self.stack.tex_out = Some(load_rgb_texture(ctx, "stack_out", &img));
+                    self.stack.graded = Some(grade);
+                }
+                // 存檔中：只更新進度，通道要留著繼續收
+                Ok(StackMsg::SaveProgress(n)) => self.stack.save_done = n,
+                Ok(StackMsg::SaveDone(r)) => {
+                    self.stack.rx = None;
+                    self.stack.busy = StackBusy::Idle;
+                    match r {
+                        Ok(p) => {
+                            self.stack.saved = Some(("已存成一張疊圖".into(), Instant::now()));
+                            self.stack.saved_path = Some(p);
+                            self.stack.dirty = false;
+                            // 當初是為了「換一批照片」才來存的：存好就接著開選檔
+                            pick_next = std::mem::take(&mut self.stack.pick_after_save);
+                        }
+                        Err(e) => {
+                            self.stack.error = Some(e);
+                            self.stack.dirty = true;
+                            // 存壞了就留在原地，別把還沒存成的東西換掉
+                            self.stack.pick_after_save = false;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.stack.rx = None;
+                    self.stack.busy = StackBusy::Idle;
+                    self.stack.error = Some("疊圖處理異常中斷".into());
+                    break;
+                }
+            }
+        }
+        if pick_next {
+            self.stack_pick_photos(ctx);
+        }
+
+        // 設定變動且沒有工作在跑就重疊；同時間最多一件，拖滑桿時自然限流。
+        // 精細底圖：一張一張進來，**全部到齊才換上去**（中途畫面照舊）
+        let mut fine_loaded = Vec::new();
+        if let Some(rx) = &self.stack.fine_rx {
+            while let Ok(m) = rx.try_recv() {
+                fine_loaded.push(m);
+            }
+        }
+        for (path, img) in fine_loaded {
+            // 收到一半時換了照片就不算數了
+            if !self.stack.photos.contains(&path) {
+                continue;
+            }
+            match img {
+                Some(img) => {
+                    self.stack.fine_pending.insert(path, Arc::new(img));
+                }
+                // 有一張讀不出來就整批放棄，別卡在「永遠差一張」
+                None => {
+                    self.stack.fine_loading = None;
+                    self.stack.fine_pending.clear();
+                    self.stack.fine_rx = None;
+                }
+            }
+        }
+        if let Some(long) = self.stack.fine_loading {
+            if self.stack.photos.iter().all(|p| self.stack.fine_pending.contains_key(p)) {
+                self.stack.bases_fine = std::mem::take(&mut self.stack.fine_pending);
+                self.stack.fine_long = long;
+                self.stack.fine_loading = None;
+                self.stack.fine_rx = None;
+            }
+        }
+        // 這一幀需要多細的底圖（None＝工作縮圖就夠了）
+        let fine_want = stack_fine_target(
+            self.stack.want_long,
+            self.stack
+                .photos
+                .iter()
+                .filter_map(|p| self.stack.src_dims.get(p))
+                .map(|(w, h)| (*w).max(*h))
+                .max()
+                .unwrap_or(0),
+            self.stack.photos.len(),
+        );
+        if self.module == Module::Stack
+            && self.stack.fine_loading.is_none()
+            && self.stack.bases_ready()
+            && fine_want.is_some_and(|want| want > self.stack.fine_long)
+        {
+            self.spawn_stack_fine_load(ctx, fine_want.expect("剛判斷過有值"));
+        }
+
+        // 疊圖與調色分兩段：只改調色時沿用疊好的快取，不必再疊一次
+        if self.module == Module::Stack
+            && self.stack.busy == StackBusy::Idle
+            && self.stack.bases_ready()
+        {
+            // 精細那一趟要等設定先停下來：畫遮色片、拉滑桿的每一步都先用工作
+            // 縮圖疊一次（快），停手之後才用精細底圖重疊換上去
+            let settled = self.stack.applied.as_ref() == Some(&self.stack.key());
+            let fine_ok = fine_want.is_some_and(|want| self.stack.fine_long >= want)
+                && self.stack.fine_ready();
+            if !settled {
+                self.spawn_stack_compose(ctx, false);
+            } else if fine_ok && self.stack.applied_long != self.stack.fine_long {
+                self.spawn_stack_compose(ctx, true);
+            } else if self.stack.stacked.is_some() && self.stack.graded != Some(self.stack.grade.grade_only()) {
+                self.spawn_stack_grade(ctx);
+            }
+        }
+    }
+
+    /// 空白鍵：在 100%（1:1）與「按之前的比例」之間來回
+    /// （與 [`App::smoke_toggle_actual_size`] 同一套習慣）
+    fn stack_toggle_actual_size(&mut self) {
+        let at_one = self.stack.zoom.is_some_and(|z| (z - 1.0).abs() < 0.001);
+        if at_one {
+            self.stack.zoom = self.stack.zoom_back.take().flatten();
+            if self.stack.zoom.is_none() {
+                self.stack.pan = egui::pos2(0.5, 0.5);
+            }
+        } else {
+            self.stack.zoom_back = Some(self.stack.zoom);
+            if self.stack.zoom.is_none() {
+                self.stack.pan = egui::pos2(0.5, 0.5);
+            }
+            self.stack.zoom = Some(1.0);
+        }
+    }
+
+    /// 「移動圖層」：在疊圖結果上拖曳，把縮圖列選著的那一層整個挪位置。
+    ///
+    /// 位移是**相對座標**（佔畫面的幾分之幾），所以預覽上挪一格、原尺寸存檔時
+    /// 就照比例挪同樣的距離，兩邊構圖一致。`img` 是整張畫布畫出來的矩形
+    fn stack_move_layer(&mut self, ui: &egui::Ui, resp: &egui::Response, img: egui::Rect) {
+        if !self.stack.can_move_cur() || img.width() <= 0.0 || img.height() <= 0.0 {
+            return;
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(if resp.dragged() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Move
+            });
+        }
+        let Some(p) = self.stack.current().cloned() else { return };
+        // Ctrl＋滾輪＝縮放、Shift＋滾輪＝旋轉（不按修飾鍵時滾輪仍是縮放預覽）。
+        // 手不必離開照片跑去拉右邊的滑桿，與筆刷粗細那邊同一個習慣
+        let (wheel, ctrl, shift) = if ui.rect_contains_pointer(img) {
+            ui.input(|i| {
+                (
+                    i.raw_scroll_delta.y,
+                    i.modifiers.ctrl || i.modifiers.command,
+                    i.modifiers.shift,
+                )
+            })
+        } else {
+            (0.0, false, false)
+        };
+        let d = resp.drag_delta();
+        let dragging = resp.dragged() && d != egui::Vec2::ZERO;
+        if !dragging && (wheel == 0.0 || !(ctrl || shift)) {
+            return;
+        }
+        let mut e = self.stack.xform_of(&p);
+        if dragging {
+            e.dx += d.x / img.width();
+            e.dy += d.y / img.height();
+        }
+        if wheel != 0.0 {
+            let step = if wheel > 0.0 { 1.0 } else { -1.0 };
+            if ctrl {
+                // 一格 2%：慢慢推才對得準
+                e.scale *= 1.0 + step * 0.02;
+            } else if shift {
+                e.rot += step * 0.5;
+            }
+        }
+        // 挪到整層都出畫面就沒東西可疊了，夾在一個畫面內；倍率與角度也各自夾好
+        e.dx = e.dx.clamp(-1.0, 1.0);
+        e.dy = e.dy.clamp(-1.0, 1.0);
+        self.stack.xforms.insert(p, e.clamped());
+        self.stack.dirty = true;
+        // 剛動過：半透明再留一下下（見 StackTool::ghost_now）
+        self.stack.touch_ghost();
+    }
+
+    /// 方向鍵推目前這一層，`px`／`py` 的單位是像素。
+    /// 位移存的是相對座標，所以照這一層的原尺寸換算回去
+    fn stack_nudge_layer(&mut self, px: f32, py: f32) {
+        let Some((p, (dw, dh))) = self
+            .stack
+            .current()
+            .cloned()
+            .zip(self.stack.source_dims())
+        else {
+            return;
+        };
+        let mut e = self.stack.xform_of(&p);
+        e.dx = (e.dx + px / dw.max(1) as f32).clamp(-1.0, 1.0);
+        e.dy = (e.dy + py / dh.max(1) as f32).clamp(-1.0, 1.0);
+        self.stack.xforms.insert(p, e.clamped());
+        self.stack.dirty = true;
+        // 剛動過：半透明再留一下下（與用拖的同一個道理）
+        self.stack.touch_ghost();
+    }
+
+    /// 「物件」工具：在目前看的那一層上，找出框住的那一塊裡面那個東西的輪廓
+    fn stack_pick_object(&mut self, a: egui::Pos2, b: egui::Pos2) {
+        let Some(base) = self
+            .stack
+            .current()
+            .and_then(|p| self.stack.bases.get(p))
+            .cloned()
+        else {
+            return;
+        };
+        // 手滑點了一下就當作沒這回事（見 [`OBJECT_MIN_BOX`]）
+        if (b.x - a.x).abs() < OBJECT_MIN_BOX || (b.y - a.y).abs() < OBJECT_MIN_BOX {
+            return;
+        }
+        let sel = Draft::region(a, b);
+        let (f, e) = (self.stack.object_feather, self.stack.object_edge);
+        match dehaze::select_object(&base, sel, f, e) {
+            Some(o) => self.stack_add_shape(dehaze::Shape::Object(o)),
+            None => {
+                self.stack.error =
+                    Some("這個框裡分不出東西——把框拉得貼近要選的那個東西再框一次".into())
+            }
+        }
+    }
+
+    /// 就地改剛選好的那個物件的羽化／邊緣（與去煙霧那邊同一個做法）
+    fn stack_refine_object(&mut self, feather: i32, edge: i32) {
+        let mut v = self.stack.cur_mask().to_vec();
+        if let Some(dehaze::Shape::Object(o)) = v.last_mut() {
+            *o = o.refined(feather, edge);
+            self.stack.set_cur_mask(v);
+        }
+    }
+
+    /// 把一個形狀加到目前這一層的遮色片上
+    fn stack_add_shape(&mut self, s: dehaze::Shape) {
+        let mut v = self.stack.cur_mask().to_vec();
+        if v.len() >= dehaze::MAX_SHAPES {
+            self.stack.error = Some(format!(
+                "一張的遮色片最多 {} 個形狀，請先清除再畫",
+                dehaze::MAX_SHAPES
+            ));
+            return;
+        }
+        self.stack.error = None;
+        v.push(s);
+        self.stack.set_cur_mask(v);
+    }
+
+    /// 疊圖模組的「調色」區塊。滑桿與另外兩個模組完全相同，差別是這裡有
+    /// **兩個東西可以調**——每一層自己的（疊進去之前先套上）、與疊完的成品——
+    /// 最上面一排切左右，底下**共用同一組滑桿**。
+    ///
+    /// 兩組滑桿上下並排會變成二十四條，捲不完也分不清哪組是哪組；
+    /// 切換一次只顯示一組，版面就跟另外兩個模組長得一樣
+    fn ui_stack_grade(&mut self, ui: &mut egui::Ui, busy: StackBusy) {
+        // 沒有選著任何一張時就沒有「這一層」可調，一律回到成品那邊
+        let cur_path = self.stack.current().cloned();
+        if cur_path.is_none() {
+            self.stack.grade_target = GradeTarget::Output;
+        }
+        // 最上面那一排：左邊「這一層」、右邊「疊圖後」
+        ui.horizontal(|ui| {
+            let on_layer = self.stack.grade_target == GradeTarget::Layer;
+            let r = ui.add_enabled_ui(cur_path.is_some(), |ui| {
+                check_label(ui, on_layer, "這一層")
+                    .on_hover_text(
+                        "調縮圖列選著的那一張，**疊進去之前**先套在它身上。\n\
+                         同一場煙火各張的曝光、白平衡本來就有差，疊之前先各自\n\
+                         拉齊，比疊完再救整張有效得多；地景那張也照樣可以調。\n\
+                         切到「單層」就看得到這一層調過的樣子",
+                    )
+                    .clicked()
+            });
+            r.response.on_disabled_hover_text("先在縮圖列點一張照片");
+            if r.inner {
+                self.stack.grade_target = GradeTarget::Layer;
+            }
+            if check_label(ui, !on_layer, "疊圖後")
+                .on_hover_text("調疊好的那一張成品，**疊完之後**才套用。裁切也在這一邊")
+                .clicked()
+            {
+                self.stack.grade_target = GradeTarget::Output;
+            }
+        });
+        let layer = self.stack.grade_target == GradeTarget::Layer;
+        // 底下這一整塊兩邊共用，只有「現在調的是哪一份」不同
+        let cur = match (&cur_path, layer) {
+            (Some(p), true) => self.stack.grade_of(p).grade_only(),
+            _ => self.stack.grade,
+        };
+        // 按下去只記旗標，畫完這一列才跳確認框（見 ui_adjust_section 的說明）
+        let (mut ask_clear, mut reset_layer) = (false, false);
+        ui.horizontal(|ui| {
+            section_toggle(ui, "調色", &mut self.stack.grade_open);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if layer {
+                    if !cur.grade_is_neutral()
+                        && ui
+                            .small_button("↺ 這層歸零")
+                            .on_hover_text("只把這一張的調色歸零，別層與疊圖後的調色都不動")
+                            .clicked()
+                    {
+                        reset_layer = true;
+                    }
+                } else if !self.stack.grade.is_neutral()
+                    && ui
+                        .small_button("↺ 清除所有修改內容")
+                        .on_hover_text("把十二條調色滑桿一次全部歸零並取消裁切（不動疊圖設定與遮色片）")
+                        .clicked()
+                {
+                    ask_clear = true;
+                }
+            });
+        });
+        if reset_layer {
+            if let Some(p) = &cur_path {
+                self.stack.grades.remove(p);
+                self.stack.dirty = true;
+            }
+        }
+        if ask_clear {
+            if ask2(
+                rfd::MessageLevel::Warning,
+                "清除所有修改內容",
+                "將清除疊圖後的調色（十二條滑桿全部歸零，裁切一併取消）。\n\
+                 各層自己的調色、疊圖的地景、混合方式與遮色片都不受影響。",
+                "清除",
+                "取消",
+            ) {
+                self.stack.grade = Adjustments::default();
+                self.stack.dirty = true;
+            }
+        }
+        if !self.stack.grade_open {
+            return;
+        }
+        if layer {
+            // 調的是哪一層要寫出來：縮圖列可能捲走了，光看滑桿分不出來
+            ui.label(
+                egui::RichText::new(format!(
+                    "第 {} 層　{}{}",
+                    self.stack.cur + 1,
+                    cur_path
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    if self.stack.on_ground() { "（地景）" } else { "" },
+                ))
+                .size(11.5)
+                .color(theme::ACCENT),
+            )
+            .on_hover_text("要調別層就先在縮圖列點那一張");
+        }
+        ui.label(
+            egui::RichText::new(if layer {
+                "疊進去之前先套用在這一層；切到「單層」就看得到調過的樣子"
+            } else {
+                "疊完之後才套用，滑桿連點兩下可歸零"
+            })
+            .size(11.0)
+            .color(theme::TEXT_WEAK),
+        );
+        let mut g = cur;
+        // 列距收緊到與照片轉影片的調色面板相同（畫完裁切再還原）
+        let keep_gap = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = ADJ_ROW_GAP;
+        ui.add_enabled_ui(busy != StackBusy::Saving, |ui| adj_sliders(ui, &mut g));
+        // 裁切只在「疊圖後」那一邊：切的是成品，不是素材
+        if !layer {
+            // 先取好再借：兩個 &mut 欄位與 &self 的方法不能同時借
+            let src = self.stack.source_dims();
+            let crop_on = busy != StackBusy::Saving && self.stack.bases_ready();
+            ui_crop_block(
+                ui,
+                &mut g.crop,
+                &mut self.stack.crop_editing,
+                &mut self.stack.crop_aspect,
+                src,
+                crop_on,
+            );
+        }
+        ui.spacing_mut().item_spacing.y = keep_gap;
+        if g != cur {
+            match (&cur_path, layer) {
+                (Some(p), true) if g.grade_is_neutral() => {
+                    self.stack.grades.remove(p);
+                }
+                (Some(p), true) => {
+                    self.stack.grades.insert(p.clone(), g);
+                }
+                _ => self.stack.grade = g,
+            }
+            self.stack.dirty = true;
+        }
+        ui.add_space(6.0);
+    }
+
+    /// 專業模式的「遮色片」區塊。畫在地景上＝保護區（誰都疊不上去），
+    /// 畫在其他張上＝這一層那一塊不要疊進來
+    fn ui_stack_mask(&mut self, ui: &mut egui::Ui, busy: StackBusy) {
+        let on_ground = self.stack.on_ground();
+        let inverted = self.stack.cur_inverted();
+        let name = self
+            .stack
+            .current()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut set_invert: Option<bool> = None;
+        // 先在某一層畫了遮色片、之後才把那張設成地景的話，那份遮色片會變成
+        // 清不掉的保護區（整區已經停用）——留一顆清除鈕當逃生門
+        let mut clear_ground_mask = false;
+        let stuck = on_ground && !self.stack.cur_mask().is_empty();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("🎭 遮色片")
+                    .size(SECTION_FONT)
+                    .color(theme::TEXT),
+            );
+            ui.label(
+                egui::RichText::new(match (on_ground, inverted) {
+                    // 地景上整區關起來：它是底圖，只用「調整圖層」對位
+                    (true, _) => format!("地景「{name}」不畫遮色片（只用「調整圖層」對位）"),
+                    (false, false) => format!("畫在「{name}」上＝這一層不要疊進來的地方"),
+                    (false, true) => format!("畫在「{name}」上＝這一層只疊這裡"),
+                })
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            )
+            .on_hover_text(match (on_ground, inverted) {
+                (true, _) => {
+                    "地景是底圖，這一區在它身上整個關起來，\n\
+                     只用「調整圖層」對位；要遮掉什麼就畫在其他層上"
+                }
+                (false, false) => {
+                    "反過來：蓋到的地方這一層就不疊進來——\n\
+                     用來擋掉這張自己的地景、或這張裡拍壞的那一朵煙火"
+                }
+                (false, true) => {
+                    "這一層只有畫到的地方疊進來，其餘一律不疊（預設）——\n\
+                     整張裡只想要某一朵煙火時，圈它一個比「把其餘全部塗掉」快得多"
+                }
+            });
+            // 正選／反選。「選擇疊圖的區域」擺前面：那是想到什麼就圈什麼的
+            // 直覺用法，「不需疊圖的區域」是反過來想的，擺後面。
+            //
+            // **地景上不顯示這兩顆**：它只有保護區一種用法
+            // （見 [`StackTool::mask_inverted`]）
+            if stuck {
+                ui.add_space(8.0);
+                if ui
+                    .small_button("清除這層遮色片")
+                    .on_hover_text(
+                        "這張被設成地景之前畫的遮色片還在，仍以保護區生效；\n\
+                         按這裡清掉",
+                    )
+                    .clicked()
+                {
+                    clear_ground_mask = true;
+                }
+            }
+            if !on_ground {
+                ui.add_space(8.0);
+                if check_label(ui, inverted, "選擇疊圖的區域")
+                    .on_hover_text("**只疊**畫到的地方，其餘一律不疊（預設）")
+                    .clicked()
+                {
+                    set_invert = Some(true);
+                }
+                if check_label(ui, !inverted, "不需疊圖的區域")
+                    .on_hover_text("反過來：畫到的地方**不疊**，其餘照疊")
+                    .clicked()
+                {
+                    set_invert = Some(false);
+                }
+            }
+        });
+        if let (Some(v), Some(p)) = (set_invert, self.stack.current().cloned()) {
+            // 按了就是明講，之後不再照預設走
+            self.stack.mask_polarity.insert(p, v);
+            self.stack.dirty = true;
+        }
+        if clear_ground_mask {
+            self.stack.set_cur_mask(Vec::new());
+        }
+        ui.add_space(2.0);
+        // 地景上整區停用：它是底圖，只用「調整圖層」對位。留著但變灰（不是
+        // 整段藏起來），面板高度才不會在切到地景時忽然縮一截
+        ui.add_enabled_ui(busy != StackBusy::Saving && !on_ground, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (tool, label, tip) in [
+                    (MaskTool::Rect, "框選", "拖曳框出一塊"),
+                    (
+                        MaskTool::Brush,
+                        "筆刷",
+                        "在照片上塗，塗到的地方才擋；同一塊想更濃就再塗一遍",
+                    ),
+                    (
+                        MaskTool::Linear,
+                        "線性漸層",
+                        "從起點全效果、沿著拖曳方向漸弱，到終點完全不遮",
+                    ),
+                    (
+                        MaskTool::Radial,
+                        "放射性漸層",
+                        "由中心往外拖出橢圓，圓內全遮；可反轉成只遮圓外",
+                    ),
+                    (
+                        MaskTool::Object,
+                        "物件",
+                        "框住要遮的東西（一朵煙火、一座橋、一棟建築），\n\
+                         程式會自動找出框裡那個東西的輪廓。\n\
+                         框得貼近一點選得越準；選完可再調羽化與邊緣",
+                    ),
+                ] {
+                    let on = self.stack.tool == Some(tool);
+                    if check_label(ui, on, label).on_hover_text(tip).clicked() {
+                        // 再點一次同一個工具就關掉，左鍵回到拖曳平移
+                        self.stack.tool = (!on).then_some(tool);
+                        // 要畫遮色片就得看得到那一層本身，不能對著疊圖結果畫
+                        if self.stack.tool.is_some() {
+                            self.stack.view_layer = true;
+                            self.stack.compare = false;
+                        }
+                    }
+                }
+                let n = self.stack.cur_mask().len();
+                if n > 0 {
+                    ui.separator();
+                    if ui
+                        .small_button("↩ 還原一個")
+                        .on_hover_text("拿掉這一層最後畫上去的那個形狀")
+                        .clicked()
+                    {
+                        let mut v = self.stack.cur_mask().to_vec();
+                        v.pop();
+                        self.stack.set_cur_mask(v);
+                    }
+                    if ui
+                        .small_button("清除這層遮色片")
+                        .on_hover_text("只清這一層，別張畫的不受影響")
+                        .clicked()
+                    {
+                        self.stack.set_cur_mask(Vec::new());
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("（{n} 個形狀）"))
+                            .size(11.0)
+                            .color(theme::TEXT_WEAK),
+                    );
+                }
+            });
+            if self.stack.cur_mask().is_empty() {
+                // 反選但還沒畫：**整張照疊**，不是整張都不疊——一個形狀都沒有
+                // 就把整層擋光的話，畫面會莫名其妙少一層（見 stack::weights）
+                ui.label(
+                    egui::RichText::new(match (self.stack.tool.is_some(), inverted) {
+                        (true, false) => {
+                            "直接在照片上拖曳；不畫就是這一層整張都照疊。畫好的框、漸層可以直接拖著搬"
+                        }
+                        (true, true) => {
+                            "圈出要疊進來的那一塊；還沒畫之前整張都照疊。畫好的框、漸層可以直接拖著搬"
+                        }
+                        (false, false) => "這一層還沒畫遮色片（整張都照疊）；要擋掉什麼再選一種工具",
+                        (false, true) => "這一層還沒畫遮色片（整張都照疊）；要只疊哪一塊再選一種工具圈起來",
+                    })
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
+                );
+            }
+
+            // 各工具自己的選項
+            match self.stack.tool {
+                Some(MaskTool::Brush) => {
+                    // 三條都走 slider_row：標籤寬度固定，滑桿起點才對得齊
+                    // （去煙霧那邊是同一組、同一個順序）
+                    let mut size = self.stack.brush_size;
+                    slider_row(ui, &mut size, 1, 40, "尺寸");
+                    self.stack.brush_size = size;
+                }
+                Some(MaskTool::Radial) => {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .checkbox(&mut self.stack.radial_invert, "反轉（只遮橢圓外）")
+                            .changed()
+                        {
+                            // 剛畫好就想反轉是最常見的用法，直接改在最後那個上面，
+                            // 不必刪掉重畫一次
+                            let inv = self.stack.radial_invert;
+                            let mut v = self.stack.cur_mask().to_vec();
+                            if let Some(dehaze::Shape::Radial(r)) = v.last_mut() {
+                                r.invert = inv;
+                                self.stack.set_cur_mask(v);
+                            }
+                        }
+                    });
+                }
+                Some(MaskTool::Object) => {
+                    // 兩條都走 slider_row，標籤寬度才與底下那組對得齊
+                    let (f0, e0) = (self.stack.object_feather, self.stack.object_edge);
+                    let (mut f, mut e) = (f0, e0);
+                    slider_row(ui, &mut f, 0, 100, "羽化");
+                    slider_row(ui, &mut e, -100, 100, "邊緣");
+                    if (f, e) != (f0, e0) {
+                        self.stack.object_feather = f;
+                        self.stack.object_edge = e;
+                        // 剛框完就想調鬆一點是最常見的用法，直接改在最後選的
+                        // 那一個上面，不必刪掉重框（分割不重跑，只是換個邊界）
+                        self.stack_refine_object(f, e);
+                    }
+                    ui.label(
+                        egui::RichText::new(OBJECT_HINT).size(11.0).color(theme::TEXT_WEAK),
+                    );
+                }
+                _ => {}
+            }
+
+            // 羽化與濃度：整組遮色片共用（與去煙霧同一組、同一個順序）。
+            //
+            // **選著「物件」時不顯示**：這兩條它都不吃——邊界柔不柔由它自己
+            // 那條「羽化」決定，濃度也一律 100%。擺在那裡只會讓人以為要調，
+            // 而且畫面上會同時出現「羽化」與「邊緣羽化」兩條，更難分
+            if self.stack.tool != Some(MaskTool::Object) {
+                let (f0, d0) = (self.stack.feather, self.stack.mask_density);
+                let (mut f, mut d) = (f0, d0);
+                slider_row(ui, &mut f, 0, 100, "邊緣羽化");
+                slider_row(ui, &mut d, 0, 100, "筆刷濃度");
+                if (f, d) != (f0, d0) {
+                    self.stack.feather = f;
+                    self.stack.mask_density = d;
+                    self.stack.dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new(MASK_HINT)
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                if check_label(ui, self.stack.show_mask, "顯示遮色片")
+                    .on_hover_text("在單層檢視上蓋一片紅：**紅色蓋住的地方這一層不會疊進來**，
+形狀的輪廓也一併畫出來")
+                    .clicked()
+                {
+                    self.stack.show_mask = !self.stack.show_mask;
+                }
+            });
+        });
+    }
+
+    /// 遮罩檢視用的紅色貼圖：**紅色蓋住的地方這一層不會疊進來**，
+    /// 與去煙霧的「顯示遮色片」是同一個意思。
+    ///
+    /// 只畫輪廓看不出「反過來選」之後實際擋掉哪一片，尤其是漸層與筆刷那種
+    /// 邊界是柔的東西——輪廓只有一條線，濃淡完全看不出來。
+    ///
+    /// 權重圖在一張小圖上算就夠：這是拿來看範圍的，不是看細節；
+    /// 原尺寸一張要好幾十 MB，更不可能每幀重算。設定沒變就沿用上次那張
+    fn stack_mask_texture(&mut self, ui: &egui::Ui, aspect: f32) -> Option<egui::TextureHandle> {
+        const LONG: f32 = 360.0;
+        let shapes = self.stack.cur_mask().to_vec();
+        if shapes.is_empty() {
+            return None;
+        }
+        let (w, h) = if aspect >= 1.0 {
+            (LONG as usize, ((LONG / aspect).round() as usize).max(1))
+        } else {
+            (((LONG * aspect).round() as usize).max(1), LONG as usize)
+        };
+        let key = (
+            shapes.clone(),
+            self.stack.feather,
+            self.stack.mask_density,
+            self.stack.cur_inverted(),
+            w,
+            h,
+        );
+        if self.stack.mask_key.as_ref() != Some(&key) {
+            // 與真正疊圖時走的是同一支（含正反選），看到的紅就是實際擋掉的
+            self.stack.mask_tex =
+                stack::weights(&shapes, key.1, key.2, w, h, key.3).map(|v| {
+                    let mut px = Vec::with_capacity(w * h * 4);
+                    for a in &v {
+                        // 顏色與透明度比照去煙霧的遮罩檢視
+                        px.extend_from_slice(&[220, 40, 60, (a.clamp(0.0, 1.0) * 140.0) as u8]);
+                    }
+                    ui.ctx().load_texture(
+                        "stack_mask",
+                        egui::ColorImage::from_rgba_unmultiplied([w, h], &px),
+                        egui::TextureOptions::LINEAR,
+                    )
+                });
+            self.stack.mask_key = Some(key);
+        }
+        self.stack.mask_tex.clone()
+    }
+
+    /// 疊圖預覽上的遮色片繪製。`img` 為照片實際畫出來的矩形。
+    /// 只有在單層檢視（看得到那一層本身）時才畫得動
+    fn ui_stack_canvas_interaction(
+        &mut self,
+        ui: &mut egui::Ui,
+        resp: &egui::Response,
+        img: egui::Rect,
+    ) {
+        let hit = ui.clip_rect();
+        let to_norm = |p: egui::Pos2| {
+            egui::pos2(
+                ((p.x - img.left()) / img.width()).clamp(0.0, 1.0),
+                ((p.y - img.top()) / img.height()).clamp(0.0, 1.0),
+            )
+        };
+        let to_screen = |p: egui::Pos2| {
+            egui::pos2(img.left() + p.x * img.width(), img.top() + p.y * img.height())
+        };
+        // 疊圖結果上不畫遮色片：形狀屬於某一層，蓋在合成後的畫面上看不出是誰的
+        if !self.stack.view_layer {
+            self.stack.draft = None;
+            self.stack.moving = None;
+            return;
+        }
+        // 簡易模式不套遮色片（見 StackTool::key），那就別在單層檢視上畫
+        // 一堆其實沒有作用的輪廓。
+        //
+        // 「顯示遮色片」說了算，**不再因為選著工具就自己畫出來**：
+        // 原本只要選著工具就一律畫，那顆開關按了畫面完全沒反應，等於失效。
+        // 正在拖的那一筆仍有即時回饋（畫在下面，不受這裡影響）
+        let outlines = self.stack.pro && self.stack.show_mask;
+        if outlines {
+            // 先鋪紅色的遮罩檢視，輪廓再畫在上面
+            if img.width() > 0.0 && img.height() > 0.0 {
+                if let Some(t) = self.stack_mask_texture(ui, img.width() / img.height()) {
+                    ui.painter().image(
+                        t.id(),
+                        img,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+            }
+            let shapes = self.stack.cur_mask().to_vec();
+            // 搬移中的那一個畫在暫時的位置，放開才真的寫回去
+            let shifted = |i: usize, s: &dehaze::Shape| match self.stack.moving {
+                Some((mi, d)) if mi == i => shape_moved(s, d),
+                _ => s.clone(),
+            };
+            match shapes.as_slice() {
+                [dehaze::Shape::Rect(r)]
+                    if self.stack.draft.is_none() && self.stack.moving.is_none() =>
+                {
+                    paint_selection(
+                        ui,
+                        img,
+                        egui::Rect::from_two_pos(
+                            to_screen(egui::pos2(r.x0, r.y0)),
+                            to_screen(egui::pos2(r.x1, r.y1)),
+                        ),
+                    )
+                }
+                shapes => {
+                    for (i, s) in shapes.iter().enumerate() {
+                        paint_shape(ui, img, &shifted(i, s), self.stack.feather);
+                    }
+                }
+            }
+        }
+
+        // 地景上不畫遮色片：那一區在面板上已經整個停用（見 ui_stack_mask）
+        let tool = self.stack.active_tool();
+        let radius = self.stack.brush_radius();
+        // 物件也是用拖的——框住要選的東西，放開才去算框裡那個東西的輪廓
+        if tool == Some(MaskTool::Object)
+            && resp
+                .hover_pos()
+                .is_some_and(|p| img.contains(p) && hit.contains(p))
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        // 按在已經畫好的形狀上＝把它整個搬走，不是再畫一個。
+        // 想在既有形狀裡面再畫一個，就從它外面開始拖
+        if resp.drag_started() && outlines {
+            let shapes = self.stack.cur_mask().to_vec();
+            self.stack.moving = resp
+                .interact_pointer_pos()
+                .filter(|p| hit.contains(*p))
+                .and_then(|p| shape_at(&shapes, p, img))
+                .filter(|&i| shape_movable(&shapes[i]))
+                .map(|i| (i, egui::Vec2::ZERO));
+        }
+        // 拖到一半視窗失焦之類的情況不會送 drag_stopped，
+        // 沒有這道保險就會永遠卡在搬移狀態
+        if self.stack.moving.is_some() && !resp.dragged() && !resp.drag_stopped() {
+            self.stack.moving = None;
+        }
+        if self.stack.moving.is_some() {
+            let d = resp.drag_delta();
+            if let Some((_, acc)) = self.stack.moving.as_mut() {
+                *acc += egui::vec2(d.x / img.width(), d.y / img.height());
+            }
+            if resp.drag_stopped() {
+                if let Some((i, acc)) = self.stack.moving.take() {
+                    let mut v = self.stack.cur_mask().to_vec();
+                    if let Some(s) = v.get(i) {
+                        v[i] = shape_moved(s, acc);
+                        self.stack.set_cur_mask(v);
+                    }
+                }
+            }
+            self.stack.draft = None;
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            return;
+        }
+        if resp.drag_started() {
+            self.stack.draft = tool.and_then(|tool| {
+                resp.interact_pointer_pos()
+                    .filter(|p| img.contains(*p) && hit.contains(*p))
+                    .map(to_norm)
+                    .and_then(|p| match tool {
+                        MaskTool::Rect => Some(Draft::Rect(p, p)),
+                        MaskTool::Linear => Some(Draft::Linear(p, p)),
+                        MaskTool::Radial => Some(Draft::Radial(p, p)),
+                        MaskTool::Brush => Some(Draft::Brush(vec![[p.x, p.y]])),
+                        MaskTool::Object => Some(Draft::Object(p, p)),
+                    })
+            });
+        }
+        // 游標停在既有形狀上時先講清楚「這個抓得動」
+        if self.stack.draft.is_none() && outlines {
+            if let Some(p) = resp.hover_pos().filter(|p| hit.contains(*p)) {
+                let shapes = self.stack.cur_mask();
+                if shape_at(shapes, p, img).is_some_and(|i| shape_movable(&shapes[i])) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+            }
+        }
+        let now = resp.interact_pointer_pos().map(to_norm);
+        if let (Some(d), Some(now)) = (self.stack.draft.as_mut(), now) {
+            let stopped = resp.drag_stopped();
+            match d {
+                Draft::Rect(_, b)
+                | Draft::Linear(_, b)
+                | Draft::Radial(_, b)
+                | Draft::Object(_, b) => *b = now,
+                Draft::Brush(pts) => {
+                    let far = pts.last().is_none_or(|l| {
+                        let (dx, dy) = (now.x - l[0], now.y - l[1]);
+                        dx * dx + dy * dy > BRUSH_STEP * BRUSH_STEP
+                    });
+                    if pts.len() < MAX_BRUSH_PTS && (far || stopped) {
+                        pts.push([now.x, now.y]);
+                    }
+                }
+            }
+        }
+        let invert = self.stack.radial_invert;
+        if let Some(d) = &self.stack.draft {
+            match d {
+                // 物件拉的也是一個框，拉的當下畫的就是同一個東西
+                Draft::Rect(a, b) | Draft::Object(a, b) => paint_selection(
+                    ui,
+                    img,
+                    egui::Rect::from_two_pos(to_screen(*a), to_screen(*b)),
+                ),
+                d => {
+                    if let Some(s) = d.to_shape(radius, invert) {
+                        paint_shape(ui, img, &s, self.stack.feather)
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            match self.stack.draft.take() {
+                // 物件：框只講「東西在這一塊裡」，輪廓要從照片內容算出來
+                Some(Draft::Object(a, b)) => self.stack_pick_object(a, b),
+                Some(d) => {
+                    if let Some(shape) = d.to_shape(radius, invert).and_then(|s| s.cleaned()) {
+                        self.stack_add_shape(shape);
+                    }
+                }
+                None => {}
+            }
+        }
+        // 筆刷游標：先看得到會刷多粗，才不會塗完才發現不對
+        if tool == Some(MaskTool::Brush) {
+            if let Some(p) = resp
+                .hover_pos()
+                .filter(|p| img.contains(*p) && hit.contains(*p))
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                let r = radius * img.width().max(img.height());
+                ui.painter().circle_stroke(
+                    p,
+                    r,
+                    egui::Stroke::new(1.2, theme::ACCENT),
+                );
+            }
+        }
+    }
+
+    /// 疊圖預覽下方的檢視列：單張／前後對照、疊圖結果／單層，以及顯示比例
+    fn ui_stack_zoom_bar(&mut self, ui: &mut egui::Ui, fit_scale: f32, pct: f32) {
+        ui.horizontal_wrapped(|ui| {
+            // 兩種模式都有：光是想確認某一張原圖拍到什麼就用得上
+            // （縮圖列點素材／點「疊圖結果」也是切這個）
+            if check_label(ui, !self.stack.view_layer, "疊圖結果")
+                .on_hover_text("看疊完的成品")
+                .clicked()
+            {
+                self.stack.view_layer = false;
+                self.stack.tool = None;
+                // 調色面板跟著走：看哪個就調哪個
+                self.stack.grade_target = GradeTarget::Output;
+            }
+            if check_label(ui, self.stack.view_layer, "單層")
+                .on_hover_text(
+                    "看縮圖列選著的那一張（含它自己的調色；\n\
+                     專業模式的遮色片也要畫在這裡）",
+                )
+                .clicked()
+            {
+                self.stack.view_layer = true;
+                self.stack.compare = false;
+                self.stack.grade_target = GradeTarget::Layer;
+            }
+            ui.separator();
+            // 單層檢視下沒有「前後」可比，這兩顆先關起來
+            ui.add_enabled_ui(!self.stack.view_layer, |ui| {
+                let cmp = self.stack.compare;
+                if check_label(ui, !cmp, "單張")
+                    .on_hover_text("只看疊圖結果（Y 鍵切換）")
+                    .clicked()
+                {
+                    self.stack.compare = false;
+                }
+                if check_label(ui, cmp, "地景／疊圖後")
+                    .on_hover_text("左右並排比對地景原圖與疊完的樣子（Y 鍵切換）")
+                    .clicked()
+                {
+                    self.stack.compare = true;
+                }
+            });
+            ui.separator();
+            let fit = self.stack.zoom.is_none();
+            if check_label(ui, fit, "符合視窗")
+                .on_hover_text("整張塞進畫面（空白鍵可在 100% 與這裡之間來回）")
+                .clicked()
+            {
+                self.stack.zoom = None;
+                self.stack.zoom_back = None;
+            }
+            for z in [0.5f32, 1.0, 2.0] {
+                let on = self.stack.zoom.is_some_and(|v| (v - z).abs() < 0.001);
+                let mut b = check_label(ui, on, format!("{:.0}%", z * 100.0));
+                if z == 1.0 {
+                    b = b.on_hover_text("原尺寸（空白鍵：跳到 100%，再按一次回原本的比例）");
+                }
+                if b.clicked() {
+                    if fit {
+                        self.stack.pan = egui::pos2(0.5, 0.5);
+                    }
+                    self.stack.zoom = Some(z);
+                    self.stack.zoom_back = None;
+                }
+            }
+            ui.label(
+                egui::RichText::new(if fit {
+                    format!("目前 {pct:.0}%（符合視窗）")
+                } else {
+                    format!("目前 {pct:.0}%")
+                })
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            )
+            .on_hover_text(format!(
+                "100% ＝ 照片 1 像素對螢幕 1 個實體像素\n\
+                 （不隨 Windows 的顯示縮放變動），\n\
+                 符合視窗時是 {:.0}%。\n\
+                 平常用整批共用比例、長邊 {SMOKE_PREVIEW_MAX} px 的工作縮圖疊；\n\
+                 放大到它不夠細時，會在背景把每一層重載成比較細的再疊一次\n\
+                 （停手幾秒後換上去，張數越多能載的越小）。\n\
+                 存檔時是拿原尺寸重疊一次，不是把這張放大。\n\
+                 滾輪縮放（開著筆刷時 Ctrl＋滾輪改筆刷粗細）；\n\
+                 沒選遮色片工具時左鍵可直接拖曳平移。",
+                fit_scale * 100.0
+            ));
+        });
+    }
+
+    /// 「煙火疊圖」模組：把好幾張煙火用加亮／濾色疊成一張。
+    /// 版面比照去煙霧（右邊調色面板＋中央預覽＋縮圖列＋存檔列）
+    fn ui_stack_module(&mut self, ctx: &egui::Context) {
+        let mut pick = false;
+        // 「加入照片」：追加到現有清單後面，不是整批換掉
+        let mut add = false;
+        // 「貼上圖片」：把剪貼簿裡的圖片加成一層
+        let mut paste = false;
+        // 要移除的那一張（右鍵選單或 Delete 鍵）
+        let mut remove_idx: Option<usize> = None;
+        // 按了存檔（會跳存檔對話框讓使用者自己挑位置與檔名）
+        let mut save = false;
+        let mut clear = false;
+        let mut goto: Option<usize> = None;
+        let mut set_ground: Option<usize> = None;
+        // 縮圖列最後那張「疊圖結果」被點了：回去看成品
+        let mut show_result = false;
+        // 自動對齊的開關被切換了，要重跑（或收工）
+        let mut align_now = false;
+        // 「這層歸零」被按了：把選著那層的平移、縮放、旋轉一起清掉
+        let mut reset_offset = false;
+        let side_frame = egui::Frame::default()
+            .fill(theme::PANEL)
+            // 內距與照片轉影片的調色面板相同，四個模組的側欄一樣寬鬆
+            .inner_margin(egui::Margin::symmetric(14, 12));
+        let center_frame = egui::Frame::default()
+            .fill(theme::BG)
+            .inner_margin(egui::Margin::same(12));
+        {
+            egui::SidePanel::right("stack_side")
+                .frame(side_frame)
+                .resizable(true)
+                .default_width(330.0)
+                .width_range(300.0..=430.0)
+                .show(ctx, |ui| {
+                    let busy = self.stack.busy;
+                    egui::ScrollArea::vertical()
+                        .id_salt("stack_side_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.ui_stack_grade(ui, busy);
+                        });
+                });
+            egui::CentralPanel::default().frame(center_frame).show(ctx, |ui| {
+                let busy = self.stack.busy;
+                let total = self.stack.photos.len();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(busy != StackBusy::Saving, egui::Button::new("🖼  選擇照片"))
+                        .on_hover_text(format!(
+                            "**整批換掉**：一次選兩張以上（最多 {MAX_STACK_PHOTOS} 張），\n\
+                             同機位、同構圖疊起來才對得準。\n\
+                             只是想再多疊一張就按旁邊的「加入照片」"
+                        ))
+                        .clicked()
+                    {
+                        pick = true;
+                    }
+                    // 追加：先挑兩三張看看效果、再想起「那張也該疊進去」是常事，
+                    // 那時不該逼人把全部重選一遍
+                    if total > 0
+                        && ui
+                            .add_enabled(
+                                busy != StackBusy::Saving && total < MAX_STACK_PHOTOS,
+                                egui::Button::new("➕  加入照片"),
+                            )
+                            .on_hover_text(
+                                "把照片**加到現在這批後面**，已經選的、\n\
+                                 已經調好的遮色片與擺法都留著，\n\
+                                 對齊也只算新加的那幾張",
+                            )
+                            .on_disabled_hover_text(format!("已經滿 {MAX_STACK_PHOTOS} 張了"))
+                            .clicked()
+                    {
+                        add = true;
+                    }
+                    // 剪貼簿：截圖（Win+Shift+S）或從別的軟體複製的圖片直接變成一層，
+                    // 不必先存成檔案再挑進來。
+                    //
+                    // 一張照片都還沒有時不顯示：貼進來的圖是「疊上去的一層」，
+                    // 手上連地景都沒有的時候貼它沒有意義，擺在空畫面上只會讓人
+                    // 以為那是另一種開檔方式
+                    if total > 0
+                        && ui
+                            .add_enabled(
+                                busy != StackBusy::Saving && total < MAX_STACK_PHOTOS,
+                                egui::Button::new("📋  貼上圖片"),
+                            )
+                            .on_hover_text(
+                                "把**剪貼簿裡的圖片**直接加成一層（快捷鍵 Ctrl+V）：\n\
+                                 Win+Shift+S 截的圖、從別的軟體複製的 logo 或標題圖，\n\
+                                 不必先存成檔案。透明的地方會變黑，\n\
+                                 用「加亮」疊起來就只有畫到的地方露出來",
+                            )
+                            .on_disabled_hover_text(format!("已經滿 {MAX_STACK_PHOTOS} 張了"))
+                            .clicked()
+                    {
+                        paste = true;
+                    }
+                    if total > 0
+                        && ui
+                            .add_enabled(busy != StackBusy::Saving, egui::Button::new("🗑  清除"))
+                            .on_hover_text("清掉目前這批照片，回到選擇照片的畫面")
+                            .clicked()
+                    {
+                        clear = true;
+                    }
+                    if total > 0 {
+                        ui.separator();
+                        // 簡易／專業：預設簡易，只要選照片、挑地景、存檔
+                        let pro = self.stack.pro;
+                        if check_label(ui, !pro, "簡易")
+                            .on_hover_text(
+                                "只要選照片、挑一張當地景，其餘自動用加亮疊起來\n\
+                                 （每一層仍可各自調色）",
+                            )
+                            .clicked()
+                        {
+                            self.stack.pro = false;
+                            // 遮色片工具與「調整圖層」都是專業模式專屬的，要一起
+                            // 收起來，否則畫面會停在一個簡易模式看不到、也改不動
+                            // 的狀態。單層檢視兩邊都有，留著不動——正在看某一張時
+                            // 切個模式就被踢回成品，反而莫名其妙
+                            self.stack.tool = None;
+                            self.stack.move_mode = false;
+                        }
+                        if check_label(ui, pro, "專業")
+                            .on_hover_text(
+                                "多了混合方式（加亮／濾色）、遮色片，\n\
+                                 以及各圖層（含地景）的移動、縮放與旋轉",
+                            )
+                            .clicked()
+                        {
+                            self.stack.pro = true;
+                        }
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!("{total} 張"))
+                                .size(12.0)
+                                .color(theme::TEXT),
+                        );
+                        if let Some(g) = self.stack.ground_path() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "地景：{}",
+                                    g.file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default()
+                                ))
+                                .size(12.0)
+                                .color(theme::TEXT_WEAK),
+                            );
+                        }
+                        // 現在看的是哪一張。地景那個名字是固定的，不會跟著
+                        // 縮圖列切換——單層檢視時沒有這一欄就不知道螢幕上
+                        // 這張到底是哪個檔案
+                        ui.separator();
+                        let viewing = if self.stack.view_layer {
+                            self.stack
+                                .current()
+                                .and_then(|p| p.file_name())
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        } else {
+                            format!("疊圖結果（{total} 張疊成）")
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("檢視：{viewing}"))
+                                .size(12.0)
+                                .color(theme::TEXT),
+                        )
+                        .on_hover_text("目前預覽顯示的是哪一張；點縮圖列可以切換");
+                        // 還在編輯狀態時講明白：工具或「調整圖層」開著的時候，
+                        // 畫面停在單層、左鍵也還在畫（或在搬圖層），那都不是成品
+                        // 的樣子。開關在設定區下半段，捲下去就忘了自己還開著
+                        // （見 [`StackTool::end_editing`]）
+                        ui.separator();
+                        if self.stack.editing() {
+                            ui.label(
+                                egui::RichText::new("✏ 編輯中")
+                                    .size(12.0)
+                                    .color(theme::TRACK),
+                            )
+                            .on_hover_text(self.stack.editing_hint());
+                            if ui
+                                .small_button("完成編輯")
+                                .on_hover_text(
+                                    "收起遮色片工具、遮罩檢視與「調整圖層」，\
+                                     畫面回到疊圖結果；左鍵也回到拖曳平移。\n\
+                                     混合方式**不會被動到**（選了濾色就是要用\
+                                     濾色出圖），只是不再提醒你它開著——\
+                                     再動一次混合方式提醒就會回來",
+                                )
+                                .clicked()
+                            {
+                                self.stack.end_editing();
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new("✔ 完成編輯")
+                                    .size(12.0)
+                                    .color(theme::TEXT_WEAK),
+                            )
+                            .on_hover_text("沒有工具開著，畫面就是存檔會拿到的疊圖結果");
+                        }
+                    }
+                    if self.stack.load_left > 0 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "照片載入中… 還有 {} 張",
+                                self.stack.load_left
+                            ))
+                            .size(11.0)
+                            .color(theme::TEXT_WEAK),
+                        );
+                        ctx.request_repaint();
+                    }
+                });
+                ui.add_space(8.0);
+
+                // 這一行講的是「剛才那個動作」怎麼了——按下一次滑鼠就代表
+                // 使用者已經在做別的事，讓它退場。否則像「框裡分不出東西」
+                // 這種提示會一直掛在最上面，早就不成立了還看起來像卡住。
+                //
+                // 判斷放在畫出來之前、其餘元件之後：這一幀新設的錯誤要等到
+                // 下一次按下才會被清掉，不會才剛出現就被自己這一下抹掉
+                if self.stack.error.is_some() && ctx.input(|i| i.pointer.any_pressed()) {
+                    self.stack.error = None;
+                }
+                if let Some(e) = &self.stack.error {
+                    ui.label(egui::RichText::new(format!("✖ {e}")).size(12.0).color(theme::ERROR));
+                    ui.add_space(6.0);
+                }
+
+                // 還沒選照片：整塊工作區就是一張引導畫面
+                if self.stack.photos.is_empty() {
+                    if stack_empty_state(ui, false) {
+                        pick = true;
+                    }
+                    return;
+                }
+
+                // 只選了一張：疊圖至少要兩張。這裡按下去是**追加**——
+                // 已經挑好的那張要留著，不是叫人重挑一次
+                if total < 2 {
+                    if stack_empty_state(ui, true) {
+                        add = true;
+                    }
+                    return;
+                }
+
+                // 預覽區高度：作法與去煙霧相同，用上一幀量到的高度留位。
+                //
+                // 預覽底下**一定**會有的東西全部列出來實際加總，不再用一個
+                // 猜的常數——簡易模式的設定區比專業模式矮，預覽就會照著長高，
+                // 猜少了就把最下面的存檔列擠出視窗（存檔鈕被裁掉）
+                let film_h = 100.0;
+                let below = 10.0                        // 預覽與比例列之間的分隔線
+                    + self.stack.zoom_h                 // 比例列（窄視窗會換行，所以用量到的）
+                    + 8.0                               // 比例列與縮圖列之間
+                    + film_h                            // 縮圖列
+                    + 6.0                               // 縮圖列與設定區之間
+                    + 6.0                               // 設定區與存檔列之間
+                    + self.stack.save_h                 // 存檔列
+                    // egui 每擺一個東西都會先墊一次 item_spacing.y（這裡是 7）：
+                    // 分隔線、比例列、縮圖列、設定區、存檔列共五個。上面那幾個
+                    // add_space 是額外加的，不含這一份。漏掉這 35 點，設定區就
+                    // 永遠差最後一小截（「顯示遮色片」被裁掉半顆）——而且是固定
+                    // 偏差，下一幀量到的 settings_h 一樣，不會自己校正回來
+                    + ui.spacing().item_spacing.y * 5.0;
+                let ctrl_h = below + self.stack.settings_h.unwrap_or(150.0);
+                let avail = ui.available_height();
+                // 預覽的下限原本是三成，遮色片搬到右欄之後那一欄有七、八列高，
+                // 設定區被這個下限卡住就差最後一列（「顯示遮色片」被裁掉）。
+                // 放寬到兩成（絕對值不低於 200 點）：設定區塞得下時這個下限根本
+                // 不會生效（預覽照 avail - ctrl_h 配），只有塞不下時預覽才多讓
+                // 那一截出來。與去煙霧同一個作法
+                let img_min = (avail * 0.20).max(200.0);
+                // 再怎麼拉高，設定區至少要留得下兩列，存檔列也要完整留在視窗內
+                let img_max = (avail - below - 56.0).max(img_min);
+                let want = avail - ctrl_h;
+                let img_h = (want + self.stack.img_extra).clamp(img_min, img_max);
+                let settled = img_h - want;
+                if settled.abs() < self.stack.img_extra.abs() {
+                    self.stack.img_extra = settled;
+                }
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), img_h),
+                    egui::Sense::click_and_drag(),
+                );
+                ui.painter().rect_filled(rect, 8.0, theme::CARD);
+                // 預覽與下面控制列之間的分隔線：上下拖曳改預覽高度，連點兩下回自動配高
+                let (bar, bar_resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 10.0),
+                    egui::Sense::click_and_drag(),
+                );
+                if bar_resp.dragged() {
+                    self.stack.img_extra += bar_resp.drag_delta().y;
+                }
+                if bar_resp.double_clicked() {
+                    self.stack.img_extra = 0.0;
+                }
+                let hot = bar_resp.hovered() || bar_resp.dragged();
+                if hot {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                let grip = egui::Rect::from_center_size(bar.center(), egui::vec2(54.0, 3.0));
+                ui.painter()
+                    .rect_filled(grip, 1.5, if hot { theme::ACCENT } else { theme::BORDER });
+                bar_resp.on_hover_text("上下拖曳可調整預覽區高度；連點兩下回到自動");
+
+                // 單層檢視要看的是那一層原圖，對照模式的左半邊則是地景原圖；
+                // 兩者都是「某一張的原圖」，共用同一個貼圖槽
+                // 單層檢視兩種模式都有（縮圖列點素材就是要看它），
+                // 這裡不能再綁專業模式——綁了的話簡易模式下這張貼圖不會載，
+                // 預覽就變成一片空白
+                // 「調整圖層」時也要這一層的貼圖：拖曳的當下要半透明疊上去當
+                // 對位參考。**開著就先載好**——等到按下去才載，第一下會沒東西可疊
+                let ghosting = self.stack.ghost_enabled();
+                let raw_want: Option<PathBuf> = if self.stack.view_layer || ghosting {
+                    self.stack.current().cloned()
+                } else if self.stack.compare {
+                    self.stack.ground_path().cloned()
+                } else {
+                    None
+                };
+                // 單層檢視與半透明疊圖都要看得到這一層自己調的色（調了半天看不到
+                // 就沒意義）；前後對照的左半邊是「疊之前的地景」，那邊看的才是原圖
+                let want_grade = |s: &StackTool, p: &PathBuf| {
+                    (s.view_layer || ghosting)
+                        .then(|| s.layer_previews.get(p).map(|(g, _)| *g))
+                        .flatten()
+                        .unwrap_or_default()
+                };
+                let want = raw_want.as_ref().map(|p| (p.clone(), want_grade(&self.stack, p)));
+                // 疊圖結果換成精細底圖疊的那一份時，單層檢視也要跟著換，
+                // 不然切過去會突然糊掉一階（layer_previews 是同一趟出來的，
+                // 本來就跟著走）
+                let fine = self.stack.applied_long > 0;
+                if self.stack.tex_raw_of != want || self.stack.tex_raw_fine != fine {
+                    let img = want.as_ref().and_then(|(p, g)| {
+                        if g.grade_is_neutral() {
+                            // 精細那一份沒有就退回工作縮圖：寧可糊一階，
+                            // 也不要因為拿不到圖而整片空白
+                            fine.then(|| self.stack.bases_fine.get(p))
+                                .flatten()
+                                .or_else(|| self.stack.bases.get(p))
+                                .cloned()
+                        } else {
+                            self.stack.layer_previews.get(p).map(|(_, i)| i.clone())
+                        }
+                    });
+                    self.stack.tex_raw_fine = fine;
+                    self.stack.tex_raw =
+                        img.map(|img| load_rgb_texture(ctx, "stack_raw", &img));
+                    self.stack.tex_raw_of = want;
+                }
+                // 單層檢視不再綁專業模式：縮圖列上點某一張就是要看它
+                let layer_view = self.stack.view_layer;
+                let tex = if layer_view {
+                    self.stack.tex_raw.clone()
+                } else {
+                    self.stack.tex_out.clone().or_else(|| self.stack.tex_raw.clone())
+                };
+
+                if let Some(tex) = tex {
+                    let full = rect.shrink(6.0);
+                    // 對照模式：左半邊地景原圖、右半邊疊圖結果。兩半同寬，
+                    // 縮放與平移只算一次（用右半邊），左邊照同一組位移畫
+                    let before_view = (self.stack.compare && !layer_view).then(|| {
+                        egui::Rect::from_min_size(
+                            full.min,
+                            egui::vec2((full.width() - SMOKE_COMPARE_GAP) / 2.0, full.height()),
+                        )
+                    });
+                    let view = match before_view {
+                        Some(b) => egui::Rect::from_min_size(
+                            egui::pos2(b.right() + SMOKE_COMPARE_GAP, full.top()),
+                            b.size(),
+                        ),
+                        None => full,
+                    };
+                    // 裁切生效時只讓人看到留下來的那塊（單層檢視看的是原圖，
+                    // 裁切是對成品的，那裡照樣顯示整張）
+                    let shown_c = if layer_view {
+                        Crop::default()
+                    } else {
+                        self.stack.shown_crop()
+                    };
+                    // 轉過的話，裁切框與縮放平移都是對著「旋轉後的外接框」算的，
+                    // 照片本身只是斜斜地畫在那塊裡面（見 paint_rotated_image）
+                    // 顯示比例照**原始照片**的尺寸算，不看貼圖多大：貼圖是整批
+                    // 共用比例縮出來的工作縮圖（長邊 1600），拿它當基準的話
+                    // 100% 只是「縮圖的 1:1」＝照片的兩成多，看起來就不是 1:1
+                    let nominal = self
+                        .stack
+                        .shown_dims()
+                        .map(|(w, h)| egui::vec2(w as f32, h as f32))
+                        .unwrap_or_else(|| tex.size_vec2());
+                    let canvas_size = {
+                        let (w, h) = shown_c.canvas(nominal.x, nominal.y);
+                        egui::vec2(w, h)
+                    };
+                    let fit = crop_fit_rect(canvas_size, view, shown_c);
+                    // 顯示比例一律以**螢幕的實體像素**為準。Windows 的顯示縮放
+                    // （125%、150%…）讓 1 點等於 1.25、1.5 個實體像素，照「點」算的話
+                    // 按下 100% 看到的其實是被放大過的畫面，看起來就不是 1:1；
+                    // 除以它之後，選了幾 % 就是幾 %，不隨顯示縮放跑掉
+                    let ppp = ui.ctx().pixels_per_point();
+                    let fit_scale = fit.width() / canvas_size.x * ppp;
+                    let (wheel, ctrl) = if ui.rect_contains_pointer(full) {
+                        ui.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl))
+                    } else {
+                        (0.0, false)
+                    };
+                    // Ctrl＋滾輪＝調筆刷粗細（比照 Photoshop／Lightroom）
+                    let brushing = layer_view && self.stack.active_tool() == Some(MaskTool::Brush);
+                    match (wheel != 0.0, ctrl && brushing) {
+                        (true, true) => {
+                            let size = &mut self.stack.brush_size;
+                            let step = (*size / 10).max(1) * if wheel > 0.0 { 1 } else { -1 };
+                            *size = (*size + step).clamp(1, 40);
+                        }
+                        (true, false) => {
+                            let cur = self.stack.zoom.unwrap_or(fit_scale);
+                            let next = cur * if wheel > 0.0 { 1.25 } else { 1.0 / 1.25 };
+                            self.stack.zoom = (next > fit_scale * 1.02).then_some(next.min(8.0));
+                            self.stack.zoom_back = None;
+                        }
+                        _ => {}
+                    }
+                    let r = match self.stack.zoom {
+                        None => {
+                            // 回到符合視窗：下次放大從裁切框的中心開始
+                            self.stack.pan = egui::pos2(
+                                (shown_c.x0 + shown_c.x1) / 2.0,
+                                (shown_c.y0 + shown_c.y1) / 2.0,
+                            );
+                            fit
+                        }
+                        Some(z) => {
+                            let size = canvas_size * (z / ppp);
+                            // 平移：中鍵或右鍵隨時可拖；沒選遮色片工具時左鍵也可以
+                            let left_pans = !layer_view || self.stack.active_tool().is_none();
+                            if ui.rect_contains_pointer(full) {
+                                if left_pans {
+                                    ui.ctx().set_cursor_icon(
+                                        if ui.input(|i| i.pointer.primary_down()) {
+                                            egui::CursorIcon::Grabbing
+                                        } else {
+                                            egui::CursorIcon::Grab
+                                        },
+                                    );
+                                }
+                                let d = ui.input(|i| {
+                                    if i.pointer.middle_down()
+                                        || i.pointer.secondary_down()
+                                        || (left_pans && i.pointer.primary_down())
+                                    {
+                                        i.pointer.delta()
+                                    } else {
+                                        egui::Vec2::ZERO
+                                    }
+                                });
+                                if d != egui::Vec2::ZERO {
+                                    self.stack.pan.x -= d.x / size.x;
+                                    self.stack.pan.y -= d.y / size.y;
+                                }
+                            }
+                            crop_clamp_pan(&mut self.stack.pan, view, size, shown_c);
+                            snap_to_pixels(
+                                egui::Rect::from_min_size(
+                                    view.center()
+                                        - egui::vec2(
+                                            self.stack.pan.x * size.x,
+                                            self.stack.pan.y * size.y,
+                                        ),
+                                    size,
+                                ),
+                                ppp,
+                            )
+                        }
+                    };
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    // 只讓裁切框裡面看得到：`r` 是整張畫布的位置，框外那圈
+                    // （轉過的話還包含四角補的黑）要裁掉，否則會露出一截
+                    // 根本不會輸出的東西。調整裁切範圍時框就是整張畫布，
+                    // 等於沒裁——那時本來就要看得到照片的邊界
+                    let show = view.intersect(crop_screen_rect(r, shown_c));
+                    if let (Some(bv), Some(btex)) = (before_view, self.stack.tex_raw.clone()) {
+                        let mut bclip = ui.new_child(egui::UiBuilder::new().max_rect(bv));
+                        bclip.set_clip_rect(show.translate(bv.min - view.min));
+                        let br = r.translate(bv.min - view.min);
+                        if shown_c.has_rotation() {
+                            paint_rotated_image(
+                                bclip.painter(),
+                                &btex,
+                                br,
+                                btex.size_vec2(),
+                                shown_c.total_deg(),
+                            );
+                        } else {
+                            bclip
+                                .painter()
+                                .image(btex.id(), br, uv, egui::Color32::WHITE);
+                        }
+                    }
+                    // 放大後照片會超出畫面，連同上面畫的遮色片輪廓一起裁掉
+                    let mut clipped = ui.new_child(egui::UiBuilder::new().max_rect(view));
+                    clipped.set_clip_rect(show);
+                    if shown_c.has_rotation() {
+                        paint_rotated_image(
+                            clipped.painter(),
+                            &tex,
+                            r,
+                            tex.size_vec2(),
+                            shown_c.total_deg(),
+                        );
+                    } else {
+                        clipped.painter().image(tex.id(), r, uv, egui::Color32::WHITE);
+                    }
+                    // 「調整圖層」：把正在調的那一層框出來、順便半透明疊上去，
+                    // 這樣「選著的圖層」與「疊圖結果」在同一個畫面上就都看得到，
+                    // 不必為了拖曳再點一次「疊圖結果」切回來。
+                    // 裁切轉過角度時整張畫布是斜的，這一層的框算起來對不上，先不畫
+                    if self.stack.move_mode && !layer_view && !shown_c.has_rotation() {
+                        if let Some(frac) = self.stack.layer_frac() {
+                            let x = self
+                                .stack
+                                .current()
+                                .map(|p| self.stack.effective_xform(p))
+                                .unwrap_or_default();
+                            let quad = layer_screen_quad(r, frac, x);
+                            // 只有正在調的當下才疊上去，放開就回到真正的疊圖結果
+                            let on = self.stack.ghost_now(resp.dragged());
+                            let ghost = on.then(|| self.stack.tex_raw.as_ref()).flatten();
+                            paint_layer_ghost(clipped.painter(), ghost, quad);
+                            // 到時間要把它收掉，得有人叫重畫
+                            if on && !resp.dragged() {
+                                ctx.request_repaint_after(GHOST_LINGER);
+                            }
+                        }
+                    }
+                    if self.stack.crop_editing && !layer_view {
+                        // 調整裁切範圍時畫布讓給裁切框（遮色片同樣用左鍵，
+                        // 兩個一起開會互相搶）
+                        let cur = self.stack.grade.crop;
+                        let ratio = self.stack.crop_aspect.ratio(self.stack.source_dims());
+                        let (next, done) = crop_overlay(&mut clipped, &resp, r, cur, ratio);
+                        if next != cur {
+                            self.stack.grade.crop = next;
+                            self.stack.dirty = true;
+                        }
+                        // 照片上連點兩下＝裁好了，直接看裁切後的樣子
+                        if done {
+                            self.stack.crop_editing = false;
+                        }
+                    } else if self.stack.move_mode && !layer_view {
+                        // 移動圖層：在成品上直接拖，看著它對到位
+                        self.stack_move_layer(&clipped, &resp, r);
+                    } else {
+                        self.ui_stack_canvas_interaction(&mut clipped, &resp, r);
+                    }
+                    if let Some(bv) = before_view {
+                        pane_label(ui, bv, "地景原圖");
+                        pane_label(ui, view, "疊圖後");
+                    } else if self.stack.move_mode && self.stack.can_move_cur() {
+                        // 標題固定不隨拖曳跳動：閃來閃去比沒有還難讀
+                        let n = self.stack.cur + 1;
+                        pane_label(
+                            ui,
+                            view,
+                            &if self.stack.ghost_enabled() {
+                                format!("疊圖結果（框起來的是第 {n} 層；拖曳時會半透明疊上來）")
+                            } else {
+                                format!("疊圖結果（框起來的是第 {n} 層，正在調）")
+                            },
+                        );
+                    } else if layer_view {
+                        // 括號裡的遮色片說明只在專業模式講：簡易模式沒有遮色片，
+                        // 提「保護區」只會讓人去找一個不存在的東西
+                        let what = if self.stack.on_ground() {
+                            "地景原圖"
+                        } else {
+                            "這一層原圖"
+                        };
+                        let label = match (self.stack.pro, self.stack.on_ground()) {
+                            (true, true) => format!("{what}（畫在這裡＝保護區）"),
+                            (true, false) => {
+                                format!("第 {} 層原圖（畫在這裡＝這層不疊進來）", self.stack.cur + 1)
+                            }
+                            (false, true) => what.to_string(),
+                            (false, false) => format!("第 {} 張原圖", self.stack.cur + 1),
+                        };
+                        pane_label(ui, view, &label);
+                    }
+                    let pct = r.width() / canvas_size.x * 100.0 * ppp;
+                    // 畫面上這張照片實際佔了多少實體像素：底圖至少要這麼細，
+                    // 看到的才不是被放大的（見 [`stack_fine_target`]）
+                    self.stack.want_long =
+                        (r.width().max(r.height()) * ppp).round().max(0.0) as u32;
+                    // 量它實際佔多高，下一幀算預覽高度時照它留位（見上面的 below）
+                    let zr = ui.scope(|ui| self.ui_stack_zoom_bar(ui, fit_scale, pct));
+                    let zh = zr.response.rect.height();
+                    if (self.stack.zoom_h - zh).abs() > 0.5 {
+                        self.stack.zoom_h = zh;
+                        ctx.request_repaint();
+                    }
+                }
+                ui.add_space(8.0);
+
+                // 縮圖列：點縮圖選層（畫遮色片的目標），地景那張標上「地景」
+                {
+                    let scroll_to = self.stack.scroll_to_cur;
+                    self.stack.scroll_to_cur = false;
+                    let thumb_size = egui::vec2(132.0, 84.0);
+                    let (cur, ground) = (self.stack.cur, self.stack.ground);
+                    // 只有真的在看某一層時，那張素材才算「選著」——否則會和
+                    // 最後那格「疊圖結果」同時亮起來，看不出螢幕上是哪一張
+                    let layer_sel = self.stack.view_layer.then_some(cur);
+                    ui.scope(|ui| {
+                        ui.style_mut().always_scroll_the_only_direction = true;
+                        egui::ScrollArea::horizontal()
+                            .id_salt("stack_film")
+                            .max_height(film_h - 8.0)
+                            .show(ui, |ui| {
+                                ui.set_min_height(thumb_size.y);
+                                ui.horizontal(|ui| {
+                                    for i in 0..total {
+                                        let p = self.stack.photos[i].clone();
+                                        let st = self.stack.thumbs.get(&p);
+                                        let tex = match st {
+                                            Some(Thumb::Ready(t)) => Some(t.clone()),
+                                            _ => None,
+                                        };
+                                        let has_mask = self.stack.pro
+                                            && !self.stack.mask_of(&p).is_empty();
+                                        let r = thumb_item(
+                                            ui,
+                                            tex.as_ref(),
+                                            Some(i),
+                                            layer_sel == Some(i),
+                                            false,
+                                            false,
+                                            has_mask,
+                                            matches!(st, Some(Thumb::Failed)),
+                                        );
+                                        if scroll_to && i == cur {
+                                            r.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        // 地景那張在縮圖上直接標出來，不必去讀上面那行字；
+                                        // 對不上地景（會被略過）的那幾張也要一眼看得到
+                                        let skipped = i != ground && self.stack.unaligned(&p);
+                                        // 調整圖層時預覽看的是疊圖結果，縮圖列上
+                                        // 不會有東西亮著；正在調的那一層另外標出來
+                                        // 地景也可以調，所以這裡不排除它
+                                        let adjusting = self.stack.move_mode && i == cur;
+                                        if adjusting {
+                                            thumb_badge(ui, r.rect, "✥ 調整中");
+                                        } else if i == ground {
+                                            thumb_badge(ui, r.rect, "地景");
+                                        } else if skipped {
+                                            thumb_badge_warn(ui, r.rect, "對不上");
+                                        }
+                                        let r = r.on_hover_text(if i == ground {
+                                            "目前的地景（底圖）"
+                                        } else if skipped {
+                                            "對不上地景，這一層不會疊進去。\n\
+                                             多半不是同一個機位；真要疊就把「地景自動對齊」關掉"
+                                        } else {
+                                            "點一下選這一層；連點兩下設成地景；\
+                                             按右鍵可移除（Delete 鍵移除選著的那張）"
+                                        });
+                                        if r.double_clicked() {
+                                            set_ground = Some(i);
+                                        } else if r.clicked() {
+                                            goto = Some(i);
+                                        }
+                                        r.context_menu(|ui| {
+                                            ui.add_enabled_ui(
+                                                busy != StackBusy::Saving,
+                                                |ui| {
+                                                    if ui.button("🗑 移除這張").clicked() {
+                                                        ui.close_menu();
+                                                        remove_idx = Some(i);
+                                                    }
+                                                    if i != ground
+                                                        && ui.button("⬇ 設成地景").clicked()
+                                                    {
+                                                        ui.close_menu();
+                                                        set_ground = Some(i);
+                                                    }
+                                                },
+                                            );
+                                            if busy == StackBusy::Saving {
+                                                ui.label(
+                                                    egui::RichText::new("存檔中無法修改照片")
+                                                        .size(11.0)
+                                                        .color(theme::TEXT_WEAK),
+                                                );
+                                            }
+                                        });
+                                    }
+                                    // 疊圖結果也排進縮圖列，跟原始素材一樣點一下
+                                    // 就切過去看——不然「疊出來長怎樣」與「某一張
+                                    // 原圖長怎樣」得在別的地方切換，來回對照很麻煩
+                                    ui.add_space(6.0);
+                                    let out = thumb_item(
+                                        ui,
+                                        self.stack.tex_out.as_ref(),
+                                        None,
+                                        !self.stack.view_layer,
+                                        false,
+                                        false,
+                                        false,
+                                        false,
+                                    );
+                                    thumb_badge(ui, out.rect, "疊圖結果");
+                                    if scroll_to && !self.stack.view_layer {
+                                        out.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                    if out
+                                        .on_hover_text("疊好的成品；點一下回到疊圖結果")
+                                        .clicked()
+                                    {
+                                        show_result = true;
+                                    }
+                                });
+                            });
+                    });
+                    ui.add_space(6.0);
+                }
+
+                // 設定區：擠不下時自己長捲軸，不把下面的存檔列頂出視窗
+                // 下限只能是 0：給它一個「至少 70」的地板，在剩餘空間不到
+                // 70+存檔列 的時候反而會把存檔列推出視窗（存檔鈕被裁掉）。
+                // 空間真的不夠時寧可讓設定區整個收掉，也不能吃掉存檔列。
+                // 要留的是「add_space(6) ＋ 擺存檔列時墊的那一次 item_spacing」，
+                // 原本寫死 10 少了三點，存檔列會被切掉一咪咪
+                let settings_max = (ui.available_height()
+                    - self.stack.save_h
+                    - 6.0
+                    - ui.spacing().item_spacing.y)
+                    .max(0.0);
+                let settings = egui::ScrollArea::vertical()
+                    .id_salt("stack_settings")
+                    .max_height(settings_max)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        // 設定區分兩欄：左邊是疊圖那一整組（地景、對齊、調整圖層、
+                        // 混合方式），右邊整塊給遮色片。作法與去煙霧的「手動清除」
+                        // 相同——遮色片本來排在最後面，設定區一長就被推進捲軸裡，
+                        // 而右半邊是空的；搬過來兩邊都看得到，滑桿也不會橫跨整個
+                        // 寬螢幕（一條拉到一千多像素反而不好調）
+                        let avail = ui.available_rect_before_wrap();
+                        let gap = 20.0;
+                        // **右欄先分、左欄拿剩下的**：右欄標題那一列是
+                        // 「🎭 遮色片 ＋ 畫在哪一張上的說明 ＋ 選擇疊圖的區域／
+                        // 不需疊圖的區域」，要 940 點左右才排得下，少一點第二顆就
+                        // 掉到下一行去。反過來讓左欄先照比例拿（原本是 55%、上限
+                        // 720），右欄永遠只剩七百多，怎麼放寬自己的上限都沒用
+                        // 上限 860：940 時右欄還空著一大截，左欄卻只剩四百出頭，
+                        // 「地景自動對齊／地景以下不疊圖／調整圖層」那一列擠到把
+                        // 「調整圖層」折成兩行。左欄的地板也從 340 提到 420，
+                        // 就是照那一列量的
+                        let right_w = (avail.width() - gap - 420.0).clamp(280.0, 860.0);
+                        // 左欄上限 720：再寬滑桿就長到不好調（一格動好幾個單位），
+                        // 多出來的寬度寧可空著
+                        let left_w = (avail.width() - gap - right_w).clamp(420.0, 720.0);
+                        // 兩欄最少要 420 ＋ gap ＋ 280 才擺得下，不夠就退回單欄，
+                        // 遮色片照舊接在最後面（見下方 !two_col）。
+                        // 簡易模式沒有遮色片可搬，一律單欄
+                        let two_col = self.stack.pro && avail.width() >= 420.0 + gap + 280.0;
+                        let mut mask_h = 0.0;
+                        if two_col {
+                            // 右欄用 new_child 直接定位，左欄那兩百行的排版完全不動
+                            let r = egui::Rect::from_min_size(
+                                egui::pos2(avail.min.x + left_w + gap, avail.min.y),
+                                egui::vec2(right_w, avail.height().max(320.0)),
+                            );
+                            // 右欄頂端一條淡灰線：上面就是縮圖列，中間只有一段空白，
+                            // 遮色片看起來像浮在那裡；有這條線才看得出這一欄從哪裡開始。
+                            // 左端不是 r.left() 而是直線那個 x（左欄與右欄之間的空隙
+                            // 是 gap，直線畫在正中間）——從 r.left() 起筆的話角落會缺
+                            // 半個 gap，兩條線接不起來
+                            ui.painter().hline(
+                                (avail.min.x + left_w + gap / 2.0)..=r.right(),
+                                r.top(),
+                                egui::Stroke::new(1.0, theme::DIVIDER),
+                            );
+                            let mut col = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(r)
+                                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                            );
+                            // 線與標題之間留一點空，不然「🎭 遮色片」會貼在線上
+                            col.add_space(8.0);
+                            self.ui_stack_mask(&mut col, busy);
+                            mask_h = col.min_rect().height();
+                        }
+                        ui.set_max_width(left_w);
+
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_enabled(
+                                    busy != StackBusy::Saving && !self.stack.on_ground(),
+                                    egui::Button::new("⬇ 設成地景"),
+                                )
+                                .on_hover_text(
+                                    "把縮圖列選著的這張當底圖：\n\
+                                     它的地面、燈火、水面倒影原封不動留著，\n\
+                                     其餘每一張只把比它亮的煙火疊上來",
+                                )
+                                .clicked()
+                            {
+                                set_ground = Some(self.stack.cur);
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "（縮圖連點兩下也可以設定地景。地景通常挑地景最乾淨、曝光最準的那一張）",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                            );
+                        });
+
+                        // 對齊與搬動圖層：兩種模式都有，跟遮色片無關
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let mut on = self.stack.auto_align;
+                            if ui
+                                .checkbox(&mut on, "地景自動對齊")
+                                .on_hover_text(
+                                    "腳架拍的連續曝光之間常差幾個到幾十個像素（快門震動、風、\n\
+                                     雲台鬆動），不校正疊起來整片燈火都是重影。\n\
+                                     開著會自動把每一張對準地景；**對不上地景的那幾張會被略過**，\n\
+                                     要連那些一起硬疊就把這個關掉",
+                                )
+                                .changed()
+                            {
+                                self.stack.auto_align = on;
+                                align_now = true;
+                            }
+                            if self.stack.align_left > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "對齊中… 還有 {} 張",
+                                        self.stack.align_left
+                                    ))
+                                    .size(11.0)
+                                    .color(theme::TEXT_WEAK),
+                                );
+                                ctx.request_repaint();
+                            } else {
+                                let n = self.stack.unaligned_count();
+                                if n > 0 {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "⚠ {n} 張對不上地景，已略過（縮圖上標「對不上」）"
+                                        ))
+                                        .size(11.0)
+                                        .color(theme::ERROR),
+                                    )
+                                    .on_hover_text(
+                                        "多半是這幾張不是同一個機位、或根本是別場的照片。\n\
+                                         真的想連它們一起疊，把「地景自動對齊」關掉",
+                                    );
+                                }
+                            }
+                            ui.separator();
+                            // 開關一動，key 就跟著變，下一幀自己會重疊一次
+                            ui.checkbox(&mut self.stack.protect_land, "地景以下不疊圖")
+                                .on_hover_text(
+                                    "天際線以下每一張拍到的是同一片地景，只是曝光各差一點；\n\
+                                     照疊下去整片地景會愈疊愈亮、燈火糊成一團。\n\
+                                     開著就只留地景那一張的地面，其餘的擋掉——\n\
+                                     但**打在地景上空的煙火照樣疊得進來**（明顯亮過地景的一律放行），\n\
+                                     水面倒影也不受影響（判定上算天空那一側）",
+                                );
+                            ui.separator();
+                            // 搬／縮／轉是專業模式限定：簡易模式每一層只給調色
+                            if self.stack.pro {
+                            let movable = self.stack.can_move_cur();
+                            let r = ui.add_enabled_ui(movable, |ui| {
+                                check_label(ui, self.stack.move_mode, "✥ 調整圖層")
+                                    .on_hover_text(
+                                        "把縮圖列選著的那一層搬位置、縮放或轉角度\n\
+                                         （**地景也可以**——它是畫布，搬的是它的內容\n\
+                                         在畫布裡的位置，讓開的地方是黑的）：\n\
+                                         · 直接在疊圖結果上**拖曳**＝移動\n\
+                                         · **Ctrl＋滾輪**＝縮放、**Shift＋滾輪**＝旋轉\n\
+                                         · 也可以用下面那兩條滑桿慢慢調\n\
+                                         開著的時候畫面固定停在疊圖結果，換層也不會跳走",
+                                    )
+                                    .clicked()
+                            });
+                            r.response.on_disabled_hover_text("先在縮圖列點一張照片");
+                            if r.inner {
+                                self.stack.move_mode = !self.stack.move_mode;
+                                // 要在成品上看著挪，不然看不出對到哪裡
+                                if self.stack.move_mode {
+                                    self.stack.view_layer = false;
+                                    self.stack.tool = None;
+                                }
+                            }
+                            if self.stack.move_mode && movable {
+                                ui.checkbox(&mut self.stack.move_ghost, "◐ 拖曳時疊上這一層")
+                                    .on_hover_text(
+                                        "**拖曳（或滾輪縮放旋轉）的當下**，把正在調的那一層\n\
+                                         半透明疊在疊圖結果上，兩個同時看得到才對得準——\n\
+                                         加亮疊出來的成品只留得住比地景亮的部分，\n\
+                                         這一層的城市、水面那些暗的東西根本看不到，\n\
+                                         而對位靠的正是那些。\n\
+                                         **手一放開就回到真正的疊圖結果**，不會擋著你看成品。\n\
+                                         關掉就全程只畫這一層的邊框",
+                                    );
+                            }
+                            if self.stack.move_mode && movable {
+                                if let Some((p, (dw, dh))) = self
+                                    .stack
+                                    .current()
+                                    .cloned()
+                                    .zip(self.stack.source_dims())
+                                {
+                                    let x = self.stack.xform_of(&p);
+                                    let (px, py) = (
+                                        (x.dx * dw as f32).round() as i32,
+                                        (x.dy * dh as f32).round() as i32,
+                                    );
+                                    // 現在調的是哪一層。調整時預覽看的是疊圖
+                                    // 結果，縮圖列上沒有東西亮著，不寫出來就
+                                    // 不知道自己正在動誰（層號與縮圖上的序號一致）
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "調整中：第 {} 層　{}",
+                                            self.stack.cur + 1,
+                                            p.file_name()
+                                                .map(|n| n.to_string_lossy().into_owned())
+                                                .unwrap_or_default()
+                                        ))
+                                        .size(11.5)
+                                        .color(theme::ACCENT),
+                                    )
+                                    .on_hover_text("要調別層就先在縮圖列點那一張");
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "位移 {px:+}, {py:+} px　縮放 {:.0}%　旋轉 {:.1}°",
+                                            x.scale * 100.0,
+                                            x.rot
+                                        ))
+                                        .size(11.0)
+                                        .color(theme::TEXT_WEAK),
+                                    );
+                                    if !x.is_identity() && ui.small_button("↺ 這層歸零").clicked() {
+                                        reset_offset = true;
+                                    }
+                                }
+                            }
+                            }
+                        });
+
+                        // 縮放與旋轉各佔一行：與裁切那邊的「拉直」同一種版面，
+                        // 滑桿才有足夠寬度慢慢調
+                        if self.stack.move_mode && self.stack.can_move_cur() {
+                            if let Some(p) = self.stack.current().cloned() {
+                                let before = self.stack.xform_of(&p);
+                                let mut x = before;
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("縮放")
+                                            .size(12.5)
+                                            .color(theme::TEXT_WEAK),
+                                    )
+                                    .on_hover_text(
+                                        "以畫面中心為基準縮放這一層（連點兩下回 100%）。\n\
+                                         也可以在照片上按 Ctrl＋滾輪",
+                                    );
+                                    ui.spacing_mut().slider_width =
+                                        (ui.available_width() - NUM_BOX_ROOM - 6.0).max(60.0);
+                                    let mut pct = x.scale * 100.0;
+                                    let (lo, hi) = (
+                                        stack::XFORM_MIN_SCALE * 100.0,
+                                        stack::XFORM_MAX_SCALE * 100.0,
+                                    );
+                                    if drop_slider(ui, &mut pct, lo, hi).double_clicked() {
+                                        pct = 100.0;
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.add_space(8.0);
+                                            let txt = format!("{pct:.0}%");
+                                            num_box(
+                                                ui,
+                                                "stack_layer_scale",
+                                                &mut pct,
+                                                lo,
+                                                hi,
+                                                &txt,
+                                                theme::TEXT,
+                                            );
+                                        },
+                                    );
+                                    x.scale = pct / 100.0;
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("旋轉")
+                                            .size(12.5)
+                                            .color(theme::TEXT_WEAK),
+                                    )
+                                    .on_hover_text(
+                                        "以畫面中心為基準轉這一層（連點兩下歸零）。\n\
+                                         也可以在照片上按 Shift＋滾輪",
+                                    );
+                                    ui.spacing_mut().slider_width =
+                                        (ui.available_width() - NUM_BOX_ROOM - 6.0).max(60.0);
+                                    let mut rot = x.rot;
+                                    if drop_slider(ui, &mut rot, -180.0, 180.0).double_clicked() {
+                                        rot = 0.0;
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.add_space(8.0);
+                                            // 圖層對齊常常差不到 1°，這一格
+                                            // 開放到小數點一位（↑↓ 也是 0.1）
+                                            let txt = format!("{rot:.1}°");
+                                            num_box_step(
+                                                ui,
+                                                "stack_layer_rot",
+                                                &mut rot,
+                                                -180.0,
+                                                180.0,
+                                                &txt,
+                                                theme::TEXT,
+                                                0.1,
+                                                1,
+                                            );
+                                        },
+                                    );
+                                    x.rot = rot;
+                                });
+                                // 位移：用拖的只能大概，差幾個像素得靠這兩格。
+                                // 存的是相對座標，這裡換算成**像素**顯示，
+                                // 與上面那行「位移 +93, −126 px」同一個尺規
+                                if let Some((dw, dh)) = self.stack.source_dims() {
+                                    let (fw, fh) = (dw.max(1) as f32, dh.max(1) as f32);
+                                    ui.horizontal(|ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(SLIDER_LABEL_W, 18.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().text(
+                                            rect.left_center(),
+                                            egui::Align2::LEFT_CENTER,
+                                            "位移",
+                                            egui::FontId::proportional(12.5),
+                                            theme::TEXT_WEAK,
+                                        );
+                                        // 拖曳那條路把位移夾在一個畫面內
+                                        // （見 stack_drag_layer），這裡照同一個範圍
+                                        let (mut px, mut py) = (x.dx * fw, x.dy * fh);
+                                        let mut moved = false;
+                                        for (salt, label, v, lim) in [
+                                            ("stack_layer_dx", "左右", &mut px, fw),
+                                            ("stack_layer_dy", "上下", &mut py, fh),
+                                        ] {
+                                            ui.label(
+                                                egui::RichText::new(label)
+                                                    .size(11.5)
+                                                    .color(theme::TEXT_WEAK),
+                                            );
+                                            let txt = format!("{v:+.0}");
+                                            moved |= num_box(
+                                                ui,
+                                                salt,
+                                                v,
+                                                -lim,
+                                                lim,
+                                                &txt,
+                                                theme::TEXT,
+                                            );
+                                            ui.add_space(8.0);
+                                        }
+                                        ui.label(
+                                            egui::RichText::new("px　（＋往右、＋往下）")
+                                                .size(11.0)
+                                                .color(theme::TEXT_WEAK),
+                                        )
+                                        .on_hover_text(
+                                            "點進去可直接輸入，↑↓ 一次 1 px、按住 Shift 一次 10。\n\
+                                             預覽上直接按方向鍵也可以推（Shift 一次 10 px）",
+                                        );
+                                        // 沒改就不寫回去：像素↔相對座標來回換算
+                                        // 會差最後一位，每幀都判定成「動過」的話
+                                        // 會一直重疊圖
+                                        if moved {
+                                            x.dx = px / fw;
+                                            x.dy = py / fh;
+                                        }
+                                    });
+                                }
+                                if x != before {
+                                    self.stack.xforms.insert(p, x.clamped());
+                                    self.stack.dirty = true;
+                                    // 用滑桿調的時候也要看得到那一層
+                                    self.stack.touch_ghost();
+                                }
+                            }
+                        }
+
+                        if !self.stack.pro {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "簡易模式：自動用「加亮」疊（只留比較亮的那個，地景不會愈疊愈亮）。\
+                                     要改混合方式或遮掉某一朵煙火，切到上面的「專業」。",
+                                )
+                                .size(11.5)
+                                .color(theme::TEXT_WEAK),
+                            );
+                        } else {
+                            ui.add_space(6.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new("混合方式")
+                                        .size(SECTION_FONT)
+                                        .color(theme::TEXT),
+                                );
+                                for m in BlendMode::ALL {
+                                    let on = self.stack.mode == m;
+                                    if check_label(ui, on, m.label())
+                                        .on_hover_text(m.hint())
+                                        .clicked()
+                                    {
+                                        self.stack.mode = m;
+                                        self.stack.dirty = true;
+                                        // 自己動了混合方式：那個提醒重新開始算
+                                        // （見 StackTool::blend_noted）
+                                        self.stack.blend_noted = false;
+                                    }
+                                }
+                            });
+                            // 遮色片已經搬到右欄；只有窄到擺不下兩欄時才接在這裡
+                            if !two_col {
+                                ui.add_space(8.0);
+                                self.ui_stack_mask(ui, busy);
+                            }
+                        }
+
+                        if two_col {
+                            // 右欄是 new_child 畫的，不會把高度算進這一區。
+                            // 它比左欄高時（簡易的設定就那幾列，很容易這樣）補上
+                            // 差額，否則下面的存檔列會壓到它
+                            let used = ui.min_rect().height();
+                            if mask_h > used {
+                                ui.allocate_space(egui::vec2(0.0, mask_h - used));
+                            }
+                            // 兩欄之間的分隔細線：沒有它兩欄的東西會糊成一片，
+                            // 看不出遮色片是獨立一區。
+                            // 兩欄都畫完才知道要多高，所以擺在最後
+                            let h = ui.min_rect().height().max(mask_h);
+                            ui.painter().vline(
+                                avail.min.x + left_w + gap / 2.0,
+                                avail.min.y..=(avail.min.y + h),
+                                egui::Stroke::new(1.0, theme::DIVIDER),
+                            );
+                        }
+                    });
+                let measured = settings.content_size.y;
+                if (self.stack.settings_h.unwrap_or(-1.0) - measured).abs() > 0.5 {
+                    ctx.request_repaint();
+                }
+                self.stack.settings_h = Some(measured);
+                ui.add_space(6.0);
+
+                let save_row = ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let saving = busy == StackBusy::Saving;
+                        if saving {
+                            // 疊圖**只會輸出一張**，所以不能像去煙霧那樣顯示
+                            // 「第幾張／共幾張」——那看起來像在存好幾個檔案。
+                            // save_done 數的是「疊到第幾層」，換算成百分比就好
+                            let frac = self.stack.save_done as f32 / total.max(1) as f32;
+                            // 最後一層疊完還要調色、裁切、寫 JPEG，先別顯示 100%
+                            let pct = (frac * 100.0).round().min(99.0);
+                            saving_button(ui, &format!("儲存中… {pct:.0}%"), frac).on_hover_text(
+                                format!(
+                                    "正在用原尺寸把這 {total} 張重疊成一張並寫檔，\
+                                     完成前請先別關視窗"
+                                ),
+                            );
+                        } else {
+                            let ready = busy == StackBusy::Idle && self.stack.bases_ready();
+                            if primary_button(ui, "💾  存檔…", ready)
+                                .on_hover_text(
+                                    "用原尺寸重疊一次存成一張。\n\
+                                     會先跳存檔視窗讓你挑位置、改檔名；\n\
+                                     檔名預設取自目前選著的那一層（不是地景），\n\
+                                     同名檔案已存在時會先問要不要覆蓋",
+                                )
+                                .clicked()
+                            {
+                                save = true;
+                            }
+                        }
+                        // 存檔尺寸緊鄰存檔鈕（與去煙霧同一組設定、同一個位置）
+                        ui.add_space(10.0);
+                        let mut size = self.export_size;
+                        // 沒勾「調整尺寸」時那兩個欄位要顯示成品的實際尺寸
+                        // ——地景的原圖尺寸套上疊圖後的裁切
+                        let natural =
+                            export_natural_dims(self.stack.source_dims(), &self.stack.grade.crop);
+                        if export_size_row(ui, &mut size, !saving, natural) {
+                            self.export_size = size;
+                            save_export_size(size);
+                        }
+                        if saving {
+                            ui.add_space(6.0);
+                            if ui.small_button("取消").clicked() {
+                                self.stack.save_cancel.store(true, Ordering::Relaxed);
+                            }
+                            ctx.request_repaint();
+                        } else if let Some(p) = self.stack.saved_path.clone() {
+                            ui.add_space(6.0);
+                            if ui
+                                .small_button("🖼 開啟圖片")
+                                .on_hover_text("用預設看圖程式開啟剛存好的疊圖")
+                                .clicked()
+                            {
+                                open_file(&p);
+                            }
+                        }
+                        if busy == StackBusy::Composing {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("疊圖中…").size(11.5).color(theme::TEXT_WEAK),
+                            );
+                        }
+                        if let Some((msg, at)) = &self.stack.saved {
+                            if at.elapsed() < Duration::from_secs(8) {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(format!("✔ {msg}"))
+                                        .size(11.5)
+                                        .color(theme::SUCCESS),
+                                );
+                                ctx.request_repaint_after(Duration::from_secs(1));
+                            }
+                        }
+                    });
+                });
+                self.stack.save_h = save_row.response.rect.height();
+            });
+            // 調整圖層時方向鍵改成**推這一層**（一次 1 px、按住 Shift 10 px）：
+            // 用拖的只能大概，對位差的那幾個像素靠的就是這個。
+            // 沒在調整圖層時方向鍵仍然是切換選著的那一層
+            let nudging = self.stack.move_mode
+                && self.stack.can_move_cur()
+                && ctx.memory(|m| m.focused().is_none());
+            if nudging {
+                let (mut nx, mut ny) = (0f32, 0f32);
+                ctx.input_mut(|i| {
+                    for (key, dx, dy) in [
+                        (egui::Key::ArrowLeft, -1.0, 0.0),
+                        (egui::Key::ArrowRight, 1.0, 0.0),
+                        (egui::Key::ArrowUp, 0.0, -1.0),
+                        (egui::Key::ArrowDown, 0.0, 1.0),
+                    ] {
+                        // 按住不放要連續推，所以數的是這一幀來了幾次；
+                        // 一併吃掉事件，下面切換層那段才不會也收到
+                        let one = i.count_and_consume_key(egui::Modifiers::NONE, key) as f32;
+                        let ten =
+                            i.count_and_consume_key(egui::Modifiers::SHIFT, key) as f32 * 10.0;
+                        nx += dx * (one + ten);
+                        ny += dy * (one + ten);
+                    }
+                });
+                if nx != 0.0 || ny != 0.0 {
+                    self.stack_nudge_layer(nx, ny);
+                }
+            }
+            // 方向鍵切換選著的那一層（滑桿等元件有焦點時不搶）
+            if goto.is_none()
+                && !nudging
+                && self.stack.photos.len() > 1
+                && ctx.memory(|m| m.focused().is_none())
+            {
+                let (cur, total) = (self.stack.cur, self.stack.photos.len());
+                if cur + 1 < total && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                    goto = Some(cur + 1);
+                } else if cur > 0 && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                    goto = Some(cur - 1);
+                }
+            }
+            // Y 切換前後對照、空白鍵跳 1:1（與去煙霧同一套習慣）
+            if !self.stack.photos.is_empty() && ctx.memory(|m| m.focused().is_none()) {
+                // 單層檢視沒有「前後」可比，兩種模式都一樣
+                if !self.stack.view_layer && ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+                    self.stack.compare = !self.stack.compare;
+                }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+                    self.stack_toggle_actual_size();
+                }
+                // Delete：移除縮圖列選著的那一張（會先問一次）。
+                // 正在畫遮色片或調整圖層時不接管——那時 Delete 該屬於那個工具
+                if remove_idx.is_none()
+                    && self.stack.active_tool().is_none()
+                    && !self.stack.move_mode
+                    && !self.stack.crop_editing
+                    && ctx.input(|i| i.key_pressed(egui::Key::Delete))
+                {
+                    remove_idx = Some(self.stack.cur);
+                }
+            }
+        }
+        if pick {
+            self.stack_pick_photos(ctx);
+        }
+        if add {
+            self.stack_add_photos(ctx);
+        }
+        // Ctrl+V：焦點在輸入框裡時讓給輸入框（那時貼的是文字）
+        let hotkey = self.stack.busy != StackBusy::Saving
+            && self.stack.photos.len() < MAX_STACK_PHOTOS
+            && ctx.memory(|m| m.focused().is_none())
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
+        if paste || hotkey {
+            self.stack_paste_image(ctx);
+        }
+        if let Some(i) = remove_idx {
+            self.stack_remove_photo(i, ctx);
+        }
+        if show_result {
+            self.stack.view_layer = false;
+            self.stack.tool = None;
+            self.stack.scroll_to_cur = true;
+            // 點「疊圖結果」就是回來看成品，調色面板一起切到那一邊
+            self.stack.grade_target = GradeTarget::Output;
+        }
+        if let Some(i) = goto {
+            self.stack_select(i);
+        }
+        if let Some(i) = set_ground {
+            self.stack_set_ground(i, ctx);
+        }
+        if align_now {
+            // 剛打開：把還沒算過的補算；剛關掉：spawn 自己會收工
+            self.spawn_stack_align(ctx);
+            self.stack.dirty = true;
+        }
+        if reset_offset {
+            if let Some(p) = self.stack.current().cloned() {
+                self.stack.xforms.remove(&p);
+                self.stack.dirty = true;
+            }
+        }
+        if save {
+            self.stack_save(ctx);
+        }
+        // 清除確認擺在最後：這一幀的操作都處理完，dirty 才是最新的狀態
+        if clear {
+            self.stack_clear_confirmed();
+        }
+    }
+
+    /// 「去煙霧」模組：去除煙火照片的煙霧、保留煙火細節。
+    /// 與影片模組一樣直接畫在主視窗裡（右邊調色面板＋中央預覽），
+    /// 由上面的模組列切換
+    fn ui_dehaze_module(&mut self, ctx: &egui::Context) {
+        // 換字型會重建整份字型圖集，得在畫任何東西之前做完
+        if self.smoke.text_open || !self.smoke.effective_finish().texts.is_empty() {
+            self.ensure_smoke_font(ctx);
+        }
+        let mut pick = false;
+        // 工具列的「➕ 加入照片」：把照片加到現在這批後面
+        let mut add = false;
+        // Some(true)＝直接存回原始資料夾，Some(false)＝另存到自己挑的資料夾
+        let mut save: Option<bool> = None;
+        let mut reset = false;
+        let mut clear = false;
+        // 工具列的「🖼 疊圖片」與「📋 貼上圖片」（畫完這一幀才處理，
+        // 檔案對話框不能開在版面中間）
+        let mut add_overlay = false;
+        let mut paste_overlay = false;
+        let mut goto: Option<usize> = None;
+        // 縮圖列上 Ctrl／Shift 點到的那一張（挑要存哪幾張）
+        let mut toggle_idx: Option<usize> = None;
+        let mut range_idx: Option<usize> = None;
+        // 要移除的那一張（右鍵選單或 Delete 鍵）
+        let mut remove_idx: Option<usize> = None;
+        let side_frame = egui::Frame::default()
+            .fill(theme::PANEL)
+            // 內距與照片轉影片的調色面板相同，四個模組的側欄一樣寬鬆
+            .inner_margin(egui::Margin::symmetric(14, 12));
+        let center_frame = egui::Frame::default()
+            .fill(theme::BG)
+            .inner_margin(egui::Margin::same(12));
+        {
+            // 調色與文字放在右邊的獨立面板：下面只留去煙那幾條滑桿，
+            // 兩邊各自捲動，調色時不用再把設定區捲上捲下。
+            //
+            // 還沒選照片時**照樣顯示**：和影片模組的起始畫面一樣有右側面板，
+            // 兩個模組切來切去版面不會忽寬忽窄；設定寫進共用的那一份，
+            // 照片載進來就直接套上（見 SmokeTool::set_finish）
+            egui::SidePanel::right("smoke_side")
+                .frame(side_frame)
+                // 預設寬度與影片模組的調色面板相同，切換模組時面板邊緣不會跳動
+                .resizable(true)
+                .default_width(330.0)
+                .width_range(300.0..=430.0)
+                .show(ctx, |ui| {
+                    let busy = self.smoke.busy;
+                    egui::ScrollArea::vertical()
+                        .id_salt("smoke_side_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            // 手動清除不在這裡：它和去煙那幾條滑桿是同一件事
+                            // （都要邊看預覽邊塗），改放到中間設定區右邊的空白處
+                            self.ui_smoke_grade(ui, busy);
+                            self.ui_smoke_image(ui, busy);
+                            self.ui_smoke_text(ui, busy);
+                        });
+                });
+            egui::CentralPanel::default().frame(center_frame).show(ctx, |ui| {
                 let busy = self.smoke.busy;
                 let total = self.smoke.photos.len();
                 let cur = self.smoke.cur;
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(busy == SmokeBusy::Idle, egui::Button::new("🖼  選擇照片"))
-                        .on_hover_text("可一次選多張，用同一組設定處理")
+                        .on_hover_text(
+                            "**整批換掉**：可一次選多張，用同一組設定處理。\n\
+                             只是想再多處理幾張就按旁邊的「加入照片」",
+                        )
                         .clicked()
                     {
                         pick = true;
+                    }
+                    // 追加：挑著挑著又想起「那張也該一起處理」是常事，
+                    // 那時不該逼人把全部重選一遍（比照煙火疊圖那顆）
+                    if total > 0
+                        && ui
+                            .add_enabled(
+                                busy == SmokeBusy::Idle,
+                                egui::Button::new("➕  加入照片"),
+                            )
+                            .on_hover_text(
+                                "把照片**加到現在這批後面**，已經調好的參數、\n\
+                                 筆跡與正在看的那一張都留著；\n\
+                                 新加的那幾張照樣會自動判參數",
+                            )
+                            .clicked()
+                    {
+                        add = true;
+                    }
+                    // 模組是常駐的，得有個回到「還沒選照片」的出口
+                    if total > 0
+                        && ui
+                            .add_enabled(busy == SmokeBusy::Idle, egui::Button::new("🗑  清除"))
+                            .on_hover_text("清掉目前這批照片，回到選擇照片的畫面")
+                            .clicked()
+                    {
+                        clear = true;
+                    }
+                    // 疊圖片就跟在選照片那兩顆旁邊：右側面板窄，這兩顆擠在
+                    // 「圖片」標題旁會把區塊名稱推掉
+                    if total > 0 {
+                        ui.separator();
+                        let ok = busy == SmokeBusy::Idle;
+                        if ui
+                            .add_enabled(ok, egui::Button::new("🖼  疊圖片"))
+                            .on_hover_text(
+                                "挑一張圖片疊到照片上（logo、標題圖；\n\
+                                 PNG 的透明背景會保留）。\n\
+                                 加進來之後在預覽上直接拖曳擺位置",
+                            )
+                            .clicked()
+                        {
+                            add_overlay = true;
+                        }
+                        if ui
+                            .add_enabled(ok, egui::Button::new("📋  貼上圖片"))
+                            .on_hover_text(
+                                "把剪貼簿裡的圖片疊到照片上（Win+Shift+S 截的圖也可以）；\n\
+                                 透明的地方會變黑，要留透明背景請改用「🖼 疊圖片」挑 PNG",
+                            )
+                            .clicked()
+                        {
+                            paste_overlay = true;
+                        }
                     }
                     if total > 1 {
                         ui.separator();
@@ -4505,7 +17071,7 @@ impl App {
                     if self
                         .smoke
                         .current()
-                        .map(|p| self.smoke.overrides.contains_key(p))
+                        .map(|p| self.smoke.has_own(p))
                         .unwrap_or(false)
                     {
                         ui.label(
@@ -4513,65 +17079,116 @@ impl App {
                                 .size(11.0)
                                 .color(theme::ACCENT),
                         );
+                    } else if self
+                        .smoke
+                        .current()
+                        .map(|p| self.smoke.auto_for(p).is_some())
+                        .unwrap_or(false)
+                    {
+                        ui.label(
+                            egui::RichText::new("自動")
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                        );
                     }
                 });
                 ui.add_space(8.0);
 
+                // 與煙火疊圖同一個規則：按下一次滑鼠就代表已經在做別的事，
+                // 這一行讓位（見 ui_stack 那邊的說明）
+                if self.smoke.error.is_some() && ctx.input(|i| i.pointer.any_pressed()) {
+                    self.smoke.error = None;
+                }
                 if let Some(e) = &self.smoke.error {
                     ui.label(egui::RichText::new(format!("✖ {e}")).size(12.0).color(theme::ERROR));
                     ui.add_space(6.0);
                 }
 
-                if self.smoke.base.is_none() {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        ui.label(egui::RichText::new("💨").size(40.0));
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(if busy == SmokeBusy::Loading {
-                                "照片載入中…"
-                            } else {
-                                "選煙火照片（可多選），把煙霧散去、只留下煙火的線條"
-                            })
-                            .size(13.0)
-                            .color(theme::TEXT_WEAK),
-                        );
-                        ui.add_space(40.0);
-                    });
+                // 還沒選照片：整塊工作區就是一張引導畫面，
+                // 版面比照影片模組的空狀態（虛線框＋大按鈕）。
+                //
+                // 條件看的是「有沒有照片」而不是「有沒有預覽底圖」：切換照片時
+                // 底圖會先歸零、等背景解碼完才回來（見 smoke_load_current），
+                // 拿底圖當條件的話那幾幀整個模組會退回引導畫面又跳回來——
+                // 看起來就像自己切回「選擇照片」再切回來。載入中的版面照畫，
+                // 只在預覽區留一句「照片載入中…」
+                if self.smoke.photos.is_empty() {
+                    if smoke_empty_state(ui, busy == SmokeBusy::Loading) {
+                        pick = true;
+                    }
                     return;
                 }
 
-                // 底部控制列的高度先扣掉，其餘留給預覽。再夾一次上限：
-                // Window 內的 available_height 不一定有界，
-                // 只靠相減會讓預覽把控制列推出視窗
+                // 底部控制列的高度先扣掉，其餘留給預覽。高度不用公式估：
+                // 每一列都會隨視窗寬度換行、區塊也依狀態增減，估少了就把存檔列
+                // 擠出視窗被裁掉——改用上一幀真正量到的高度（見下面 settings_h）
                 let eff = self.smoke.effective();
-                let has_region = eff.region.is_some();
-                let has_protect = eff.has_protect();
+                // 目前這張的滑桿值是不是來自自動判參數（動過滑桿的照片就不是了）
+                let auto_here = self
+                    .smoke
+                    .current()
+                    .map(|p| self.smoke.auto_for(p).is_some())
+                    .unwrap_or(false);
                 let film_h = if total > 1 { 100.0 } else { 0.0 };
-                // 「天空」區塊展開時佔的高度：標題＋雲朵滑桿＋色票列＋說明，
-                // 範圍與上色兩條滑桿依條件才出現
-                let sky_h = if self.smoke.sky_open {
-                    24.0
-                        + 31.0
-                        + 26.0
-                        + 20.0
-                        + if eff.sky_clean > 0 || eff.sky_color.is_some() { 31.0 } else { 0.0 }
-                        + if eff.sky_color.is_some() { 31.0 } else { 0.0 }
-                } else {
-                    24.0
-                };
-                let ctrl_h = 206.0
-                    + film_h
-                    + sky_h
-                    + if has_region { 31.0 } else { 0.0 }
-                    + if has_protect { 31.0 } else { 0.0 };
-                let img_h = (ui.available_height() - ctrl_h).clamp(160.0, img_max_h);
+                // 360 只是切進來第一幀還沒量到時的粗估，下一幀就會校正；
+                // 24＝分隔線 10 ＋ 比例列下面 8 ＋ 設定區下面 6，逐項對得上程式碼。
+                // 這幾個數估少了就是「最底下那排被裁掉」，寧可多留一點
+                let ctrl_h = film_h
+                    + self.smoke.zoom_h              // 比例列（窄視窗會換行，所以用量到的）
+                    + self.smoke.settings_h.unwrap_or(360.0)
+                    + self.smoke.save_h
+                    + 24.0;
+                let avail = ui.available_height();
+                // 視窗拉小時預覽先讓位。下限原本是三成，但設定區左欄從去煙滑桿
+                // 一路排到「吸取保護色」有六、七百點高，連最大化的視窗都會被這個
+                // 下限卡住——預覽硬留三成、設定區只好自己捲，最下面兩三列一開畫面
+                // 就看不到。放寬到兩成（絕對值不低於 200 點）：設定區塞得下時這個
+                // 下限根本不會生效（預覽照 avail - ctrl_h 配），只有塞不下時預覽
+                // 才多讓那一截出來，換設定區整片看得到
+                let img_min = (avail * 0.20).max(200.0);
+                // 再怎麼拉高也要留得下比例列、縮圖列、一小塊設定區與存檔列
+                let img_max = (avail - film_h - self.smoke.save_h - 150.0).max(img_min);
+                // 使用者拖過分隔線就在自動配高上加減他拖的量
+                let want = avail - ctrl_h;
+                let img_h = (want + self.smoke.img_extra).clamp(img_min, img_max);
+                // 夾住的結果只在「往回收」時寫回去：拖過頭不會一直累積，
+                // 往回拖第一下就有反應。反向不寫——視窗小到設定區塞不下時，
+                // 預覽會被 img_min 撐住而多出一截，那是被迫的、不是使用者的
+                // 意思；記下來的話視窗再放大，預覽就一直佔著當初借走的高度，
+                // 設定區永遠掛著捲軸（開窗後按最大化必中）
+                let settled = img_h - want;
+                if settled.abs() < self.smoke.img_extra.abs() {
+                    self.smoke.img_extra = settled;
+                }
                 // 影像區要接收拖曳（框選）與點擊（吸取保護色）
                 let (rect, resp) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), img_h),
                     egui::Sense::click_and_drag(),
                 );
                 ui.painter().rect_filled(rect, 8.0, theme::CARD);
+                // 預覽與下面控制列之間的分隔線：上下拖曳改預覽高度，連點兩下回自動配高
+                let (bar, bar_resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 10.0),
+                    egui::Sense::click_and_drag(),
+                );
+                if bar_resp.dragged() {
+                    self.smoke.img_extra += bar_resp.drag_delta().y;
+                }
+                if bar_resp.double_clicked() {
+                    self.smoke.img_extra = 0.0;
+                }
+                let hot = bar_resp.hovered() || bar_resp.dragged();
+                if hot {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                // 平常是一小條灰把手，指到或拖著才亮起來，不搶照片的注意力
+                let grip = egui::Rect::from_center_size(bar.center(), egui::vec2(54.0, 3.0));
+                ui.painter()
+                    .rect_filled(grip, 1.5, if hot { theme::ACCENT } else { theme::BORDER });
+                bar_resp.on_hover_text("上下拖曳可調整預覽區高度；連點兩下回到自動");
+                // 比例列在有沒有底圖時都要畫：少畫一列，下面的縮圖列與設定區
+                // 會整個往上跳一下（換照片那零點幾秒特別明顯）
+                let mut zoom_info: Option<(f32, f32)> = None;
                 // 尚未算出結果前先顯示原圖，不要留一塊空白
                 let tex = self
                     .smoke
@@ -4580,14 +17197,251 @@ impl App {
                     .or(self.smoke.tex_before.as_ref())
                     .cloned();
                 if let Some(tex) = tex {
-                    let r = fit_rect(tex.size_vec2(), rect.shrink(6.0));
-                    ui.painter().image(
-                        tex.id(),
-                        r,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                    let full = rect.shrink(6.0);
+                    // 前後對照：左半邊放編輯前、右半邊放編輯後。兩半同寬，
+                    // 縮放與平移只算一次（用右半邊），左邊照同一組位移畫，
+                    // 兩張永遠對得起來
+                    let before_view = self.smoke.compare.then(|| {
+                        egui::Rect::from_min_size(
+                            full.min,
+                            egui::vec2((full.width() - SMOKE_COMPARE_GAP) / 2.0, full.height()),
+                        )
+                    });
+                    let view = match before_view {
+                        Some(b) => egui::Rect::from_min_size(
+                            egui::pos2(b.right() + SMOKE_COMPARE_GAP, full.top()),
+                            b.size(),
+                        ),
+                        None => full,
+                    };
+                    // 裁切生效時只讓人看到留下來的那塊：整張畫布照樣畫，
+                    // 只是畫在一個「讓裁切框剛好填滿畫面」的位置再裁掉外面
+                    // （見 crop_view_rect）。轉過的話這塊就是旋轉後的外接框，
+                    // 照片斜斜地畫在裡面；文字的座標也是對著它算的
+                    let shown_c = self.smoke.shown_crop();
+                    // 顯示比例照**原始照片**的尺寸算，不看貼圖本身多大。
+                    //
+                    // 貼圖只是工作用的縮圖（放大時還會換成更細的一份），拿它當基準
+                    // 的話 100% 是「縮圖的 1:1」＝照片的兩成多，換一份底圖畫面還會
+                    // 整個跳大一圈。照原圖算，100% 就是照片的 1 像素對螢幕 1 個
+                    // 實體像素，跟其他看圖軟體講的是同一件事
+                    let nominal = self
+                        .smoke
+                        .source_dims()
+                        .map(|(w, h)| egui::vec2(w as f32, h as f32))
+                        .or_else(|| {
+                            self.smoke
+                                .base
+                                .as_ref()
+                                .map(|b| egui::vec2(b.width() as f32, b.height() as f32))
+                        })
+                        .unwrap_or_else(|| tex.size_vec2());
+                    let canvas_size = {
+                        let (w, h) = shown_c.canvas(nominal.x, nominal.y);
+                        egui::vec2(w, h)
+                    };
+                    let fit = crop_fit_rect(canvas_size, view, shown_c);
+                    // 滾輪縮放：以 1.25 為級距，縮到比「符合視窗」還小就回到符合視窗
+                    // 顯示比例一律以**螢幕的實體像素**為準。Windows 的顯示縮放
+                    // （125%、150%…）讓 1 點等於 1.25、1.5 個實體像素，照「點」算的話
+                    // 按下 100% 看到的其實是被放大過的畫面，看起來就不是 1:1；
+                    // 除以它之後，選了幾 % 就是幾 %，不隨顯示縮放跑掉
+                    let ppp = ui.ctx().pixels_per_point();
+                    let fit_scale = fit.width() / canvas_size.x * ppp;
+                    // 滾輪與平移在整塊預覽區都收得到，滑鼠停在「編輯前」那半邊
+                    // 一樣可以縮放拖曳
+                    let (wheel, ctrl) = if ui.rect_contains_pointer(full) {
+                        ui.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl))
+                    } else {
+                        (0.0, false)
+                    };
+                    // Ctrl＋滾輪＝調筆刷粗細（比照 Photoshop／Lightroom）：
+                    // 塗到一半發現太粗，手不必離開照片跑去拉滑桿。
+                    // 沒開筆刷時 Ctrl 不特別處理，滾輪照樣是縮放
+                    let brush = if self.smoke.wipe_on {
+                        Some(&mut self.smoke.wipe_size)
+                    } else if self.smoke.mask_tool == Some(MaskTool::Brush) {
+                        Some(&mut self.smoke.brush_size)
+                    } else {
+                        None
+                    };
+                    match (wheel != 0.0, ctrl, brush) {
+                        (true, true, Some(size)) => {
+                            // 一格改一成：細的時候一格一格微調，粗的時候跨得快
+                            let step = (*size / 10).max(1) * if wheel > 0.0 { 1 } else { -1 };
+                            *size = (*size + step).clamp(1, 40);
+                        }
+                        (true, ..) => {
+                            let cur = self.smoke.zoom.unwrap_or(fit_scale);
+                            let next = cur * if wheel > 0.0 { 1.25 } else { 1.0 / 1.25 };
+                            self.smoke.zoom =
+                                (next > fit_scale * 1.02).then_some(next.min(8.0));
+                            // 自己動手改過比例，空白鍵就沒有「上一次」可回了
+                            self.smoke.zoom_back = None;
+                        }
+                        _ => {}
+                    }
+                    let r = match self.smoke.zoom {
+                        None => {
+                            // 回到符合視窗：下次放大從裁切框的中心開始
+                            self.smoke.pan = egui::pos2(
+                                (shown_c.x0 + shown_c.x1) / 2.0,
+                                (shown_c.y0 + shown_c.y1) / 2.0,
+                            );
+                            fit
+                        }
+                        Some(z) => {
+                            let size = canvas_size * (z / ppp);
+                            // 平移：中鍵或右鍵隨時可拖；沒選遮色片工具、不在吸色、
+                            // 滑鼠也不在文字上時左鍵一樣可以拖
+                            // （左鍵優先讓給工具、吸色與文字）
+                            let left_pans = self.smoke.mask_tool.is_none()
+                                && self.smoke.picking.is_none()
+                                && !self.smoke.wipe_on
+                                && !self.smoke.text_busy
+                                && !self.smoke.image_busy;
+                            if ui.rect_contains_pointer(full) {
+                                // 游標先講清楚現在左鍵是拿來拖畫面的
+                                if left_pans {
+                                    ui.ctx().set_cursor_icon(
+                                        if ui.input(|i| i.pointer.primary_down()) {
+                                            egui::CursorIcon::Grabbing
+                                        } else {
+                                            egui::CursorIcon::Grab
+                                        },
+                                    );
+                                }
+                                let d = ui.input(|i| {
+                                    if i.pointer.middle_down()
+                                        || i.pointer.secondary_down()
+                                        || (left_pans && i.pointer.primary_down())
+                                    {
+                                        i.pointer.delta()
+                                    } else {
+                                        egui::Vec2::ZERO
+                                    }
+                                });
+                                if d != egui::Vec2::ZERO {
+                                    self.smoke.pan.x -= d.x / size.x;
+                                    self.smoke.pan.y -= d.y / size.y;
+                                }
+                            }
+                            // 夾住平移範圍：照片比畫面窄的那個方向一律置中，
+                            // 有裁切時再收緊到裁切框內
+                            crop_clamp_pan(&mut self.smoke.pan, view, size, shown_c);
+                            snap_to_pixels(
+                                egui::Rect::from_min_size(
+                                    view.center()
+                                        - egui::vec2(
+                                            self.smoke.pan.x * size.x,
+                                            self.smoke.pan.y * size.y,
+                                        ),
+                                    size,
+                                ),
+                                ppp,
+                            )
+                        }
+                    };
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    // 只讓裁切框裡面看得到：`r` 是整張畫布的位置，框外那圈
+                    // （轉過的話還包含四角補的黑）要裁掉，否則會露出一截
+                    // 根本不會輸出的東西。調整裁切範圍時框就是整張畫布，
+                    // 等於沒裁——那時本來就要看得到照片的邊界
+                    let show = view.intersect(crop_screen_rect(r, shown_c));
+                    // 對照模式的左半邊：原圖照同樣的縮放、平移與旋轉畫，
+                    // 只是換到左邊那格——兩邊對得起來才比得出差別。
+                    // 遮色片、文字與吸色都只認右邊那張，左邊純粹是拿來比對的
+                    if let (Some(bv), Some(btex)) = (before_view, self.smoke.tex_before.clone()) {
+                        let mut bclip = ui.new_child(egui::UiBuilder::new().max_rect(bv));
+                        bclip.set_clip_rect(show.translate(bv.min - view.min));
+                        let br = r.translate(bv.min - view.min);
+                        if shown_c.has_rotation() {
+                            paint_rotated_image(
+                                bclip.painter(),
+                                &btex,
+                                br,
+                                btex.size_vec2(),
+                                shown_c.total_deg(),
+                            );
+                        } else {
+                            bclip
+                                .painter()
+                                .image(btex.id(), br, uv, egui::Color32::WHITE);
+                        }
+                    }
+                    // 放大後照片會超出畫面，連同上面畫的遮色片輪廓一起裁掉
+                    let mut clipped = ui.new_child(egui::UiBuilder::new().max_rect(view));
+                    clipped.set_clip_rect(show);
+                    if shown_c.has_rotation() {
+                        paint_rotated_image(
+                            clipped.painter(),
+                            &tex,
+                            r,
+                            tex.size_vec2(),
+                            shown_c.total_deg(),
+                        );
+                    } else {
+                        clipped
+                            .painter()
+                            .image(tex.id(), r, uv, egui::Color32::WHITE);
+                    }
+                    if self.smoke.crop_editing {
+                        // 調整裁切範圍時整片畫布讓給裁切框：遮色片、筆刷、
+                        // 吸色與文字都靠同一支左鍵，同時開著只會互相搶
+                        let cur = self.smoke.effective_grade().crop;
+                        let ratio = self.smoke.crop_aspect.ratio(self.smoke.source_dims());
+                        let (next, done) = crop_overlay(&mut clipped, &resp, r, cur, ratio);
+                        if next != cur {
+                            let mut f = self.smoke.effective_finish();
+                            f.grade.crop = next;
+                            self.smoke.set_finish(f);
+                        }
+                        // 照片上連點兩下＝裁好了，直接看裁切後的樣子
+                        if done {
+                            self.smoke.crop_editing = false;
+                        }
+                    } else {
+                        self.ui_smoke_canvas_interaction(&mut clipped, &resp, r);
+                        // 疊圖片與文字都在遮色片輔助線之上；文字最後畫，
+                        // 與存檔時的順序一致（圖片在下、文字在上）
+                        self.ui_smoke_image_overlay(&mut clipped, view, r);
+                        self.ui_smoke_text_overlay(&mut clipped, view, r);
+                    }
+                    // 兩格的標籤最後畫，才不會被照片或輔助線蓋掉
+                    if let Some(bv) = before_view {
+                        pane_label(ui, bv, "編輯前");
+                        pane_label(ui, view, "編輯後");
+                    }
+                    let pct = r.width() / canvas_size.x * 100.0 * ppp;
+                    // 這張照片在畫面上實際佔了多少實體像素：底圖至少要這麼細，
+                    // 看到的才不是被放大的（見 [`fine_target`]）。判斷放在畫預覽
+                    // 這裡，滾輪縮放、比例按鈕與拉視窗都算得進去
+                    self.smoke.want_long =
+                        (r.width().max(r.height()) * ppp).round().max(0.0) as u32;
+                    zoom_info = Some((fit_scale, pct));
+                } else {
+                    // 換照片時預覽底圖要重解一次（幾十毫秒到一兩秒）。
+                    // 這幾幀就在空的預覽卡上寫一句，版面其他東西都不動
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if self.smoke.error.is_some() {
+                            "這張讀不到"
+                        } else {
+                            "照片載入中…"
+                        },
+                        egui::FontId::proportional(15.0),
+                        theme::TEXT_WEAK,
                     );
-                    self.ui_smoke_canvas_interaction(ui, &resp, r);
+                }
+                // 量它實際佔多高，下一幀算預覽高度時照它留位（見上面的 ctrl_h）。
+                // 漏算這一列的話預覽會永遠多佔一列，設定區就永遠短一列——
+                // 而且是固定的偏差，不會自己校正回來
+                let zr = ui.scope(|ui| self.ui_smoke_zoom_bar(ui, zoom_info));
+                let zh = zr.response.rect.height();
+                if (self.smoke.zoom_h - zh).abs() > 0.5 {
+                    self.smoke.zoom_h = zh;
+                    ctx.request_repaint();
                 }
                 ui.add_space(8.0);
 
@@ -4597,274 +17451,769 @@ impl App {
                     let scroll_to = self.smoke.scroll_to_cur;
                     self.smoke.scroll_to_cur = false;
                     let thumb_size = egui::vec2(132.0, 84.0);
-                    egui::ScrollArea::horizontal()
-                        .id_salt("smoke_film")
-                        .max_height(film_h - 8.0)
-                        .show_viewport(ui, |ui, viewport| {
-                            ui.set_min_height(thumb_size.y);
-                            ui.horizontal(|ui| {
-                                let stride = thumb_size.x + ui.spacing().item_spacing.x;
-                                let origin = ui.next_widget_position();
-                                // 對虛擬位置捲動，目標縮圖不必真的被畫出來
-                                if scroll_to {
-                                    let r = egui::Rect::from_min_size(
-                                        egui::pos2(origin.x + cur as f32 * stride, origin.y),
-                                        thumb_size,
-                                    );
-                                    ui.scroll_to_rect(r, Some(egui::Align::Center));
-                                }
-                                let first =
-                                    (((viewport.min.x / stride).floor() as isize) - 1).max(0)
-                                        as usize;
-                                let last = ((((viewport.max.x / stride).ceil() as isize) + 1)
-                                    .max(0)
-                                    as usize)
-                                    .min(total);
-                                let first = first.min(last);
-                                self.smoke.vis_range = Some((first, last));
-                                if first > 0 {
-                                    ui.add_space(first as f32 * stride);
-                                }
-                                // 縮圖的自動 ID 與索引繫結，捲動時 hover 狀態才不會錯位
-                                ui.skip_ahead_auto_ids(first);
-                                for i in first..last {
-                                    let p = &self.smoke.photos[i];
-                                    let st = self.smoke.thumbs.get(p);
-                                    let tex = match st {
-                                        Some(Thumb::Ready(t)) => Some(t.clone()),
-                                        _ => None,
-                                    };
-                                    let r = thumb_item(
-                                        ui,
-                                        tex.as_ref(),
-                                        i,
-                                        i == cur,
-                                        false,
-                                        false,
-                                        self.smoke.overrides.contains_key(p),
-                                        matches!(st, Some(Thumb::Failed)),
-                                    );
-                                    if r.clicked() {
-                                        goto = Some(i);
+                    // 這一列只捲得動左右，所以直接把滾輪當成左右捲——
+                    // 游標停在縮圖上轉滾輪就能把整排移過去，不必去按 Shift 或拖捲軸。
+                    // 只改這個 scope 裡的樣式，別處的捲動維持原樣
+                    ui.scope(|ui| {
+                        ui.style_mut().always_scroll_the_only_direction = true;
+                        egui::ScrollArea::horizontal()
+                            .id_salt("smoke_film")
+                            .max_height(film_h - 8.0)
+                            .show_viewport(ui, |ui, viewport| {
+                                ui.set_min_height(thumb_size.y);
+                                ui.horizontal(|ui| {
+                                    let stride = thumb_size.x + ui.spacing().item_spacing.x;
+                                    let origin = ui.next_widget_position();
+                                    // 對虛擬位置捲動，目標縮圖不必真的被畫出來
+                                    if scroll_to {
+                                        let r = egui::Rect::from_min_size(
+                                            egui::pos2(origin.x + cur as f32 * stride, origin.y),
+                                            thumb_size,
+                                        );
+                                        ui.scroll_to_rect(r, Some(egui::Align::Center));
                                     }
-                                }
-                                if last < total {
-                                    ui.add_space((total - last) as f32 * stride);
-                                }
+                                    let first =
+                                        (((viewport.min.x / stride).floor() as isize) - 1).max(0)
+                                            as usize;
+                                    let last = ((((viewport.max.x / stride).ceil() as isize) + 1)
+                                        .max(0)
+                                        as usize)
+                                        .min(total);
+                                    let first = first.min(last);
+                                    self.smoke.vis_range = Some((first, last));
+                                    if first > 0 {
+                                        ui.add_space(first as f32 * stride);
+                                    }
+                                    // 縮圖的自動 ID 與索引繫結，捲動時 hover 狀態才不會錯位
+                                    ui.skip_ahead_auto_ids(first);
+                                    for i in first..last {
+                                        let p = &self.smoke.photos[i];
+                                        let st = self.smoke.thumbs.get(p);
+                                        let tex = match st {
+                                            Some(Thumb::Ready(t)) => Some(t.clone()),
+                                            _ => None,
+                                        };
+                                        let r = thumb_item(
+                                            ui,
+                                            tex.as_ref(),
+                                            Some(i),
+                                            i == cur,
+                                            false,
+                                            self.smoke.multi_sel.contains(p),
+                                            self.smoke.has_own(p),
+                                            matches!(st, Some(Thumb::Failed)),
+                                        );
+                                        // 挑要存哪幾張：與檔案總管同一套手勢
+                                        // （Ctrl 加減一張、Shift 選一段、
+                                        // 直接點就回到「沒挑，整批都存」）
+                                        if r.clicked() {
+                                            let mods = ui.input(|inp| inp.modifiers);
+                                            if mods.ctrl {
+                                                toggle_idx = Some(i);
+                                            } else if mods.shift {
+                                                range_idx = Some(i);
+                                            } else {
+                                                goto = Some(i);
+                                            }
+                                        }
+                                        r.context_menu(|ui| {
+                                            ui.add_enabled_ui(busy == SmokeBusy::Idle, |ui| {
+                                                if ui.button("🗑 移除這張").clicked() {
+                                                    ui.close_menu();
+                                                    remove_idx = Some(i);
+                                                }
+                                            });
+                                            if busy != SmokeBusy::Idle {
+                                                ui.label(
+                                                    egui::RichText::new("處理中無法移除照片")
+                                                        .size(11.0)
+                                                        .color(theme::TEXT_WEAK),
+                                                );
+                                            }
+                                        });
+                                    }
+                                    if last < total {
+                                        ui.add_space((total - last) as f32 * stride);
+                                    }
+                                });
                             });
-                        });
+                    });
                     ui.add_space(6.0);
                 }
 
-                ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
-                    let mut p = eff;
-                    slider_row(ui, &mut p.strength, 0, 100, "去除");
-                    slider_row(ui, &mut p.detail, 0, 100, "細節");
-                    slider_row(ui, &mut p.black, 0, 100, "壓黑");
-                    if p.region.is_some() {
-                        slider_row(ui, &mut p.feather, 0, 100, "羽化");
-                    }
-                    if p.has_protect() {
-                        slider_row(ui, &mut p.tolerance, 0, 100, "容差");
-                    }
-                    if p != eff {
-                        self.smoke.set_params(p);
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "去除＝煙霧扣掉多少 · 細節＝煙火線條的保留程度 · 壓黑＝把殘留的薄霧壓回夜色",
-                    )
-                    .size(11.0)
-                    .color(theme::TEXT_WEAK),
-                );
-                ui.add_space(6.0);
-
-                // 天空：清掉雲朵、換夜空顏色。預設收合，不佔掉預覽的版面
-                section_toggle(ui, "天空", &mut self.smoke.sky_open);
-                if self.smoke.sky_open {
-                    ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
-                        let mut p = eff;
-                        slider_row(ui, &mut p.sky_clean, 0, 100, "雲朵");
-                        if p.sky_clean > 0 || p.sky_color.is_some() {
-                            slider_row(ui, &mut p.sky_range, 0, 100, "範圍");
+                // 設定區：擠不下時自己長捲軸，不把下面的存檔列頂出視窗
+                let settings_max =
+                    (ui.available_height() - self.smoke.save_h - 10.0).max(90.0);
+                let settings = egui::ScrollArea::vertical()
+                    .id_salt("smoke_settings")
+                    .max_height(settings_max)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        // 設定區分兩欄：左邊是去煙那一整組，右邊放手動清除。
+                        //
+                        // 這一區原本讓滑桿橫跨整個視窗，寬螢幕上一條拉到一千多
+                        // 像素——拖一格動好幾個單位，反而不好調；名稱和數值也
+                        // 隔得老遠。把左欄夾在一個好操作的寬度，右邊空出來的位置
+                        // 正好給手動清除，兩邊都看得到、也不必再捲動
+                        let avail = ui.available_rect_before_wrap();
+                        let gap = 20.0;
+                        let left_w = (avail.width() * 0.55).clamp(340.0, 720.0);
+                        // 右欄太窄就擺不下「清除筆刷 ＋ 大小滑桿」那一列，
+                        // 這時退回單欄，手動清除接在最後面（見下方 !two_col）
+                        let right_w = (avail.width() - left_w - gap).min(520.0);
+                        let two_col = right_w >= 280.0;
+                        let mut wipe_h = 0.0;
+                        if two_col {
+                            // 右欄用 new_child 直接定位，左欄那三百行的排版完全不動
+                            let r = egui::Rect::from_min_size(
+                                egui::pos2(avail.min.x + left_w + gap, avail.min.y),
+                                egui::vec2(right_w, avail.height().max(320.0)),
+                            );
+                            let mut col = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(r)
+                                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                            );
+                            self.ui_smoke_wipe(&mut col, busy);
+                            wipe_h = col.min_rect().height();
                         }
-                        ui.horizontal(|ui| {
-                            let (lb, _) = ui.allocate_exact_size(
-                                egui::vec2(30.0, 18.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().text(
-                                lb.left_center(),
-                                egui::Align2::LEFT_CENTER,
-                                "夜空",
-                                egui::FontId::proportional(12.5),
-                                theme::TEXT_WEAK,
-                            );
-                            // 沒設過色時給一個深藍當起點，比從純黑開始好調
-                            let mut c = p.sky_color.unwrap_or([22, 42, 100]);
-                            if ui.color_edit_button_srgb(&mut c).changed() {
-                                p.sky_color = Some(c);
+                        ui.set_max_width(left_w);
+
+                        // 自動判參數：開檔就替每張量一次，滑桿一開始就停在這張該有的位置
+                        ui.horizontal_wrapped(|ui| {
+                            let mut on = self.smoke.auto_on;
+                            if ui
+                                .checkbox(&mut on, "自動判參數")
+                                .on_hover_text(
+                                    "每張照片各自量出去除煙霧、細節、去除雲朵、範圍該有的值；\
+                                     動過滑桿的照片會保留你調的，不再被蓋回去",
+                                )
+                                .changed()
+                            {
+                                self.smoke.auto_on = on;
                             }
-                            if p.sky_color.is_some() {
-                                if ui.small_button("✕ 不改色").clicked() {
-                                    p.sky_color = None;
-                                }
-                            } else {
+                            if self.smoke.auto_left > 0 {
                                 ui.label(
-                                    egui::RichText::new("點色塊挑一個夜空顏色")
+                                    egui::RichText::new(format!(
+                                        "量測中… 還有 {} 張",
+                                        self.smoke.auto_left
+                                    ))
+                                    .size(11.0)
+                                    .color(theme::TEXT_WEAK),
+                                );
+                            } else if auto_here {
+                                ui.label(
+                                    egui::RichText::new("這張已照自己的煙量調好")
+                                        .size(11.0)
+                                        .color(theme::TEXT_WEAK),
+                                );
+                            }
+                            // 動過滑桿之後想回到量出來的那一組：一張一張各自回自己的，
+                            // 不影響別張，也不動遮色片與調色
+                            if self.smoke.off_auto()
+                                && ui
+                                    .small_button("回自動預設值")
+                                    .on_hover_text(
+                                        "把去除煙霧、細節、去除雲朵、範圍放回這張自己量出來的值；\
+                                         遮色片、保護色、雲色、夜空色與調色、文字都保留",
+                                    )
+                                    .clicked()
+                            {
+                                self.smoke.back_to_auto();
+                            }
+                            // 還在編輯狀態時講明白：遮色片工具或清除筆刷勾著的時候，
+                            // 預覽是沒轉也沒裁的原圖、左鍵也還在畫。工具那一排在設定區
+                            // 的下半段，捲下去就看不到，常常忘了自己還開著
+                            // （見 [`SmokeTool::end_editing`]）。靠右擺才不會被
+                            // 前面那幾句擠掉，位置也固定
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if self.smoke.source_tools_active() {
+                                        // 右到左，所以先放的按鈕會在最右邊
+                                        if ui
+                                            .small_button("完成編輯")
+                                            .on_hover_text(
+                                                "收起遮色片工具、清除筆刷與吸色，\
+                                                 預覽回到套了旋轉與裁切的成品樣子；\
+                                                 左鍵也回到拖曳平移",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.smoke.end_editing();
+                                        }
+                                        ui.label(
+                                            egui::RichText::new("✏ 編輯中")
+                                                .size(11.0)
+                                                .color(theme::TRACK),
+                                        )
+                                        .on_hover_text(
+                                            "還有工具開著：預覽顯示的是沒轉、沒裁的原圖，\
+                                             左鍵是拿來畫的。按右邊「完成編輯」收起來",
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("✔ 完成編輯")
+                                                .size(11.0)
+                                                .color(theme::TEXT_WEAK),
+                                        )
+                                        .on_hover_text(
+                                            "沒有工具開著，預覽就是存檔會拿到的樣子",
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
+                            let mut p = eff.clone();
+                            slider_row(ui, &mut p.strength, 0, 100, "去除煙霧");
+                            slider_row(ui, &mut p.detail, 0, 100, "細節");
+                            // 羽化與濃度搬到下面的「遮色片」區去了：它們是遮色片
+                            // 自己的設定，跟尺寸擺在一起才看得懂（與煙火疊圖一致）
+                            if p.has_protect() {
+                                slider_row(ui, &mut p.tolerance, 0, 100, "容差");
+                            }
+                            if p != eff {
+                                self.smoke.set_params(p);
+                            }
+                        });
+                        ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
+                            // 兩條滑桿的說明自己佔一行、就貼在滑桿下面：擠在勾選框
+                            // 右邊時視窗一窄就被裁掉，看不到後半句
+                            ui.label(
+                                egui::RichText::new(
+                                    "去除煙霧＝煙霧扣掉多少 · 細節＝煙火線條的保留程度",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                            );
+                            ui.horizontal(|ui| {
+                                let mut restore = eff.restore_trails;
+                                if ui
+                                    .checkbox(&mut restore, "補回煙裡的軌跡")
+                                    .on_hover_text(
+                                        "濃煙很亮時，估出來的煙霧層會比煙裡的軌跡還高，\n\
+                                         相減把兩者一起扣成全黑——畫面上就是煙火被咬掉一塊。\n\
+                                         勾著就把「比周圍高出來」的那一截撈回來，\n\
+                                         顏色照原本的給，不是無中生有畫上去的。\n\
+                                         純粹是煙的地方高出量接近 0，所以煙照樣去得乾淨",
+                                    )
+                                    .changed()
+                                {
+                                    let mut p = eff.clone();
+                                    p.restore_trails = restore;
+                                    self.smoke.set_params(p);
+                                }
+                                let mut on = eff.sky_only;
+                                if ui
+                                    .checkbox(&mut on, "只處理天空")
+                                    .on_hover_text(
+                                        "作用範圍自動限在天際線以上。\n\
+                                         煙只飄在天空，但岸邊燈火與水面倒影又亮又連續，\n\
+                                         估起來也像一層煙，扣下去整片會被壓暗。\n\
+                                         煙真的飄到地面、或畫面裡根本沒有地景時才需要關掉",
+                                    )
+                                    .changed()
+                                {
+                                    let mut p = eff.clone();
+                                    p.sky_only = on;
+                                    self.smoke.set_params(p);
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+
+                        // 天空：清掉沒有煙火紋路的煙霧與雲、換夜空顏色。
+                        // 預設收合，不佔掉預覽的版面
+                        section_toggle(ui, "天空", &mut self.smoke.sky_open);
+                        if self.smoke.sky_open {
+                            ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
+                                let mut p = eff.clone();
+                                slider_row(ui, &mut p.sky_clean, 0, 100, "去除雲朵");
+                                if p.sky_clean > 0 || p.sky_color.is_some() || p.has_cloud() {
+                                    slider_row(ui, &mut p.sky_range, 0, 100, "範圍");
+                                }
+                                // 被燈光照亮、亮到判定不出來的雲：用吸管直接指名它的顏色
+                                ui.horizontal_wrapped(|ui| {
+                                    let picking = self.smoke.picking == Some(PickTarget::Cloud);
+                                    if check_label(ui, picking, "💧 吸取雲色")
+                                        .on_hover_text(
+                                            "點一下再到照片上點雲，與它相近的地方就當成天空，一起壓回夜色",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.smoke.picking = (!picking).then_some(PickTarget::Cloud);
+                                        self.smoke.wipe_on = false;
+                                    }
+                                    let mut drop_cloud: Option<usize> = None;
+                                    for (i, c) in p.cloud_colors() {
+                                        if color_chip(ui, c, "點一下移除這個雲色") {
+                                            drop_cloud = Some(i);
+                                        }
+                                    }
+                                    if let Some(i) = drop_cloud {
+                                        p.remove_cloud(i);
+                                    }
+                                    if p.has_cloud() {
+                                        if ui.small_button("全部清除").clicked() {
+                                            p.clear_cloud();
+                                        }
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("亮到壓不掉的雲，吸它的顏色直接指名")
+                                                .size(11.0)
+                                                .color(theme::TEXT_WEAK),
+                                        );
+                                    }
+                                });
+                                if p.has_cloud() {
+                                    slider_row(ui, &mut p.cloud_range, 0, 100, "相近");
+                                }
+                                ui.horizontal(|ui| {
+                                    let (lb, _) = ui.allocate_exact_size(
+                                        egui::vec2(SLIDER_LABEL_W, 20.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().text(
+                                        lb.left_center(),
+                                        egui::Align2::LEFT_CENTER,
+                                        "夜空",
+                                        // 和「天空」那種區塊標題同字級：這一列是天空
+                                        // 底下自成一段的設定，不是滑桿的名稱
+                                        egui::FontId::proportional(SECTION_FONT),
+                                        theme::TEXT,
+                                    );
+                                    // 沒設過色時給一個深藍當起點，比從純黑開始好調
+                                    let mut c = p.sky_color.unwrap_or([22, 42, 100]);
+                                    if ui.color_edit_button_srgb(&mut c).changed() {
+                                        p.sky_color = Some(c);
+                                    }
+                                    if p.sky_color.is_some() {
+                                        if ui.small_button("不改色").clicked() {
+                                            p.sky_color = None;
+                                        }
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("點色塊挑一個夜空顏色")
+                                                .size(11.0)
+                                                .color(theme::TEXT_WEAK),
+                                        );
+                                    }
+                                });
+                                if p.sky_color.is_some() {
+                                    slider_row(ui, &mut p.sky_tint, 0, 100, "上色");
+                                }
+                                if p != eff {
+                                    self.smoke.set_params(p);
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "去除雲朵＝把天空裡沒有煙火紋路的煙霧與雲壓回夜色 · 範圍＝多亮的煙霧也算雲朵 · 吸雲色＝指名壓不掉的亮雲 · 煙火、水面與地面不受影響",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                            );
+                            ui.add_space(6.0);
+                        }
+
+                        // 多張時的套用範圍：預設一起調，需要時只調目前這張
+                        if total > 1 {
+                            ui.horizontal_wrapped(|ui| {
+                                let mut per = self.smoke.per_photo;
+                                if ui
+                                    .checkbox(&mut per, "只調整這張")
+                                    .on_hover_text("不勾＝改動套用到全部照片；勾起來只改目前這張")
+                                    .changed()
+                                {
+                                    self.smoke.per_photo = per;
+                                }
+                                // 自動判參數開著時，收掉個別設定是回到那張量出來的值，
+                                // 不是回到共用參數——按鈕就照實說是哪一種
+                                let back_to_auto = self
+                                    .smoke
+                                    .current()
+                                    .map(|p| self.smoke.auto.contains_key(p))
+                                    .unwrap_or(false)
+                                    && self.smoke.auto_on;
+                                let label = if back_to_auto {
+                                    "↩ 這張改回自動判的值"
+                                } else {
+                                    "↩ 這張改回共用設定"
+                                };
+                                if self
+                                    .smoke
+                                    .current()
+                                    .map(|p| self.smoke.has_own(p))
+                                    .unwrap_or(false)
+                                    && ui.small_button(label).clicked()
+                                {
+                                    if let Some(p) = self.smoke.current().cloned() {
+                                        self.smoke.overrides.remove(&p);
+                                        self.smoke.finish_overrides.remove(&p);
+                                        self.smoke.sel_text = None;
+                                    }
+                                }
+                                let n = self
+                                    .smoke
+                                    .photos
+                                    .iter()
+                                    .filter(|p| self.smoke.has_own(p))
+                                    .count();
+                                if n > 0 {
+                                    ui.label(
+                                        egui::RichText::new(format!("（{n} 張有個別設定）"))
+                                            .size(11.0)
+                                            .color(theme::TEXT_WEAK),
+                                    );
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+
+                        // 遮色片：選一種工具直接在照片上畫，只有畫到的地方會去煙。
+                        // 筆刷與物件一筆加一次；框選與兩種漸層以最後畫的那個為準
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new("🎭 遮色片")
+                                    .size(SECTION_FONT)
+                                    .color(theme::TEXT),
+                            );
+                            for (tool, label, tip) in [
+                                (
+                                    MaskTool::Rect,
+                                    "框選",
+                                    "拖曳框出一塊，只有框內去煙",
+                                ),
+                                (
+                                    MaskTool::Brush,
+                                    "筆刷",
+                                    "在照片上塗，塗到的地方才去煙；同一塊想更濃就再塗一遍",
+                                ),
+                                (
+                                    MaskTool::Linear,
+                                    "線性漸層",
+                                    "從起點全效果、沿著拖曳方向漸弱，到終點完全不動",
+                                ),
+                                (
+                                    MaskTool::Radial,
+                                    "放射性漸層",
+                                    "由中心往外拖出橢圓，圓內去煙；可反轉成只處理圓外",
+                                ),
+                                (
+                                    MaskTool::Object,
+                                    "物件",
+                                    "框住要選的東西（一朵煙火、一團煙），\n\
+                                     程式會自動找出框裡那個東西的輪廓。\n\
+                                     框得貼近一點選得越準；選完可再調羽化與邊緣",
+                                ),
+                            ] {
+                                let on = self.smoke.mask_tool == Some(tool);
+                                if check_label(ui, on, label).on_hover_text(tip).clicked() {
+                                    // 再點一次同一個工具就關掉，左鍵回到拖曳平移
+                                    self.smoke.mask_tool = (!on).then_some(tool);
+                                    // 吸色、清除與畫遮色片都靠同一片畫布，不能同時開著
+                                    self.smoke.picking = None;
+                                    self.smoke.wipe_on = false;
+                                }
+                            }
+                            let n = eff.shapes.len();
+                            if n > 0 {
+                                ui.separator();
+                                if ui
+                                    .small_button("↩ 還原一個")
+                                    .on_hover_text("拿掉最後畫上去的那個形狀")
+                                    .clicked()
+                                {
+                                    let mut v = eff.clone();
+                                    v.undo_shape();
+                                    self.smoke.set_params(v);
+                                }
+                                if ui.small_button("清除遮色片").clicked() {
+                                    let mut v = eff.clone();
+                                    v.clear_shapes();
+                                    self.smoke.set_params(v);
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("（{n} 個形狀）"))
                                         .size(11.0)
                                         .color(theme::TEXT_WEAK),
                                 );
                             }
                         });
-                        if p.sky_color.is_some() {
-                            slider_row(ui, &mut p.sky_tint, 0, 100, "上色");
-                        }
-                        if p != eff {
-                            self.smoke.set_params(p);
-                        }
-                    });
-                    ui.label(
-                        egui::RichText::new(
-                            "雲朵＝把天空裡沒有紋理的暗面壓回夜色 · 範圍＝多亮的雲也算天空 · 水面與地面不受影響",
-                        )
-                        .size(11.0)
-                        .color(theme::TEXT_WEAK),
-                    );
-                    ui.add_space(6.0);
-                }
-
-                // 多張時的套用範圍：預設一起調，需要時只調目前這張
-                if total > 1 {
-                    ui.horizontal_wrapped(|ui| {
-                        let mut per = self.smoke.per_photo;
-                        if ui
-                            .checkbox(&mut per, "只調整這張")
-                            .on_hover_text("不勾＝改動套用到全部照片；勾起來只改目前這張")
-                            .changed()
-                        {
-                            self.smoke.per_photo = per;
-                        }
-                        if self
-                            .smoke
-                            .current()
-                            .map(|p| self.smoke.overrides.contains_key(p))
-                            .unwrap_or(false)
-                            && ui
-                                .small_button("↩ 這張改回共用設定")
-                                .clicked()
-                        {
-                            if let Some(p) = self.smoke.current().cloned() {
-                                self.smoke.overrides.remove(&p);
-                            }
-                        }
-                        let n = self.smoke.overrides.len();
-                        if n > 0 {
+                        // 還沒畫遮色片時的說明自己佔一行、接在工具那排下面：
+                        // 跟在按鈕後面時會被擠成兩截，讀起來卡卡的
+                        if eff.shapes.is_empty() {
                             ui.label(
-                                egui::RichText::new(format!("（{n} 張有個別設定）"))
+                                egui::RichText::new(if self.smoke.mask_tool.is_some() {
+                                    "直接在照片上拖曳；不畫就是整片天空都去煙。畫好的框、漸層可以直接拖著搬"
+                                } else {
+                                    "預設不用遮色片（整片天空都去煙，地景與水面不動）；要再縮小範圍才選一種工具"
+                                })
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                            );
+                        }
+
+                        // 各工具自己的選項
+                        match self.smoke.mask_tool {
+                            Some(MaskTool::Brush) => {
+                                // 三條都走 slider_row：標籤寬度固定，滑桿起點才對得齊
+                                // （與煙火疊圖是同一組、同一個順序）
+                                let mut size = self.smoke.brush_size;
+                                slider_row(ui, &mut size, 1, 40, "尺寸");
+                                self.smoke.brush_size = size;
+                            }
+                            Some(MaskTool::Radial) => {
+                                ui.horizontal(|ui| {
+                                    let mut inv = self.smoke.radial_invert;
+                                    if ui
+                                        .checkbox(&mut inv, "反轉（只處理橢圓外）")
+                                        .changed()
+                                    {
+                                        self.smoke.radial_invert = inv;
+                                        // 剛畫好就想反轉是最常見的用法，直接改在最後那個上面，
+                                        // 不必刪掉重畫一次
+                                        let mut v = eff.clone();
+                                        if let Some(dehaze::Shape::Radial(r)) = v.last_shape_mut() {
+                                            r.invert = inv;
+                                            self.smoke.set_params(v);
+                                        }
+                                    }
+                                });
+                            }
+                            Some(MaskTool::Object) => {
+                                // 兩條都走 slider_row，標籤寬度才與底下那組對得齊
+                                let (f0, e0) =
+                                    (self.smoke.object_feather, self.smoke.object_edge);
+                                let (mut f, mut e) = (f0, e0);
+                                slider_row(ui, &mut f, 0, 100, "羽化");
+                                slider_row(ui, &mut e, -100, 100, "邊緣");
+                                if (f, e) != (f0, e0) {
+                                    self.smoke.object_feather = f;
+                                    self.smoke.object_edge = e;
+                                    // 剛框完就想調鬆一點是最常見的用法，直接改在
+                                    // 最後選的那一個上面，不必刪掉重框
+                                    self.smoke_refine_object(f, e);
+                                }
+                                ui.label(
+                                    egui::RichText::new(OBJECT_HINT)
+                                        .size(11.0)
+                                        .color(theme::TEXT_WEAK),
+                                );
+                            }
+                            _ => {}
+                        }
+                        // 羽化與濃度：整組遮色片共用（與煙火疊圖同一組、同一個順序）。
+                        //
+                        // **不看有沒有畫過東西，一律顯示**：原本只在畫了形狀之後才
+                        // 出現，於是剛選好筆刷、還沒下筆時這兩條是不見的，看起來像
+                        // 少了東西；而且濃度本來就該在下筆**之前**先調好。
+                        //
+                        // 唯一的例外是「物件」：這兩條它都不吃——邊界柔不柔由它
+                        // 自己那條「羽化」決定，濃度也一律 100%。擺在那裡只會讓人
+                        // 以為要調，而且會同時出現「羽化」與「邊緣羽化」兩條
+                        if self.smoke.mask_tool != Some(MaskTool::Object) {
+                            let mut v = eff.clone();
+                            slider_row(ui, &mut v.feather, 0, 100, "邊緣羽化");
+                            slider_row(ui, &mut v.mask_density, 0, 100, "筆刷濃度");
+                            if v != eff {
+                                self.smoke.set_params(v);
+                            }
+                            ui.label(
+                                egui::RichText::new(MASK_HINT)
                                     .size(11.0)
                                     .color(theme::TEXT_WEAK),
                             );
                         }
-                    });
-                    ui.add_space(6.0);
-                }
+                        ui.add_space(6.0);
 
-                // 範圍控制：框選區塊、吸取保護色、遮色片預覽
-                ui.horizontal_wrapped(|ui| {
-                    let picking = self.smoke.picking;
-                    if ui
-                        .selectable_label(picking, "🎨 吸取保護色")
-                        .on_hover_text("點一下再到照片上點選顏色，與它相近的區域就不會被去煙")
-                        .clicked()
-                    {
-                        self.smoke.picking = !picking;
-                    }
-                    // 已選的保護色：點色塊即可移除單一個
-                    let mut drop_color: Option<usize> = None;
-                    for (i, c) in eff.protect_colors() {
-                        let (sw, r) = ui.allocate_exact_size(
-                            egui::vec2(22.0, 18.0),
-                            egui::Sense::click(),
-                        );
-                        ui.painter()
-                            .rect_filled(sw, 3.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
-                        ui.painter().rect_stroke(
-                            sw,
-                            3.0,
-                            egui::Stroke::new(
-                                1.0,
-                                if r.hovered() { theme::ERROR } else { theme::BORDER },
-                            ),
-                            egui::StrokeKind::Inside,
-                        );
-                        if r.on_hover_text("點一下移除這個保護色").clicked() {
-                            drop_color = Some(i);
+                        // 保護色與遮色片預覽
+                        ui.horizontal_wrapped(|ui| {
+                            let picking = self.smoke.picking == Some(PickTarget::Protect);
+                            if check_label(ui, picking, "🎨 吸取保護色")
+                                .on_hover_text("點一下再到照片上點選顏色，與它相近的區域就不會被去煙")
+                                .clicked()
+                            {
+                                self.smoke.picking = (!picking).then_some(PickTarget::Protect);
+                                self.smoke.wipe_on = false;
+                            }
+                            // 已選的保護色：點色塊即可移除單一個
+                            let mut drop_color: Option<usize> = None;
+                            for (i, c) in eff.protect_colors() {
+                                if color_chip(ui, c, "點一下移除這個保護色") {
+                                    drop_color = Some(i);
+                                }
+                            }
+                            if let Some(i) = drop_color {
+                                let mut v = eff.clone();
+                                v.remove_protect(i);
+                                self.smoke.set_params(v);
+                            }
+                            if eff.has_protect() && ui.small_button("全部清除").clicked() {
+                                let mut v = eff.clone();
+                                v.clear_protect();
+                                self.smoke.set_params(v);
+                            }
+                            ui.separator();
+                            // 沒有遮色片也沒有保護色時這顆沒有意義：整片天空都會去煙，
+                            // 遮罩檢視只會蓋出一片紅（那是地景，不是使用者畫的東西），
+                            // 看起來像「遮色片清不掉」。所以沒東西可看就停用它
+                            let can_show = eff.has_shapes() || eff.has_protect();
+                            // 清掉最後一個形狀時它會自己關掉——否則畫面會卡在遮罩
+                            // 檢視，而開關已經變灰，使用者反而退不出來
+                            if !can_show && self.smoke.show_mask {
+                                self.smoke.show_mask = false;
+                                self.smoke.applied = None;
+                            }
+                            let mut show_mask = self.smoke.show_mask;
+                            let r = ui.add_enabled_ui(can_show, |ui| {
+                                check_label(ui, show_mask, "顯示遮色片")
+                                    .on_hover_text("紅色蓋住的地方不會被去煙")
+                                    .clicked()
+                            });
+                            r.response
+                                .on_disabled_hover_text("先畫一個遮色片或吸一個保護色才有東西可看");
+                            if r.inner {
+                                show_mask = !show_mask;
+                                self.smoke.show_mask = show_mask;
+                                // 遮色片與成品是兩種畫面，切換後要重畫
+                                self.smoke.applied = None;
+                            }
+                        });
+
+                        if two_col {
+                            // 右欄是 new_child 畫的，不會把高度算進這一區。
+                            // 它比左欄高時（左欄收合了幾個區塊就會這樣）補上差額，
+                            // 否則下面的存檔列會壓到它
+                            let used = ui.min_rect().height();
+                            if wipe_h > used {
+                                ui.allocate_space(egui::vec2(0.0, wipe_h - used));
+                            }
+                            // 兩欄之間的分隔細線：沒有它兩欄的東西會糊成一片，
+                            // 看不出手動清除是獨立一區。
+                            // 兩欄都畫完才知道要多高，所以擺在最後
+                            let h = ui.min_rect().height().max(wipe_h);
+                            ui.painter().vline(
+                                avail.min.x + left_w + gap / 2.0,
+                                avail.min.y..=(avail.min.y + h),
+                                egui::Stroke::new(1.0, theme::DIVIDER),
+                            );
+                        } else {
+                            // 視窗太窄擺不下兩欄：手動清除接在最後面
+                            ui.add_space(6.0);
+                            self.ui_smoke_wipe(ui, busy);
                         }
-                    }
-                    if let Some(i) = drop_color {
-                        let mut v = eff;
-                        v.remove_protect(i);
-                        self.smoke.set_params(v);
-                    }
-                    if eff.has_protect() && ui.small_button("✕ 全部清除").clicked() {
-                        let mut v = eff;
-                        v.clear_protect();
-                        self.smoke.set_params(v);
-                    }
-                    ui.separator();
-                    if eff.region.is_some() {
-                        if ui.small_button("✕ 清除框選").clicked() {
-                            let mut v = eff;
-                            v.region = None;
-                            self.smoke.set_params(v);
-                        }
-                    } else {
-                        ui.label(
-                            egui::RichText::new("在照片上拖曳可框出只去煙的區塊")
-                                .size(11.0)
-                                .color(theme::TEXT_WEAK),
-                        );
-                    }
-                    ui.separator();
-                    let mut show_mask = self.smoke.show_mask;
-                    if ui
-                        .selectable_label(show_mask, "◧ 顯示遮色片")
-                        .on_hover_text("紅色蓋住的地方不會被去煙")
-                        .clicked()
-                    {
-                        show_mask = !show_mask;
-                        self.smoke.show_mask = show_mask;
-                        // 遮色片與成品是兩種畫面，切換後要重畫
-                        self.smoke.applied = None;
-                    }
-                });
+                    });
+                // 這一區真正的高度畫完才知道；記下來給下一幀算預覽高度用，
+                // 與這一幀用的值不同就再排一次重畫，版面立刻校正回來
+                let measured = settings.content_size.y;
+                if (self.smoke.settings_h.unwrap_or(-1.0) - measured).abs() > 0.5 {
+                    ctx.request_repaint();
+                }
+                self.smoke.settings_h = Some(measured);
                 ui.add_space(6.0);
 
-                ui.horizontal(|ui| {
-                    if ui.small_button("↺ 重設").clicked() {
+                let save_row = ui.horizontal(|ui| {
+                    if ui
+                        .small_button("↺ 清除所有修改內容")
+                        .on_hover_text("把這張照片調過的東西全部清掉，回到剛載進來的樣子")
+                        .clicked()
+                    {
                         reset = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let saving = busy == SmokeBusy::Saving;
-                        let label = if saving {
-                            format!("儲存中… {}/{}", self.smoke.save_done, total)
-                        } else if total > 1 {
-                            format!("💾  全部另存（{total} 張）")
+                        // 存檔中換一顆會動的按鈕：轉圈 + 掃光 + 進度填色，
+                        // 一眼看得出程式正在寫檔、而且寫到第幾張了
+                        if saving {
+                            let done = self.smoke.save_done;
+                            // 分母是「這一批要存幾張」，挑了幾張存就報幾張
+                            let batch = self.smoke.save_total.max(1);
+                            saving_button(
+                                ui,
+                                &format!("儲存中… {done}/{batch}"),
+                                done as f32 / batch as f32,
+                            )
+                            .on_hover_text("正在把處理好的照片寫回檔案，完成前請先別關視窗");
                         } else {
-                            "💾  另存新檔".to_string()
-                        };
-                        if primary_button(ui, &label, busy == SmokeBusy::Idle).clicked() {
-                            save = true;
+                            // 縮圖列挑過就只存挑到的那幾張；沒挑就是整批
+                            // （與檔案總管一樣，沒選取＝全部）
+                            let picked = self.smoke.multi_sel.len();
+                            let label = if picked > 0 {
+                                format!("💾  存選取的（{picked} 張）")
+                            } else if total > 1 {
+                                format!("💾  全部存檔（{total} 張）")
+                            } else {
+                                "💾  存檔".to_string()
+                            };
+                            if primary_button(ui, &label, busy == SmokeBusy::Idle)
+                                .on_hover_text(if picked > 0 {
+                                    "只存縮圖列上挑起來的那幾張；\
+                                     每張都存回它自己的原始資料夾，檔名加上 _去煙。\n\
+                                     在縮圖上直接點一下就取消挑選，改成整批都存"
+                                } else if total > 1 {
+                                    "每張都存回它自己的原始資料夾，檔名加上 _去煙，不用再選位置。\n\
+                                     只想存其中幾張：在縮圖列上按住 Ctrl 逐張點、\
+                                     或按住 Shift 選一整段"
+                                } else {
+                                    "存回原始照片所在的資料夾，檔名加上 _去煙，不用再選位置"
+                                })
+                                .clicked()
+                            {
+                                save = Some(true);
+                            }
+                        }
+                        // 要放到別的地方才點這顆；平常直接用右邊那顆存回原資料夾
+                        if !saving {
+                            ui.add_space(6.0);
+                            if ui
+                                .small_button("📁 另存新檔…")
+                                .on_hover_text("自己挑一個資料夾存放成品")
+                                .clicked()
+                            {
+                                save = Some(false);
+                            }
+                        }
+                        // 存檔尺寸緊鄰存檔鈕：要縮多大是按下去之前才決定的事
+                        ui.add_space(10.0);
+                        let mut size = self.export_size;
+                        // 沒勾「調整尺寸」時那兩個欄位要顯示成品的實際尺寸
+                        // ——這張的原圖尺寸套上它自己的裁切
+                        let natural = export_natural_dims(
+                            self.smoke.source_dims(),
+                            &self.smoke.effective_grade().crop,
+                        );
+                        if export_size_row(ui, &mut size, !saving, natural) {
+                            self.export_size = size;
+                            save_export_size(size);
                         }
                         // 批次可能要跑上一陣子，給個中止的出口
                         if saving {
                             ui.add_space(6.0);
-                            if ui.small_button("✕ 取消").clicked() {
+                            if ui.small_button("取消").clicked() {
                                 self.smoke.save_cancel.store(true, Ordering::Relaxed);
                             }
-                            ctx.request_repaint_after(Duration::from_millis(200));
+                            // 按鈕上的轉圈與掃光要每幀重畫，不能只等進度更新才動
+                            ctx.request_repaint();
+                        }
+                        // 存好後直接看成品，不用自己去資料夾翻。
+                        // 提示訊息幾秒就消失，這顆按鈕留到下次輸出或換照片為止
+                        if busy != SmokeBusy::Saving {
+                            if let Some(p) = self.smoke.saved_path.clone() {
+                                ui.add_space(6.0);
+                                if ui
+                                    .small_button("🖼 開啟圖片")
+                                    .on_hover_text(if total > 1 {
+                                        "用預設看圖程式開啟剛存好的第一張"
+                                    } else {
+                                        "用預設看圖程式開啟剛存好的照片"
+                                    })
+                                    .clicked()
+                                {
+                                    open_file(&p);
+                                }
+                            }
                         }
                         if busy == SmokeBusy::Rendering {
                             ui.add_space(8.0);
@@ -4886,38 +18235,131 @@ impl App {
                         }
                     });
                 });
+                // 存檔列不捲動，量它的高度下一幀留位用（見上面算 img_h 的地方）
+                self.smoke.save_h = save_row.response.rect.height();
             });
-        self.smoke.open = open;
-        // 方向鍵切換照片（滑桿等元件有焦點時不搶，否則調整滑桿會跳張）
-        if goto.is_none()
-            && self.smoke.open
-            && self.smoke.photos.len() > 1
-            && self.smoke.busy == SmokeBusy::Idle
-            && ctx.memory(|m| m.focused().is_none())
-        {
-            let (cur, total) = (self.smoke.cur, self.smoke.photos.len());
-            if cur + 1 < total && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-                goto = Some(cur + 1);
-            } else if cur > 0 && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-                goto = Some(cur - 1);
+            // 方向鍵切換照片（滑桿等元件有焦點時不搶，否則調整滑桿會跳張）
+            if goto.is_none()
+                && self.smoke.photos.len() > 1
+                && self.smoke.busy == SmokeBusy::Idle
+                && ctx.memory(|m| m.focused().is_none())
+            {
+                let (cur, total) = (self.smoke.cur, self.smoke.photos.len());
+                if cur + 1 < total && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                    goto = Some(cur + 1);
+                } else if cur > 0 && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                    goto = Some(cur - 1);
+                }
+            }
+            // Y 切換前後對照（沿用 Lightroom 的習慣）；同樣讓給有焦點的輸入元件
+            if self.smoke.base.is_some()
+                && ctx.memory(|m| m.focused().is_none())
+                && ctx.input(|i| i.key_pressed(egui::Key::Y))
+            {
+                self.smoke.compare = !self.smoke.compare;
+            }
+            // Delete：移除縮圖列選著的那一張（會先問一次）。
+            // 選著工具時不接管——那時 Delete 該屬於那個工具
+            if remove_idx.is_none()
+                && !self.smoke.photos.is_empty()
+                && self.smoke.busy == SmokeBusy::Idle
+                && !self.smoke.source_tools_active()
+                && ctx.memory(|m| m.focused().is_none())
+                && ctx.input(|i| i.key_pressed(egui::Key::Delete))
+            {
+                remove_idx = Some(self.smoke.cur);
+            }
+            // 空白鍵：跳到 1:1 看細節，再按一次回到剛才的比例（同樣是
+            // Lightroom 的習慣）。輸入格有焦點時不搶——那裡的空白是空格
+            if self.smoke.base.is_some()
+                && ctx.memory(|m| m.focused().is_none())
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+            {
+                self.smoke_toggle_actual_size();
             }
         }
         // 縮圖列畫完才知道可視範圍，這時再依範圍補請求
-        if self.smoke.open {
-            self.request_smoke_thumbs();
-        }
+        self.request_smoke_thumbs();
         if pick {
             self.smoke_pick_photo(ctx);
         }
+        if add {
+            self.smoke_add_photos(ctx);
+        }
+        if add_overlay {
+            if let Some(p) = dir_dialog(LastDir::DehazeOverlay)
+                .add_filter("圖片", IMAGE_EXTS)
+                .set_title("選擇要疊上去的圖片")
+                .pick_file()
+            {
+                remember_dir(LastDir::DehazeOverlay, &p);
+                self.smoke_add_overlay(p);
+            }
+        }
+        if paste_overlay {
+            self.smoke_paste_overlay();
+        }
         if let Some(i) = goto {
+            // 直接點＝回到「沒挑」，存檔又是整批（與檔案總管一樣）
+            self.smoke.multi_sel.clear();
             self.smoke_select(i, ctx);
         }
-        if reset {
-            // 重設只還原目前編輯的那一份，不動到別張的個別設定
-            self.smoke.set_params(SmokeParams::default());
+        if let Some(i) = toggle_idx {
+            if let Some(p) = self.smoke.photos.get(i).cloned() {
+                if !self.smoke.multi_sel.remove(&p) {
+                    self.smoke.multi_sel.insert(p);
+                }
+                self.smoke_select(i, ctx);
+            }
         }
-        if save {
-            self.smoke_save_all(ctx);
+        if let Some(i) = range_idx {
+            // 從目前這張拉到點到的那一張，中間整段都收進來
+            let anchor = self.smoke.cur.min(self.smoke.photos.len().saturating_sub(1));
+            for k in anchor.min(i)..=anchor.max(i) {
+                if let Some(p) = self.smoke.photos.get(k) {
+                    self.smoke.multi_sel.insert(p.clone());
+                }
+            }
+            self.smoke_select(i, ctx);
+        }
+        if let Some(i) = remove_idx {
+            self.smoke_remove_photo(i, ctx);
+        }
+        // 這一顆一次丟掉整張的編輯（去煙參數、遮色片、色票、調色、文字、
+        // 筆跡），誤點的代價太大，先問一次
+        if reset {
+            reset = ask2(
+                rfd::MessageLevel::Warning,
+                "清除所有修改內容",
+                "將清除這張照片的所有修改：去煙參數、遮色片、保護色與雲色、\
+                 夜空色、調色、文字，以及手動清除的筆跡。\n\
+                 別張照片不受影響。",
+                "清除",
+                "取消",
+            );
+        }
+        if reset {
+            self.smoke.reset_params_for_current();
+            // 調色與文字沒有自動值，一律歸零。沒勾「只調整這張」時，
+            // 這張若有個別設定也一起收掉，否則按了重設畫面卻沒變
+            self.smoke.set_finish(Finish::default());
+            if !self.smoke.per_photo {
+                if let Some(p) = self.smoke.current().cloned() {
+                    self.smoke.finish_overrides.remove(&p);
+                }
+            }
+            // 手動清除本來就只屬於這一張，一併收掉
+            self.smoke.set_wipes(Vec::new());
+            self.smoke.sel_text = None;
+            self.smoke.sel_image = None;
+            self.smoke.wipe_draft = None;
+        }
+        if let Some(here) = save {
+            self.smoke_save_all(ctx, here);
+        }
+        // 清除確認擺在最後：這一幀的操作都處理完，dirty 才是最新的狀態
+        if clear {
+            self.smoke_clear_confirmed();
         }
     }
 
@@ -4925,12 +18367,1683 @@ impl App {
     /// 轉檔中放開的檔案會被忽略（update 有 !is_working 守門）：這裡不能
     /// 直接不畫——拖著檔案毫無反應、放開又默默消失，看起來像程式壞掉；
     /// 改顯示「轉換中無法加入」讓使用者放開前就知道現在不能加
+    // ---------- 優化影像 ----------
+
+    /// 「🖼 選擇照片」：整批換掉（可一次選多張）
+    fn enhance_pick_photos(&mut self, ctx: &egui::Context) {
+        if !self.enhance_confirm_replace() {
+            return;
+        }
+        let Some(paths) = dir_dialog(LastDir::EnhancePhotos)
+            .add_filter("照片", IMAGE_EXTS)
+            .set_title("選擇要優化的照片（可多選）")
+            .pick_files()
+        else {
+            return;
+        };
+        if let Some(p) = paths.first() {
+            remember_dir(LastDir::EnhancePhotos, p);
+        }
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| is_image(p)).collect();
+        self.enhance_set_photos(paths, ctx);
+    }
+
+    /// 「📂 選擇資料夾」：整個資料夾的照片一次收進來。
+    ///
+    /// 這個模組是拿來「整批處理一整天的成果」的，一張一張挑反而是例外——
+    /// 所以選資料夾與選檔案並列成兩顆按鈕，不藏在功能表裡
+    fn enhance_pick_folder(&mut self, ctx: &egui::Context) {
+        if !self.enhance_confirm_replace() {
+            return;
+        }
+        let Some(dir) = folder_dialog(LastDir::EnhancePhotos)
+            .set_title("選擇要優化的照片資料夾")
+            .pick_folder()
+        else {
+            return;
+        };
+        remember_dir(LastDir::EnhancePhotos, &dir);
+        let mut files = collect_images_in_dir(&dir);
+        if files.is_empty() {
+            self.enhance.error =
+                Some("這個資料夾裡沒有可以處理的照片（子資料夾不會一起找）".into());
+            return;
+        }
+        natural_sort(&mut files);
+        self.enhance.error = None;
+        self.enhance_set_photos(files, ctx);
+    }
+
+    /// 「➕ 加入照片」：加到現在這批後面，已經調好的設定都留著
+    fn enhance_add_photos(&mut self, ctx: &egui::Context) {
+        let Some(picked) = dir_dialog(LastDir::EnhancePhotos)
+            .add_filter("照片", IMAGE_EXTS)
+            .set_title("加入要一起優化的照片（可多選）")
+            .pick_files()
+        else {
+            return;
+        };
+        if let Some(p) = picked.first() {
+            remember_dir(LastDir::EnhancePhotos, p);
+        }
+        let picked: Vec<PathBuf> = picked.into_iter().filter(|p| is_image(p)).collect();
+        self.enhance_append(picked, ctx);
+    }
+
+    /// 把 `picked` 併到現有這批後面。已經在清單裡的略過，
+    /// 不會出現兩張一樣的（縮圖與個別設定都以路徑當鍵，重複會互相打架）
+    fn enhance_append(&mut self, picked: Vec<PathBuf>, ctx: &egui::Context) {
+        if self.enhance.photos.is_empty() {
+            self.enhance_set_photos(picked, ctx);
+            return;
+        }
+        let before = self.enhance.photos.len();
+        for p in picked {
+            if !self.enhance.photos.contains(&p) {
+                self.enhance.photos.push(p);
+            }
+        }
+        if self.enhance.photos.len() == before {
+            return;
+        }
+        self.enhance.vis_range = None;
+        self.enhance.error = None;
+        self.enhance.dirty = true;
+        // 只算還沒量過的那幾張（見 spawn_enhance_auto 的 filter）
+        self.spawn_enhance_auto(ctx);
+        self.request_enhance_thumbs();
+    }
+
+    /// 換掉整批照片之前先問一次（選檔、選資料夾與拖曳都走這裡）。
+    /// 回傳 true＝可以換
+    fn enhance_confirm_replace(&mut self) -> bool {
+        if !self.enhance.dirty || self.enhance.photos.is_empty() {
+            return true;
+        }
+        let n = self.enhance.photos.len();
+        ask2(
+            rfd::MessageLevel::Warning,
+            "尚未存檔",
+            &format!(
+                "有 {n} 張照片優化過還沒存檔，換一批照片就要重來一次。\n\n\
+                 想先存起來就選「回去存檔」，再按下面的「💾 存檔」或「📁 另存新檔」。"
+            ),
+            "不存檔，直接換",
+            "回去存檔",
+        )
+    }
+
+    /// 從縮圖列移除第 `i` 張（右鍵選單或 Delete 鍵）
+    fn enhance_remove_photo(&mut self, i: usize, ctx: &egui::Context) {
+        if self.enhance.busy == EnhanceBusy::Saving || i >= self.enhance.photos.len() {
+            return;
+        }
+        let name = self.enhance.photos[i]
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !ask2(
+            rfd::MessageLevel::Warning,
+            "移除照片",
+            &format!(
+                "要把「{name}」從這批裡移掉嗎？\n\n（原始照片不會被刪除，只是不再處理它）"
+            ),
+            "移除",
+            "取消",
+        ) {
+            return;
+        }
+        let gone = self.enhance.photos.remove(i);
+        self.enhance.grade_overrides.remove(&gone);
+        self.enhance.local_overrides.remove(&gone);
+        self.enhance.preset_overrides.remove(&gone);
+        self.enhance.thumbs.remove(&gone);
+        self.enhance.auto.remove(&gone);
+        self.enhance.vis_range = None;
+        if self.enhance.photos.is_empty() {
+            self.enhance_clear_photos();
+            return;
+        }
+        self.enhance.cur = self.enhance.cur.min(self.enhance.photos.len() - 1);
+        self.enhance.dirty = true;
+        self.enhance_load_current(ctx);
+        self.request_enhance_thumbs();
+    }
+
+    /// 換掉整批照片（選檔對話框、選資料夾與拖曳進來都走這裡）
+    fn enhance_set_photos(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if paths.is_empty() {
+            return;
+        }
+        // 仍在新清單裡的照片，保留它的個別設定、量好的自動值與縮圖：
+        // 重選時多半只是增減幾張，全部清掉會白白丟失調好的設定，也要重量一次
+        let keep: HashSet<&PathBuf> = paths.iter().collect();
+        self.enhance.grade_overrides.retain(|k, _| keep.contains(k));
+        self.enhance.local_overrides.retain(|k, _| keep.contains(k));
+        self.enhance.preset_overrides.retain(|k, _| keep.contains(k));
+        self.enhance.thumbs.retain(|k, _| keep.contains(k));
+        self.enhance.auto.retain(|k, _| keep.contains(k));
+        self.enhance.photos = paths;
+        self.enhance.cur = 0;
+        self.enhance.vis_range = None;
+        self.enhance.error = None;
+        self.enhance.saved = None;
+        self.enhance.saved_path = None;
+        // 選進來就有東西可存（自動判斷會替每張調好），清掉或關程式前要問一次
+        self.enhance.dirty = true;
+        self.enhance_load_current(ctx);
+        self.spawn_enhance_auto(ctx);
+        self.request_enhance_thumbs();
+    }
+
+    /// 使用者主動清掉這批照片。還沒存檔就先問一次
+    fn enhance_clear_confirmed(&mut self) {
+        // 正在存檔：清掉會讓寫檔中的那批失去依據，等它跑完再說
+        if self.enhance.busy == EnhanceBusy::Saving {
+            return;
+        }
+        if self.enhance.dirty && !self.enhance.photos.is_empty() {
+            let n = self.enhance.photos.len();
+            if !ask2(
+                rfd::MessageLevel::Warning,
+                "尚未存檔",
+                &format!("有 {n} 張照片優化過還沒存檔，清掉就要重來一次。"),
+                "清除",
+                "取消",
+            ) {
+                return;
+            }
+        }
+        self.enhance_clear_photos();
+    }
+
+    /// 回到「選擇照片」的起始狀態。
+    ///
+    /// 個別設定與量好的自動值一起清掉（與去煙霧、疊圖同一個道理）：
+    /// 那些是以檔案路徑為鍵存的，留著的話下一批只要有同名檔案就會悄悄套回去。
+    /// 想留著設定就別按「清除」，直接用「選擇照片」重選。
+    /// **類型與那兩條強化滑桿留著**——它們講的是「你想怎麼修圖」，
+    /// 不屬於某一批照片
+    fn enhance_clear_photos(&mut self) {
+        self.enhance.auto_cancel.store(true, Ordering::Relaxed);
+        self.enhance.auto_rx = None;
+        self.enhance.auto_jobs = None;
+        self.enhance.auto_left = 0;
+        self.enhance.photos.clear();
+        self.enhance.cur = 0;
+        self.enhance.auto.clear();
+        self.enhance.grade_overrides.clear();
+        self.enhance.local_overrides.clear();
+        self.enhance.preset_overrides.clear();
+        self.enhance.params.grade = Adjustments::default();
+        self.enhance.base = None;
+        self.enhance.base_long = 0;
+        self.enhance.tex_before = None;
+        self.enhance.tex_after = None;
+        self.enhance.applied = None;
+        self.enhance.rx = None;
+        self.enhance.busy = EnhanceBusy::Idle;
+        self.enhance.error = None;
+        self.enhance.saved = None;
+        self.enhance.saved_path = None;
+        self.enhance.thumbs.clear();
+        self.enhance.vis_range = None;
+        self.enhance.zoom = None;
+        self.enhance.zoom_back = None;
+        self.enhance.pan = egui::pos2(0.5, 0.5);
+        self.enhance.crop_editing = false;
+        self.enhance.show_mask = false;
+        self.enhance.dirty = false;
+    }
+
+    /// 開檔後在背景替每張照片量一次建議值（見 [`enhance::analyze`]）。
+    ///
+    /// 量好一張就送回來一張，滑桿會自己跳到那一張該有的位置。
+    /// 每張各用**自己的類型**量（見 [`EnhanceTool::preset_for`]），所以待辦
+    /// 佇列裡帶著類型一起走；回報時也附上「量的時候是哪個類型」，
+    /// 中途又換過類型的結果就作廢。
+    ///
+    /// 只排「還沒量」或「量的類型已經對不上」的那幾張——換一張照片的類型
+    /// 不該讓另外三百張重量一次
+    fn spawn_enhance_auto(&mut self, ctx: &egui::Context) {
+        self.enhance.auto_cancel.store(true, Ordering::Relaxed);
+        let todo: VecDeque<(PathBuf, enhance::Preset)> = self
+            .enhance
+            .photos
+            .iter()
+            .filter(|p| self.enhance.measured(p).is_none())
+            .map(|p| (p.clone(), self.enhance.preset_for(p)))
+            .collect();
+        self.enhance.auto_left = todo.len();
+        if todo.is_empty() {
+            self.enhance.auto_rx = None;
+            self.enhance.auto_jobs = None;
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.enhance.auto_cancel = Arc::clone(&cancel);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.enhance.auto_rx = Some(rx);
+        let jobs = Arc::new(Mutex::new(todo));
+        self.enhance.auto_jobs = Some(Arc::clone(&jobs));
+        for _ in 0..ENHANCE_AUTO_WORKERS {
+            let jobs = Arc::clone(&jobs);
+            let cancel = Arc::clone(&cancel);
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Some((path, preset)) = jobs.lock().unwrap().pop_front() else {
+                    return;
+                };
+                // 讀不到的照片也要回報，否則進度永遠差那一張
+                let got = decode_for_auto(&path).map(|(img, _)| enhance::analyze(&img, preset));
+                if tx.send((path, preset, got)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// 使用者在類型列上點了一個類型。
+    ///
+    /// 寫進哪裡由 [`EnhanceTool::set_preset`] 決定（這張，或整批）；
+    /// 接著只把「類型對不上了」的那幾張重新排進量測佇列——
+    /// 已經量好而且類型沒變的都留著，不必重跑
+    fn enhance_pick_preset(&mut self, p: enhance::Preset, ctx: &egui::Context) {
+        let old_shared = self.enhance.preset;
+        if !self.enhance.set_preset(p) {
+            return;
+        }
+        if self.enhance.preset != old_shared {
+            // 整批的那一個才記進設定檔：下次開程式的起點是它，
+            // 不是某一張照片的個別選擇
+            save_enhance_preset(self.enhance.preset);
+            // 那兩條強化滑桿若還停在舊類型的起點（沒被動過）就跟著換成新
+            // 類型的起點；自己調過就留著他調的——拍鳥調到 80 的人切去人像
+            // 再切回來，不該被默默打回 65
+            if self.enhance.params.local == EnhanceParams::neutral(old_shared).local {
+                self.enhance.params.local = EnhanceParams::neutral(self.enhance.preset).local;
+            }
+        }
+        self.enhance.applied = None;
+        self.spawn_enhance_auto(ctx);
+    }
+
+    /// 依縮圖列的可視範圍請求縮圖，並淘汰離得夠遠的貼圖
+    /// （與 [`App::request_smoke_thumbs`] 同一套，解碼共用同一組常駐工作池）
+    fn request_enhance_thumbs(&mut self) {
+        /// 可視範圍外先預先解碼的張數（單側）
+        const PREFETCH: usize = 32;
+        /// 可視範圍外保留貼圖的張數（單側），之外的淘汰
+        const KEEP: usize = 128;
+
+        let n = self.enhance.photos.len();
+        if n < 2 {
+            return;
+        }
+        let (first, last) = clamp_vis_range(self.enhance.vis_range, n, PREFETCH);
+        let lo = first.saturating_sub(PREFETCH);
+        let hi = (last + PREFETCH).min(n);
+        let need: Vec<PathBuf> = (first..last)
+            .chain(last..hi)
+            .chain(lo..first)
+            .map(|i| &self.enhance.photos[i])
+            .filter(|p| !self.enhance.thumbs.contains_key(*p))
+            .cloned()
+            .collect();
+        if !need.is_empty() {
+            for p in &need {
+                self.enhance.thumbs.insert(p.clone(), Thumb::Loading);
+            }
+            let (lock, cv) = &*self.thumb_jobs;
+            let mut q = lock.lock().unwrap();
+            for p in need.into_iter().rev() {
+                q.push_front(p);
+            }
+            cv.notify_all();
+        }
+        let keep_lo = first.saturating_sub(KEEP);
+        let keep_hi = (last + KEEP).min(n);
+        if self.enhance.thumbs.len() > (keep_hi - keep_lo) + KEEP {
+            let keep: HashSet<&PathBuf> = self.enhance.photos[keep_lo..keep_hi].iter().collect();
+            self.enhance.thumbs.retain(|p, _| keep.contains(p));
+        }
+    }
+
+    /// 載入目前這張的預覽底圖
+    fn enhance_load_current(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.enhance.current().cloned() else {
+            return;
+        };
+        self.enhance.base = None;
+        self.enhance.tex_before = None;
+        self.enhance.tex_after = None;
+        self.enhance.applied = None;
+        self.enhance.busy = EnhanceBusy::Loading;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.enhance.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let r = image::open(&path)
+                .map_err(|e| format!("無法讀取這張照片：{e}"))
+                .map(|img| {
+                    let img = img.to_rgb8();
+                    let long = img.width().max(img.height());
+                    (shrink_to_preview(img), long)
+                });
+            let _ = tx.send(EnhanceMsg::Loaded(path, r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 切換到第 i 張
+    fn enhance_select(&mut self, i: usize, ctx: &egui::Context) {
+        if i >= self.enhance.photos.len() || i == self.enhance.cur {
+            return;
+        }
+        self.enhance.cur = i;
+        self.enhance.scroll_to_cur = true;
+        self.enhance_load_current(ctx);
+        // 還沒量到這張就把它插到待辦最前面：眼前這張的滑桿要最先就位
+        if let (Some(jobs), Some(p)) = (&self.enhance.auto_jobs, self.enhance.current()) {
+            let mut q = jobs.lock().unwrap();
+            if let Some(at) = q.iter().position(|(x, _)| x == p) {
+                let job = q.remove(at).expect("position 保證這個索引存在");
+                q.push_front(job);
+            }
+        }
+    }
+
+    /// 以目前設定重算預覽。
+    ///
+    /// 不像去煙霧分成「去煙」與「調色」兩段快取：這裡最貴的一段（主體強化）
+    /// 本來就要看調色後的結果，拆開反而要多存一張中間圖。
+    /// 預覽尺寸下整條跑完約幾十毫秒，拖滑桿照樣跟得上
+    fn spawn_enhance_render(&mut self, ctx: &egui::Context) {
+        let Some(base) = self.enhance.base.clone() else {
+            return;
+        };
+        let key = self.enhance.key();
+        self.enhance.busy = EnhanceBusy::Rendering;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.enhance.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let out = if key.show_mask {
+                // 主體範圍是診斷用的畫面：調色與強化套上去只會看不清楚圈到哪裡
+                enhance::mask_overlay(&base, key.preset)
+            } else {
+                let mut out = (*base).clone();
+                edit::apply_grade(&mut out, &key.grade);
+                enhance::apply_local(&mut out, key.preset, key.local);
+                out
+            };
+            let _ = tx.send(EnhanceMsg::Preview(key, out));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 批次輸出優化成品。`here` 為真就直接存回每張照片自己的原始資料夾，
+    /// 否則跳資料夾對話框讓使用者自己挑（與去煙霧同一套流程與命名規則）
+    fn enhance_save_all(&mut self, ctx: &egui::Context, here: bool) {
+        if self.enhance.photos.is_empty() {
+            return;
+        }
+        // None＝各自存回來源資料夾
+        let out_dir: Option<PathBuf> = if here {
+            None
+        } else {
+            let dialog = if load_last_dir(LastDir::EnhanceOutput).is_some() {
+                folder_dialog(LastDir::EnhanceOutput)
+            } else {
+                match self.enhance.current().and_then(|p| p.parent()) {
+                    Some(dir) => file_dialog().set_directory(dir),
+                    None => file_dialog(),
+                }
+            };
+            let Some(d) = dialog
+                .set_title("選擇要存放優化照片的資料夾")
+                .pick_folder()
+            else {
+                return;
+            };
+            remember_dir(LastDir::EnhanceOutput, &d);
+            Some(d)
+        };
+        // 輸出檔名先在這裡決定好，不留到背景執行緒——已經存在的要先問過
+        // 使用者才寫下去（這一批是自動命名、沒有存檔對話框可以問）
+        let out_of = |src: &Path| -> PathBuf {
+            let stem = src
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "photo".into());
+            let dir = match &out_dir {
+                Some(d) => d.clone(),
+                None => src.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+            };
+            let out = dir.join(format!("{stem}_優化.jpg"));
+            // 輸出到來源資料夾時，別讓成品覆蓋掉同名的原始照片
+            if same_path_ci(&out, src) {
+                dir.join(format!("{stem}_優化(1).jpg"))
+            } else {
+                out
+            }
+        };
+        let mut outs: Vec<PathBuf> = self.enhance.photos.iter().map(|p| out_of(p)).collect();
+        // 一張一張問會問到天荒地老，整批只問一次
+        let exist = outs.iter().filter(|p| p.exists()).count();
+        if exist > 0 {
+            let sample = outs
+                .iter()
+                .find(|p| p.exists())
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match ask3(
+                rfd::MessageLevel::Warning,
+                "成品檔已存在",
+                &format!(
+                    "有 {exist} 張的成品檔已經存在（例如「{sample}」）。\n\n\
+                     「全部覆蓋」：舊檔直接被蓋掉\n\
+                     「另取新檔名」：保留舊檔，這批自動改成不重複的檔名\n\
+                     「取消」：不存檔"
+                ),
+                "全部覆蓋",
+                "另取新檔名",
+                "取消",
+            ) {
+                Ask3::First => {}
+                Ask3::Second => {
+                    for p in &mut outs {
+                        *p = next_free_path(p);
+                    }
+                }
+                Ask3::Cancel => return,
+            }
+        }
+        // 每張照片連同它自己的設定、**自己的類型**與輸出位置一起交給
+        // 背景執行緒（一批照片裡混著鳥與風景時，各張要照各自的類型處理）
+        let jobs: Vec<(PathBuf, PathBuf, EnhanceParams, enhance::Preset)> = self
+            .enhance
+            .photos
+            .iter()
+            .zip(outs)
+            .map(|(p, out)| {
+                (
+                    p.clone(),
+                    out,
+                    self.enhance.params_for(p),
+                    self.enhance.preset_for(p),
+                )
+            })
+            .collect();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // 存檔尺寸在按下去的當下定案，寫檔途中改滑桿不影響這一批
+        let export = self.export_size;
+        self.enhance.save_cancel = cancel.clone();
+        self.enhance.save_done = 0;
+        self.enhance.busy = EnhanceBusy::Saving;
+        self.enhance.error = None;
+        self.enhance.saved = None;
+        self.enhance.saved_path = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.enhance.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let mut ok = 0usize;
+            let mut errs: Vec<String> = Vec::new();
+            let mut first_out: Option<PathBuf> = None;
+            for (src, out, p, preset) in jobs {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let name = src
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                // 重讀原檔跑完整解析度，不是把預覽縮圖放大
+                let r = image::open(&src)
+                    .map_err(|e| format!("{name}：無法讀取（{e}）"))
+                    .and_then(|img| {
+                        // 順序與預覽相同：調色 → 主體強化 → 旋轉 → 裁切。
+                        // 強化排在調色之後，提亮與加銳才是對著「調完的樣子」做的
+                        let mut done = img.to_rgb8();
+                        edit::apply_grade(&mut done, &p.grade);
+                        enhance::apply_local(&mut done, preset, p.local);
+                        let done = edit::apply_rotate(done, p.grade.crop);
+                        let done = edit::apply_crop(done, p.grade.crop);
+                        // 最後才縮到指定尺寸：前面每一步都是對原尺寸算的
+                        let done = fit_export(done, export);
+                        done.save(&out)
+                            .map_err(|e| format!("{name}：存檔失敗（{e}）"))
+                    });
+                match r {
+                    Ok(()) => {
+                        ok += 1;
+                        first_out.get_or_insert(out);
+                    }
+                    Err(e) => errs.push(e),
+                }
+                let _ = tx.send(EnhanceMsg::SaveProgress(ok + errs.len()));
+                ctx.request_repaint();
+            }
+            let _ = tx.send(EnhanceMsg::SaveDone(ok, errs, first_out));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_enhance(&mut self, ctx: &egui::Context) {
+        if self.enhance.rx.is_some() {
+            loop {
+                let Some(rx) = &self.enhance.rx else { break };
+                match rx.try_recv() {
+                    Ok(msg) => match msg {
+                        EnhanceMsg::Loaded(path, res) => {
+                            self.enhance.rx = None;
+                            self.enhance.busy = EnhanceBusy::Idle;
+                            // 連續切張時舊的結果可能後到，只認目前這張的
+                            if self.enhance.current() != Some(&path) {
+                                continue;
+                            }
+                            match res {
+                                Ok((img, long)) => {
+                                    self.enhance.tex_before =
+                                        Some(load_rgb_texture(ctx, "enhance_before", &img));
+                                    self.enhance.base = Some(Arc::new(img));
+                                    self.enhance.base_long = long;
+                                    // applied 為 None，下面的重算判斷會立刻排一次預覽
+                                }
+                                Err(e) => self.enhance.error = Some(e),
+                            }
+                        }
+                        EnhanceMsg::Preview(key, img) => {
+                            self.enhance.rx = None;
+                            self.enhance.busy = EnhanceBusy::Idle;
+                            self.enhance.tex_after =
+                                Some(load_rgb_texture(ctx, "enhance_after", &img));
+                            self.enhance.applied = Some(key);
+                        }
+                        // 批次輸出中：只更新進度，通道要留著繼續收
+                        EnhanceMsg::SaveProgress(n) => self.enhance.save_done = n,
+                        EnhanceMsg::SaveDone(ok, errs, first_out) => {
+                            self.enhance.rx = None;
+                            self.enhance.busy = EnhanceBusy::Idle;
+                            self.enhance.saved = Some((format!("已完成 {ok} 張"), Instant::now()));
+                            self.enhance.saved_path = first_out;
+                            // 中途按取消的那次不算存完，剩下的張數還在等著存
+                            let cancelled = self.enhance.save_cancel.load(Ordering::Relaxed);
+                            self.enhance.dirty = cancelled || !errs.is_empty();
+                            if !errs.is_empty() {
+                                let shown: Vec<String> = errs.iter().take(3).cloned().collect();
+                                let more = errs.len().saturating_sub(shown.len());
+                                let mut m = format!("{} 張失敗：{}", errs.len(), shown.join("；"));
+                                if more > 0 {
+                                    m.push_str(&format!("…等另外 {more} 張"));
+                                }
+                                self.enhance.error = Some(m);
+                            }
+                        }
+                    },
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // 執行緒沒回結果就結束：清掉等待狀態，否則工具永遠卡在忙碌中
+                        self.enhance.rx = None;
+                        self.enhance.busy = EnhanceBusy::Idle;
+                        self.enhance.error = Some("優化處理異常中斷".into());
+                        break;
+                    }
+                }
+            }
+        }
+        // 自動判斷的結果：一張一張進來。量到目前這張時 effective() 跟著變，
+        // 下面的重算判斷就會把預覽更新成新設定的樣子
+        let mut measured = Vec::new();
+        if let Some(rx) = &self.enhance.auto_rx {
+            while let Ok(m) = rx.try_recv() {
+                measured.push(m);
+            }
+        }
+        for (path, preset, got) in measured {
+            self.enhance.auto_left = self.enhance.auto_left.saturating_sub(1);
+            // 中途又換過這張的類型：這一份是照舊類型量的，收下來只會讓畫面
+            // 對不上（下一輪 spawn_enhance_auto 會照新類型重排一次）
+            if preset != self.enhance.preset_for(&path) {
+                continue;
+            }
+            if let Some(a) = got {
+                // 連同「是用哪個類型量的」一起存，之後才分辨得出還算不算數
+                self.enhance.auto.insert(path, (preset, a));
+            }
+        }
+        if self.enhance.auto_left == 0 && self.enhance.auto_rx.is_some() {
+            self.enhance.auto_rx = None;
+            self.enhance.auto_jobs = None;
+        }
+
+        // 設定變動且沒有工作在跑就重算；同時間最多一個，拖動滑桿時自然限流
+        if self.module == Module::Enhance
+            && self.enhance.busy == EnhanceBusy::Idle
+            && self.enhance.base.is_some()
+            && self.enhance.applied.as_ref() != Some(&self.enhance.key())
+        {
+            self.spawn_enhance_render(ctx);
+        }
+    }
+
+    /// 空白鍵：在 100%（1:1）與「按之前的比例」之間來回（與去煙霧一致）
+    fn enhance_toggle_actual_size(&mut self) {
+        let at_one = self.enhance.zoom.is_some_and(|z| (z - 1.0).abs() < 0.001);
+        if at_one {
+            self.enhance.zoom = self.enhance.zoom_back.take().flatten();
+            if self.enhance.zoom.is_none() {
+                self.enhance.pan = egui::pos2(0.5, 0.5);
+            }
+        } else {
+            self.enhance.zoom_back = Some(self.enhance.zoom);
+            self.enhance.zoom = Some(1.0);
+        }
+    }
+
+    /// 右側面板的「調色」區塊：那十二條共用滑桿 ＋ 裁切。
+    ///
+    /// 滑桿上顯示的是**這張實際生效的值**（自動判出來的、或使用者改過的），
+    /// 動它就等於接手這張——寫進個別設定，自動值不再蓋回去
+    fn ui_enhance_grade(&mut self, ui: &mut egui::Ui, busy: EnhanceBusy) {
+        // 按下去只記旗標，畫完這一列才跳確認框（見 ui_adjust_section 的說明）
+        let mut ask_clear = false;
+        ui.horizontal(|ui| {
+            section_toggle(ui, "調色", &mut self.enhance.grade_open);
+            let neutral = self.enhance.effective().grade.is_neutral();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !neutral
+                    && ui
+                        .small_button("↺ 清除所有修改內容")
+                        .on_hover_text(
+                            "把十二條調色滑桿一次全部歸零並取消裁切\n\
+                             （不動主體強化與柔膚）",
+                        )
+                        .clicked()
+                {
+                    ask_clear = true;
+                }
+            });
+        });
+        if ask_clear
+            && ask2(
+                rfd::MessageLevel::Warning,
+                "清除所有修改內容",
+                "將清除這裡的調色（十二條滑桿全部歸零，裁切一併取消）。\n\
+                 主體強化與柔膚不受影響。\n\n\
+                 自動調色仍開著的話，下次換照片或重量時會再填回建議值。",
+                "清除",
+                "取消",
+            )
+        {
+            self.enhance.set_grade(Adjustments::default());
+        }
+        if !self.enhance.grade_open {
+            return;
+        }
+        let cur = self.enhance.effective().grade;
+        let mut g = cur;
+        // 列距收緊到與照片轉影片的調色面板相同（畫完裁切再還原）
+        let keep_gap = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = ADJ_ROW_GAP;
+        ui.label(
+            egui::RichText::new(if self.enhance.auto_for_current().is_some() {
+                "目前停在這張自動判出來的位置；動任何一條就改成這張的個別設定"
+            } else {
+                "滑桿連點兩下可歸零"
+            })
+            .size(11.0)
+            .color(theme::TEXT_WEAK),
+        );
+        ui.add_enabled_ui(busy != EnhanceBusy::Saving, |ui| {
+            adj_sliders(ui, &mut g);
+        });
+        // 裁切：與調色記在同一份設定裡
+        let src = self.enhance.source_dims();
+        ui_crop_block(
+            ui,
+            &mut g.crop,
+            &mut self.enhance.crop_editing,
+            &mut self.enhance.crop_aspect,
+            src,
+            busy != EnhanceBusy::Saving && self.enhance.base.is_some(),
+        );
+        ui.spacing_mut().item_spacing.y = keep_gap;
+        if g != cur {
+            self.enhance.set_grade(g);
+        }
+        ui.add_space(6.0);
+    }
+
+    /// 預覽上方的比例列（單張／前後對照、縮放比例）
+    fn ui_enhance_zoom_bar(&mut self, ui: &mut egui::Ui, zoom: Option<(f32, f32)>) {
+        ui.horizontal(|ui| {
+            let cmp = self.enhance.compare;
+            if check_label(ui, !cmp, "單張")
+                .on_hover_text("只看優化後的結果（Y 鍵切換）")
+                .clicked()
+            {
+                self.enhance.compare = false;
+            }
+            if check_label(ui, cmp, "編輯前／後")
+                .on_hover_text("左右並排比對原圖與優化後（Y 鍵切換）")
+                .clicked()
+            {
+                self.enhance.compare = true;
+            }
+            ui.separator();
+            let fit = self.enhance.zoom.is_none();
+            if check_label(ui, fit, "符合視窗")
+                .on_hover_text("整張塞進畫面（空白鍵可在 100% 與這裡之間來回）")
+                .clicked()
+            {
+                self.enhance.zoom = None;
+                self.enhance.zoom_back = None;
+            }
+            for z in [0.5f32, 1.0, 2.0] {
+                let on = self.enhance.zoom.is_some_and(|v| (v - z).abs() < 0.001);
+                let mut b = check_label(ui, on, format!("{:.0}%", z * 100.0));
+                if z == 1.0 {
+                    b = b.on_hover_text("原尺寸（空白鍵：跳到 100%，再按一次回原本的比例）");
+                }
+                if b.clicked() {
+                    // 換倍率時維持目前看的位置，剛從符合視窗放大則從中心開始
+                    if fit {
+                        self.enhance.pan = egui::pos2(0.5, 0.5);
+                    }
+                    self.enhance.zoom = Some(z);
+                    self.enhance.zoom_back = None;
+                }
+            }
+            let r = ui.label(
+                egui::RichText::new(match zoom {
+                    Some((_, pct)) if fit => format!("目前 {pct:.0}%（符合視窗）"),
+                    Some((_, pct)) => format!("目前 {pct:.0}%"),
+                    None => "照片載入中…".to_string(),
+                })
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+            if let Some((fit_scale, _)) = zoom {
+                r.on_hover_text(format!(
+                    "100% ＝ 照片 1 像素對螢幕 1 個實體像素\n\
+                     （不隨 Windows 的顯示縮放變動），\n\
+                     符合視窗時是 {:.0}%。\n\
+                     預覽是原圖縮到長邊 {SMOKE_PREVIEW_MAX} px 的工作縮圖，\n\
+                     放大超過它的部分是內插出來的（會糊）；\n\
+                     存檔走原尺寸，不受影響。\n\
+                     滾輪縮放，左鍵（或中鍵、右鍵）拖曳平移",
+                    fit_scale * 100.0
+                ));
+            }
+        });
+    }
+
+    fn ui_enhance_module(&mut self, ctx: &egui::Context) {
+        let mut pick = false;
+        let mut pick_folder = false;
+        let mut add = false;
+        let mut clear = false;
+        // Some(true)＝直接存回原始資料夾，Some(false)＝另存到自己挑的資料夾
+        let mut save: Option<bool> = None;
+        let mut reset = false;
+        let mut goto: Option<usize> = None;
+        let mut remove_idx: Option<usize> = None;
+        let mut set_preset: Option<enhance::Preset> = None;
+        let side_frame = egui::Frame::default()
+            .fill(theme::PANEL)
+            .inner_margin(egui::Margin::symmetric(14, 12));
+        let center_frame = egui::Frame::default()
+            .fill(theme::BG)
+            .inner_margin(egui::Margin::same(12));
+
+        // 調色放在右邊的獨立面板，與另外三個模組同寬——切來切去版面不會忽寬忽窄
+        egui::SidePanel::right("enhance_side")
+            .frame(side_frame)
+            .resizable(true)
+            .default_width(330.0)
+            .width_range(300.0..=430.0)
+            .show(ctx, |ui| {
+                let busy = self.enhance.busy;
+                egui::ScrollArea::vertical()
+                    .id_salt("enhance_side_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.ui_enhance_grade(ui, busy);
+                    });
+            });
+
+        egui::CentralPanel::default()
+            .frame(center_frame)
+            .show(ctx, |ui| {
+                let busy = self.enhance.busy;
+                let total = self.enhance.photos.len();
+                let cur = self.enhance.cur;
+                let idle = busy != EnhanceBusy::Saving;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(idle, egui::Button::new("🖼  選擇照片"))
+                        .on_hover_text(
+                            "**整批換掉**：可一次選多張，每張各自量、各自調。\n\
+                             只是想再多處理幾張就按旁邊的「加入照片」",
+                        )
+                        .clicked()
+                    {
+                        pick = true;
+                    }
+                    if ui
+                        .add_enabled(idle, egui::Button::new("📂  選擇資料夾"))
+                        .on_hover_text(
+                            "把整個資料夾裡的照片一次收進來（子資料夾不會一起找）",
+                        )
+                        .clicked()
+                    {
+                        pick_folder = true;
+                    }
+                    if total > 0
+                        && ui
+                            .add_enabled(idle, egui::Button::new("➕  加入照片"))
+                            .on_hover_text(
+                                "把照片**加到現在這批後面**，已經調好的設定與\n\
+                                 正在看的那一張都留著；新加的那幾張照樣會自動量",
+                            )
+                            .clicked()
+                    {
+                        add = true;
+                    }
+                    if total > 0
+                        && ui
+                            .add_enabled(idle, egui::Button::new("🗑  清除"))
+                            .on_hover_text("清掉目前這批照片，回到選擇照片的畫面")
+                            .clicked()
+                    {
+                        clear = true;
+                    }
+                    if total > 1 {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!("{} / {}", cur + 1, total))
+                                .size(12.0)
+                                .color(theme::TEXT),
+                        );
+                    }
+                    if let Some(src) = self.enhance.current() {
+                        ui.label(
+                            egui::RichText::new(
+                                src.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                            )
+                            .size(12.0)
+                            .color(theme::TEXT_WEAK),
+                        );
+                    }
+                    // 這張有個別設定時明講，否則使用者會以為滑桿沒反應
+                    if self
+                        .enhance
+                        .current()
+                        .map(|p| self.enhance.has_own(p))
+                        .unwrap_or(false)
+                    {
+                        ui.label(
+                            egui::RichText::new("🎨 個別設定")
+                                .size(11.0)
+                                .color(theme::ACCENT),
+                        );
+                    } else if self.enhance.auto_for_current().is_some() {
+                        ui.label(egui::RichText::new("自動").size(11.0).color(theme::TEXT_WEAK));
+                    }
+                });
+                ui.add_space(8.0);
+
+                if let Some(e) = &self.enhance.error {
+                    ui.label(
+                        egui::RichText::new(format!("✖ {e}"))
+                            .size(12.0)
+                            .color(theme::ERROR),
+                    );
+                    ui.add_space(6.0);
+                }
+
+                // 還沒選照片：整塊工作區就是一張引導畫面（版面比照另外三個模組）
+                if self.enhance.photos.is_empty() {
+                    match enhance_empty_state(ui, busy == EnhanceBusy::Loading) {
+                        Some(true) => pick = true,
+                        Some(false) => pick_folder = true,
+                        None => {}
+                    }
+                    return;
+                }
+
+                // 底部控制列的高度先扣掉，其餘留給預覽（作法與去煙霧相同：
+                // 用上一幀真正量到的高度，不用公式估）
+                let film_h = if total > 1 { 100.0 } else { 0.0 };
+                let ctrl_h = film_h
+                    + self.enhance.zoom_h
+                    + self.enhance.settings_h.unwrap_or(200.0)
+                    + self.enhance.save_h
+                    + 24.0;
+                let avail = ui.available_height();
+                let img_min = (avail * 0.30).max(120.0);
+                let img_max = (avail - film_h - self.enhance.save_h - 150.0).max(img_min);
+                let want = avail - ctrl_h;
+                let img_h = (want + self.enhance.img_extra).clamp(img_min, img_max);
+                // 夾住的結果只在「往回收」時寫回去（見去煙霧那邊的長註解）
+                let settled = img_h - want;
+                if settled.abs() < self.enhance.img_extra.abs() {
+                    self.enhance.img_extra = settled;
+                }
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), img_h),
+                    egui::Sense::click_and_drag(),
+                );
+                ui.painter().rect_filled(rect, 8.0, theme::CARD);
+                // 預覽與下面控制列之間的分隔線：上下拖曳改預覽高度，連點兩下回自動配高
+                let (bar, bar_resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 10.0),
+                    egui::Sense::click_and_drag(),
+                );
+                if bar_resp.dragged() {
+                    self.enhance.img_extra += bar_resp.drag_delta().y;
+                }
+                if bar_resp.double_clicked() {
+                    self.enhance.img_extra = 0.0;
+                }
+                let hot = bar_resp.hovered() || bar_resp.dragged();
+                if hot {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                let grip = egui::Rect::from_center_size(bar.center(), egui::vec2(54.0, 3.0));
+                ui.painter()
+                    .rect_filled(grip, 1.5, if hot { theme::ACCENT } else { theme::BORDER });
+                bar_resp.on_hover_text("上下拖曳可調整預覽區高度；連點兩下回到自動");
+
+                let mut zoom_info: Option<(f32, f32)> = None;
+                // 尚未算出結果前先顯示原圖，不要留一塊空白
+                let tex = self
+                    .enhance
+                    .tex_after
+                    .as_ref()
+                    .or(self.enhance.tex_before.as_ref())
+                    .cloned();
+                if let Some(tex) = tex {
+                    let full = rect.shrink(6.0);
+                    let before_view = self.enhance.compare.then(|| {
+                        egui::Rect::from_min_size(
+                            full.min,
+                            egui::vec2((full.width() - SMOKE_COMPARE_GAP) / 2.0, full.height()),
+                        )
+                    });
+                    let view = match before_view {
+                        Some(b) => egui::Rect::from_min_size(
+                            egui::pos2(b.right() + SMOKE_COMPARE_GAP, full.top()),
+                            b.size(),
+                        ),
+                        None => full,
+                    };
+                    let shown_c = self.enhance.shown_crop();
+                    // 顯示比例照**原始照片**算，不看貼圖多大（同去煙霧那邊的說明）：
+                    // 拿工作縮圖當基準的話，100% 只是縮圖的 1:1
+                    let nominal = self
+                        .enhance
+                        .source_dims()
+                        .map(|(w, h)| egui::vec2(w as f32, h as f32))
+                        .unwrap_or_else(|| tex.size_vec2());
+                    let canvas_size = {
+                        let (w, h) = shown_c.canvas(nominal.x, nominal.y);
+                        egui::vec2(w, h)
+                    };
+                    let fit = crop_fit_rect(canvas_size, view, shown_c);
+                    // 顯示比例一律以**螢幕的實體像素**為準。Windows 的顯示縮放
+                    // （125%、150%…）讓 1 點等於 1.25、1.5 個實體像素，照「點」算的話
+                    // 按下 100% 看到的其實是被放大過的畫面，看起來就不是 1:1；
+                    // 除以它之後，選了幾 % 就是幾 %，不隨顯示縮放跑掉
+                    let ppp = ui.ctx().pixels_per_point();
+                    let fit_scale = fit.width() / canvas_size.x * ppp;
+                    // 滾輪縮放：以 1.25 為級距，縮到比「符合視窗」還小就回到符合視窗
+                    let wheel = if ui.rect_contains_pointer(full) {
+                        ui.input(|i| i.raw_scroll_delta.y)
+                    } else {
+                        0.0
+                    };
+                    if wheel != 0.0 {
+                        let z = self.enhance.zoom.unwrap_or(fit_scale);
+                        let next = z * if wheel > 0.0 { 1.25 } else { 1.0 / 1.25 };
+                        self.enhance.zoom = (next > fit_scale * 1.02).then_some(next.min(8.0));
+                        // 自己動手改過比例，空白鍵就沒有「上一次」可回了
+                        self.enhance.zoom_back = None;
+                    }
+                    let r = match self.enhance.zoom {
+                        None => {
+                            // 回到符合視窗：下次放大從裁切框的中心開始
+                            self.enhance.pan = egui::pos2(
+                                (shown_c.x0 + shown_c.x1) / 2.0,
+                                (shown_c.y0 + shown_c.y1) / 2.0,
+                            );
+                            fit
+                        }
+                        Some(z) => {
+                            let size = canvas_size * (z / ppp);
+                            // 這個模組沒有畫在照片上的工具，左鍵一律拿來平移
+                            // （調整裁切範圍時除外，那時左鍵屬於裁切框）
+                            let left_pans = !self.enhance.crop_editing;
+                            if ui.rect_contains_pointer(full) {
+                                if left_pans {
+                                    ui.ctx().set_cursor_icon(
+                                        if ui.input(|i| i.pointer.primary_down()) {
+                                            egui::CursorIcon::Grabbing
+                                        } else {
+                                            egui::CursorIcon::Grab
+                                        },
+                                    );
+                                }
+                                let d = ui.input(|i| {
+                                    if i.pointer.middle_down()
+                                        || i.pointer.secondary_down()
+                                        || (left_pans && i.pointer.primary_down())
+                                    {
+                                        i.pointer.delta()
+                                    } else {
+                                        egui::Vec2::ZERO
+                                    }
+                                });
+                                if d != egui::Vec2::ZERO {
+                                    self.enhance.pan.x -= d.x / size.x;
+                                    self.enhance.pan.y -= d.y / size.y;
+                                }
+                            }
+                            crop_clamp_pan(&mut self.enhance.pan, view, size, shown_c);
+                            snap_to_pixels(
+                                egui::Rect::from_min_size(
+                                    view.center()
+                                        - egui::vec2(
+                                            self.enhance.pan.x * size.x,
+                                            self.enhance.pan.y * size.y,
+                                        ),
+                                    size,
+                                ),
+                                ppp,
+                            )
+                        }
+                    };
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    // 只讓裁切框裡面看得到（見去煙霧那邊的說明）
+                    let show = view.intersect(crop_screen_rect(r, shown_c));
+                    if let (Some(bv), Some(btex)) = (before_view, self.enhance.tex_before.clone()) {
+                        let mut bclip = ui.new_child(egui::UiBuilder::new().max_rect(bv));
+                        bclip.set_clip_rect(show.translate(bv.min - view.min));
+                        let br = r.translate(bv.min - view.min);
+                        if shown_c.has_rotation() {
+                            paint_rotated_image(
+                                bclip.painter(),
+                                &btex,
+                                br,
+                                btex.size_vec2(),
+                                shown_c.total_deg(),
+                            );
+                        } else {
+                            bclip
+                                .painter()
+                                .image(btex.id(), br, uv, egui::Color32::WHITE);
+                        }
+                    }
+                    let mut clipped = ui.new_child(egui::UiBuilder::new().max_rect(view));
+                    clipped.set_clip_rect(show);
+                    if shown_c.has_rotation() {
+                        paint_rotated_image(
+                            clipped.painter(),
+                            &tex,
+                            r,
+                            tex.size_vec2(),
+                            shown_c.total_deg(),
+                        );
+                    } else {
+                        clipped
+                            .painter()
+                            .image(tex.id(), r, uv, egui::Color32::WHITE);
+                    }
+                    if self.enhance.crop_editing {
+                        let cur = self.enhance.effective().grade.crop;
+                        let ratio = self.enhance.crop_aspect.ratio(self.enhance.source_dims());
+                        let (next, done) = crop_overlay(&mut clipped, &resp, r, cur, ratio);
+                        if next != cur {
+                            let mut g = self.enhance.effective().grade;
+                            g.crop = next;
+                            self.enhance.set_grade(g);
+                        }
+                        // 照片上連點兩下＝裁好了，直接看裁切後的樣子
+                        if done {
+                            self.enhance.crop_editing = false;
+                        }
+                    }
+                    if let Some(bv) = before_view {
+                        pane_label(ui, bv, "編輯前");
+                        pane_label(ui, view, "編輯後");
+                    }
+                    let pct = r.width() / canvas_size.x * 100.0 * ppp;
+                    zoom_info = Some((fit_scale, pct));
+                } else {
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if self.enhance.error.is_some() {
+                            "這張讀不到"
+                        } else {
+                            "照片載入中…"
+                        },
+                        egui::FontId::proportional(15.0),
+                        theme::TEXT_WEAK,
+                    );
+                }
+                // 量比例列實際佔多高，下一幀算預覽高度時照它留位
+                let zr = ui.scope(|ui| self.ui_enhance_zoom_bar(ui, zoom_info));
+                let zh = zr.response.rect.height();
+                if (self.enhance.zoom_h - zh).abs() > 0.5 {
+                    self.enhance.zoom_h = zh;
+                    ctx.request_repaint();
+                }
+                ui.add_space(8.0);
+
+                // 縮圖列：點縮圖切換，有個別設定的標 🎨。
+                // 只畫可視範圍內的，張數再多也不會每幀走訪整份清單
+                if total > 1 {
+                    let scroll_to = self.enhance.scroll_to_cur;
+                    self.enhance.scroll_to_cur = false;
+                    let thumb_size = egui::vec2(132.0, 84.0);
+                    ui.scope(|ui| {
+                        ui.style_mut().always_scroll_the_only_direction = true;
+                        egui::ScrollArea::horizontal()
+                            .id_salt("enhance_film")
+                            .max_height(film_h - 8.0)
+                            .show_viewport(ui, |ui, viewport| {
+                                ui.set_min_height(thumb_size.y);
+                                ui.horizontal(|ui| {
+                                    let stride = thumb_size.x + ui.spacing().item_spacing.x;
+                                    let origin = ui.next_widget_position();
+                                    if scroll_to {
+                                        let r = egui::Rect::from_min_size(
+                                            egui::pos2(origin.x + cur as f32 * stride, origin.y),
+                                            thumb_size,
+                                        );
+                                        ui.scroll_to_rect(r, Some(egui::Align::Center));
+                                    }
+                                    let first =
+                                        (((viewport.min.x / stride).floor() as isize) - 1).max(0)
+                                            as usize;
+                                    let last = ((((viewport.max.x / stride).ceil() as isize) + 1)
+                                        .max(0)
+                                        as usize)
+                                        .min(total);
+                                    let first = first.min(last);
+                                    self.enhance.vis_range = Some((first, last));
+                                    if first > 0 {
+                                        ui.add_space(first as f32 * stride);
+                                    }
+                                    // 縮圖的自動 ID 與索引繫結，捲動時 hover 狀態才不會錯位
+                                    ui.skip_ahead_auto_ids(first);
+                                    for i in first..last {
+                                        let p = &self.enhance.photos[i];
+                                        let st = self.enhance.thumbs.get(p);
+                                        let tex = match st {
+                                            Some(Thumb::Ready(t)) => Some(t.clone()),
+                                            _ => None,
+                                        };
+                                        let r = thumb_item(
+                                            ui,
+                                            tex.as_ref(),
+                                            Some(i),
+                                            i == cur,
+                                            false,
+                                            false,
+                                            self.enhance.has_own(p),
+                                            matches!(st, Some(Thumb::Failed)),
+                                        );
+                                        if r.clicked() {
+                                            goto = Some(i);
+                                        }
+                                        r.context_menu(|ui| {
+                                            ui.add_enabled_ui(idle, |ui| {
+                                                if ui.button("🗑 移除這張").clicked() {
+                                                    ui.close_menu();
+                                                    remove_idx = Some(i);
+                                                }
+                                            });
+                                            if !idle {
+                                                ui.label(
+                                                    egui::RichText::new("存檔中無法移除照片")
+                                                        .size(11.0)
+                                                        .color(theme::TEXT_WEAK),
+                                                );
+                                            }
+                                        });
+                                    }
+                                    if last < total {
+                                        ui.add_space((total - last) as f32 * stride);
+                                    }
+                                });
+                            });
+                    });
+                    ui.add_space(6.0);
+                }
+
+                // 設定區：擠不下時自己長捲軸，不把下面的存檔列頂出視窗
+                let settings_max = (ui.available_height() - self.enhance.save_h - 10.0).max(90.0);
+                let settings = egui::ScrollArea::vertical()
+                    .id_salt("enhance_settings")
+                    .max_height(settings_max)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        // 滑桿不橫跨整個寬螢幕：一條拉到一千多像素反而不好調
+                        // （與去煙霧的設定區同一個道理）
+                        ui.set_max_width(ui.available_width().min(760.0));
+                        ui.add_enabled_ui(idle, |ui| {
+                            set_preset = self.ui_enhance_settings(ui);
+                        });
+                    });
+                // 這一區真正的高度畫完才知道；記下來給下一幀算預覽高度用
+                let measured = settings.content_size.y;
+                if (self.enhance.settings_h.unwrap_or(-1.0) - measured).abs() > 0.5 {
+                    ctx.request_repaint();
+                }
+                self.enhance.settings_h = Some(measured);
+                ui.add_space(6.0);
+
+                let save_row = ui.horizontal(|ui| {
+                    if ui
+                        .small_button("↺ 清除這張的修改")
+                        .on_hover_text("把這張照片改回自動判出來的樣子（別張不受影響）")
+                        .clicked()
+                    {
+                        reset = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let saving = busy == EnhanceBusy::Saving;
+                        if saving {
+                            let done = self.enhance.save_done;
+                            saving_button(
+                                ui,
+                                &format!("儲存中… {done}/{total}"),
+                                done as f32 / total.max(1) as f32,
+                            )
+                            .on_hover_text("正在把處理好的照片寫成檔案，完成前請先別關視窗");
+                        } else {
+                            let label = if total > 1 {
+                                format!("💾  全部存檔（{total} 張）")
+                            } else {
+                                "💾  存檔".to_string()
+                            };
+                            if primary_button(ui, &label, busy == EnhanceBusy::Idle)
+                                .on_hover_text(if total > 1 {
+                                    "每張都存回它自己的原始資料夾，檔名加上 _優化，不用再選位置"
+                                } else {
+                                    "存回原始照片所在的資料夾，檔名加上 _優化，不用再選位置"
+                                })
+                                .clicked()
+                            {
+                                save = Some(true);
+                            }
+                        }
+                        if !saving {
+                            ui.add_space(6.0);
+                            if ui
+                                .small_button("📁 另存新檔…")
+                                .on_hover_text("自己挑一個資料夾存放成品")
+                                .clicked()
+                            {
+                                save = Some(false);
+                            }
+                        }
+                        // 存檔尺寸緊鄰存檔鈕：要縮多大是按下去之前才決定的事
+                        ui.add_space(10.0);
+                        let mut size = self.export_size;
+                        let natural = export_natural_dims(
+                            self.enhance.source_dims(),
+                            &self.enhance.effective().grade.crop,
+                        );
+                        if export_size_row(ui, &mut size, !saving, natural) {
+                            self.export_size = size;
+                            save_export_size(size);
+                        }
+                        // 批次可能要跑上一陣子，給個中止的出口
+                        if saving {
+                            ui.add_space(6.0);
+                            if ui.small_button("取消").clicked() {
+                                self.enhance.save_cancel.store(true, Ordering::Relaxed);
+                            }
+                            // 按鈕上的轉圈與掃光要每幀重畫
+                            ctx.request_repaint();
+                        }
+                        if !saving {
+                            if let Some(p) = self.enhance.saved_path.clone() {
+                                ui.add_space(6.0);
+                                if ui
+                                    .small_button("🖼 開啟圖片")
+                                    .on_hover_text(if total > 1 {
+                                        "用預設看圖程式開啟剛存好的第一張"
+                                    } else {
+                                        "用預設看圖程式開啟剛存好的照片"
+                                    })
+                                    .clicked()
+                                {
+                                    open_file(&p);
+                                }
+                            }
+                        }
+                        if busy == EnhanceBusy::Rendering {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("處理中…")
+                                    .size(11.5)
+                                    .color(theme::TEXT_WEAK),
+                            );
+                        }
+                        // 存檔完成的提示只留幾秒，不長期佔著版面
+                        if let Some((msg, at)) = &self.enhance.saved {
+                            if at.elapsed() < Duration::from_secs(8) {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(format!("✔ {msg}"))
+                                        .size(11.5)
+                                        .color(theme::SUCCESS),
+                                );
+                                ctx.request_repaint_after(Duration::from_secs(1));
+                            }
+                        }
+                    });
+                });
+                // 存檔列不捲動，量它的高度下一幀留位用
+                self.enhance.save_h = save_row.response.rect.height();
+            });
+
+        // 方向鍵切換照片（滑桿等元件有焦點時不搶）
+        if goto.is_none()
+            && self.enhance.photos.len() > 1
+            && self.enhance.busy != EnhanceBusy::Saving
+            && ctx.memory(|m| m.focused().is_none())
+        {
+            let (cur, total) = (self.enhance.cur, self.enhance.photos.len());
+            if cur + 1 < total && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                goto = Some(cur + 1);
+            } else if cur > 0 && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                goto = Some(cur - 1);
+            }
+        }
+        // Y 切換前後對照、空白鍵跳 1:1、Delete 移除這張（都與去煙霧一致）
+        if self.enhance.base.is_some() && ctx.memory(|m| m.focused().is_none()) {
+            if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+                self.enhance.compare = !self.enhance.compare;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+                self.enhance_toggle_actual_size();
+            }
+        }
+        if remove_idx.is_none()
+            && !self.enhance.photos.is_empty()
+            && self.enhance.busy != EnhanceBusy::Saving
+            && !self.enhance.crop_editing
+            && ctx.memory(|m| m.focused().is_none())
+            && ctx.input(|i| i.key_pressed(egui::Key::Delete))
+        {
+            remove_idx = Some(self.enhance.cur);
+        }
+
+        // 縮圖列畫完才知道可視範圍，這時再依範圍補請求
+        self.request_enhance_thumbs();
+        if let Some(p) = set_preset {
+            self.enhance_pick_preset(p, ctx);
+        }
+        if pick {
+            self.enhance_pick_photos(ctx);
+        }
+        if pick_folder {
+            self.enhance_pick_folder(ctx);
+        }
+        if add {
+            self.enhance_add_photos(ctx);
+        }
+        if let Some(i) = goto {
+            self.enhance_select(i, ctx);
+        }
+        if let Some(i) = remove_idx {
+            self.enhance_remove_photo(i, ctx);
+        }
+        if reset {
+            // 這張的個別設定收掉就回到自動值；沒有自動值就是回到共用設定
+            if self.enhance.reset_current() {
+                self.enhance.dirty = true;
+            }
+        }
+        if let Some(here) = save {
+            self.enhance_save_all(ctx, here);
+        }
+        // 清除確認擺在最後：這一幀的操作都處理完，dirty 才是最新的狀態
+        if clear {
+            self.enhance_clear_confirmed();
+        }
+    }
+
+    /// 設定區：類型、自動調色、主體強化與柔膚。
+    /// 回傳使用者這一幀選了哪個類型（換類型要重新量，不能在畫版面時做）
+    fn ui_enhance_settings(&mut self, ui: &mut egui::Ui) -> Option<enhance::Preset> {
+        let mut set_preset = None;
+        // 類型列顯示的一律是**目前這張**該用的那一個（自己挑過就是它自己的）
+        let cur_preset = self.enhance.cur_preset();
+        let own_preset = self
+            .enhance
+            .current()
+            .is_some_and(|p| self.enhance.preset_overrides.contains_key(p));
+        // --- 類型 ---
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("🎯 類型")
+                    .size(SECTION_FONT)
+                    .color(theme::TEXT),
+            );
+            for p in enhance::Preset::ALL {
+                let on = cur_preset == p;
+                if check_label(ui, on, p.label())
+                    .on_hover_text(p.hint())
+                    .clicked()
+                    && !on
+                {
+                    set_preset = Some(p);
+                }
+            }
+            // 這張自己挑過類型：講出來，否則使用者會以為整批都被改掉了
+            if own_preset {
+                ui.label(
+                    egui::RichText::new("🎯 這張自己挑的")
+                        .size(11.0)
+                        .color(theme::ACCENT),
+                )
+                .on_hover_text(
+                    "這張的類型是你單獨挑的，切換照片時會自動跟著顯示它。\n\
+                     要改回跟整批一樣就按下面的「↺ 清除這張的修改」",
+                );
+            }
+            if self.enhance.auto_left > 0 {
+                ui.label(
+                    egui::RichText::new(format!("分析中… 還有 {} 張", self.enhance.auto_left))
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            }
+        });
+        ui.label(
+            egui::RichText::new(cur_preset.hint())
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+        );
+        // 混批時講清楚「改這裡會動到誰」——不然點下去才發現整批都變了
+        if self.enhance.photos.len() > 1 {
+            let mixed = self.enhance.preset_overrides.len();
+            ui.label(
+                egui::RichText::new(if self.enhance.per_photo || own_preset {
+                    "改類型只會動到這張（勾著「只調整這張」，或這張本來就自己挑過）".to_string()
+                } else if mixed > 0 {
+                    format!("改類型會套到整批；已經有 {mixed} 張自己挑過，不受影響")
+                } else {
+                    "改類型會套到整批；想只改這張就勾下面的「只調整這張」".to_string()
+                })
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+        }
+        ui.add_space(6.0);
+
+        // 這張的柔膚有沒有真的開著（決定下面要不要提膚色，見那裡的說明）
+        let skin_on = self.enhance.effective().local.skin > 0;
+
+        // --- 自動調色 ---
+        ui.horizontal_wrapped(|ui| {
+            let mut on = self.enhance.auto_on;
+            if ui
+                .checkbox(&mut on, "自動調色")
+                .on_hover_text(
+                    "每張照片各自量出白平衡、曝光、對比、陰影、黑白場、去朦朧、\n\
+                     鮮豔度與清晰度該有的值，右邊那十二條滑桿就會停在那個位置。\n\
+                     動過滑桿的照片會保留你調的，不再被蓋回去",
+                )
+                .changed()
+            {
+                self.enhance.auto_on = on;
+                self.enhance.dirty = true;
+            }
+            // 這張測到什麼：講出來，使用者才知道程式看到的是不是他看到的。
+            // 膚色照實說是「膚色」不是「人物」——顏色判得出膚色範圍，
+            // 判不出那是不是人（見 enhance::Auto::has_skin）
+            //
+            // **柔膚沒開就完全不提膚色**：膚色範圍是拿來餵柔膚的，柔膚是 0
+            // 時它對成品沒有任何影響，講了只會誤導。實際遇過——一張秋天的
+            // 楓葉照在「鳥類」模式下報「膚色範圍約 13%」（橘紅落葉正好落在
+            // 膚色的色彩範圍裡），看的人會以為程式把樹當成人了，
+            // 但那個數字其實一點作用都沒有
+            if let Some(a) = self.enhance.auto_here() {
+                let mut bits = vec![format!("主體約佔 {:.0}%", a.subject_cover * 100.0)];
+                if a.has_skin() && skin_on {
+                    bits.push(format!("膚色範圍約 {:.0}%", a.skin_cover * 100.0));
+                }
+                ui.label(
+                    egui::RichText::new(format!("（這張：{}）", bits.join("、")))
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                )
+                .on_hover_text(
+                    "按「顯示主體範圍」就看得到圈在哪裡：\n\
+                     主體維持原樣、膚色染粉紅、其餘壓暗染藍。\n\
+                     圈錯了把對應的滑桿調小或歸零即可",
+                );
+            }
+        });
+        if self.enhance.auto_on {
+            let mut amount = self.enhance.auto_amount;
+            slider_row(ui, &mut amount, 0, ENHANCE_AMOUNT_MAX, "強度");
+            if amount != self.enhance.auto_amount {
+                self.enhance.auto_amount = amount;
+                self.enhance.dirty = true;
+            }
+            ui.label(
+                egui::RichText::new(
+                    "強度＝建議值要採用幾成（100＝照建議、50＝一半、200＝加倍）。\
+                     覺得整批調得太重或太淡時，動這一條比十二條各拉一次快",
+                )
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+        }
+        ui.add_space(6.0);
+
+        // --- 主體強化與柔膚 ---
+        let cur = self.enhance.effective().local;
+        let mut l = cur;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("✨ 主體")
+                    .size(SECTION_FONT)
+                    .color(theme::TEXT),
+            );
+            let show = self.enhance.show_mask;
+            if check_label(ui, show, "顯示主體範圍")
+                .on_hover_text(
+                    "預覽改成「主體維持原樣、膚色染粉紅、其餘壓暗染藍」，\n\
+                     一眼看得出程式圈到哪裡。判錯了就把對應的滑桿調小或歸零",
+                )
+                .clicked()
+            {
+                self.enhance.show_mask = !show;
+            }
+        });
+        slider_row(ui, &mut l.subject, 0, 100, "主體強化");
+        slider_row(ui, &mut l.skin, 0, 100, "柔膚");
+        // 兩條的說明照類型給：人像才需要解釋「為什麼銳利度反而降了」
+        ui.label(
+            egui::RichText::new(if cur_preset == enhance::Preset::Portrait {
+                "主體強化＝把人從背景裡拉出來（提亮、加清晰與銳利），\
+                 但**皮膚會自動避開**，只加在頭髮、眼睛、衣服上 · \
+                 柔膚＝臉與皮膚的細紋、色斑抹勻，眼睛、嘴唇與髮際線的邊緣留著"
+            } else {
+                "主體強化＝主體提亮、加清晰與銳利，背景不動 · \
+                 柔膚＝只作用在膚色範圍上（測不到膚色就完全不跑）"
+            })
+            .size(11.0)
+            .color(theme::TEXT_WEAK),
+        );
+        if l.skin > 0 && !self.enhance.auto_here().is_some_and(|a| a.has_skin()) {
+            ui.label(
+                egui::RichText::new("這張測不到膚色範圍，柔膚不會有作用")
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
+            );
+        }
+        if l != cur {
+            self.enhance.set_local(l);
+        }
+
+        // --- 多張時的套用範圍 ---
+        if self.enhance.photos.len() > 1 {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                let mut per = self.enhance.per_photo;
+                if ui
+                    .checkbox(&mut per, "只調整這張")
+                    .on_hover_text(
+                        "不勾＝改動套用到全部照片（調色除外——那是逐張自動判的，\n\
+                         動了就只算這張）；勾起來連強化滑桿也只改目前這張",
+                    )
+                    .changed()
+                {
+                    self.enhance.per_photo = per;
+                }
+                let n = self
+                    .enhance
+                    .photos
+                    .iter()
+                    .filter(|p| self.enhance.has_own(p))
+                    .count();
+                if n > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("（{n} 張有個別設定）"))
+                            .size(11.0)
+                            .color(theme::TEXT_WEAK),
+                    );
+                }
+            });
+        }
+        set_preset
+    }
+
     fn ui_drop_overlay(&self, ctx: &egui::Context) {
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
         if !hovering {
             return;
         }
-        let working = self.is_working();
         let screen = ctx.screen_rect();
         let p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -4939,10 +20052,28 @@ impl App {
         p.rect_filled(screen, 0, egui::Color32::from_black_alpha(150));
         let card = egui::Rect::from_center_size(screen.center(), egui::vec2(340.0, 116.0));
         p.rect_filled(card, 12, theme::CARD);
-        let (accent, icon, msg) = if working {
-            (theme::TEXT_WEAK, "⏳", "轉換中，暫時無法加入檔案")
-        } else {
-            (theme::ACCENT, "⬇", "放開滑鼠加入照片")
+        // 放開後檔案會進哪個模組，先在這裡講清楚
+        let (accent, icon, msg) = match self.module {
+            Module::Dehaze if self.smoke.busy == SmokeBusy::Saving => {
+                (theme::TEXT_WEAK, "⏳", "存檔中，暫時無法加入照片")
+            }
+            Module::Dehaze => (theme::ACCENT, "⬇", "放開滑鼠加入要去煙霧的照片"),
+            Module::Stack if self.stack.busy == StackBusy::Saving => {
+                (theme::TEXT_WEAK, "⏳", "存檔中，暫時無法加入照片")
+            }
+            Module::Stack => (theme::ACCENT, "⬇", "放開滑鼠加入要疊圖的照片"),
+            Module::Video if self.is_working() => {
+                (theme::TEXT_WEAK, "⏳", "轉換中，暫時無法加入檔案")
+            }
+            Module::Video => (theme::ACCENT, "⬇", "放開滑鼠加入照片"),
+            Module::Movie if self.movie.busy == MovieBusy::Exporting => {
+                (theme::TEXT_WEAK, "⏳", "輸出中，暫時無法換影片")
+            }
+            Module::Movie => (theme::ACCENT, "⬇", "放開滑鼠載入要去煙霧的影片"),
+            Module::Enhance if self.enhance.busy == EnhanceBusy::Saving => {
+                (theme::TEXT_WEAK, "⏳", "存檔中，暫時無法加入照片")
+            }
+            Module::Enhance => (theme::ACCENT, "⬇", "放開滑鼠加入要優化的照片"),
         };
         p.rect_stroke(
             card,
@@ -4976,6 +20107,8 @@ impl Drop for App {
         // 再 spawn 一個 ffmpeg，drop 已執行不會再 kill，那個軟體 ffmpeg
         // 就成了孤兒。旗標讓退回邏輯與 run_once 都不再啟動新的 ffmpeg
         CONVERT_CANCEL.store(true, Ordering::Relaxed);
+        // 追蹤的解碼執行緒同理：不叫停的話，關窗後它們還會把整批照片解完
+        TRACK_CANCEL.store(true, Ordering::Relaxed);
         let pid = CONVERT_FFMPEG_PID.swap(0, Ordering::Relaxed);
         if pid != 0 {
             kill_pid(pid);
@@ -5010,10 +20143,73 @@ fn clean_own_temp_files() {
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
         for e in entries.flatten() {
             if e.file_name().to_string_lossy().starts_with(&prefix) {
+                // 貼上的圖片放在自己的資料夾裡（見 [`paste_dir`]），
+                // 兩種都要清得掉
                 let _ = std::fs::remove_file(e.path());
+                let _ = std::fs::remove_dir_all(e.path());
             }
         }
     }
+}
+
+/// 貼上的圖片放哪：暫存資料夾底下本行程專屬的一個目錄。
+///
+/// 疊圖模組整個是以檔案路徑為主鍵的（遮色片、位移、每層調色都掛在路徑上），
+/// 剪貼簿來的圖先落地成檔案，後面每一段就完全不必改。放在自己的目錄裡是為了
+/// 檔名好看——縮圖列與圖層列顯示的就是檔名，「貼上的圖片 1.png」比
+/// 「photo2video_12345_paste1.png」清楚得多
+/// 合併影片時，各段先寫到這裡（見 [`movie::concat`]）。
+/// 與貼上的圖片一樣掛本行程專屬的前綴，關程式時一起清掉
+fn merge_dir() -> std::io::Result<PathBuf> {
+    let d = std::env::temp_dir().join(format!("photo2video_{}_merge", std::process::id()));
+    std::fs::create_dir_all(&d)?;
+    Ok(d)
+}
+
+fn paste_dir() -> std::io::Result<PathBuf> {
+    let d = std::env::temp_dir().join(format!("photo2video_{}_paste", std::process::id()));
+    std::fs::create_dir_all(&d)?;
+    Ok(d)
+}
+
+/// 把剪貼簿裡的圖片存成暫存 PNG 並回傳它的路徑（沒有圖片就回錯誤訊息）。
+///
+/// Win+Shift+S 截的圖、從瀏覽器或別的軟體「複製圖片」都走這條。
+/// 剪貼簿給的是 RGBA，透明的地方直接壓到黑：疊圖用「加亮」時黑色不影響結果，
+/// 等於只有畫到的地方會疊上來
+fn clipboard_image_to_temp() -> Result<PathBuf, String> {
+    let img = arboard::Clipboard::new()
+        .and_then(|mut c| c.get_image())
+        .map_err(|e| format!("剪貼簿裡沒有圖片（{e}）"))?;
+    let (w, h) = (img.width as u32, img.height as u32);
+    if w == 0 || h == 0 {
+        return Err("剪貼簿裡的圖片是空的".into());
+    }
+    let mut out = image::RgbImage::new(w, h);
+    for (i, px) in out.pixels_mut().enumerate() {
+        let s = &img.bytes[i * 4..i * 4 + 4];
+        let a = s[3] as f32 / 255.0;
+        *px = image::Rgb([
+            (s[0] as f32 * a).round() as u8,
+            (s[1] as f32 * a).round() as u8,
+            (s[2] as f32 * a).round() as u8,
+        ]);
+    }
+    let dir = paste_dir().map_err(|e| format!("建立暫存資料夾失敗：{e}"))?;
+    // 同一次執行貼好幾張時各自留一份，不互相覆蓋
+    let mut n = 1;
+    let path = loop {
+        let p = dir.join(format!("貼上的圖片 {n}.png"));
+        if !p.exists() {
+            break p;
+        }
+        n += 1;
+        if n > 999 {
+            break dir.join("貼上的圖片.png");
+        }
+    };
+    out.save(&path).map_err(|e| format!("暫存貼上的圖片失敗：{e}"))?;
+    Ok(path)
 }
 
 /// 清掉先前執行留下的孤兒暫存檔。閃退、強制結束或斷電時 App::drop
@@ -5039,34 +20235,112 @@ fn clean_stale_temp_files() {
             .is_some_and(|age| age > STALE_AGE);
         if stale {
             let _ = std::fs::remove_file(e.path());
+            let _ = std::fs::remove_dir_all(e.path());
         }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 心跳：跑到這裡代表 UI 執行緒還活著（給看門狗判斷有沒有卡住）
+        UI_TICK.store(now_ms(), Ordering::Relaxed);
+        ui_phase(PHASE_UPDATE);
+
+        ACTIVE_MODULE.store(
+            Module::ALL.iter().position(|m| *m == self.module).unwrap_or(0) as u8,
+            Ordering::Relaxed,
+        );
+
         // 關閉視窗前，若有尚未儲存的專案變更就攔下確認，避免辛苦設定的照片、
         // 調色、文字、音樂一按 X 就無聲無息全丟。轉檔進行中不攔（讓使用者能中止
         // 離開）。allow_close 一旦設起就永遠放行，確保絕不會困住使用者
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.allow_close
-            && !self.is_working()
-            && self.has_unsaved_changes()
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && !self.is_working()
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            let close_anyway = rfd::MessageDialog::new()
-                .set_level(rfd::MessageLevel::Warning)
-                .set_title("尚未儲存")
-                .set_description(
-                    "有尚未儲存的專案變更（照片、調色、文字、音樂等）。\n\
-                     確定要不儲存直接關閉嗎？\n\n\
-                     （按「否」回去，可用 Ctrl+S 或工具列「💾 儲存專案」保存）",
-                )
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show();
-            if close_anyway == rfd::MessageDialogResult::Yes {
-                self.allow_close = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            // 去煙霧正在批次寫檔：關掉會留下寫到一半的檔案，也看不到哪幾張
+            // 失敗。先擋下來，請使用者等它跑完
+            if self.smoke.busy == SmokeBusy::Saving {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.module = Module::Dehaze;
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Info)
+                    .set_title("正在存檔")
+                    .set_description("去煙霧正在把照片寫回檔案，請等這批存完再關閉。")
+                    .show();
+            } else if self.stack.busy == StackBusy::Saving {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.module = Module::Stack;
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Info)
+                    .set_title("正在存檔")
+                    .set_description("煙火疊圖正在寫檔，請等它存完再關閉。")
+                    .show();
+            } else if self.movie.busy == MovieBusy::Exporting {
+                // 關掉會留下一支寫到一半、播不完的影片；先擋下來讓使用者
+                // 自己決定要等它跑完還是按中止
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.module = Module::Movie;
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Info)
+                    .set_title("正在輸出影片")
+                    .set_description(
+                        "影片去煙霧還在跑，請等它輸出完，或按「✖ 中止」再關閉。",
+                    )
+                    .show();
+            } else if self.enhance.busy == EnhanceBusy::Saving {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.module = Module::Enhance;
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Info)
+                    .set_title("正在存檔")
+                    .set_description("優化影像正在把照片寫成檔案，請等這批存完再關閉。")
+                    .show();
+            } else {
+                // 專案與去煙霧各自可能有沒存的東西，一次講完再問一次就好
+                let mut pending: Vec<&str> = Vec::new();
+                if self.has_unsaved_changes() {
+                    pending.push("· 影片專案有尚未儲存的變更（照片、調色、文字、音樂等）");
+                }
+                let smoke_dirty = self.smoke.dirty && !self.smoke.photos.is_empty();
+                if smoke_dirty {
+                    pending.push("· 去煙霧有處理過、還沒存成檔案的照片");
+                }
+                let stack_dirty = self.stack.dirty && self.stack.photos.len() > 1;
+                if stack_dirty {
+                    pending.push("· 煙火疊圖有疊好、還沒存成檔案的照片");
+                }
+                let enhance_dirty = self.enhance.dirty && !self.enhance.photos.is_empty();
+                if enhance_dirty {
+                    pending.push("· 優化影像有調好、還沒存成檔案的照片");
+                }
+                if !pending.is_empty() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    if ask2(
+                        rfd::MessageLevel::Warning,
+                        "尚未儲存",
+                        &format!(
+                            "{}\n\n選「回去存檔」的話：影片專案用 Ctrl+S 保存，\
+                             其餘模組在自己的畫面裡按「💾 存檔」。",
+                            pending.join("\n")
+                        ),
+                        "不儲存，直接關閉",
+                        "回去存檔",
+                    ) {
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else if !self.has_unsaved_changes() {
+                        // 沒存的只有某一個模組那邊：直接帶過去，使用者不用自己找。
+                        // 好幾邊都有就留在原地——挑一邊帶過去反而像把其他邊吃掉了
+                        let only = [
+                            (smoke_dirty, Module::Dehaze),
+                            (stack_dirty, Module::Stack),
+                            (enhance_dirty, Module::Enhance),
+                        ];
+                        let mut it = only.iter().filter(|(d, _)| *d);
+                        if let (Some((_, m)), None) = (it.next(), it.next()) {
+                            self.module = *m;
+                        }
+                    }
+                }
             }
         }
 
@@ -5099,8 +20373,14 @@ impl eframe::App for App {
         self.poll_update();
         self.poll_worker();
         self.poll_preview(ctx);
+        self.poll_track(ctx);
+        // 全部檢查完就自己退出檢查模式（那兩個勾選留著只會擋版面）
+        self.track_review_done();
         self.poll_thumbs(ctx);
         self.poll_smoke(ctx);
+        self.poll_stack(ctx);
+        self.poll_movie(ctx);
+        self.poll_enhance(ctx);
 
         // 支援直接拖曳檔案/資料夾進視窗
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -5110,13 +20390,119 @@ impl eframe::App for App {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        if !dropped.is_empty() && !self.is_working() {
+        // 去煙霧模組：拖進來的照片就是要去煙的那批，不會跑去影片專案裡
+        if !dropped.is_empty()
+            && self.module == Module::Dehaze
+            && self.smoke.busy != SmokeBusy::Saving
+        {
+            let mut files = Vec::new();
+            for p in &dropped {
+                if p.is_dir() {
+                    files.extend(collect_images_in_dir(p));
+                } else if is_image(p) {
+                    files.push(p.clone());
+                }
+            }
+            if files.is_empty() {
+                self.smoke.error =
+                    Some("拖進來的檔案裡沒有可以處理的照片（支援 JPG／PNG／BMP／WebP／TIFF）".into());
+            } else {
+                self.smoke.error = None;
+                natural_sort(&mut files);
+                // 拖進來的位置也算「這個模組上次用的資料夾」：
+                // 下次按「選擇照片」就從同一批照片的地方開始
+                remember_dir(LastDir::DehazePhotos, &files[0]);
+                // 拖曳同樣是整批換掉，一樣要先問（見 smoke_confirm_replace）
+                if self.smoke_confirm_replace() {
+                    self.smoke_set_photos(files, ctx);
+                }
+            }
+        } else if !dropped.is_empty()
+            && self.module == Module::Stack
+            && self.stack.busy != StackBusy::Saving
+        {
+            // 疊圖模組：拖進來的照片就是要疊的那批
+            let mut files = Vec::new();
+            for p in &dropped {
+                if p.is_dir() {
+                    files.extend(collect_images_in_dir(p));
+                } else if is_image(p) {
+                    files.push(p.clone());
+                }
+            }
+            if files.is_empty() {
+                self.stack.error =
+                    Some("拖進來的檔案裡沒有可以疊的照片（支援 JPG／PNG／BMP／WebP／TIFF）".into());
+            } else {
+                self.stack.error = None;
+                natural_sort(&mut files);
+                remember_dir(LastDir::StackPhotos, &files[0]);
+                // 已經有一批就**加進去**，不是換掉：手上疊到一半又想起
+                // 「那張也該疊進來」時，拖進來就該是加一張。
+                // 要整批重來按「🗑 清除」或「🖼 選擇照片」
+                if self.stack.photos.is_empty() {
+                    self.stack_set_photos(files, ctx);
+                } else {
+                    self.stack_append(files, ctx);
+                }
+            }
+        } else if !dropped.is_empty()
+            && self.module == Module::Movie
+            && self.movie.busy != MovieBusy::Exporting
+        {
+            // 影片去煙霧模組：拖一疊進來就整批排隊（第一支拿來預覽、
+            // 其餘排在後面，全部套同一組設定）
+            let vids: Vec<PathBuf> = dropped.iter().filter(|p| is_video(p)).cloned().collect();
+            match vids.first() {
+                Some(v) => {
+                    remember_dir(LastDir::MovieSource, v);
+                    self.movie_append(vids.clone(), ctx);
+                }
+                None => {
+                    self.movie.error = Some(format!(
+                        "拖進來的檔案裡沒有影片（支援 {}）",
+                        VIDEO_EXTS.join("／").to_uppercase()
+                    ))
+                }
+            }
+        } else if !dropped.is_empty()
+            && self.module == Module::Enhance
+            && self.enhance.busy != EnhanceBusy::Saving
+        {
+            // 優化影像模組：拖進來的照片就是要優化的那批（資料夾照樣收）
+            let mut files = Vec::new();
+            for p in &dropped {
+                if p.is_dir() {
+                    files.extend(collect_images_in_dir(p));
+                } else if is_image(p) {
+                    files.push(p.clone());
+                }
+            }
+            if files.is_empty() {
+                self.enhance.error = Some(
+                    "拖進來的檔案裡沒有可以處理的照片（支援 JPG／PNG／BMP／WebP／TIFF）".into(),
+                );
+            } else {
+                self.enhance.error = None;
+                natural_sort(&mut files);
+                // 拖進來的位置也算「這個模組上次用的資料夾」
+                remember_dir(LastDir::EnhancePhotos, &files[0]);
+                // 已經有一批就**加進去**，不是換掉（與煙火疊圖一致）：
+                // 挑到一半又想起「那張也該一起處理」時，拖進來就該是加一張
+                if self.enhance.photos.is_empty() {
+                    self.enhance_set_photos(files, ctx);
+                } else {
+                    self.enhance_append(files, ctx);
+                }
+            }
+        } else if !dropped.is_empty() && !self.is_working() {
             // 這批含專案檔就只開專案：開專案是「取代整個工作狀態」的操作，
             // 同批夾帶的照片/音訊語意不明。若照原順序逐一處理，load_project
             // 會先清空並載入專案，接著 add_photos 又把同批照片加上去弄髒
             // 專案；且 load_project 的取代確認被按「取消」時，照片仍會被加入。
             // 多個專案檔也只取第一個，不連續跳出多個確認框
             if let Some(proj) = dropped.iter().find(|p| is_project_file(p)) {
+                remember_dir(LastDir::VideoProject, proj);
                 self.load_project(proj);
             } else {
                 let mut files = Vec::new();
@@ -5130,6 +20516,7 @@ impl eframe::App for App {
                         // 拖入音訊檔＝設定為背景音樂，並展開「轉場與音樂」區塊
                         // （比照新增文字自動展開）：收合時拖入音樂否則毫無回饋，
                         // 使用者會以為沒設定成功
+                        remember_dir(LastDir::VideoMusic, &p);
                         self.music_path = Some(p);
                         self.sec_fx_open = true;
                     } else if is_image(&p) {
@@ -5144,25 +20531,55 @@ impl eframe::App for App {
                 if files.is_empty() && (any_dir || had_unsupported) {
                     self.import_found_nothing = true;
                 }
+                if let Some(f) = files.first() {
+                    remember_dir(LastDir::VideoPhotos, f);
+                }
                 self.add_photos(files);
             }
         }
 
-        // Ctrl+S 儲存專案、Ctrl+O 開啟專案（轉換中不動作）
+        // Ctrl+S 存檔、Ctrl+O 開啟專案（轉換中不動作）。Ctrl+S 存的是
+        // 「目前模組手上的東西」：影片模組存專案，去煙霧模組把成品寫成檔案
         if !self.is_working() {
-            if !self.photos.is_empty()
-                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
-            {
-                self.quick_save_project();
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+                match self.module {
+                    Module::Video if !self.photos.is_empty() => self.quick_save_project(),
+                    Module::Dehaze
+                        if !self.smoke.photos.is_empty()
+                            && self.smoke.busy == SmokeBusy::Idle =>
+                    {
+                        self.smoke_save_all(ctx, true);
+                    }
+                    Module::Stack
+                        if self.stack.photos.len() > 1
+                            && self.stack.busy == StackBusy::Idle
+                            && self.stack.bases_ready() =>
+                    {
+                        self.stack_save(ctx);
+                    }
+                    Module::Enhance
+                        if !self.enhance.photos.is_empty()
+                            && self.enhance.busy != EnhanceBusy::Saving =>
+                    {
+                        self.enhance_save_all(ctx, true);
+                    }
+                    _ => {}
+                }
             }
+            // 專案是影片模組的東西，從別的模組開啟就順便切過去，
+            // 否則按了好像沒反應
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+                self.module = Module::Video;
                 self.open_project_dialog();
             }
         }
 
-        // 左右方向鍵切換預覽（輸入框有焦點、或去煙視窗開著時不動作——
-        // 那邊的方向鍵是切換要去煙的照片）
-        if !self.photos.is_empty() && !self.smoke.open && ctx.memory(|m| m.focused().is_none()) {
+        // 左右方向鍵切換預覽（輸入框有焦點時不動作）。去煙霧模組的方向鍵
+        // 是切換要去煙的那張，各自在自己的模組裡處理
+        if self.module == Module::Video
+            && !self.photos.is_empty()
+            && ctx.memory(|m| m.focused().is_none())
+        {
             let cur = self.preview_selected.unwrap_or(0);
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && cur + 1 < self.photos.len()
             {
@@ -5175,12 +20592,24 @@ impl eframe::App for App {
             }
         }
 
-        self.ui_bottom_bar(ctx);
-        self.ui_side_panel(ctx);
-        self.ui_central(ctx);
+        self.update_menu_bar_visibility(ctx);
+        if self.menu_bar_visible {
+            self.ui_menu_bar(ctx);
+        } else {
+            self.ui_menu_bar_hint(ctx);
+        }
+        // 模組列一直都在：收的只有上面那條功能表列
+        self.ui_module_bar(ctx);
+        // 頂端這幾條列畫完後剩下的區域，上緣就是它們的底緣——下一輪用它判斷
+        // 游標有沒有離開
+        self.top_bars_bottom = ctx.available_rect().top();
+        self.ui_module_body(ctx);
         self.ui_about_window(ctx);
-        self.ui_smoke_window(ctx);
         self.ui_drop_overlay(ctx);
+
+        // update 跑完了，接下來是繪製與等事件：卡在這個階段代表問題不在
+        // 程式自己的邏輯，而在繪製或視窗事件（看門狗會這樣記錄）
+        ui_phase(PHASE_IDLE);
     }
 }
 
@@ -5266,9 +20695,1327 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.all_styles_mut(|s| *s = style.clone());
 }
 
+/// 把原圖等比縮成預覽底圖（長邊不超過 [`SMOKE_PREVIEW_MAX`]）。
+/// 本來就夠小就原樣回傳，不白縮一次
+/// 照指定的比例等比縮小（疊圖那邊整批共用一個比例，見
+/// [`StackTool::common_scale`]）。比例接近 1 就原樣回傳，不白縮一次
+fn shrink_by(img: image::RgbImage, k: f32) -> image::RgbImage {
+    if !(k.is_finite() && k > 0.0) || k >= 0.999 {
+        return img;
+    }
+    image::imageops::resize(
+        &img,
+        ((img.width() as f32 * k).round() as u32).max(1),
+        ((img.height() as f32 * k).round() as u32).max(1),
+        image::imageops::FilterType::Triangle,
+    )
+}
+
+/// 等比縮到長邊不超過 `max`；本來就夠小就原樣回傳（不複製）
+fn shrink_long(img: image::RgbImage, max: u32) -> image::RgbImage {
+    let long = img.width().max(img.height());
+    if long <= max {
+        return img;
+    }
+    let s = max as f32 / long as f32;
+    image::imageops::resize(
+        &img,
+        ((img.width() as f32 * s).round() as u32).max(1),
+        ((img.height() as f32 * s).round() as u32).max(1),
+        image::imageops::FilterType::Triangle,
+    )
+}
+
+fn shrink_to_preview(img: image::RgbImage) -> image::RgbImage {
+    shrink_long(img, SMOKE_PREVIEW_MAX)
+}
+
+/// 用原尺寸把整組疊成一張並存檔（在背景執行緒裡跑）。
+///
+/// 一次只讀一層疊進去，不把全部原圖同時攤開：兩千萬像素的照片一張就要
+/// 60MB，十張同時放在記憶體裡光是解碼就先吃掉一 GB。
+/// `progress` 回報「已經疊進去幾張」（含地景）
+fn stack_render_and_save(
+    key: &StackKey,
+    grade: &Adjustments,
+    export: ExportSize,
+    out: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(usize),
+) -> Result<PathBuf, String> {
+    let name = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let ground = key
+        .photos
+        .get(key.ground)
+        .ok_or_else(|| "找不到當地景的那張照片".to_string())?;
+    let mut acc = image::open(ground)
+        .map_err(|e| format!("{}：無法讀取（{e}）", name(ground)))?
+        .to_rgb8();
+    // 地景自己的調色與擺法：先調色再擺（反過來會把擺開後露出來的黑邊也調亮）。
+    // 這兩步都在別層疊上來之前做完——地景同時就是畫布
+    edit::apply_grade(&mut acc, &key.grades.get(key.ground).copied().unwrap_or_default());
+    stack::place(&mut acc, key.xforms.get(key.ground).copied().unwrap_or_default());
+    // 地景的保護區整批共用，畫一次就好（原尺寸畫一張權重圖不便宜）
+    let protect = stack::weights(
+        key.masks.get(key.ground).map(Vec::as_slice).unwrap_or(&[]),
+        key.feather,
+        key.density,
+        acc.width() as usize,
+        acc.height() as usize,
+        key.inverts.get(key.ground).copied().unwrap_or(false),
+    );
+    // 天際線同樣只算一次，而且是在**還沒疊任何東西**的地景上算的
+    let gmap = key.protect_land.then(|| stack::GuardMap::new(&acc));
+    let guard = gmap.as_ref().map(stack::GuardMap::guard);
+    progress(1);
+    for (i, p) in key.photos.iter().enumerate() {
+        // 地景本身、與對不上地景被略過的那幾層都不必再疊一次
+        if i == key.ground || key.skip.get(i).copied().unwrap_or(false) {
+            progress(i + 1);
+            continue;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消，沒有存檔".into());
+        }
+        let mut img = image::open(p)
+            .map_err(|e| format!("{}：無法讀取（{e}）", name(p)))?
+            .to_rgb8();
+        // 這一層自己的調色：疊進去之前先套在它身上
+        edit::apply_grade(&mut img, &key.grades.get(i).copied().unwrap_or_default());
+        let mask = key.masks.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        stack::blend_layer(
+            &mut acc,
+            &img,
+            mask,
+            key.inverts.get(i).copied().unwrap_or(false),
+            key.xforms.get(i).copied().unwrap_or_default(),
+            protect.as_deref(),
+            guard.as_ref(),
+            key.feather,
+            key.density,
+            key.mode,
+        );
+        progress(i + 1);
+    }
+    edit::apply_grade(&mut acc, grade);
+    // 旋轉與裁切最後才做：遮色片的座標都是對整張算的
+    let acc = edit::apply_rotate(acc, grade.crop);
+    let acc = edit::apply_crop(acc, grade.crop);
+    // 最後才縮到指定尺寸：疊圖、遮色片、裁切都是對原尺寸算的
+    let acc = fit_export(acc, export);
+    acc.save(out).map_err(|e| format!("存檔失敗（{e}）"))?;
+    Ok(out.to_path_buf())
+}
+
+/// 裁切框八個把手的編號：0~3 是四角（左上、右上、右下、左下），
+/// 4~7 是四邊（上、右、下、左）
+const CROP_HANDLES: usize = 8;
+
+/// 把手的抓取半徑（螢幕像素）。比畫出來的方塊大一圈，不必瞄得很準
+const CROP_GRAB: f32 = 11.0;
+
+/// 三個調色面板共用的「裁切」區塊。
+///
+/// `src` 是原圖的像素尺寸（拿來算「原圖」比例與顯示裁切後的尺寸），
+/// `editing` 是「現在正在調整裁切範圍」——開著時預覽會顯示整張照片並畫出
+/// 可拖曳的裁切框，關掉就直接看裁切後的樣子。
+///
+/// 回傳 true 表示這一幀動到了 `crop`（呼叫端要把它寫回去並重畫）
+fn ui_crop_block(
+    ui: &mut egui::Ui,
+    crop: &mut Crop,
+    editing: &mut bool,
+    aspect: &mut CropAspect,
+    src: Option<(u32, u32)>,
+    enabled: bool,
+) -> bool {
+    let before = *crop;
+    // 裁切框是對著「旋轉後的畫布」算的，所以顯示尺寸、算「原圖」比例、
+    // 套固定比例時要用轉完的外接框尺寸，不是原始照片的尺寸
+    let canvas = src.map(|(w, h)| {
+        let (cw, ch) = crop.canvas(w as f32, h as f32);
+        (cw.round() as u32, ch.round() as u32)
+    });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        group_label(ui, "裁切");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !crop.is_full() && ui.small_button("↺ 重設裁切").clicked() {
+                *crop = Crop::default();
+            }
+        });
+    });
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if check_label(ui, *editing, "✂ 調整裁切範圍")
+                .on_hover_text(
+                    "開著時預覽會顯示整張照片，直接拖曳四角、四邊或框內移動。\n\
+                     裁好後在照片上連點兩下（或再按這顆）就收工，改看裁切後的樣子。\n\
+                     存檔時才真的切下去，原始照片不會被更動",
+                )
+                .clicked()
+            {
+                *editing = !*editing;
+            }
+            if crop.is_full() {
+                ui.label(
+                    egui::RichText::new("目前沒有裁切（整張輸出）")
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            } else if let (Some((iw, ih)), Some((sw, sh))) = (canvas, src) {
+                let (_, _, w, h) = crop.pixels(iw, ih);
+                // 百分比對原始照片算（轉完的畫布比原圖大，拿它當分母會虛胖）
+                let pct = (w as f32 * h as f32) / (sw as f32 * sh as f32) * 100.0;
+                let turned = if crop.has_rotation() {
+                    format!("，轉 {:.1}°", crop.total_deg())
+                } else {
+                    String::new()
+                };
+                ui.label(
+                    egui::RichText::new(format!("{w} × {h}（原圖的 {pct:.0}%{turned}）"))
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            }
+        });
+        // 比例與旋轉只有在調整裡才有意義（不調整時看不到框，按了也沒有回饋）
+        if *editing {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("比例")
+                        .size(12.5)
+                        .color(theme::TEXT_WEAK),
+                );
+                for preset in CropAspect::PRESETS {
+                    // 使用者按過「⇄ 轉向」之後存的是對調過的比例，
+                    // 要讓那一顆仍然亮著，所以正反都算命中
+                    let on = *aspect == preset || *aspect == preset.flipped();
+                    if check_label(ui, on, preset.label()).clicked() {
+                        *aspect = preset;
+                        // 換比例就立刻把現有的框調成那個比例，
+                        // 不必再自己拖一次才看得出來
+                        if let Some(r) = preset.ratio(canvas) {
+                            *crop = crop_to_ratio(*crop, r, canvas);
+                        }
+                    }
+                }
+                let flippable = matches!(aspect, CropAspect::Ratio(a, b) if a != b);
+                if ui
+                    .add_enabled(flippable, egui::Button::new("⇄ 轉向").small())
+                    .on_hover_text("直式與橫式對調（例如 16:9 換成 9:16）")
+                    .clicked()
+                {
+                    *aspect = aspect.flipped();
+                    if let Some(r) = aspect.ratio(canvas) {
+                        *crop = crop_to_ratio(*crop, r, canvas);
+                    }
+                }
+            });
+
+            // 旋轉：整圈的 90° 與小角度的拉直分兩件事——前者純搬像素不會糊，
+            // 後者要重新取樣，放在一起反而看不出差別
+            let mut turned = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("旋轉")
+                        .size(12.5)
+                        .color(theme::TEXT_WEAK),
+                );
+                if ui
+                    .add(egui::Button::new("⟲ 90°").small())
+                    .on_hover_text("逆時針轉 90°（整圈的旋轉不會讓畫質變差）")
+                    .clicked()
+                {
+                    crop.quarter = (crop.quarter + 3) % 4;
+                    turned = true;
+                }
+                if ui
+                    .add(egui::Button::new("⟳ 90°").small())
+                    .on_hover_text("順時針轉 90°（整圈的旋轉不會讓畫質變差）")
+                    .clicked()
+                {
+                    crop.quarter = (crop.quarter + 1) % 4;
+                    turned = true;
+                }
+                if crop.has_rotation() && ui.small_button("↺ 轉回 0°").clicked() {
+                    crop.quarter = 0;
+                    crop.angle = 0.0;
+                    turned = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("拉直")
+                        .size(12.5)
+                        .color(theme::TEXT_WEAK),
+                )
+                .on_hover_text("把歪掉的水平線轉正（±45°，連點兩下歸零）");
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - NUM_BOX_ROOM - 6.0).max(60.0);
+                let mut a = crop.angle;
+                if drop_slider(ui, &mut a, -CROP_MAX_ANGLE, CROP_MAX_ANGLE).double_clicked() {
+                    a = 0.0;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    let txt = format!("{a:.1}°");
+                    num_box(ui, "crop_angle", &mut a, -CROP_MAX_ANGLE, CROP_MAX_ANGLE, &txt, theme::TEXT);
+                });
+                if (a - crop.angle).abs() > 1e-4 {
+                    crop.angle = a;
+                    turned = true;
+                }
+            });
+            if turned {
+                // 轉完畫布換了形狀：鎖著比例的話重新套一次，
+                // 再把框縮回照片裡，免得四角切到補出來的黑
+                if let Some((sw, sh)) = src {
+                    let c2 = crop.canvas(sw as f32, sh as f32);
+                    let canvas2 = Some((c2.0.round() as u32, c2.1.round() as u32));
+                    if let Some(r) = aspect.ratio(canvas2) {
+                        *crop = crop_to_ratio(*crop, r, canvas2);
+                    }
+                    *crop = crop.shrunk_into_photo(sw as f32, sh as f32);
+                }
+            }
+        }
+    });
+    ui.add_space(4.0);
+    *crop != before
+}
+
+/// 把裁切框調成指定的「寬 ÷ 高」（像素比），盡量維持中心與大小。
+/// `src` 未知時就當成正方形像素（相對座標直接當比例用）
+fn crop_to_ratio(crop: Crop, ratio: f32, src: Option<(u32, u32)>) -> Crop {
+    let (iw, ih) = src.unwrap_or((1, 1));
+    let (iw, ih) = (iw.max(1) as f32, ih.max(1) as f32);
+    // 相對座標下要維持的 w/h：像素比 ratio 換算回相對座標要乘上 ih/iw
+    let want = ratio * ih / iw;
+    let (cx, cy) = ((crop.x0 + crop.x1) / 2.0, (crop.y0 + crop.y1) / 2.0);
+    // 以現有面積為準取新的寬高，框不會因為換比例就忽大忽小
+    let area = (crop.w() * crop.h()).max(CROP_MIN * CROP_MIN);
+    let mut w = (area * want).sqrt();
+    let mut h = w / want;
+    // 超出畫面就整體縮到塞得下（比例維持）
+    let shrink = (1.0 / w).min(1.0 / h).min(1.0);
+    w *= shrink;
+    h *= shrink;
+    // 置中之後再把整個框推回畫面內
+    let x0 = (cx - w / 2.0).clamp(0.0, 1.0 - w);
+    let y0 = (cy - h / 2.0).clamp(0.0, 1.0 - h);
+    Crop { x0, y0, x1: x0 + w, y1: y0 + h, ..crop }.clamped()
+}
+
+/// 在預覽上畫裁切框並處理拖曳，回傳（這一幀之後的裁切框，**是否收工**）。
+///
+/// `img` 是**整張照片**畫出來的矩形（放大平移之後的實際位置），`resp` 是
+/// 那塊畫布的互動回應。四角、四邊各一個把手，框內拖曳＝整個移動；
+/// `ratio` 有值時固定長寬比。框外會壓暗，一眼看得出哪些會被切掉。
+///
+/// 在照片上**連點兩下**代表「裁好了」，第二個回傳值就是 true——呼叫端
+/// 據此關掉調整狀態、把預覽換成裁切後的樣子（不必特地把游標移回面板按鈕）
+fn crop_overlay(
+    ui: &mut egui::Ui,
+    resp: &egui::Response,
+    img: egui::Rect,
+    crop: Crop,
+    ratio: Option<f32>,
+) -> (Crop, bool) {
+    let to_screen = |x: f32, y: f32| {
+        egui::pos2(img.left() + x * img.width(), img.top() + y * img.height())
+    };
+    let mut c = crop.clamped();
+    let rect = egui::Rect::from_two_pos(to_screen(c.x0, c.y0), to_screen(c.x1, c.y1));
+
+    // 把手位置：四角在前、四邊在後，順序與下面的拖曳處理一致
+    let handles = |r: egui::Rect| -> [egui::Pos2; CROP_HANDLES] {
+        [
+            r.left_top(),
+            r.right_top(),
+            r.right_bottom(),
+            r.left_bottom(),
+            egui::pos2(r.center().x, r.top()),
+            egui::pos2(r.right(), r.center().y),
+            egui::pos2(r.center().x, r.bottom()),
+            egui::pos2(r.left(), r.center().y),
+        ]
+    };
+
+    // 這塊畫布上按下去的那一刻決定抓到哪個把手，整段拖曳都認它——
+    // 拖到一半換抓另一個把手的話，框會自己跳掉。
+    //
+    // id 用固定值而不是 ui.id()：裁切框畫在每幀重建的子 Ui 上，那種
+    // 自動編出來的 id 不保證跨幀一樣，記不住就等於每一幀都重新抓一次。
+    // 同一時間全程式只會有一個裁切框在拖，固定一個 id 綽綽有餘
+    let id = egui::Id::new("crop_drag_handle");
+    let mut grabbed: Option<i8> = ui.ctx().memory(|m| m.data.get_temp(id));
+    // 抓哪個把手要看**按下去的那一點**，不能看目前游標在哪：egui 是等游標
+    // 移出一小段距離才判定成拖曳，那時游標早就離開把手了，拿它去比對會變成
+    // 「按在框外」。press_origin 記的正是按下去的位置。
+    // drag_started 只有一幀，萬一沒趕上（拖得很快時）就在 dragged 期間補抓
+    if resp.drag_started() || (grabbed.is_none() && resp.dragged()) {
+        let origin = ui.input(|i| i.pointer.press_origin());
+        grabbed = origin.map(|p| {
+            let hs = handles(rect);
+            let near = hs
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (i, h.distance(p)))
+                .filter(|(_, d)| *d <= CROP_GRAB)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i as i8);
+            // 沒抓到把手但按在框內＝整個框一起移動（-1）
+            near.unwrap_or(if rect.contains(p) { -1 } else { -2 })
+        });
+        ui.ctx().memory_mut(|m| m.data.insert_temp(id, grabbed.unwrap_or(-2)));
+    }
+    if resp.drag_stopped() {
+        ui.ctx().memory_mut(|m| m.data.remove::<i8>(id));
+    }
+
+    if let (Some(g), Some(p)) = (grabbed.filter(|g| *g >= -1), resp.interact_pointer_pos()) {
+        // 螢幕座標換回相對座標
+        let ux = ((p.x - img.left()) / img.width()).clamp(0.0, 1.0);
+        let uy = ((p.y - img.top()) / img.height()).clamp(0.0, 1.0);
+        if g == -1 {
+            // 整個框平移：用滑鼠位移，框的大小不變
+            let d = resp.drag_delta();
+            let (dx, dy) = (d.x / img.width(), d.y / img.height());
+            let (w, h) = (c.w(), c.h());
+            let x0 = (c.x0 + dx).clamp(0.0, 1.0 - w);
+            let y0 = (c.y0 + dy).clamp(0.0, 1.0 - h);
+            c = Crop { x0, y0, x1: x0 + w, y1: y0 + h, ..c };
+        } else {
+            // 拖把手：先照滑鼠改那一邊，固定比例的再回頭補另一邊
+            match g {
+                0 => { c.x0 = ux; c.y0 = uy; }
+                1 => { c.x1 = ux; c.y0 = uy; }
+                2 => { c.x1 = ux; c.y1 = uy; }
+                3 => { c.x0 = ux; c.y1 = uy; }
+                4 => c.y0 = uy,
+                5 => c.x1 = ux,
+                6 => c.y1 = uy,
+                _ => c.x0 = ux,
+            }
+            c = c.clamped();
+            if let Some(r) = ratio {
+                c = crop_fix_ratio(c, r, img.width() / img.height(), g);
+            }
+        }
+        c = c.clamped();
+    }
+
+    let rect = egui::Rect::from_two_pos(to_screen(c.x0, c.y0), to_screen(c.x1, c.y1));
+    let p = ui.painter();
+    // 框外壓暗：只在照片範圍內壓，照片外面本來就是背景
+    let shade = egui::Color32::from_black_alpha(140);
+    let clip = img.intersect(ui.clip_rect());
+    for band in [
+        egui::Rect::from_min_max(clip.left_top(), egui::pos2(clip.right(), rect.top())),
+        egui::Rect::from_min_max(egui::pos2(clip.left(), rect.bottom()), clip.right_bottom()),
+        egui::Rect::from_min_max(egui::pos2(clip.left(), rect.top()), egui::pos2(rect.left(), rect.bottom())),
+        egui::Rect::from_min_max(egui::pos2(rect.right(), rect.top()), egui::pos2(clip.right(), rect.bottom())),
+    ] {
+        if band.is_positive() {
+            p.rect_filled(band.intersect(clip), 0, shade);
+        }
+    }
+    // 三分法格線：構圖時對齊用（與 Lightroom 的裁切一樣）
+    let grid = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(60));
+    for i in 1..3 {
+        let t = i as f32 / 3.0;
+        let x = rect.left() + rect.width() * t;
+        let y = rect.top() + rect.height() * t;
+        p.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], grid);
+        p.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], grid);
+    }
+    p.rect_stroke(
+        rect,
+        0,
+        egui::Stroke::new(1.6, egui::Color32::WHITE),
+        egui::StrokeKind::Inside,
+    );
+    // 把手：四角畫成 L 形粗角、四邊畫成短粗線，比小方塊好認也好抓
+    let hot = egui::Color32::WHITE;
+    let arm = 14.0_f32.min(rect.width() / 3.0).min(rect.height() / 3.0);
+    let thick = egui::Stroke::new(3.0, hot);
+    for (corner, dx, dy) in [
+        (rect.left_top(), 1.0, 1.0),
+        (rect.right_top(), -1.0, 1.0),
+        (rect.right_bottom(), -1.0, -1.0),
+        (rect.left_bottom(), 1.0, -1.0),
+    ] {
+        p.line_segment([corner, corner + egui::vec2(arm * dx, 0.0)], thick);
+        p.line_segment([corner, corner + egui::vec2(0.0, arm * dy)], thick);
+    }
+    for (a, b) in [
+        (egui::pos2(rect.center().x - arm / 2.0, rect.top()), egui::pos2(rect.center().x + arm / 2.0, rect.top())),
+        (egui::pos2(rect.center().x - arm / 2.0, rect.bottom()), egui::pos2(rect.center().x + arm / 2.0, rect.bottom())),
+        (egui::pos2(rect.left(), rect.center().y - arm / 2.0), egui::pos2(rect.left(), rect.center().y + arm / 2.0)),
+        (egui::pos2(rect.right(), rect.center().y - arm / 2.0), egui::pos2(rect.right(), rect.center().y + arm / 2.0)),
+    ] {
+        p.line_segment([a, b], thick);
+    }
+    // 游標提示現在拖得動什麼
+    if let Some(pos) = resp.hover_pos() {
+        let hs = handles(rect);
+        let near = hs.iter().position(|h| h.distance(pos) <= CROP_GRAB);
+        let icon = match near {
+            Some(0) | Some(2) => Some(egui::CursorIcon::ResizeNwSe),
+            Some(1) | Some(3) => Some(egui::CursorIcon::ResizeNeSw),
+            Some(4) | Some(6) => Some(egui::CursorIcon::ResizeVertical),
+            Some(_) => Some(egui::CursorIcon::ResizeHorizontal),
+            None if rect.contains(pos) => Some(egui::CursorIcon::Move),
+            None => None,
+        };
+        if let Some(i) = icon {
+            ui.ctx().set_cursor_icon(i);
+        }
+    }
+    // 在照片上連點兩下＝裁好了。範圍限在照片內，避免點到旁邊的留白也收工。
+    // 連點兩下的第一下可能已經起了一段位移為零的拖曳，收工前先把它清掉，
+    // 否則那筆抓取會留在 memory 裡，下次進來第一下就被當成延續上次的拖曳
+    let done = resp.double_clicked()
+        && resp.interact_pointer_pos().is_some_and(|p| img.contains(p));
+    if done {
+        ui.ctx().memory_mut(|m| m.data.remove::<i8>(id));
+    }
+    (c, done)
+}
+
+/// 主體框最小要多大（佔畫面的比例）。
+///
+/// 這個下限是給**比對**用的：追蹤在長邊 1024 的工作圖上取樣板，短邊不到
+/// 五個像素就沒有花紋可認（見 `track` 模組）。但使用者框遠處的小鳥時，
+/// 拖出來的框常常比它還小——那時**不能默默丟掉**（那張會一直留在「要檢查」
+/// 裡，怎麼框都沒反應），而是以拖曳的中心把框撐到這個大小
+const TRACK_BOX_MIN: f32 = 0.006;
+
+/// 自動框選完把框統一成同一個大小時，至少要有這麼大（佔畫面的比例）。
+/// 太小的框在預覽上只有幾個像素，抓不到也搬不動（見 [`App::track_uniform_boxes`]）
+const TRACK_BOX_UNIFORM_MIN: f32 = 0.05;
+
+/// 在預覽上檢查／重畫「要跟的主體」。
+/// 回傳（拖出來的框（沒拖到就是 None）, 是否收工）。
+///
+/// `img` 是整張照片畫出來的矩形（與裁切框同一塊畫布），`cur` 是這張現有的框、
+/// `src` 是它的來源（決定框上標什麼字）。每一次拖曳都是重畫一個新框，不做
+/// 把手微調：主體通常只佔畫面一小塊，重框一次比瞄準把手快得多；框大概圈住
+/// 就夠，比對只需要主體身上的花紋
+fn track_overlay(
+    ui: &mut egui::Ui,
+    resp: &egui::Response,
+    img: egui::Rect,
+    cur: Option<[f32; 4]>,
+    src: Option<BoxSrc>,
+) -> (Option<[f32; 4]>, bool) {
+    let to_rel = |p: egui::Pos2| -> (f32, f32) {
+        (
+            ((p.x - img.left()) / img.width()).clamp(0.0, 1.0),
+            ((p.y - img.top()) / img.height()).clamp(0.0, 1.0),
+        )
+    };
+    let to_screen = |r: [f32; 4]| {
+        egui::Rect::from_two_pos(
+            egui::pos2(img.left() + r[0] * img.width(), img.top() + r[1] * img.height()),
+            egui::pos2(img.left() + r[2] * img.width(), img.top() + r[3] * img.height()),
+        )
+    };
+    // 八個把手：四角在前、四邊在後（順序與下面的拖曳處理一致）
+    let handles = |r: egui::Rect| -> [egui::Pos2; CROP_HANDLES] {
+        [
+            r.left_top(),
+            r.right_top(),
+            r.right_bottom(),
+            r.left_bottom(),
+            egui::pos2(r.center().x, r.top()),
+            egui::pos2(r.right(), r.center().y),
+            egui::pos2(r.center().x, r.bottom()),
+            egui::pos2(r.left(), r.center().y),
+        ]
+    };
+
+    // 按下去的那一刻決定這一段拖曳在做什麼，整段都認它（跟裁切框同一套）：
+    // −2＝在框外拉一個全新的框、−1＝框內拖曳整個搬家、0~7＝拉某個把手。
+    // 框好之後常常只是「位置差一點」，能搬能拉就不必整個重畫
+    let id = egui::Id::new("track_drag_handle");
+    let mut grabbed: Option<i8> = ui.ctx().memory(|m| m.data.get_temp(id));
+    if resp.drag_started() || (grabbed.is_none() && resp.dragged()) {
+        let origin = ui.input(|i| i.pointer.press_origin());
+        grabbed = origin.map(|q| {
+            let Some(r) = cur.map(to_screen) else { return -2 };
+            let hs = handles(r);
+            hs.iter()
+                .enumerate()
+                .map(|(i, h)| (i, h.distance(q)))
+                .filter(|(_, d)| *d <= CROP_GRAB)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i as i8)
+                .unwrap_or(if r.contains(q) { -1 } else { -2 })
+        });
+        ui.ctx().memory_mut(|m| m.data.insert_temp(id, grabbed.unwrap_or(-2)));
+    }
+    if resp.drag_stopped() {
+        ui.ctx().memory_mut(|m| m.data.remove::<i8>(id));
+    }
+
+    let mut out: Option<[f32; 4]> = None;
+    let mut live = cur;
+    if resp.dragged() {
+        let start = ui.input(|i| i.pointer.press_origin());
+        if let (Some(a), Some(b)) = (start, resp.interact_pointer_pos()) {
+            let (ux, uy) = to_rel(b);
+            let r = match (grabbed.unwrap_or(-2), cur) {
+                // 框內拖曳：整個框跟著滑鼠位移搬過去，大小不變
+                (-1, Some(c)) => {
+                    let d = resp.drag_delta();
+                    let (dx, dy) = (d.x / img.width(), d.y / img.height());
+                    let (w, h) = (c[2] - c[0], c[3] - c[1]);
+                    let x0 = (c[0] + dx).clamp(0.0, 1.0 - w);
+                    let y0 = (c[1] + dy).clamp(0.0, 1.0 - h);
+                    [x0, y0, x0 + w, y0 + h]
+                }
+                // 拉把手：只改它負責的那一邊（或那個角）
+                (g, Some(mut c)) if g >= 0 => {
+                    match g {
+                        0 => { c[0] = ux; c[1] = uy; }
+                        1 => { c[2] = ux; c[1] = uy; }
+                        2 => { c[2] = ux; c[3] = uy; }
+                        3 => { c[0] = ux; c[3] = uy; }
+                        4 => c[1] = uy,
+                        5 => c[2] = ux,
+                        6 => c[3] = uy,
+                        _ => c[0] = ux,
+                    }
+                    clamp_rect(c)
+                }
+                // 框外（或本來就沒有框）：從按下去的那一點拉出一個新的框
+                _ => {
+                    let (x0, y0) = to_rel(a);
+                    [x0.min(ux), y0.min(uy), x0.max(ux), y0.max(uy)]
+                }
+            };
+            live = Some(r);
+            // 框得比下限小就以拖曳的中心撐到下限（框遠處的小鳥時很常發生）。
+            // 直接丟掉的話，使用者會覺得「怎麼框都沒反應、那張一直在要檢查裡」
+            let (w, h) = (r[2] - r[0], r[3] - r[1]);
+            let (cx, cy) = ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
+            let (w, h) = (w.max(TRACK_BOX_MIN), h.max(TRACK_BOX_MIN));
+            out = Some(clamp_rect([cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0]));
+        }
+    }
+    // 拖曳中畫的一律是「正在畫的手動框」；否則照這張現有的框標它的來源
+    let tag = match (out.is_some() || resp.dragged(), src) {
+        (true, _) | (_, Some(BoxSrc::Manual)) => "✋ 主體（手動）",
+        (_, Some(BoxSrc::Auto)) => "⚡ 主體（自動）",
+        (_, Some(BoxSrc::Tracked)) => "🔗 主體（追蹤）",
+        _ => "主體",
+    };
+
+    let p = ui.painter().with_clip_rect(img.intersect(ui.clip_rect()));
+    match live {
+        Some(r) => {
+            let rect = to_screen(r);
+            p.rect_stroke(
+                rect,
+                0,
+                egui::Stroke::new(2.0, theme::TRACK),
+                egui::StrokeKind::Inside,
+            );
+            // 四角加粗：框畫在雜亂的背景上時，光一條細線並不好認
+            let arm = 12.0_f32.min(rect.width() / 3.0).min(rect.height() / 3.0);
+            let thick = egui::Stroke::new(3.5, theme::TRACK);
+            for (corner, dx, dy) in [
+                (rect.left_top(), 1.0, 1.0),
+                (rect.right_top(), -1.0, 1.0),
+                (rect.right_bottom(), -1.0, -1.0),
+                (rect.left_bottom(), 1.0, -1.0),
+            ] {
+                p.line_segment([corner, corner + egui::vec2(arm * dx, 0.0)], thick);
+                p.line_segment([corner, corner + egui::vec2(0.0, arm * dy)], thick);
+            }
+            // 四邊中點各一個小方塊：看得出「這裡可以拉」（角落已經有粗角了）
+            for h in handles(rect).iter().skip(4) {
+                p.rect_filled(
+                    egui::Rect::from_center_size(*h, egui::vec2(7.0, 7.0)),
+                    1,
+                    theme::TRACK,
+                );
+            }
+            // 正中心的十字：鏡頭就是以這一點為中心，標出來才對得準主體。
+            // 中間留一段空隙，不會蓋住要瞄的那一點；白線加深色描邊，
+            // 不管背景是亮綠葉還是暗樹幹都看得見
+            let c = rect.center();
+            let arm = (rect.width().min(rect.height()) * 0.45).clamp(5.0, 12.0);
+            let gap = (arm * 0.35).clamp(2.0, 4.0);
+            for (a, b) in [
+                (egui::pos2(c.x - arm, c.y), egui::pos2(c.x - gap, c.y)),
+                (egui::pos2(c.x + gap, c.y), egui::pos2(c.x + arm, c.y)),
+                (egui::pos2(c.x, c.y - arm), egui::pos2(c.x, c.y - gap)),
+                (egui::pos2(c.x, c.y + gap), egui::pos2(c.x, c.y + arm)),
+            ] {
+                p.line_segment([a, b], egui::Stroke::new(3.2, egui::Color32::from_black_alpha(170)));
+                p.line_segment([a, b], egui::Stroke::new(1.4, egui::Color32::WHITE));
+            }
+            // 標籤畫在框上緣外面；貼著畫面頂端時改畫到框裡，才不會被切掉
+            let galley = p.layout_no_wrap(
+                tag.into(),
+                egui::FontId::proportional(11.0),
+                egui::Color32::BLACK,
+            );
+            let size = galley.size() + egui::vec2(10.0, 4.0);
+            let above = rect.top() - size.y - 4.0 >= img.top();
+            let at = if above {
+                egui::pos2(rect.left(), rect.top() - size.y - 4.0)
+            } else {
+                egui::pos2(rect.left(), rect.top() + 4.0)
+            };
+            let chip = egui::Rect::from_min_size(at, size);
+            p.rect_filled(chip, 4, theme::TRACK);
+            p.galley(chip.min + egui::vec2(5.0, 2.0), galley, egui::Color32::BLACK);
+        }
+        None => {
+            // 這張沒框到：講清楚可以自己框（自動框選找不到時的退路）
+            let at = img.center_top() + egui::vec2(0.0, 26.0);
+            let galley = p.layout_no_wrap(
+                "這張沒框到主體 — 直接拖曳圈住牠".into(),
+                egui::FontId::proportional(13.0),
+                theme::TEXT,
+            );
+            let chip = egui::Rect::from_center_size(at, galley.size() + egui::vec2(18.0, 10.0));
+            p.rect_filled(chip, 6, egui::Color32::from_black_alpha(170));
+            p.galley(chip.min + egui::vec2(9.0, 5.0), galley, theme::TEXT);
+        }
+    }
+    // 游標提示現在能做什麼：拉某一邊、整個搬、還是在空白處拉一個新的
+    if let Some(q) = resp.hover_pos().filter(|q| img.contains(*q)) {
+        let icon = match live.map(to_screen) {
+            Some(rect) => {
+                let near = handles(rect).iter().position(|h| h.distance(q) <= CROP_GRAB);
+                match near {
+                    Some(0) | Some(2) => egui::CursorIcon::ResizeNwSe,
+                    Some(1) | Some(3) => egui::CursorIcon::ResizeNeSw,
+                    Some(4) | Some(6) => egui::CursorIcon::ResizeVertical,
+                    Some(_) => egui::CursorIcon::ResizeHorizontal,
+                    None if rect.contains(q) => egui::CursorIcon::Move,
+                    None => egui::CursorIcon::Crosshair,
+                }
+            }
+            None => egui::CursorIcon::Crosshair,
+        };
+        ui.ctx().set_cursor_icon(icon);
+    }
+    // 連點兩下＝看完了（與裁切一致，不必把游標移回面板按鈕）。
+    // 第一下可能已經起了一段位移為零的拖曳，收工前先把那筆抓取清掉
+    let done =
+        resp.double_clicked() && resp.interact_pointer_pos().is_some_and(|q| img.contains(q));
+    if done {
+        ui.ctx().memory_mut(|m| m.data.remove::<i8>(id));
+    }
+    (out, done)
+}
+
+/// 拖完把手之後把長寬比補回來。`view_ratio` 是照片畫出來的寬高比
+/// （相對座標 1×1 對應的螢幕形狀），拿它把「像素比」換算成相對座標的比。
+/// 依剛才拖的是哪個把手決定要往哪一邊補，拖住的那個角才不會自己跑掉
+fn crop_fix_ratio(c: Crop, ratio: f32, view_ratio: f32, handle: i8) -> Crop {
+    let want = ratio / view_ratio.max(1e-6);
+    let (mut x0, mut y0, mut x1, mut y1) = (c.x0, c.y0, c.x1, c.y1);
+    // 上下邊只改得動高度，左右邊只改得動寬度；四角兩邊都可動，
+    // 取比較大的那個變化量當基準，拖起來才跟得上手
+    let by_width = match handle {
+        4 | 6 => false,
+        5 | 7 => true,
+        _ => (x1 - x0) / want >= (y1 - y0),
+    };
+    if by_width {
+        let h = ((x1 - x0) / want).clamp(CROP_MIN, 1.0);
+        // 動到上緣的把手往上長，其餘往下長
+        if matches!(handle, 0 | 1 | 4) {
+            y0 = (y1 - h).clamp(0.0, 1.0 - CROP_MIN);
+            y1 = y0 + h;
+        } else {
+            y1 = (y0 + h).clamp(CROP_MIN, 1.0);
+            y0 = y1 - h;
+        }
+    } else {
+        let w = ((y1 - y0) * want).clamp(CROP_MIN, 1.0);
+        if matches!(handle, 0 | 3 | 7) {
+            x0 = (x1 - w).clamp(0.0, 1.0 - CROP_MIN);
+            x1 = x0 + w;
+        } else {
+            x1 = (x0 + w).clamp(CROP_MIN, 1.0);
+            x0 = x1 - w;
+        }
+    }
+    Crop { x0, y0, x1, y1, ..c }.clamped()
+}
+
+/// 裁切生效時，預覽要把「整張照片」畫在哪裡，才會剛好只看到留下來的那塊。
+///
+/// 呼叫端照舊把整張照片畫進回傳的矩形、並裁切到 `view`：所有疊在上面的
+/// 東西（遮色片、筆跡、文字）用的都還是整張照片的座標，一行都不必改，
+/// 畫面上卻已經是裁切後的構圖
+/// 把照片依角度畫進「旋轉後畫布」的矩形裡。
+///
+/// `canvas` 是外接框在螢幕上的位置（也就是裁切框的座標系），`src` 是照片
+/// 本身的像素尺寸，`deg` 是順時針角度。四角空出來的地方不畫，露出底下的
+/// 卡片底色——與存檔時補黑是同一個構圖，只是預覽上看起來是背景色
+/// 「調整圖層」時，正在調的那一層半透明疊上去的濃度。
+///
+/// 一半一半：再淡就看不清這一層的暗部（對位靠的正是城市燈火那些暗東西），
+/// 再濃就看不到底下的成品，變成在看單層
+const LAYER_GHOST_ALPHA: u8 = 128;
+
+/// 放開之後半透明還留多久。留一下下是為了拖到定位的那一瞬間還看得到，
+/// 不然手一放就閃掉，最關鍵的那一眼反而看不到
+const GHOST_LINGER: Duration = Duration::from_millis(500);
+
+/// 算出選著那一層的四個角落在螢幕上的位置。
+///
+/// 每一層都是原尺寸、置中擺進畫布的，再照 `x` 平移／縮放／旋轉——
+/// 與 [`stack::blend_layer`] 用的是同一套幾何，所以框出來的位置就是它真正
+/// 會疊上去的位置。`canvas` 是整張畫布（地景）畫在螢幕上的矩形、
+/// `frac` 是這一層佔畫布的寬高比例
+fn layer_screen_quad(canvas: egui::Rect, frac: egui::Vec2, x: stack::Xform) -> [egui::Pos2; 4] {
+    let x = x.clamped();
+    let c = egui::pos2(
+        canvas.center().x + x.dx * canvas.width(),
+        canvas.center().y + x.dy * canvas.height(),
+    );
+    let half = egui::vec2(canvas.width() * frac.x, canvas.height() * frac.y) * x.scale * 0.5;
+    let (sin, cos) = x.rot.to_radians().sin_cos();
+    [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(sx, sy)| {
+        let (px, py) = (sx * half.x, sy * half.y);
+        egui::pos2(c.x + px * cos - py * sin, c.y + px * sin + py * cos)
+    })
+}
+
+/// 把正在調的那一層畫在成品上：先半透明疊一張（`tex` 是 None 就只畫框），
+/// 再沿著它的四個邊框一圈。四個角是 [`layer_screen_quad`] 算好的
+fn paint_layer_ghost(
+    p: &egui::Painter,
+    tex: Option<&egui::TextureHandle>,
+    quad: [egui::Pos2; 4],
+) {
+    if let Some(tex) = tex {
+        let mut mesh = egui::Mesh::with_texture(tex.id());
+        let uv = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        for (i, pos) in quad.iter().enumerate() {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: *pos,
+                uv: egui::pos2(uv[i].0, uv[i].1),
+                color: egui::Color32::from_white_alpha(LAYER_GHOST_ALPHA),
+            });
+        }
+        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        p.add(egui::Shape::mesh(mesh));
+    }
+    // 框線：這一層的邊界。與畫布邊界不重合的那幾段，就是它被推出去多少
+    let mut pts = quad.to_vec();
+    pts.push(quad[0]);
+    p.add(egui::Shape::line(pts, egui::Stroke::new(1.5, theme::ACCENT)));
+}
+
+fn paint_rotated_image(
+    p: &egui::Painter,
+    tex: &egui::TextureHandle,
+    canvas: egui::Rect,
+    src: egui::Vec2,
+    deg: f32,
+) {
+    let a = deg.to_radians();
+    let (sin, cos) = a.sin_cos();
+    // 外接框寬度對 canvas 寬度的比＝照片在畫面上的縮放
+    let bw = (src.x * cos.abs() + src.y * sin.abs()).max(1.0);
+    let scale = canvas.width() / bw;
+    let half = src * scale * 0.5;
+    let c = canvas.center();
+    let corner = |dx: f32, dy: f32| {
+        let (x, y) = (dx * half.x, dy * half.y);
+        egui::pos2(c.x + x * cos - y * sin, c.y + x * sin + y * cos)
+    };
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    for (i, (dx, dy)) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let uv = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)][i];
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: corner(dx, dy),
+            uv: egui::pos2(uv.0, uv.1),
+            color: egui::Color32::WHITE,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    p.add(egui::Shape::mesh(mesh));
+}
+
+/// 已經畫好的遮色片形狀能不能用拖的整個搬走。
+///
+/// 只有幾何式的三種可以（框選、線性漸層、放射性漸層）——它們就是幾個數字，
+/// 搬過去還是同一個形狀。筆刷的筆跡與「物件」的點陣遮罩是跟著照片內容畫的，
+/// 搬到別的地方就對不上那團東西了，所以不給搬
+fn shape_movable(s: &dehaze::Shape) -> bool {
+    matches!(
+        s,
+        dehaze::Shape::Rect(_) | dehaze::Shape::Linear(_) | dehaze::Shape::Radial(_)
+    )
+}
+
+/// 點到螢幕上某一段線的距離（拿來判斷有沒有壓在線性漸層的軸線上）
+fn dist_to_seg(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let len2 = ab.length_sq();
+    if len2 <= 1e-6 {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
+/// 找出壓在螢幕座標 `p` 上的遮色片形狀（**後畫的在上面**，所以從後面找起）。
+/// `img` 是整張照片畫出來的矩形
+fn shape_at(shapes: &[dehaze::Shape], p: egui::Pos2, img: egui::Rect) -> Option<usize> {
+    /// 線性漸層抓軸線的容許距離（螢幕點）
+    const GRAB: f32 = 12.0;
+    let to_screen =
+        |x: f32, y: f32| egui::pos2(img.left() + x * img.width(), img.top() + y * img.height());
+    shapes.iter().enumerate().rev().find_map(|(i, s)| {
+        let hit = match s {
+            dehaze::Shape::Rect(r) => {
+                egui::Rect::from_two_pos(to_screen(r.x0, r.y0), to_screen(r.x1, r.y1)).contains(p)
+            }
+            dehaze::Shape::Linear(l) => {
+                dist_to_seg(p, to_screen(l.x0, l.y0), to_screen(l.x1, l.y1)) <= GRAB
+            }
+            dehaze::Shape::Radial(r) => {
+                let c = to_screen(r.cx, r.cy);
+                let (rx, ry) = (r.rx * img.width(), r.ry * img.height());
+                if rx <= 0.5 || ry <= 0.5 {
+                    false
+                } else {
+                    let (dx, dy) = ((p.x - c.x) / rx, (p.y - c.y) / ry);
+                    dx * dx + dy * dy <= 1.0
+                }
+            }
+            _ => false,
+        };
+        hit.then_some(i)
+    })
+}
+
+/// 把形狀整個平移 `d`（相對座標）。框與橢圓會被夾住不讓它整個跑出畫面；
+/// 線性漸層本來就是無限延伸的帶子，只把兩端夾在畫面外一點點的範圍內
+fn shape_moved(s: &dehaze::Shape, d: egui::Vec2) -> dehaze::Shape {
+    // 平移量先夾好，形狀本身的大小才不會被夾變形
+    let clamp_delta = |lo_x: f32, hi_x: f32, lo_y: f32, hi_y: f32, min: f32, max: f32| {
+        egui::vec2(
+            d.x.clamp(min - lo_x, max - hi_x),
+            d.y.clamp(min - lo_y, max - hi_y),
+        )
+    };
+    match s {
+        dehaze::Shape::Rect(r) => {
+            let (x0, x1) = (r.x0.min(r.x1), r.x0.max(r.x1));
+            let (y0, y1) = (r.y0.min(r.y1), r.y0.max(r.y1));
+            let d = clamp_delta(x0, x1, y0, y1, 0.0, 1.0);
+            dehaze::Shape::Rect(dehaze::Region {
+                x0: x0 + d.x,
+                y0: y0 + d.y,
+                x1: x1 + d.x,
+                y1: y1 + d.y,
+            })
+        }
+        dehaze::Shape::Linear(l) => {
+            let (lo_x, hi_x) = (l.x0.min(l.x1), l.x0.max(l.x1));
+            let (lo_y, hi_y) = (l.y0.min(l.y1), l.y0.max(l.y1));
+            // 兩端可以稍微推出畫面：漸層的方向與長度才不會被邊界壓扁
+            let d = clamp_delta(lo_x, hi_x, lo_y, hi_y, -0.25, 1.25);
+            dehaze::Shape::Linear(dehaze::Linear {
+                x0: l.x0 + d.x,
+                y0: l.y0 + d.y,
+                x1: l.x1 + d.x,
+                y1: l.y1 + d.y,
+            })
+        }
+        dehaze::Shape::Radial(r) => {
+            // 橢圓夾中心就好：整顆推出畫面等於沒有作用範圍
+            let d = clamp_delta(r.cx, r.cx, r.cy, r.cy, 0.0, 1.0);
+            dehaze::Shape::Radial(dehaze::Radial {
+                cx: r.cx + d.x,
+                cy: r.cy + d.y,
+                ..*r
+            })
+        }
+        other => other.clone(),
+    }
+}
+
+/// 裁切框在螢幕上的位置。`canvas` 是整張（旋轉後）畫布畫出來的矩形
+fn crop_screen_rect(canvas: egui::Rect, c: Crop) -> egui::Rect {
+    let c = c.clamped();
+    egui::Rect::from_min_max(
+        egui::pos2(
+            canvas.left() + c.x0 * canvas.width(),
+            canvas.top() + c.y0 * canvas.height(),
+        ),
+        egui::pos2(
+            canvas.left() + c.x1 * canvas.width(),
+            canvas.top() + c.y1 * canvas.height(),
+        ),
+    )
+}
+
+/// 「符合視窗」時整張照片要畫在哪，才會剛好只看到裁切留下來的那塊。
+/// 沒裁切（`c` 是整張）時就等於一般的 [`fit_rect`]
+fn crop_fit_rect(tex: egui::Vec2, view: egui::Rect, c: Crop) -> egui::Rect {
+    if c.is_full() {
+        return fit_rect(tex, view);
+    }
+    let region = fit_rect(egui::vec2(tex.x * c.w(), tex.y * c.h()), view);
+    crop_view_rect(region, c)
+}
+
+/// 放大之後的平移夾住範圍。沒裁切時就是「照片比畫面窄的方向置中」；
+/// 有裁切時再收緊到裁切框內——看不到的地方不該讓人拖過去
+/// 把畫布的位置對齊到螢幕的實體像素格線。
+///
+/// 100% 的意思是「預覽底圖 1 像素對螢幕 1 個實體像素」，可是位置只要偏了
+/// 半個像素，畫上去就得重新取樣一次——線條被抹到隔壁去，看起來就不是 1:1。
+/// 尺寸本身已經是整數個實體像素（見比例列那段的 `ppp`），這裡只要對齊左上角
+fn snap_to_pixels(r: egui::Rect, ppp: f32) -> egui::Rect {
+    if !(ppp > 0.0) {
+        return r;
+    }
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    egui::Rect::from_min_size(egui::pos2(snap(r.min.x), snap(r.min.y)), r.size())
+}
+
+fn crop_clamp_pan(pan: &mut egui::Pos2, view: egui::Rect, size: egui::Vec2, c: Crop) {
+    let half = egui::vec2(view.width() / size.x, view.height() / size.y) * 0.5;
+    let mid = egui::pos2((c.x0 + c.x1) / 2.0, (c.y0 + c.y1) / 2.0);
+    pan.x = pan.x.clamp((c.x0 + half.x).min(mid.x), (c.x1 - half.x).max(mid.x));
+    pan.y = pan.y.clamp((c.y0 + half.y).min(mid.y), (c.y1 - half.y).max(mid.y));
+}
+
+fn crop_view_rect(view: egui::Rect, crop: Crop) -> egui::Rect {
+    let c = crop.clamped();
+    let full = egui::vec2(view.width() / c.w(), view.height() / c.h());
+    egui::Rect::from_min_size(
+        egui::pos2(view.left() - c.x0 * full.x, view.top() - c.y0 * full.y),
+        full,
+    )
+}
+
+/// 縮圖左上角的小標籤（疊圖模組拿來標「地景」）
+fn thumb_badge(ui: &egui::Ui, rect: egui::Rect, text: &str) {
+    thumb_badge_colored(ui, rect, text, theme::ACCENT);
+}
+
+/// 警示版的縮圖標籤（疊圖模組拿來標「對不上」——那一層不會被疊進去）。
+/// 換成警示色，一整排縮圖裡才一眼分得出「這張有狀況」與「這張是地景」
+fn thumb_badge_warn(ui: &egui::Ui, rect: egui::Rect, text: &str) {
+    thumb_badge_colored(ui, rect, text, theme::ERROR);
+}
+
+fn thumb_badge_colored(ui: &egui::Ui, rect: egui::Rect, text: &str, fill: egui::Color32) {
+    let p = ui.painter();
+    let galley = p.layout_no_wrap(
+        text.to_string(),
+        egui::FontId::proportional(10.5),
+        egui::Color32::WHITE,
+    );
+    let chip = egui::Rect::from_min_size(
+        rect.min + egui::vec2(6.0, 6.0),
+        galley.size() + egui::vec2(10.0, 5.0),
+    );
+    p.rect_filled(chip, 4, fill);
+    p.galley(chip.min + egui::vec2(5.0, 2.5), galley, egui::Color32::WHITE);
+}
+
+/// 疊圖模組還沒選夠照片時的引導畫面（版面比照另外兩個模組的空狀態）。
+/// `need_more` ＝已經選了但只有一張，疊圖至少要兩張
+fn stack_empty_state(ui: &mut egui::Ui, need_more: bool) -> bool {
+    let mut pick = false;
+    let r = ui.available_rect_before_wrap().shrink(4.0);
+    ui.painter()
+        .rect_filled(r, 14, egui::Color32::from_rgb(0x17, 0x18, 0x1C));
+    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x3A, 0x3D, 0x46));
+    let rr = r.shrink(1.5);
+    for (a, b) in [
+        (rr.left_top(), rr.right_top()),
+        (rr.right_top(), rr.right_bottom()),
+        (rr.right_bottom(), rr.left_bottom()),
+        (rr.left_bottom(), rr.left_top()),
+    ] {
+        ui.painter()
+            .extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
+    }
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(r)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+    );
+    child.add_space(((r.height() - 190.0) / 2.0).max(24.0));
+    child.label(egui::RichText::new("🎆").size(46.0));
+    child.add_space(8.0);
+    child.label(
+        egui::RichText::new(if need_more {
+            "還差一張——疊圖至少要兩張"
+        } else {
+            "選幾張煙火，疊成一張"
+        })
+        .size(17.0)
+        .strong()
+        .color(theme::TEXT),
+    );
+    child.add_space(2.0);
+    child.label(
+        egui::RichText::new(if need_more {
+            "再挑一張加進來（已經選好的那張會留著）；也可以直接把照片拖曳進來"
+        } else {
+            "同機位、同構圖（腳架連拍）的照片疊起來才對得準；也可以直接把照片拖曳進來"
+        })
+        .size(12.0)
+        .color(theme::TEXT_WEAK),
+    );
+    child.add_space(16.0);
+    // 已經有一張了就是「再加一張」，不是重選（回傳值由呼叫端接去做追加）
+    let label = if need_more { "➕  加入照片" } else { "🖼  選擇照片" };
+    if primary_button(&mut child, label, true).clicked() {
+        pick = true;
+    }
+    pick
+}
+
+/// 去煙霧模組還沒選照片時的引導畫面（版面比照影片模組的空狀態）。
+/// 回傳 true＝使用者按了「選擇照片」
+fn smoke_empty_state(ui: &mut egui::Ui, loading: bool) -> bool {
+    let mut pick = false;
+    let r = ui.available_rect_before_wrap().shrink(4.0);
+    ui.painter()
+        .rect_filled(r, 14, egui::Color32::from_rgb(0x17, 0x18, 0x1C));
+    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x3A, 0x3D, 0x46));
+    let rr = r.shrink(1.5);
+    for (a, b) in [
+        (rr.left_top(), rr.right_top()),
+        (rr.right_top(), rr.right_bottom()),
+        (rr.right_bottom(), rr.left_bottom()),
+        (rr.left_bottom(), rr.left_top()),
+    ] {
+        ui.painter()
+            .extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
+    }
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(r)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+    );
+    child.add_space(((r.height() - 190.0) / 2.0).max(24.0));
+    child.label(egui::RichText::new("💨").size(46.0));
+    child.add_space(8.0);
+    child.label(
+        egui::RichText::new(if loading {
+            "照片載入中…"
+        } else {
+            "選煙火照片，把煙霧散去"
+        })
+        .size(17.0)
+        .strong()
+        .color(theme::TEXT),
+    );
+    child.add_space(2.0);
+    child.label(
+        egui::RichText::new("可一次選多張，用同一組設定處理；也可以直接把照片拖曳進來")
+            .size(12.0)
+            .color(theme::TEXT_WEAK),
+    );
+    child.add_space(16.0);
+    if primary_button(&mut child, "🖼  選擇照片", !loading).clicked() {
+        pick = true;
+    }
+    pick
+}
+
+/// 影片去煙霧模組還沒選影片時的引導畫面（版面比照另外兩個模組的空狀態）。
+/// 回傳 true＝使用者按了「選擇影片」
+fn movie_empty_state(ui: &mut egui::Ui) -> bool {
+    let mut pick = false;
+    let r = ui.available_rect_before_wrap().shrink(4.0);
+    ui.painter()
+        .rect_filled(r, 14, egui::Color32::from_rgb(0x17, 0x18, 0x1C));
+    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x3A, 0x3D, 0x46));
+    let rr = r.shrink(1.5);
+    for (a, b) in [
+        (rr.left_top(), rr.right_top()),
+        (rr.right_top(), rr.right_bottom()),
+        (rr.right_bottom(), rr.left_bottom()),
+        (rr.left_bottom(), rr.left_top()),
+    ] {
+        ui.painter()
+            .extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
+    }
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(r)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+    );
+    child.add_space(((r.height() - 190.0) / 2.0).max(24.0));
+    child.label(egui::RichText::new("🎥").size(46.0));
+    child.add_space(8.0);
+    child.label(
+        egui::RichText::new("選一支煙火影片，把煙霧散去")
+            .size(17.0)
+            .strong()
+            .color(theme::TEXT),
+    );
+    child.add_space(2.0);
+    child.label(
+        egui::RichText::new(
+            "整支影片逐格處理，聲音原樣保留；可一次選多支，也可以直接把影片拖曳進來",
+        )
+        .size(12.0)
+        .color(theme::TEXT_WEAK),
+    );
+    child.add_space(16.0);
+    if primary_button(&mut child, "🎥  選擇影片", true).clicked() {
+        pick = true;
+    }
+    pick
+}
+
+/// 優化影像模組還沒選照片時的引導畫面（版面比照另外三個模組的空狀態）。
+/// 回傳 `Some(true)`＝按了「選擇照片」、`Some(false)`＝按了「選擇資料夾」
+fn enhance_empty_state(ui: &mut egui::Ui, loading: bool) -> Option<bool> {
+    let mut act = None;
+    let r = ui.available_rect_before_wrap().shrink(4.0);
+    ui.painter()
+        .rect_filled(r, 14, egui::Color32::from_rgb(0x17, 0x18, 0x1C));
+    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x3A, 0x3D, 0x46));
+    let rr = r.shrink(1.5);
+    for (a, b) in [
+        (rr.left_top(), rr.right_top()),
+        (rr.right_top(), rr.right_bottom()),
+        (rr.right_bottom(), rr.left_bottom()),
+        (rr.left_bottom(), rr.left_top()),
+    ] {
+        ui.painter()
+            .extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
+    }
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(r)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+    );
+    child.add_space(((r.height() - 200.0) / 2.0).max(24.0));
+    child.label(egui::RichText::new("✨").size(46.0));
+    child.add_space(8.0);
+    child.label(
+        egui::RichText::new(if loading {
+            "照片載入中…"
+        } else {
+            "選一批照片，一次調好層次、光影與主體"
+        })
+        .size(17.0)
+        .strong()
+        .color(theme::TEXT),
+    );
+    child.add_space(2.0);
+    child.label(
+        egui::RichText::new(
+            "每張各自分析，調色滑桿自動就位，主體再另外提亮加銳；也可以直接把照片或資料夾拖曳進來",
+        )
+        .size(12.0)
+        .color(theme::TEXT_WEAK),
+    );
+    child.add_space(16.0);
+    child.horizontal(|ui| {
+        // 兩顆按鈕擺中間：這一層是 top_down(Center)，水平排的那一列
+        // 得自己往右推半個寬度才會落在正中間
+        let w = 300.0;
+        ui.add_space(((r.width() - w) / 2.0).max(0.0));
+        if primary_button(ui, "🖼  選擇照片", !loading).clicked() {
+            act = Some(true);
+        }
+        ui.add_space(8.0);
+        if ui
+            .add_enabled(!loading, egui::Button::new("📂  選擇資料夾"))
+            .clicked()
+        {
+            act = Some(false);
+        }
+    });
+    act
+}
+
+/// 模組列上的一個模組名稱。比照 Lightroom：沒有按鈕框，選中的那個亮起來
+/// 並在下面壓一條底線，其餘是灰字、指過去才轉亮
+fn module_tab(ui: &mut egui::Ui, m: Module, active: bool) -> egui::Response {
+    let text = format!("{}  {}", m.icon(), m.label());
+    let font = egui::FontId::proportional(14.0);
+    let galley = ui.painter().layout_no_wrap(text, font, theme::TEXT);
+    // 底線畫在文字下方 6px，所以高度要留得比字高一些
+    let size = egui::vec2(galley.size().x + 14.0, galley.size().y + 12.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let color = if active {
+        theme::TEXT
+    } else if resp.hovered() {
+        theme::ACCENT_HOVER
+    } else {
+        theme::TEXT_WEAK
+    };
+    if resp.hovered() && !active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let p = ui.painter();
+    p.galley(
+        egui::pos2(rect.center().x - galley.size().x / 2.0, rect.top() + 2.0),
+        galley,
+        color,
+    );
+    if active {
+        let y = rect.bottom() - 2.0;
+        p.line_segment(
+            [
+                egui::pos2(rect.left() + 3.0, y),
+                egui::pos2(rect.right() - 3.0, y),
+            ],
+            egui::Stroke::new(2.0, theme::ACCENT),
+        );
+    }
+    resp.on_hover_text(m.hint())
+}
+
+/// 前後對照時貼在每半邊上緣的標籤（「編輯前」／「編輯後」）。
+/// 半透明底色壓在照片上，亮色照片也讀得到字
+fn pane_label(ui: &egui::Ui, pane: egui::Rect, text: &str) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        egui::FontId::proportional(12.0),
+        theme::TEXT,
+    );
+    let chip = egui::Rect::from_min_size(
+        egui::pos2(pane.center().x - galley.size().x / 2.0 - 9.0, pane.top() + 6.0),
+        galley.size() + egui::vec2(18.0, 8.0),
+    );
+    let p = ui.painter();
+    p.rect_filled(chip, 6, egui::Color32::from_black_alpha(170));
+    p.galley(chip.min + egui::vec2(9.0, 4.0), galley, theme::TEXT);
+}
+
 /// 可收合的區段標題：色條 + 標題 + 展開/收合三角形，點擊切換
+/// 區塊標題的字級（「天空」那種）。同一層的「夜空」「遮色片」也跟著它走，
+/// 一眼看得出這幾塊是同一級的東西
+const SECTION_FONT: f32 = 14.5;
+
 fn section_toggle(ui: &mut egui::Ui, title: &str, open: &mut bool) {
-    let font = egui::FontId::proportional(14.5);
+    let font = egui::FontId::proportional(SECTION_FONT);
     let galley = ui
         .painter()
         .layout_no_wrap(title.to_string(), font, theme::TEXT);
@@ -5308,13 +22055,245 @@ fn section_toggle(ui: &mut egui::Ui, title: &str, open: &mut bool) {
     }
 }
 
-/// 小型分組標籤
+/// 影片清單那一顆晶片被點到哪裡
+#[derive(PartialEq)]
+enum ChipHit {
+    None,
+    /// 檔名（＝改成預覽這一支）
+    Name,
+    /// 右邊的 ✕（＝從清單拿掉）
+    Remove,
+}
+
+/// 影片去煙霧的清單晶片：**整顆是一個 widget**，所以換行時不會把檔名與 ✕
+/// 拆到兩行去（那正是先前的樣子）。點檔名切換預覽、點 ✕ 移除、
+/// **按住拖曳可以調順序**。
+///
+/// 回傳（點到哪裡, 這一幀有沒有別顆被放到這一顆上面＝來源索引）
+fn movie_chip(
+    ui: &mut egui::Ui,
+    name: &str,
+    current: bool,
+    enabled: bool,
+    idx: usize,
+) -> (ChipHit, Option<usize>) {
+    /// 勾的寬度（與 check_label 一致）
+    const MARK_W: f32 = 11.0;
+    /// ✕ 的點擊區寬度
+    const X_W: f32 = 18.0;
+    const GAP: f32 = 5.0;
+
+    let padding = ui.spacing().button_padding;
+    let galley = ui.painter().layout_no_wrap(
+        name.to_owned(),
+        egui::FontId::proportional(11.0),
+        theme::TEXT,
+    );
+    let mut size = padding * 2.0
+        + galley.size()
+        + egui::vec2(MARK_W + GAP + GAP + X_W, 0.0);
+    size.y = size.y.max(ui.spacing().interact_size.y);
+    let sense = if enabled {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_at_least(size, sense);
+    let x_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.max.x - padding.x - X_W, rect.min.y),
+        egui::vec2(X_W, rect.height()),
+    );
+    // 拖著走的時候整顆淡出，一眼看得出「這顆正被搬」
+    let dragging = resp.dragged();
+    if resp.drag_started() {
+        egui::DragAndDrop::set_payload(ui.ctx(), idx);
+    }
+    let dropped = resp
+        .dnd_release_payload::<usize>()
+        .map(|p| *p)
+        .filter(|from| *from != idx);
+    // 別顆正被拖到這一顆上面：畫一條插入線
+    let hover_from = resp.dnd_hover_payload::<usize>().map(|p| *p);
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&resp, current);
+        let p = ui.painter();
+        p.rect(
+            rect,
+            visuals.corner_radius,
+            if dragging {
+                theme::CARD_HOVER
+            } else {
+                visuals.weak_bg_fill
+            },
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        if current {
+            // 與 check_label 同一條三點折線：左中 → 下中 → 右上
+            let cx = rect.min.x + padding.x + MARK_W / 2.0;
+            let cy = rect.center().y;
+            let h = MARK_W / 2.0;
+            p.add(egui::Shape::line(
+                vec![
+                    egui::pos2(cx - h, cy),
+                    egui::pos2(cx - h * 0.25, cy + h * 0.75),
+                    egui::pos2(cx + h, cy - h * 0.75),
+                ],
+                egui::Stroke::new(1.6, visuals.text_color()),
+            ));
+        }
+        p.galley(
+            egui::pos2(
+                rect.min.x + padding.x + MARK_W + GAP,
+                rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            visuals.text_color(),
+        );
+        // ✕
+        let c = x_rect.center();
+        let r = 3.5;
+        let stroke = egui::Stroke::new(
+            1.4,
+            if x_rect.contains(resp.hover_pos().unwrap_or(egui::Pos2::ZERO)) {
+                theme::TEXT
+            } else {
+                theme::TEXT_WEAK
+            },
+        );
+        p.line_segment([c + egui::vec2(-r, -r), c + egui::vec2(r, r)], stroke);
+        p.line_segment([c + egui::vec2(r, -r), c + egui::vec2(-r, r)], stroke);
+        if hover_from.is_some_and(|f| f != idx) {
+            // 插入線畫在這一顆的左邊界
+            p.line_segment(
+                [rect.left_top(), rect.left_bottom()],
+                egui::Stroke::new(2.5, theme::ACCENT),
+            );
+        }
+    }
+    if enabled {
+        if dragging {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if resp.hovered() {
+            ui.ctx().set_cursor_icon(if x_rect
+                .contains(resp.hover_pos().unwrap_or(egui::Pos2::ZERO))
+            {
+                egui::CursorIcon::PointingHand
+            } else {
+                egui::CursorIcon::Grab
+            });
+        }
+    }
+    let hit = if resp.clicked() {
+        match resp.interact_pointer_pos() {
+            Some(p) if x_rect.contains(p) => ChipHit::Remove,
+            _ => ChipHit::Name,
+        }
+    } else {
+        ChipHit::None
+    };
+    let resp = resp.on_hover_text(if current {
+        "正在預覽的就是這一支，也是輸出時第一個跑的\n拖曳可以調整順序，右邊的 ✕ 移除"
+    } else {
+        "點一下改成預覽這一支（設定不變）\n拖曳可以調整順序，右邊的 ✕ 移除"
+    });
+    let _ = resp;
+    (hit, dropped)
+}
+
+/// 開關型按鈕（單張／編輯前後、清除筆刷、吸色、遮色片工具、下拉選單的選項…）。
+///
+/// 選著的就在文字前面畫一個勾——與「保留煙火紋路」那種勾選框裡的勾同一個
+/// 畫法，全系統一致：哪一項是選著的用看的就知道，不必去分辨底色深淺。
+/// 沒選的一樣把勾的位置留著（只是不畫），切換時同一排按鈕不會跟著抖動。
+fn check_label(ui: &mut egui::Ui, on: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    /// 勾佔的寬度，與 egui 勾選框裡那個勾差不多大
+    const MARK_W: f32 = 11.0;
+    /// 勾與文字之間留的空
+    const MARK_GAP: f32 = 5.0;
+
+    let padding = ui.spacing().button_padding;
+    let lead = MARK_W + MARK_GAP;
+    let wrap_w = ui.available_width() - padding.x * 2.0 - lead;
+    let galley = text
+        .into()
+        .into_galley(ui, None, wrap_w, egui::TextStyle::Button);
+
+    let mut size = padding * 2.0 + galley.size() + egui::vec2(lead, 0.0);
+    size.y = size.y.max(ui.spacing().interact_size.y);
+    let (rect, resp) = ui.allocate_at_least(size, egui::Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            on,
+            galley.text(),
+        )
+    });
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&resp, on);
+        if on || resp.hovered() || resp.highlighted() || resp.has_focus() {
+            ui.painter().rect(
+                rect.expand(visuals.expansion),
+                visuals.corner_radius,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        if on {
+            // 與 egui 勾選框同一條三點折線：左中 → 下中 → 右上
+            let cx = rect.min.x + padding.x + MARK_W / 2.0;
+            let cy = rect.center().y;
+            let h = MARK_W / 2.0;
+            ui.painter().add(egui::Shape::line(
+                vec![
+                    egui::pos2(cx - h, cy),
+                    egui::pos2(cx - h * 0.25, cy + h * 0.7),
+                    egui::pos2(cx + h, cy - h * 0.75),
+                ],
+                visuals.fg_stroke,
+            ));
+        }
+        ui.painter().galley(
+            egui::pos2(
+                rect.min.x + padding.x + lead,
+                rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            visuals.text_color(),
+        );
+    }
+    resp
+}
+
+/// 下拉選單裡的選項：目前選著的那一個掛上勾（[`check_label`] 的 `selectable_value` 版）
+fn check_value<T: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    value: T,
+    text: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let resp = check_label(ui, *current == value, text);
+    if resp.clicked() {
+        *current = value;
+    }
+    resp
+}
+
+/// 面板裡的分組標題（白平衡、光線、質感與色彩…）。
+///
+/// 要比它底下那排滑桿的名稱**更大更亮**才像標題——先前是 11.5px 的灰字，
+/// 反而比 12.5px 的滑桿名稱小又暗，看起來像註解而不是分組
 fn group_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(1.0);
     ui.label(
         egui::RichText::new(text)
-            .size(11.5)
+            .size(13.0)
             .strong()
-            .color(theme::TEXT_WEAK),
+            .color(theme::TEXT),
     );
 }
 
@@ -5343,18 +22322,109 @@ fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Respons
     .inner
 }
 
-/// 自訂滑桿：細軌道 + 水滴形把手（尖端朝上、圓弧在下），點擊或拖曳皆可調整
+/// 存檔中的按鈕：底下填到第幾張（進度）、上面一道來回掃的亮帶配左側轉圈（表示還在跑）。
+/// 大張照片寫檔要好幾秒，只有數字不動的話會像當掉，動畫是用來說「還活著」的
+fn saving_button(ui: &mut egui::Ui, text: &str, progress: f32) -> egui::Response {
+    let font = egui::FontId::proportional(14.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font, egui::Color32::WHITE);
+    // 轉圈 + 間距 + 文字 + 左右內距；與 primary_button 同高、同最小寬度，
+    // 從「存檔」切到「儲存中」時按鈕不會忽大忽小
+    let w = (16.0 + 14.0 + 8.0 + galley.size().x + 16.0).max(150.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 38.0), egui::Sense::hover());
+    let t = ui.input(|i| i.time) as f32;
+    let radius = egui::CornerRadius::same(8);
+    let p = ui.painter();
+
+    // 底色是暗一階的 ACCENT，已完成的張數再用實色從左邊填過去
+    p.rect_filled(rect, radius, theme::ACCENT.gamma_multiply(0.35));
+    let done = progress.clamp(0.0, 1.0);
+    if done > 0.0 {
+        let fill = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.left() + rect.width() * done, rect.bottom()),
+        );
+        // 用裁切而不是畫小圓角矩形：左邊圓角留著、右邊切齊，進度看起來才是連續的
+        p.with_clip_rect(fill).rect_filled(rect, radius, theme::ACCENT);
+    }
+
+    // 亮帶：1.4 秒掃一次。同一張照片可能要跑好幾秒，進度數字不動時就靠它證明沒卡住
+    let inner = rect.shrink(1.0);
+    let phase = (t % 1.4) / 1.4;
+    let half = inner.width() * 0.22;
+    let cx = inner.left() - half + (inner.width() + half * 2.0) * phase;
+    let mut mesh = egui::Mesh::default();
+    for (x, a) in [(cx - half, 0), (cx, 34), (cx + half, 0)] {
+        let c = egui::Color32::from_white_alpha(a);
+        mesh.colored_vertex(egui::pos2(x, inner.top()), c);
+        mesh.colored_vertex(egui::pos2(x, inner.bottom()), c);
+    }
+    mesh.add_triangle(0, 1, 3);
+    mesh.add_triangle(0, 3, 2);
+    mesh.add_triangle(2, 3, 5);
+    mesh.add_triangle(2, 5, 4);
+    p.with_clip_rect(inner).add(egui::Shape::mesh(mesh));
+
+    // 左側轉圈（畫四分之三圈，缺口轉起來才看得出方向）
+    let center = egui::pos2(rect.left() + 23.0, rect.center().y);
+    let start = t * 5.0;
+    let pts: Vec<egui::Pos2> = (0..=18)
+        .map(|k| {
+            let a = start + k as f32 * (std::f32::consts::TAU * 0.75 / 18.0);
+            center + egui::vec2(a.cos(), a.sin()) * 7.0
+        })
+        .collect();
+    p.add(egui::Shape::line(pts, egui::Stroke::new(2.0, egui::Color32::WHITE)));
+
+    // 文字排在轉圈右邊，置中於剩下的空間
+    let text_area = egui::Rect::from_min_max(egui::pos2(rect.left() + 38.0, rect.top()), rect.max);
+    p.galley(
+        text_area.center() - galley.size() / 2.0,
+        galley,
+        egui::Color32::WHITE,
+    );
+    resp
+}
+
+/// 自訂滑桿：圓角軌道 + 水滴形把手（尖端朝上、圓弧在下），點擊或拖曳皆可調整
 fn drop_slider(ui: &mut egui::Ui, value: &mut f32, min: f32, max: f32) -> egui::Response {
     drop_slider_rail(ui, value, min, max, None)
 }
 
-/// rail 給 Some((左色, 右色)) 時，軌道畫成水平漸層（如白平衡的藍→黃）
+/// 軌道的粗細（像素）。太細瞄不準、也撐不起漸層（顏色只剩一絲，
+/// 看不出這條滑桿往哪邊拉會變成什麼樣）；太粗則整面板變得笨重
+const RAIL_H: f32 = 4.0;
+
+/// 把軌道畫成水平漸層。`stops` 是由左到右等距的色標，兩個以上才會漸層；
+/// 只有一個就是純色
+fn paint_rail(p: &egui::Painter, r: egui::Rect, stops: &[egui::Color32]) {
+    let round = egui::CornerRadius::same((RAIL_H / 2.0) as u8);
+    if stops.len() < 2 {
+        p.rect_filled(r, round, stops.first().copied().unwrap_or(theme::CARD_HOVER));
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    for (i, c) in stops.iter().enumerate() {
+        let x = r.left() + r.width() * i as f32 / (stops.len() - 1) as f32;
+        mesh.colored_vertex(egui::pos2(x, r.top()), *c);
+        mesh.colored_vertex(egui::pos2(x, r.bottom()), *c);
+        if i > 0 {
+            let b = (i as u32 - 1) * 2;
+            mesh.add_triangle(b, b + 1, b + 3);
+            mesh.add_triangle(b, b + 3, b + 2);
+        }
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
+/// rail 給 Some(色標) 時，軌道畫成水平漸層（如白平衡的藍→黃）
 fn drop_slider_rail(
     ui: &mut egui::Ui,
     value: &mut f32,
     min: f32,
     max: f32,
-    rail: Option<(egui::Color32, egui::Color32)>,
+    rail: Option<&[egui::Color32]>,
 ) -> egui::Response {
     let width = ui.spacing().slider_width;
     let (rect, mut resp) =
@@ -5373,25 +22443,11 @@ fn drop_slider_rail(
     let cx = rect.left() + t * rect.width();
     let cy = rect.center().y;
     let p = ui.painter();
-    match rail {
-        Some((c0, c1)) => {
-            let r = egui::Rect::from_min_max(
-                egui::pos2(rect.left(), cy - 2.0),
-                egui::pos2(rect.right(), cy + 2.0),
-            );
-            let mut mesh = egui::Mesh::default();
-            mesh.colored_vertex(r.left_top(), c0);
-            mesh.colored_vertex(r.right_top(), c1);
-            mesh.colored_vertex(r.right_bottom(), c1);
-            mesh.colored_vertex(r.left_bottom(), c0);
-            mesh.add_triangle(0, 1, 2);
-            mesh.add_triangle(0, 2, 3);
-            p.add(egui::Shape::mesh(mesh));
-        }
-        None => {
-            p.hline(rect.x_range(), cy, egui::Stroke::new(2.0, theme::CARD_HOVER));
-        }
-    }
+    let track = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), cy - RAIL_H / 2.0),
+        egui::pos2(rect.right(), cy + RAIL_H / 2.0),
+    );
+    paint_rail(p, track, rail.unwrap_or(&[theme::CARD_HOVER]));
     let fill = if resp.dragged() {
         theme::ACCENT
     } else if resp.hovered() {
@@ -5399,9 +22455,10 @@ fn drop_slider_rail(
     } else {
         egui::Color32::from_rgb(0xC8, 0xCA, 0xD2)
     };
-    let r = 4.0;
-    let bulb = egui::pos2(cx, cy + 2.5);
-    let apex = egui::pos2(cx, cy - 6.5);
+    // 把手比軌道大一圈，壓在漸層上才看得清楚它停在哪
+    let r = 4.2;
+    let bulb = egui::pos2(cx, cy + 2.8);
+    let apex = egui::pos2(cx, cy - 7.0);
     p.circle_filled(bulb, r, fill);
     p.add(egui::Shape::convex_polygon(
         vec![apex, egui::pos2(cx - r, bulb.y), egui::pos2(cx + r, bulb.y)],
@@ -5419,38 +22476,133 @@ fn drop_slider_i32(ui: &mut egui::Ui, value: &mut i32, min: i32, max: i32) -> eg
     resp
 }
 
-/// 調色滑桿：左標籤、右數值，連點兩下歸零
-fn adj_slider(ui: &mut egui::Ui, value: &mut i32, label: &str) {
-    adj_slider_rail(ui, value, label, None)
+/// 那十二條調色滑桿，分成白平衡／光線／質感與色彩三組。
+///
+/// 疊圖模組有兩處要用（成品的調色、每一層自己的調色），版面必須一模一樣——
+/// 兩邊各抄一份的話，改了一邊忘了另一邊，兩處就會長得不一樣
+/// 調色區塊的列距。十二條滑桿加上裁切在側欄裡佔掉一大截，三個模組一律收到
+/// 這個值（整區高度約收到原本的四分之三），面板大小才會一致
+const ADJ_ROW_GAP: f32 = 3.0;
+
+/// 十二條調色滑桿。照片轉影片、去煙霧、煙火疊圖三個模組都走這裡，連群組
+/// 之間的間距都在這裡定死，三邊的調色面板才會長得一樣大。
+/// 呼叫前記得把列距收成 [`ADJ_ROW_GAP`]（見各模組的調色區塊）
+fn adj_sliders(ui: &mut egui::Ui, g: &mut Adjustments) {
+    ui.add_space(6.0);
+    group_label(ui, "白平衡");
+    // 滑桿方向與濾鏡一致：色溫 + 偏暖（黃）、色調 + 偏洋紅
+    adj_slider(ui, &mut g.temp, "色溫");
+    adj_slider(ui, &mut g.tint, "色調");
+    ui.add_space(5.0);
+    group_label(ui, "光線");
+    adj_slider(ui, &mut g.exposure, "曝光度");
+    adj_slider(ui, &mut g.contrast, "對比");
+    adj_slider(ui, &mut g.brightness, "亮度");
+    adj_slider(ui, &mut g.shadows, "陰影");
+    adj_slider(ui, &mut g.whites, "白色");
+    adj_slider(ui, &mut g.blacks, "黑色");
+    ui.add_space(5.0);
+    group_label(ui, "質感與色彩");
+    adj_slider(ui, &mut g.clarity, "清晰度");
+    adj_slider(ui, &mut g.dehaze, "去朦朧");
+    adj_slider(ui, &mut g.vibrance, "鮮豔度");
+    adj_slider(ui, &mut g.saturation, "飽和度");
 }
 
-/// 帶漸層軌道的調色滑桿（白平衡用：色溫 藍→黃、色調 綠→洋紅）
-fn adj_slider_rail(
-    ui: &mut egui::Ui,
-    value: &mut i32,
-    label: &str,
-    rail: Option<(egui::Color32, egui::Color32)>,
-) {
+/// 每一條調色滑桿的軌道漸層：**左端是往 −100 拉會變成的樣子、右端是 +100**。
+///
+/// 三個模組的調色面板都走這裡，所以顏色只定義一次，哪一邊都長得一樣。
+/// 用標籤當鍵是刻意的——這十二條在三個模組裡本來就用同一組名字當識別
+/// （數字框的 id 也是拿它算的），另立一組列舉只會多一份要同步的東西。
+///
+/// 有實際顏色可對應的就用真的顏色（色溫的藍→黃、去朦朧的霧白→通透的深藍）；
+/// 其餘的用「暗→亮」的灰階，至少一眼看得出往哪邊是加、往哪邊是減
+fn adj_rail(label: &str) -> &'static [egui::Color32] {
+    const fn c(r: u8, g: u8, b: u8) -> egui::Color32 {
+        egui::Color32::from_rgb(r, g, b)
+    }
+    // 白平衡：與濾鏡的方向一致（色溫 + 偏暖、色調 + 偏洋紅）
+    const TEMP: &[egui::Color32] = &[c(0x50, 0x78, 0xE0), c(0xE0, 0xC8, 0x46)];
+    const TINT: &[egui::Color32] = &[c(0x55, 0xC0, 0x50), c(0xD8, 0x5C, 0xC8)];
+    // 光線：拉右邊就是更亮／更白，灰階直接照著畫
+    const EXPOSURE: &[egui::Color32] = &[c(0x12, 0x12, 0x16), c(0xFF, 0xFF, 0xFF)];
+    const CONTRAST: &[egui::Color32] = &[c(0x54, 0x54, 0x5C), c(0xFF, 0xFF, 0xFF)];
+    const BRIGHTNESS: &[egui::Color32] = &[c(0x16, 0x16, 0x1A), c(0xF0, 0xF0, 0xF4)];
+    const SHADOWS: &[egui::Color32] = &[c(0x00, 0x00, 0x00), c(0xB8, 0xB8, 0xC2)];
+    const WHITES: &[egui::Color32] = &[c(0x78, 0x78, 0x82), c(0xFF, 0xFF, 0xFF)];
+    const BLACKS: &[egui::Color32] = &[c(0x00, 0x00, 0x00), c(0x8E, 0x8E, 0x98)];
+    // 質感與色彩：去朦朧左邊是加霧（乳白）、右邊是撥開（通透的深藍）；
+    // 鮮豔度是收斂版的彩虹、飽和度是全開的那一版，兩條一眼分得出來
+    const CLARITY: &[egui::Color32] = &[c(0x5C, 0x5C, 0x64), c(0xEA, 0xEA, 0xF0)];
+    const DEHAZE: &[egui::Color32] = &[c(0xD8, 0xDE, 0xE6), c(0x16, 0x32, 0x4F)];
+    const VIBRANCE: &[egui::Color32] = &[
+        c(0x6E, 0x6E, 0x76),
+        c(0xA8, 0x7A, 0x72),
+        c(0xB0, 0xA4, 0x68),
+        c(0x6F, 0xA8, 0x78),
+        c(0x6E, 0x90, 0xB4),
+        c(0x90, 0x78, 0xA8),
+    ];
+    const SATURATION: &[egui::Color32] = &[
+        c(0x6E, 0x6E, 0x76),
+        c(0xD0, 0x50, 0x50),
+        c(0xD8, 0xC0, 0x44),
+        c(0x4C, 0xC0, 0x60),
+        c(0x4C, 0x9C, 0xE0),
+        c(0xB0, 0x58, 0xD8),
+    ];
+    const PLAIN: &[egui::Color32] = &[theme::CARD_HOVER];
+    match label {
+        "色溫" => TEMP,
+        "色調" => TINT,
+        "曝光度" => EXPOSURE,
+        "對比" => CONTRAST,
+        "亮度" => BRIGHTNESS,
+        "陰影" => SHADOWS,
+        "白色" => WHITES,
+        "黑色" => BLACKS,
+        "清晰度" => CLARITY,
+        "去朦朧" => DEHAZE,
+        "鮮豔度" => VIBRANCE,
+        "飽和度" => SATURATION,
+        _ => PLAIN,
+    }
+}
+
+/// 調色滑桿：左標籤、右數值，連點兩下歸零。軌道的漸層照名字取（見 [`adj_rail`]）
+fn adj_slider(ui: &mut egui::Ui, value: &mut i32, label: &str) {
+    let rail = adj_rail(label);
     ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(52.0, 18.0), egui::Sense::hover());
+        // 標籤本身也能連點兩下歸零。滑桿拖過頭還會改到值，
+        // 名稱是好瞄很多的目標；指過去會轉亮，讓人知道這裡按得下去
+        // 列高 16 而不是 18：十二條加起來就省下一截側欄（見「調色」區的列距）
+        let (rect, label_resp) =
+            ui.allocate_exact_size(egui::vec2(52.0, 16.0), egui::Sense::click());
+        let label_reset = label_resp.double_clicked();
+        let hot = label_resp.hovered();
+        if hot {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        label_resp.on_hover_text("連點兩下歸零");
         ui.painter().text(
             rect.left_center(),
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::proportional(12.5),
-            theme::TEXT_WEAK,
+            if hot { theme::TEXT } else { theme::TEXT_WEAK },
         );
-        ui.spacing_mut().slider_width = (ui.available_width() - 44.0).max(60.0);
+        ui.spacing_mut().slider_width = (ui.available_width() - NUM_BOX_ROOM).max(60.0);
         let resp = {
             let mut f = *value as f32;
-            let r = drop_slider_rail(ui, &mut f, -100.0, 100.0, rail);
+            let r = drop_slider_rail(ui, &mut f, -100.0, 100.0, Some(rail));
             *value = f.round() as i32;
             r
         };
-        // 滑桿是拖曳型元件，double_clicked() 不會觸發，須自行偵測雙擊
-        let double_clicked = resp.hovered()
+        // 滑桿是拖曳型元件，double_clicked() 不會觸發，須自行偵測雙擊；
+        // 標籤是一般可點元件，用它自己的 double_clicked() 就好
+        let rail_reset = resp.hovered()
             && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
-        if double_clicked {
+        if rail_reset || label_reset {
             *value = 0;
         }
         let (txt, color) = if *value == 0 {
@@ -5460,15 +22612,19 @@ fn adj_slider_rail(
         };
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            ui.label(egui::RichText::new(txt).size(11.5).color(color));
+            num_box_i32(ui, label, value, -100, 100, &txt, color);
         });
     });
 }
 
 /// 一般滑桿列：左標籤、右數值
+/// 滑桿左邊標籤欄的寬度：要容得下四個字（「去除煙霧」「去除雲朵」）
+const SLIDER_LABEL_W: f32 = 58.0;
+
 fn slider_row(ui: &mut egui::Ui, value: &mut i32, min: i32, max: i32, label: &str) {
     ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 18.0), egui::Sense::hover());
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(SLIDER_LABEL_W, 18.0), egui::Sense::hover());
         ui.painter().text(
             rect.left_center(),
             egui::Align2::LEFT_CENTER,
@@ -5476,17 +22632,248 @@ fn slider_row(ui: &mut egui::Ui, value: &mut i32, min: i32, max: i32, label: &st
             egui::FontId::proportional(12.5),
             theme::TEXT_WEAK,
         );
-        ui.spacing_mut().slider_width = (ui.available_width() - 40.0).max(60.0);
+        ui.spacing_mut().slider_width = (ui.available_width() - NUM_BOX_ROOM).max(60.0);
         drop_slider_i32(ui, value, min, max);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(value.to_string())
-                    .size(11.5)
-                    .color(theme::TEXT),
-            );
+            let txt = value.to_string();
+            num_box_i32(ui, label, value, min, max, &txt, theme::TEXT);
         });
     });
+}
+
+/// 旋轉滑桿列（文字的角度，−180～180 度）：和 [`slider_row`] 一樣是
+/// 標籤＋滑桿＋可輸入的數值，只是值是帶單位的浮點數，連點兩下歸零
+fn rot_slider_row(ui: &mut egui::Ui, id_salt: &str, rot: &mut f32) {
+    ui.horizontal(|ui| {
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(SLIDER_LABEL_W, 18.0), egui::Sense::hover());
+        ui.painter().text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            "旋轉",
+            egui::FontId::proportional(12.5),
+            theme::TEXT_WEAK,
+        );
+        ui.spacing_mut().slider_width = (ui.available_width() - NUM_BOX_ROOM).max(60.0);
+        let resp = drop_slider(ui, rot, -180.0, 180.0);
+        if resp.hovered()
+            && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary))
+        {
+            *rot = 0.0;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
+            let color = if rot.abs() > 0.01 {
+                theme::ACCENT
+            } else {
+                theme::TEXT_WEAK
+            };
+            let txt = format!("{rot:.0}°");
+            num_box(ui, id_salt, rot, -180.0, 180.0, &txt, color);
+        });
+    });
+}
+
+/// 滑桿右邊要留給數值框的寬度（8 的間距 ＋ 框本身 ＋ 一點餘裕）
+const NUM_BOX_ROOM: f32 = 52.0;
+
+/// 數值框的大小：和原本那個純顯示的數字一樣高，寬度容得下「-180」
+const NUM_BOX_SIZE: egui::Vec2 = egui::vec2(40.0, 18.0);
+const NUM_BOX_FONT: f32 = 11.5;
+/// 數值框的提示。↑↓ 一次加減多少是逐個欄位決定的（見 [`num_box_step`]），
+/// 所以刻度要填進去
+fn num_box_tip(step: f32) -> String {
+    format!(
+        "點一下可直接輸入數值；輸入中 ↑↓ 一次加減 {}，按住 Shift 一次 {}，\
+         Enter 或點別的地方套用、Esc 取消",
+        trim_zeros(step),
+        trim_zeros(step * 10.0)
+    )
+}
+
+/// 把 `1` 寫成「1」而不是「1.0」，`0.1` 仍是「0.1」
+fn trim_zeros(v: f32) -> String {
+    let s = format!("{v:.1}");
+    s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
+}
+
+/// 滑桿右邊那個數字，改成點下去就能打字的輸入格。
+///
+/// 平常畫的樣子和原本的純文字一模一樣（顏色由呼叫端決定，才能維持
+/// 「歸零是灰的、動過是藍的」那套規則），滑鼠指過去才透出底色；點一下
+/// （或用 Tab 走過來）就變成輸入格，整串預先選起來，直接打新的數字覆蓋。
+/// 輸入中 ↑／↓ 一次 1、Shift+↑／↓ 一次 10；Enter 或點到別處套用，
+/// Esc 放棄。值真的變了才回傳 true
+fn num_box(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    display: &str,
+    color: egui::Color32,
+) -> bool {
+    num_box_step(ui, id_salt, value, min, max, display, color, 1.0, 0)
+}
+
+/// [`num_box`] 的細刻度版本：`step` 是 ↑↓ 一次加減多少（按住 Shift 是十倍），
+/// `decimals` 是點進去編輯時草稿要保留幾位小數。
+///
+/// 角度這種以 0.1 為單位的值走這裡。整數欄位如果也吃小數，打字時多按一個點
+/// 就會被無聲吃掉，所以刻度是逐個欄位講明的，不是一律開放
+#[allow(clippy::too_many_arguments)]
+fn num_box_step(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    display: &str,
+    color: egui::Color32,
+    step: f32,
+    decimals: usize,
+) -> bool {
+    let id = ui.id().with(("num_box", id_salt));
+    // 和 egui 的 DragValue 同一套：有焦點就是輸入模式，Tab 也走得過來
+    let editing = ui.memory_mut(|m| {
+        m.interested_in_focus(id, ui.layer_id());
+        m.has_focus(id)
+    });
+    let mut changed = false;
+
+    if !editing {
+        let (rect, resp) = ui.allocate_exact_size(NUM_BOX_SIZE, egui::Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            ui.painter().rect_filled(rect, 3.0, theme::CARD);
+        }
+        ui.painter().text(
+            rect.right_center() - egui::vec2(4.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            display,
+            egui::FontId::proportional(NUM_BOX_FONT),
+            color,
+        );
+        if resp.clicked() {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        resp.on_hover_text(num_box_tip(step));
+        return changed;
+    }
+
+    // 沒有草稿＝這是進輸入格的第一輪（點進來或用 Tab 走過來）：
+    // 值待會從現在的數字重新來一份，並整串選起來
+    let mut fresh = ui.data(|d| d.get_temp::<String>(id).is_none());
+    // ↑／↓ 微調。單行的 TextEdit 不會用到上下鍵，先攔下來自己用，
+    // 免得它把事件吃掉（和 DragValue 的作法一致）
+    let delta = ui.input_mut(|i| {
+        let one = i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) as f32
+            - i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) as f32;
+        let ten = i.count_and_consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) as f32
+            - i.count_and_consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) as f32;
+        one + ten * 10.0
+    });
+    if delta != 0.0 {
+        // 每按一次都四捨五入到這個欄位的位數：0.1 連加十次的浮點誤差
+        // 會讓顯示變成 0.9999999，之後再怎麼按都差那麼一點
+        let q = 10f32.powi(decimals as i32);
+        let new = (((*value + delta * step) * q).round() / q).clamp(min, max);
+        if new != *value {
+            *value = new;
+            changed = true;
+        }
+        // 值被上下鍵改掉了，輸入格裡的草稿跟著重來
+        ui.data_mut(|d| d.remove::<String>(id));
+        fresh = true;
+    }
+
+    let mut buf = ui
+        .data_mut(|d| d.remove_temp::<String>(id))
+        .unwrap_or_else(|| format!("{value:.decimals$}"));
+    if fresh {
+        let mut st = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+        st.cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::default(),
+                egui::text::CCursor::new(buf.chars().count()),
+            )));
+        st.store(ui.ctx(), id);
+    }
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut buf)
+            .id(id)
+            .desired_width(NUM_BOX_SIZE.x - 10.0)
+            .min_size(NUM_BOX_SIZE)
+            .font(egui::FontId::proportional(NUM_BOX_FONT))
+            .horizontal_align(egui::Align::Max)
+            .margin(egui::Margin::symmetric(3, 1)),
+    );
+    if resp.lost_focus() {
+        // Esc 是「不要了」，其他離開輸入格的方式（Enter、點別的地方）才套用
+        if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if let Some(v) = parse_num(&buf) {
+                let v = v.clamp(min, max);
+                if v != *value {
+                    *value = v;
+                    changed = true;
+                }
+            }
+        }
+        ui.data_mut(|d| d.remove::<String>(id));
+    } else {
+        ui.data_mut(|d| d.insert_temp(id, buf));
+    }
+    changed
+}
+
+/// [`num_box`] 的整數版本
+fn num_box_i32(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    value: &mut i32,
+    min: i32,
+    max: i32,
+    display: &str,
+    color: egui::Color32,
+) -> bool {
+    let mut f = *value as f32;
+    let changed = num_box(ui, id_salt, &mut f, min as f32, max as f32, display, color);
+    if changed {
+        *value = f.round() as i32;
+    }
+    changed
+}
+
+/// 讀使用者打進數值框的字。允許前面的正號、後面的單位（如「°」）
+/// 與多餘的空白，看不懂就當作沒改
+fn parse_num(s: &str) -> Option<f32> {
+    let t: String = s
+        .trim()
+        .trim_end_matches(|c: char| !c.is_ascii_digit())
+        .trim_start_matches('+')
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    t.parse::<f32>().ok().filter(|v| v.is_finite())
+}
+
+/// 吸下來的顏色色塊（保護色與雲色共用）：點一下代表要移除它，
+/// 滑過去時框線轉成警示色，先看得出「點下去會不見」
+fn color_chip(ui: &mut egui::Ui, c: [u8; 3], tip: &str) -> bool {
+    let (sw, r) = ui.allocate_exact_size(egui::vec2(22.0, 18.0), egui::Sense::click());
+    ui.painter()
+        .rect_filled(sw, 3.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+    ui.painter().rect_stroke(
+        sw,
+        3.0,
+        egui::Stroke::new(
+            1.0,
+            if r.hovered() { theme::ERROR } else { theme::BORDER },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    r.on_hover_text(tip).clicked()
 }
 
 /// 畫出去煙的框選範圍：框外壓暗、框線用強調色，一眼看得出哪塊會被處理
@@ -5519,6 +22906,210 @@ fn paint_selection(ui: &mut egui::Ui, img: egui::Rect, sel: egui::Rect) {
     );
 }
 
+/// 遮色片形狀畫在預覽上的樣子：漸層畫出方向與邊界、筆跡畫出筆畫本身。
+/// 這裡只標範圍，實際的作用強度要按「顯示遮色片」才看得到
+fn paint_shape(ui: &egui::Ui, img: egui::Rect, s: &dehaze::Shape, feather: i32) {
+    let to_screen =
+        |x: f32, y: f32| egui::pos2(img.left() + x * img.width(), img.top() + y * img.height());
+    // 漸層的輔助線會延伸到畫面外，畫筆先夾在照片範圍內
+    let p = ui.painter().with_clip_rect(img);
+    match s {
+        dehaze::Shape::Rect(r) => {
+            p.rect_stroke(
+                egui::Rect::from_two_pos(to_screen(r.x0, r.y0), to_screen(r.x1, r.y1)),
+                0.0,
+                egui::Stroke::new(1.4, theme::ACCENT),
+                egui::StrokeKind::Middle,
+            );
+        }
+        dehaze::Shape::Linear(l) => {
+            paint_linear(&p, img, to_screen(l.x0, l.y0), to_screen(l.x1, l.y1))
+        }
+        dehaze::Shape::Radial(r) => paint_radial(
+            &p,
+            to_screen(r.cx, r.cy),
+            egui::vec2(r.rx * img.width(), r.ry * img.height()),
+            feather,
+            r.invert,
+        ),
+        dehaze::Shape::Brush(b) => {
+            let pts: Vec<egui::Pos2> = b.pts.iter().map(|q| to_screen(q[0], q[1])).collect();
+            // 半徑存的是佔長邊的比例，照片是等比縮放的，換算回畫面長邊即可
+            let w = b.radius * 2.0 * img.width().max(img.height());
+            paint_brush(&p, &pts, w);
+        }
+        dehaze::Shape::Object(o) => paint_object(&p, img, o),
+    }
+}
+
+/// 自動選取的物件：沿著權重圖的邊界描一圈。
+///
+/// 物件的形狀是照片內容決定的，沒有幾何式可以畫，只能逐格看「這一格在裡面、
+/// 隔壁在外面嗎」，是的話就在兩格之間點一段線。格子本來就不大
+/// （見 [`dehaze::select_object`] 的工作解析度），描出來的輪廓夠貼。
+///
+/// **只描邊、不塗色**：那一片紅是「顯示遮色片」的事，由那顆開關說了算——
+/// 這裡再塗一層的話，開關關掉之後別的形狀都不見了，物件卻還留著一塊紅
+fn paint_object(p: &egui::Painter, img: egui::Rect, o: &dehaze::Object) {
+    if o.w == 0 || o.h == 0 {
+        return;
+    }
+    // 權重圖只鋪在框住的那一塊上，不是整張照片（見 [`dehaze::Object::area`]）
+    let ax = img.left() + o.area.x0 * img.width();
+    let ay = img.top() + o.area.y0 * img.height();
+    let cw = (o.area.x1 - o.area.x0) * img.width() / o.w as f32;
+    let ch = (o.area.y1 - o.area.y0) * img.height() / o.h as f32;
+    let stroke = egui::Stroke::new(1.4, theme::ACCENT);
+    // 0.5 當作邊界：權重圖已經抹柔過，這條等高線就是視覺上的邊
+    let inside = |x: usize, y: usize| o.mask[y * o.w + x] >= 128;
+    for y in 0..o.h {
+        for x in 0..o.w {
+            if !inside(x, y) {
+                continue;
+            }
+            let x0 = ax + x as f32 * cw;
+            let y0 = ay + y as f32 * ch;
+            // 右邊、下面是外面就描那一條；左上兩邊交給隔壁那一格處理，
+            // 每條邊只會被畫一次
+            if x + 1 >= o.w || !inside(x + 1, y) {
+                p.line_segment([egui::pos2(x0 + cw, y0), egui::pos2(x0 + cw, y0 + ch)], stroke);
+            }
+            if x == 0 || !inside(x - 1, y) {
+                p.line_segment([egui::pos2(x0, y0), egui::pos2(x0, y0 + ch)], stroke);
+            }
+            if y + 1 >= o.h || !inside(x, y + 1) {
+                p.line_segment([egui::pos2(x0, y0 + ch), egui::pos2(x0 + cw, y0 + ch)], stroke);
+            }
+            if y == 0 || !inside(x, y - 1) {
+                p.line_segment([egui::pos2(x0, y0), egui::pos2(x0 + cw, y0)], stroke);
+            }
+        }
+    }
+}
+
+/// 線性漸層：起點與終點各一條實線標出「全效果」與「完全不動」的界線，
+/// 中間一條淡線是 50%，另拉一條方向線把兩端連起來
+fn paint_linear(p: &egui::Painter, img: egui::Rect, a: egui::Pos2, b: egui::Pos2) {
+    let d = b - a;
+    let len = d.length();
+    if len < 1e-3 {
+        return;
+    }
+    // 與拖曳方向垂直、長到必定超出畫面的一段，用來畫等值線
+    let n = egui::vec2(-d.y, d.x) / len * img.size().length();
+    // 位置、線寬、透明度
+    let lines: [(f32, f32, f32); 3] = [(0.0, 1.4, 1.0), (0.5, 1.0, 0.45), (1.0, 1.4, 1.0)];
+    for (t, w, alpha) in lines {
+        let c = a + d * t;
+        p.line_segment(
+            [c - n, c + n],
+            egui::Stroke::new(w, theme::ACCENT.gamma_multiply(alpha)),
+        );
+    }
+    p.line_segment([a, b], egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.7)));
+    // 實心的那端是全效果，空心的那端歸零
+    p.circle_filled(a, 4.0, theme::ACCENT);
+    p.circle_stroke(b, 4.0, egui::Stroke::new(1.4, theme::ACCENT));
+}
+
+/// 放射性漸層：外圈是作用範圍的邊界，內圈是羽化帶的起點（以內為全效果）。
+/// 反轉時外圈畫成虛線，表示被蓋住的是外面
+fn paint_radial(p: &egui::Painter, c: egui::Pos2, r: egui::Vec2, feather: i32, invert: bool) {
+    let ring = |k: f32| -> Vec<egui::Pos2> {
+        (0..=64)
+            .map(|i| {
+                let a = i as f32 / 64.0 * std::f32::consts::TAU;
+                egui::pos2(c.x + r.x * k * a.cos(), c.y + r.y * k * a.sin())
+            })
+            .collect()
+    };
+    let strong = egui::Stroke::new(1.4, theme::ACCENT);
+    let weak = egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.45));
+    let inner = 1.0 - feather as f32 / 100.0;
+    // 主線畫在**內圈**（效果滿的那一圈），外圈那條羽化到 0 的界線用細淡線。
+    // 內圈才是「這裡面是實打實處理到的」，拖的時候盯的也是它；
+    // 羽化拉到底時內圈會縮成一點，那就把主線讓給外圈，免得整個看不見
+    let core = inner > 0.02;
+    if core {
+        p.add(egui::Shape::line(ring(1.0), weak));
+    }
+    let main = ring(if core { inner } else { 1.0 });
+    if invert {
+        p.extend(egui::Shape::dashed_line(&main, strong, 6.0, 4.0));
+    } else {
+        p.add(egui::Shape::line(main, strong));
+    }
+    p.circle_filled(c, 3.0, theme::ACCENT);
+}
+
+/// 筆跡：用筆刷的粗細把走過的路徑塗出來。`w` 為畫面上的筆畫寬度
+fn paint_brush(p: &egui::Painter, pts: &[egui::Pos2], w: f32) {
+    let Some((&first, rest)) = pts.split_first() else {
+        return;
+    };
+    let base = theme::ACCENT;
+    let r = (w * 0.5).max(0.5);
+    // 一段一塊各自畫，不用 Shape::line 把整條路徑串成一條粗線。
+    //
+    // 串成一條的話，路徑急轉彎或自己交叉的地方，egui 的斜接會往外爆出長長的
+    // 尖刺，半透明再一疊就是一條條細紋——那正是畫面上看到的星芒與 X 形。
+    // 拆成「每段一個凸四邊形＋每個轉折點補一個圓」就沒有接縫可言，
+    // 每一塊自己也不會與自己重疊。
+    //
+    // 單塊的透明度取得比較低（0.18），相鄰兩塊在轉折處自然疊成兩層，
+    // 整體濃度與原本那條 0.3 的粗線差不多
+    let fill = base.gamma_multiply(0.18);
+    if rest.is_empty() {
+        p.circle_filled(first, r, fill);
+        return;
+    }
+    let mut shapes: Vec<egui::Shape> = Vec::with_capacity(pts.len() * 2);
+    for seg in pts.windows(2) {
+        let (a, b) = (seg[0], seg[1]);
+        let d = b - a;
+        let len = d.length();
+        if len < 1e-3 {
+            continue;
+        }
+        // 垂直於這一段、長度為半徑的向量：往兩側各推出去就是這一段的方塊
+        let n = egui::vec2(-d.y, d.x) / len * r;
+        shapes.push(egui::Shape::convex_polygon(
+            vec![a + n, b + n, b - n, a - n],
+            fill,
+            egui::Stroke::NONE,
+        ));
+    }
+    // 轉折處與兩端補圓，方塊之間外側的缺口才會補起來、端點也才是圓的
+    for &q in pts {
+        shapes.push(egui::Shape::circle_filled(q, r, fill));
+    }
+    p.extend(shapes);
+}
+
+/// 手動清除的筆跡畫在預覽上的樣子（塗過的地方蓋一層淡色）。
+/// `pts` 是相對座標、`r` 是畫面上的半徑
+fn paint_wipe(
+    p: &egui::Painter,
+    img: egui::Rect,
+    pts: &[[f32; 2]],
+    r: f32,
+    color: egui::Color32,
+) {
+    let pts: Vec<egui::Pos2> = pts
+        .iter()
+        .map(|q| egui::pos2(img.left() + q[0] * img.width(), img.top() + q[1] * img.height()))
+        .collect();
+    let Some((&first, rest)) = pts.split_first() else {
+        return;
+    };
+    if !rest.is_empty() {
+        p.add(egui::Shape::line(pts.clone(), egui::Stroke::new(r * 2.0, color)));
+    }
+    // 線段是平頭的，兩端補圓才與實際塗出來的形狀一致
+    p.circle_filled(first, r, color);
+    p.circle_filled(*pts.last().expect("split_first 保證非空"), r, color);
+}
+
 /// 把 RGB 影像上傳成 egui 材質
 fn load_rgb_texture(
     ctx: &egui::Context,
@@ -5542,13 +23133,15 @@ fn rot_vec(v: egui::Vec2, a: f32) -> egui::Vec2 {
     egui::vec2(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
-/// 膠卷縮圖項目。multi＝在個別調色的多選集合中；has_adj＝這張照片有個別調色；
+/// 膠卷縮圖項目。`idx` 是要標在左下角的 0-based 序號，None＝不標序號
+/// （疊圖模組排在最後的「疊圖結果」不是素材之一，標個號碼只會讓人數錯張數）；
+/// multi＝在個別調色的多選集合中；has_adj＝這張照片有個別調色；
 /// failed＝縮圖解碼失敗（檔案損毀或格式不支援），顯示警告而非載入中
 #[allow(clippy::too_many_arguments)]
 fn thumb_item(
     ui: &mut egui::Ui,
     tex: Option<&egui::TextureHandle>,
-    idx: usize,
+    idx: Option<usize>,
     selected: bool,
     has_caption: bool,
     multi: bool,
@@ -5598,14 +23191,16 @@ fn thumb_item(
     }
 
     // 左下角序號
-    let num = (idx + 1).to_string();
-    let galley = p.layout_no_wrap(num, egui::FontId::proportional(10.5), theme::TEXT);
-    let chip = egui::Rect::from_min_size(
-        egui::pos2(rect.min.x + 6.0, rect.max.y - galley.size().y - 11.0),
-        galley.size() + egui::vec2(10.0, 5.0),
-    );
-    p.rect_filled(chip, 4, egui::Color32::from_black_alpha(170));
-    p.galley(chip.min + egui::vec2(5.0, 2.5), galley, theme::TEXT);
+    if let Some(idx) = idx {
+        let num = (idx + 1).to_string();
+        let galley = p.layout_no_wrap(num, egui::FontId::proportional(10.5), theme::TEXT);
+        let chip = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + 6.0, rect.max.y - galley.size().y - 11.0),
+            galley.size() + egui::vec2(10.0, 5.0),
+        );
+        p.rect_filled(chip, 4, egui::Color32::from_black_alpha(170));
+        p.galley(chip.min + egui::vec2(5.0, 2.5), galley, theme::TEXT);
+    }
 
     // 右上角字幕標記
     if has_caption {
@@ -5622,13 +23217,17 @@ fn thumb_item(
     if multi {
         let c = egui::pos2(rect.min.x + 12.0, rect.min.y + 12.0);
         p.circle_filled(c, 8.0, theme::ACCENT);
-        p.text(
-            c,
-            egui::Align2::CENTER_CENTER,
-            "✓",
-            egui::FontId::proportional(11.0),
-            egui::Color32::WHITE,
-        );
+        // 勾自己畫，與各處開關按鈕上的勾同一條折線：字型裡沒有這個勾，
+        // 交給文字排版只會得到一個空心方框
+        let h = 4.0_f32;
+        p.add(egui::Shape::line(
+            vec![
+                egui::pos2(c.x - h, c.y),
+                egui::pos2(c.x - h * 0.25, c.y + h * 0.7),
+                egui::pos2(c.x + h, c.y - h * 0.75),
+            ],
+            egui::Stroke::new(1.6_f32, egui::Color32::WHITE),
+        ));
     }
     // 右下角標記：這張照片有自己的調色設定
     if has_adj {
@@ -5677,6 +23276,51 @@ fn is_apple_double(p: &Path) -> bool {
 
 fn is_image(p: &Path) -> bool {
     ext_in(p, IMAGE_EXTS) && !is_apple_double(p)
+}
+
+fn is_video(p: &Path) -> bool {
+    // 影片同樣要擋 AppleDouble（見 is_apple_double）：._clip.mp4 裡面沒有影像
+    ext_in(p, VIDEO_EXTS) && !is_apple_double(p)
+}
+
+/// 要寫的檔案已經存在時問一次要不要覆蓋；回 true 代表可以寫下去。
+///
+/// 系統的存檔對話框本來就會問，所以**只有在對話框之後又動過檔名**時才需要
+/// 呼叫（例如補上副檔名）——那個補完的檔名使用者沒被問過。
+/// 檔案不存在時直接回 true，不打擾
+fn confirm_overwrite(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    ask2(
+        rfd::MessageLevel::Warning,
+        "檔案已存在",
+        &format!("「{name}」已經存在。"),
+        "覆蓋",
+        "取消",
+    )
+}
+
+/// 在檔名後面加序號，直到找到一個還沒被佔用的（`照片_去煙(1).jpg`…）。
+/// 找不到（極端情況）就回原本那個
+fn next_free_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+    let ext = path.extension().map(|s| s.to_string_lossy().into_owned());
+    let (Some(stem), Some(ext)) = (stem, ext) else {
+        return path.to_path_buf();
+    };
+    (1..1000)
+        .map(|n| dir.join(format!("{stem}({n}).{ext}")))
+        .find(|p| !p.exists())
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// 檔案存在且非 0 位元組。0 位元組的圖片檔（下載中斷、雲端同步佔位、存檔
@@ -5789,19 +23433,42 @@ fn flush_part(buf: &str, is_num: bool) -> NatPart {
 /// 讀取系統中文字型檔（約 20MB+）；在 main 一開始的背景執行緒呼叫，
 /// 與視窗建立同時進行，啟動時不用再等這段磁碟讀取
 fn load_cjk_font_bytes() -> Option<Vec<u8>> {
-    // 檔名相對 %WINDIR%\Fonts（見 windows_fonts_dir），不硬編碼 C: 磁碟
-    let dir = windows_fonts_dir();
-    ["msjh.ttc", "msjhbd.ttc", "mingliu.ttc", "msyh.ttc"]
+    // 依偏好排序：優先繁體黑體，找不到才退而求其次。檔名經 font_dirs
+    // 逐一比對（見 find_font_file），不硬編碼絕對路徑
+    #[cfg(windows)]
+    let names: &[&str] = &["msjh.ttc", "msjhbd.ttc", "mingliu.ttc", "msyh.ttc"];
+    #[cfg(target_os = "macos")]
+    let names: &[&str] = &[
+        "PingFang.ttc",
+        "STHeiti Medium.ttc",
+        "Hiragino Sans GB.ttc",
+        "Songti.ttc",
+        "Arial Unicode.ttf",
+    ];
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let names: &[&str] = &[
+        "NotoSansCJK-Regular.ttc",
+        "NotoSansCJKtc-Regular.otf",
+        "NotoSerifCJK-Regular.ttc",
+    ];
+    names
         .iter()
-        .find_map(|file| std::fs::read(dir.join(file)).ok())
+        .find_map(|file| find_font_file(file).and_then(|p| std::fs::read(p).ok()))
 }
+
+/// 啟動時載入的中文字型。去煙工具換預覽字型時要重建整份字型設定，
+/// 沒有留著它，介面上的中文會在那之後全變成方框
+static CJK_FONT: OnceLock<Arc<egui::FontData>> = OnceLock::new();
+
+/// 去煙工具預覽文字用的字型家族名稱（見 [`App::ensure_smoke_font`]）
+const SMOKE_FONT: &str = "smoke_text";
 
 fn setup_chinese_fonts(ctx: &egui::Context, bytes: Option<Vec<u8>>) {
     let Some(bytes) = bytes else { return };
+    let data: Arc<egui::FontData> = egui::FontData::from_owned(bytes).into();
+    let _ = CJK_FONT.set(data.clone());
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("cjk".into(), egui::FontData::from_owned(bytes).into());
+    fonts.font_data.insert("cjk".into(), data);
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
@@ -5842,6 +23509,7 @@ enum H264Encoder {
     Nvenc,
     Qsv,
     Amf,
+    VideoToolbox,
     Software,
 }
 
@@ -5851,6 +23519,7 @@ impl H264Encoder {
             H264Encoder::Nvenc => "NVIDIA NVENC（硬體加速）",
             H264Encoder::Qsv => "Intel Quick Sync（硬體加速）",
             H264Encoder::Amf => "AMD AMF（硬體加速）",
+            H264Encoder::VideoToolbox => "Apple VideoToolbox（硬體加速）",
             H264Encoder::Software => "libx264（軟體）",
         }
     }
@@ -5865,22 +23534,29 @@ impl H264Encoder {
                 "-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", "22",
                 "-qp_p", "22",
             ],
+            // -q:v 是 1~100（愈大愈好），與其他編碼器的 cq 23 / crf 18 大致相當。
+            // 但這個固定品質模式只有 Apple Silicon 支援，Intel Mac 會直接報錯——
+            // 交給 detect_h264_encoder 的實測擋掉（見 test_encoder 帶完整參數）
+            H264Encoder::VideoToolbox => vec!["-c:v", "h264_videotoolbox", "-q:v", "65"],
             H264Encoder::Software => vec!["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"],
         }
     }
 }
 
-/// 用 0.2 秒的測試片段確認編碼器真的能用（清單有列不代表有對應的 GPU）
-fn test_encoder(name: &str) -> bool {
+/// 用 0.2 秒的測試片段確認編碼器真的能用（清單有列不代表有對應的 GPU）。
+/// 帶入實際轉檔會用的完整編碼參數（而非只有 -c:v）：有些編碼器本身可用、
+/// 但不支援我們指定的品質模式（如 Intel Mac 的 videotoolbox 不吃 -q:v），
+/// 只測編碼器名稱會誤判成可用，等到真的轉檔才失敗
+fn test_encoder(codec_args: &[&str]) -> bool {
     let mut cmd = FfmpegCommand::new();
     cmd.args([
         "-hide_banner",
         "-f", "lavfi",
         "-i", "color=black:s=640x360:d=0.2",
         "-pix_fmt", "yuv420p",
-        "-c:v", name,
-        "-f", "null", "-",
     ]);
+    cmd.args(codec_args);
+    cmd.args(["-f", "null", "-"]);
     let Ok(mut child) = cmd.spawn() else { return false };
     // 逾時保護：0.2 秒的測試正常在 1~2 秒內結束，但硬體編碼器初始化可能
     // 因顯卡驅動問題而卡住不返回，讓整個偵測（進而整個轉檔）永久卡在
@@ -5912,16 +23588,19 @@ fn test_encoder(name: &str) -> bool {
 fn detect_h264_encoder() -> H264Encoder {
     static DETECTED: OnceLock<H264Encoder> = OnceLock::new();
     *DETECTED.get_or_init(|| {
-        // 三種硬體編碼器平行測試；逐一測試時沒有對應硬體的機器
-        // 每個候選都要等它失敗才輪到下一個，最壞要白等三段測試時間
+        // 各硬體編碼器平行測試；逐一測試時沒有對應硬體的機器
+        // 每個候選都要等它失敗才輪到下一個，最壞要白等數段測試時間。
+        // 不依平台篩選候選：ffmpeg 對該平台沒有的編碼器會立刻報錯，
+        // 平行測試下這些失敗不佔額外時間（如 Windows 上的 videotoolbox）
         let candidates = [
-            ("h264_nvenc", H264Encoder::Nvenc),
-            ("h264_qsv", H264Encoder::Qsv),
-            ("h264_amf", H264Encoder::Amf),
+            H264Encoder::Nvenc,
+            H264Encoder::Qsv,
+            H264Encoder::Amf,
+            H264Encoder::VideoToolbox,
         ];
         let handles = candidates
-            .map(|(name, enc)| thread::spawn(move || test_encoder(name).then_some(enc)));
-        // 依候選順序取結果，優先序維持 NVENC > QSV > AMF
+            .map(|enc| thread::spawn(move || test_encoder(&enc.codec_args()).then_some(enc)));
+        // 依候選順序取結果，優先序維持 NVENC > QSV > AMF > VideoToolbox
         for h in handles {
             if let Ok(Some(enc)) = h.join() {
                 return enc;
@@ -5965,7 +23644,14 @@ fn kill_pid(pid: u32) {
         .status();
 }
 #[cfg(not(windows))]
-fn kill_pid(_pid: u32) {}
+fn kill_pid(pid: u32) {
+    // 專案未引入 libc，改呼叫系統的 kill。ffmpeg 是直接 spawn 的、底下沒有
+    // 子行程，對該 PID 送 SIGKILL 就夠（Windows 版加 /T 是因為 taskkill 走
+    // 行程樹）。行程已結束時 kill 回非 0，忽略即可
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status();
+}
 
 /// 在檔案總管開啟並選取指定檔案（比只開父目錄好找）。
 /// 檔案已不在（被刪/移動）時退回開啟父目錄
@@ -5982,7 +23668,20 @@ fn open_in_explorer(path: &Path) {
         let _ = std::process::Command::new("explorer").arg(dir).spawn();
     }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn open_in_explorer(path: &Path) {
+    if path.exists() {
+        // open -R 在 Finder 開啟並選取該檔案，等同 Windows 的 explorer /select
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    } else if let Some(dir) = path.parent() {
+        let _ = std::process::Command::new("open").arg(dir).spawn();
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn open_in_explorer(path: &Path) {
     if let Some(dir) = path.parent() {
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
@@ -6001,7 +23700,17 @@ fn open_file(path: &Path) {
         open_in_explorer(path);
     }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn open_file(path: &Path) {
+    if path.exists() {
+        // open <檔案> 會以副檔名關聯的預設程式開啟（影片即播放器）
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    } else {
+        open_in_explorer(path);
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn open_file(path: &Path) {
     if path.exists() {
         let _ = std::process::Command::new("xdg-open").arg(path).spawn();
@@ -6192,14 +23901,17 @@ fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewRe
         }
     };
 
-    // 與輸出相同順序：先縮放、再調色、後補邊。
-    // chain 為縮放之後的濾鏡（調色、補邊）；清晰度半徑依預覽寬與輸出寬的比例縮放
+    // 與輸出相同順序：先旋轉裁切、再縮放、再調色、後補邊。
+    // 清晰度半徑依預覽寬與輸出寬的比例縮放
     let adjust_mid = adj
         .filter_chain(pw as f64 / res.w as f64)
         .map(|c| format!("{c},"))
         .unwrap_or_default();
-    let chain = format!("{adjust_mid}pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black");
-    let scale = format!("scale={pw}:{ph}:force_original_aspect_ratio=decrease");
+    // 旋轉與裁切都寫成相對量（角度、iw/ih 的比例），所以同一串濾鏡套在原圖
+    // 或套在「已縮好的底圖」上，轉出來、切到的都是同一塊；
+    // 底圖那條路徑因此不必另外組一份
+    let crop_pre = adj.crop.vf_prefix();
+    let vf = base_scale_pad_vf(pw, ph, &crop_pre, &adjust_mid);
 
     // 直接以 rawvideo 從 stdout 取回 RGB 像素，省去圖檔編碼、寫檔與再解碼
     let render_once = |input: &Path, vf: &str| -> PreviewResult {
@@ -6237,10 +23949,10 @@ fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewRe
         })
     };
 
-    let full_vf = format!("{scale},{chain}");
     match &base {
-        // 底圖已是縮放後的尺寸，直接跑後段濾鏡
-        BaseRole::Cached(f) => render_once(f, &chain).or_else(|_| {
+        // 底圖已是縮放後的尺寸，同一串濾鏡照跑：沒裁切時那個 scale 是原尺寸
+        // 對原尺寸，等於沒事做；有裁切時正好把切出來的那塊重新放大填滿畫面
+        BaseRole::Cached(f) => render_once(f, &vf).or_else(|_| {
             // 取得路徑到 ffmpeg 開檔之間，底圖可能剛被 LRU 汰換刪除
             // （或被清暫存/防毒移走）：直接失敗會卡在「預覽失敗」且
             // dirty 已清、不會自動重試。移除失效的快取項目後
@@ -6254,9 +23966,9 @@ fn render_preview(photo: &Path, adj: &Adjustments, res: Resolution) -> PreviewRe
                     }
                 }
             }
-            render_once(photo, &full_vf)
+            render_once(photo, &vf)
         }),
-        BaseRole::Skip => render_once(photo, &full_vf),
+        BaseRole::Skip => render_once(photo, &vf),
     }
 }
 
@@ -6268,8 +23980,10 @@ fn pre_adjust_photo(
     res: Resolution,
     out: &Path,
 ) -> Result<(), String> {
+    // 旋轉與裁切要在縮放之前：先轉正、切掉不要的，剩下那塊才放大到目標解析度內
+    let crop_pre = adj.crop.vf_prefix();
     let scale = format!(
-        "scale={}:{}:force_original_aspect_ratio=decrease",
+        "{crop_pre}scale={}:{}:force_original_aspect_ratio=decrease",
         res.w, res.h
     );
     let vf = match adj.filter_chain(1.0) {
@@ -6325,12 +24039,15 @@ struct SubtitleJob {
     entries: Vec<TextJob>,
 }
 
-/// 主視訊濾鏡的基底：先縮放到目標解析度內、套用調色（adjust 已含結尾逗號或
-/// 為空）、最後補黑邊。關鍵是「調色在補邊之前」——黑邊是補邊後才加的純黑，
+/// 主視訊濾鏡的基底：先旋轉＋裁切（`crop` 這一段已含結尾逗號或為空）、縮放到目標解析度內、
+/// 套用調色（adjust 同樣已含結尾逗號或為空）、最後補黑邊。
+///
+/// 兩個關鍵順序：**旋轉與裁切在縮放之前**（先轉正、切掉不要的，剩下那塊才放大填滿畫面，
+/// 而不是切完留在原位），**調色在補邊之前**——黑邊是補邊後才加的純黑，
 /// 不受亮度/曝光等調色影響，否則直向照片的左右黑邊會被一起調亮成灰。
-fn base_scale_pad_vf(w: u32, h: u32, adjust: &str) -> String {
+fn base_scale_pad_vf(w: u32, h: u32, crop: &str, adjust: &str) -> String {
     format!(
-        "scale={w}:{h}:force_original_aspect_ratio=decrease,{adjust}\
+        "{crop}scale={w}:{h}:force_original_aspect_ratio=decrease,{adjust}\
          pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
     )
 }
@@ -6394,6 +24111,19 @@ fn photo_frame_timing(fps: u32, ken_burns: bool) -> (f64, i64) {
 /// 下限 0.05、上限 0.5 秒。關鍵是最後再 `.min(eff_dur*0.5)`：淡出半寬絕不
 /// 能超過半張照片時長，否則畫面中點也回不到全亮、整支影片會恆定變暗
 /// （高 fps 時 0.05 的下限就會超過 d/2，故必須夾）。
+/// 結尾淡出的 ffmpeg 濾鏡（不含結尾逗號）；影片短到不值得淡出就回 None。
+///
+/// 淡出 [`FADE_OUT_SECS`] 秒，但最多只佔全片的三分之一——三張照片的影片
+/// 淡出一秒等於有三分之一在變黑
+fn fade_out_filter(total_secs: f64) -> Option<String> {
+    if !total_secs.is_finite() || total_secs <= 0.3 {
+        return None;
+    }
+    let d = FADE_OUT_SECS.min(total_secs / 3.0).max(0.2);
+    let st = (total_secs - d).max(0.0);
+    Some(format!("fade=t=out:st={st:.3}:d={d:.3}:c=black"))
+}
+
 fn transition_fade_width(eff_dur: f64) -> f64 {
     (eff_dur * 0.4).clamp(0.05, 0.5).min(eff_dur * 0.5)
 }
@@ -6624,7 +24354,13 @@ fn run_conversion(
             .map(|c| format!("{c},"))
             .unwrap_or_default()
     };
-    let mut vf = base_scale_pad_vf(w, h, &adjust_mid);
+    // 個別調色模式下旋轉與裁切也已經烙進暫存圖（pre_adjust_photo 會做），主鏈不再處理
+    let crop_pre = if has_per_photo {
+        String::new()
+    } else {
+        adj.crop.vf_prefix()
+    };
+    let mut vf = base_scale_pad_vf(w, h, &crop_pre, &adjust_mid);
 
     // 動態縮放（Ken Burns）：每張照片產生 kb_frames 格緩慢推近/拉遠（奇偶張交替）；
     // 沒有 Ken Burns 但有轉場時，用 fps 濾鏡升頻，讓淡入淡出有足夠格數呈現
@@ -6711,6 +24447,14 @@ fn run_conversion(
     // alpha 對黑底合成——實測對「所有」轉檔多耗約 11%（不分透明與否），而透明
     // 照片在幻燈片極罕見、且透明像素多為黑（在黑底上本就隱形），成本效益不划算，
     // 故刻意不做。若日後要支援，應只對「確實含 alpha」的照片有條件套用。
+    // 結尾淡出：最後一段把整個畫面漸漸壓到全黑。放在轉場之後、送進編碼器
+    // 之前，蓋在所有東西上（含文字），影片才是整個畫面一起暗下去
+    if fx.fade_out {
+        if let Some(f) = fade_out_filter(total_secs) {
+            tail.push_str(&f);
+            tail.push(',');
+        }
+    }
     tail.push_str("crop=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p");
 
     // 先把視訊濾鏡定案：有旋轉文字走 filter_complex，否則走 -vf
@@ -7007,6 +24751,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     let no_fx = OutputFx {
         transition: Transition::None,
         ken_burns: false,
+        fade_out: false,
         music: None,
     };
     run_conversion(
@@ -7058,10 +24803,14 @@ fn load_app_icon() -> egui::IconData {
 fn main() -> eframe::Result {
     // 越早裝越好：連啟動階段（字型載入、視窗建立）的 panic 都要留下紀錄
     install_panic_hook();
+    // 固定時間基準（看門狗的時間戳都以它為準），順便讓啟動耗時也算得進去
+    app_start();
 
-    // 清掉上次一鍵更新留下的舊版檔案
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::fs::remove_file(exe.with_extension("exe.old"));
+    // 清掉上次一鍵更新留下的舊版檔案（只有支援一鍵更新的平台會產生）
+    if SELF_UPDATE_SUPPORTED {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::fs::remove_file(exe.with_extension("exe.old"));
+        }
     }
 
     // 在背景清掉先前閃退/強制結束留下的孤兒暫存檔（不佔啟動時間）
@@ -7099,7 +24848,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Photo2Video — 照片轉影片")
             .with_icon(load_app_icon())
-            .with_inner_size([1280.0, 800.0])
+            // 起始就開最大化：側欄有四個區塊（調色、主體追蹤、文字、轉場與音樂），
+            // 1280×800 的視窗裝不下，後面兩個要捲動才看得到。最大化不必猜螢幕
+            // 多大、也不必擔心高 DPI 縮放後放不下（1440×900 是還原後的尺寸）
+            .with_inner_size([1440.0, 900.0])
+            .with_maximized(true)
             .with_min_inner_size([1024.0, 640.0]),
         ..Default::default()
     };
@@ -7117,6 +24870,175 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// 建一個有 `n` 張假照片的優化影像工具（純狀態，不碰檔案系統）
+    fn enhance_with(n: usize) -> EnhanceTool {
+        let mut t = EnhanceTool::default();
+        t.photos = (0..n).map(|i| PathBuf::from(format!("p{i}.jpg"))).collect();
+        t
+    }
+
+    /// 類型是「這張裡面是什麼」，所以挑過就跟著那張走：
+    /// 切回那張時類型列自動顯示它自己的那一個，別張不受影響
+    #[test]
+    fn 類型逐張記住並在切張時跟著顯示() {
+        let mut t = enhance_with(3);
+        t.preset = enhance::Preset::Landscape;
+        // 勾了「只調整這張」，改的就只有眼前這張
+        t.per_photo = true;
+        t.cur = 1;
+        assert!(t.set_preset(enhance::Preset::Bird));
+        assert_eq!(t.preset_for(&t.photos[1]), enhance::Preset::Bird);
+        assert_eq!(t.preset_for(&t.photos[0]), enhance::Preset::Landscape);
+        assert_eq!(t.preset_for(&t.photos[2]), enhance::Preset::Landscape);
+        // 整批那一個不動（下次開程式的起點）
+        assert_eq!(t.preset, enhance::Preset::Landscape);
+        // 切走再切回來，顯示的還是它自己挑的那個
+        t.cur = 0;
+        assert_eq!(t.cur_preset(), enhance::Preset::Landscape);
+        t.cur = 1;
+        assert_eq!(t.cur_preset(), enhance::Preset::Bird);
+        assert!(t.has_own(&t.photos[1]));
+        assert!(!t.has_own(&t.photos[0]));
+    }
+
+    /// 沒勾「只調整這張」時改的是整批——四百張都是拍鳥時，
+    /// 總不能一張一張點過去
+    #[test]
+    fn 沒勾只調整這張時類型套到整批() {
+        let mut t = enhance_with(3);
+        t.preset = enhance::Preset::Landscape;
+        t.per_photo = false;
+        assert!(t.set_preset(enhance::Preset::Bird));
+        assert_eq!(t.preset, enhance::Preset::Bird);
+        for p in &t.photos {
+            assert_eq!(t.preset_for(p), enhance::Preset::Bird);
+        }
+    }
+
+    /// 已經自己挑過的那張，之後整批換類型不該把它蓋掉
+    #[test]
+    fn 自己挑過的那張不會被整批的類型蓋掉() {
+        let mut t = enhance_with(3);
+        t.preset = enhance::Preset::Landscape;
+        // 第 1 張單獨挑成人像
+        t.per_photo = true;
+        t.cur = 1;
+        t.set_preset(enhance::Preset::Portrait);
+        // 回到第 0 張，取消勾選後把整批改成鳥類
+        t.per_photo = false;
+        t.cur = 0;
+        t.set_preset(enhance::Preset::Bird);
+        assert_eq!(t.preset_for(&t.photos[0]), enhance::Preset::Bird);
+        assert_eq!(t.preset_for(&t.photos[2]), enhance::Preset::Bird);
+        assert_eq!(
+            t.preset_for(&t.photos[1]),
+            enhance::Preset::Portrait,
+            "自己挑過的那張要留著"
+        );
+    }
+
+    /// 站在自己挑過的那張上改類型，改的是它自己——不會意外動到整批
+    #[test]
+    fn 在自己挑過的那張上改類型只動那一張() {
+        let mut t = enhance_with(2);
+        t.preset = enhance::Preset::Landscape;
+        t.per_photo = true;
+        t.cur = 0;
+        t.set_preset(enhance::Preset::Bird);
+        // 就算取消勾選，這張已經有自己的選擇，改的還是它自己
+        t.per_photo = false;
+        t.set_preset(enhance::Preset::Portrait);
+        assert_eq!(t.preset_for(&t.photos[0]), enhance::Preset::Portrait);
+        assert_eq!(t.preset, enhance::Preset::Landscape, "整批那一個不該被動到");
+        assert_eq!(t.preset_for(&t.photos[1]), enhance::Preset::Landscape);
+    }
+
+    /// 換了類型，先前用舊類型量出來的建議就作廢——目標值不同，
+    /// 留著會讓滑桿顯示對不上畫面的值
+    #[test]
+    fn 換類型會讓舊的自動值失效() {
+        let mut t = enhance_with(1);
+        t.preset = enhance::Preset::Landscape;
+        let path = t.photos[0].clone();
+        t.auto.insert(
+            path.clone(),
+            (enhance::Preset::Landscape, enhance::Auto::default()),
+        );
+        assert!(t.measured(&path).is_some());
+        t.per_photo = true;
+        t.set_preset(enhance::Preset::Bird);
+        assert!(
+            t.measured(&path).is_none(),
+            "類型換了，舊的量測結果不能再算數"
+        );
+    }
+
+    /// 「清除這張的修改」要連它自己挑的類型一起收掉，回到整批那一個
+    #[test]
+    fn 清除這張的修改會把類型也還原() {
+        let mut t = enhance_with(2);
+        t.preset = enhance::Preset::Landscape;
+        t.per_photo = true;
+        t.cur = 0;
+        t.set_preset(enhance::Preset::Bird);
+        assert!(t.reset_current());
+        assert_eq!(t.preset_for(&t.photos[0]), enhance::Preset::Landscape);
+        assert!(!t.has_own(&t.photos[0]));
+    }
+
+    /// 使用者在選檔對話框裡慢慢翻資料夾，超過門檻會先記一筆；
+    /// **但對話框一關就要把那筆撤銷**——程式從頭到尾沒當掉，
+    /// 不該在下次啟動時要人回報。實際遇過兩次（影片去煙霧與優化影像各一），
+    /// 兩次都只是使用者在挑照片
+    #[test]
+    fn 對話框關掉之後就把停止回應的紀錄撤銷() {
+        for phase in [PHASE_FILE_DIALOG, PHASE_MSG_DIALOG] {
+            // 還沒到門檻：什麼都不做
+            assert_eq!(
+                hang_action(phase, DIALOG_HANG_MS - 1, false, false),
+                HangAction::Fine
+            );
+            // 過了門檻：記一筆
+            assert_eq!(
+                hang_action(phase, DIALOG_HANG_MS, false, false),
+                HangAction::Report
+            );
+            // 還卡著：不重複寫
+            assert_eq!(
+                hang_action(phase, DIALOG_HANG_MS * 2, true, true),
+                HangAction::AlreadyReported
+            );
+            // 對話框關掉、UI 恢復：撤銷剛才那筆
+            assert_eq!(hang_action(phase, 0, true, true), HangAction::Withdraw);
+        }
+    }
+
+    /// 對話框的門檻要比一般狀態寬得多——UI 執行緒停在對話框裡是本來就會發生的事
+    #[test]
+    fn 對話框的門檻比一般狀態寬() {
+        assert!(DIALOG_HANG_MS > HANG_MS);
+        // 一般狀態下停這麼久就是真的卡住了，即使對話框門檻還沒到
+        assert_eq!(
+            hang_action(PHASE_UPDATE, HANG_MS, false, false),
+            HangAction::Report
+        );
+        assert_eq!(
+            hang_action(PHASE_FILE_DIALOG, HANG_MS, false, false),
+            HangAction::Fine
+        );
+    }
+
+    /// 真的凍住又自己恢復的畫面**不能**撤銷紀錄：那本身就是該追的問題。
+    /// 撤銷只給對話框
+    #[test]
+    fn 一般畫面凍住的紀錄不會被撤銷() {
+        assert_eq!(
+            hang_action(PHASE_UPDATE, 0, true, false),
+            HangAction::Fine
+        );
+        assert_eq!(hang_action(PHASE_IDLE, 0, true, false), HangAction::Fine);
+    }
 
     fn sorted(names: &[&str]) -> Vec<String> {
         let mut v: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
@@ -7290,6 +25212,17 @@ mod tests {
             .filter_chain(2.0)
             .unwrap();
         assert!(s2.contains("luma_msize_x=23:luma_msize_y=23"), "{s2}");
+
+        // 去朦朧 +100 → 減掉 0.22 那層幕（拉高輸入黑點）；
+        // 負值則反過來墊高輸出黑點，等於加一層幕上去
+        let dh = Adjustments { dehaze: 100, ..Default::default() }
+            .filter_chain(1.0)
+            .unwrap();
+        assert!(dh.contains("colorlevels=rimin=0.2200:gimin=0.2200:bimin=0.2200"), "{dh}");
+        let dl = Adjustments { dehaze: -50, ..Default::default() }
+            .filter_chain(1.0)
+            .unwrap();
+        assert!(dl.contains("colorlevels=romin=0.1100:gomin=0.1100:bomin=0.1100"), "{dl}");
 
         // 色調 +100 → colorbalance gm = -100/100*0.3 = -0.3（負＝偏洋紅）
         let ti = Adjustments { tint: 100, ..Default::default() }
@@ -7598,6 +25531,53 @@ mod tests {
     }
 
     #[test]
+    fn folder_dialog_starts_one_level_up_so_the_list_is_not_empty() {
+        // 選資料夾的對話框列的是子資料夾。開在上次選的那個裡面，照片資料夾
+        // 底下通常沒有子資料夾，使用者只會看到「沒有符合搜尋條件的項目」。
+        // 正確行為是開在上一層、把名字預填好
+        let root = std::env::temp_dir().join(format!("p2v_dlg_{}", std::process::id()));
+        let child = root.join("連拍1");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let (start, name) = folder_dialog_start(&child);
+        assert_eq!(start, root, "應該開在上一層，否則清單會是空的");
+        assert_eq!(name.as_deref(), Some("連拍1"), "上次選的資料夾名要預填");
+
+        // 上一層不存在（已被刪掉／磁碟機根目錄）時退回開在它自己裡面，
+        // 不能把對話框丟到一個不存在的路徑
+        let orphan = root.join("已刪掉的上層").join("裡面");
+        let (start, name) = folder_dialog_start(&orphan);
+        assert_eq!(start, orphan, "上一層不存在時就開在它自己");
+        assert_eq!(name, None, "沒有上一層就不預填名字");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn last_dir_keys_are_unique_per_purpose() {
+        // 每個模組、每種用途各記一份資料夾。兩個用途不小心共用同一個
+        // config 欄位（複製貼上少改一個字）就會互相蓋掉，症狀是「存完影片
+        // 再去選照片，對話框跑到影片輸出的資料夾」——很難從畫面上看出來，
+        // 所以在這裡把重複擋掉
+        let mut seen: Vec<&str> = Vec::new();
+        for d in LastDir::ALL {
+            assert!(
+                !seen.contains(&d.key()),
+                "有兩個用途共用 config 欄位 {}",
+                d.key()
+            );
+            seen.push(d.key());
+        }
+        // 欄位名也不能撞到既有設定（fps、recent_projects 等）
+        for k in seen {
+            assert!(
+                k.starts_with("dir_"),
+                "資料夾記錄欄位 {k} 沒有 dir_ 前綴，可能與其他設定衝突"
+            );
+        }
+    }
+
+    #[test]
     fn adjustments_values_and_values_mut_same_order() {
         // values()（讀）與 values_mut()（滑桿寫）必須同欄位順序：對不上的話
         // 拖某條滑桿會改到另一個調色參數。逐欄寫入唯一值再讀回驗證一致。
@@ -7697,6 +25677,24 @@ mod tests {
         assert_eq!(fx("my.video.avi", "mp4"), "my.video.mp4");
     }
 
+    /// 結尾淡出：淡出一秒、剛好收在影片結束的那一刻；
+    /// 短片依比例縮短，短到沒意義就不淡
+    #[test]
+    fn fade_out_lands_exactly_at_the_end() {
+        let f = fade_out_filter(13.8).expect("十幾秒的影片要淡出");
+        assert!(f.starts_with("fade=t=out:"), "{f}");
+        assert!(f.contains("st=12.800") && f.contains("d=1.000"), "{f}");
+        assert!(f.ends_with(":c=black"), "{f}");
+
+        // 一秒半的影片：淡出縮到全片的三分之一（0.5 秒），仍收在結尾
+        let short = fade_out_filter(1.5).expect("短片也該淡出");
+        assert!(short.contains("st=1.000") && short.contains("d=0.500"), "{short}");
+
+        // 短到只有兩三格就別淡了，整支影片都在變黑
+        assert!(fade_out_filter(0.2).is_none());
+        assert!(fade_out_filter(0.0).is_none());
+    }
+
     #[test]
     fn transition_fade_width_never_exceeds_half_photo() {
         // 關鍵不變式：淡出半寬 ≤ 半張照片時長，否則畫面中點回不到全亮、整支
@@ -7753,6 +25751,22 @@ mod tests {
         // 涵蓋整段（第 0~e 張）：結尾 = (e+1)*d - buf
         let (_, full_end) = subtitle_enable_window(0, 4, d, fps);
         assert!((full_end - (5.0 * d - buf)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn num_box_reads_what_people_actually_type() {
+        // 一般情形
+        assert_eq!(parse_num("50"), Some(50.0));
+        assert_eq!(parse_num("-12"), Some(-12.0));
+        // 照著畫面上的樣子打回去也要讀得懂：帶正號、帶單位、前後有空白
+        assert_eq!(parse_num("+5"), Some(5.0));
+        assert_eq!(parse_num("180°"), Some(180.0));
+        assert_eq!(parse_num("  -180° "), Some(-180.0));
+        assert_eq!(parse_num("7.5"), Some(7.5));
+        // 看不懂的就當作沒改（呼叫端會保留原值）
+        assert_eq!(parse_num(""), None);
+        assert_eq!(parse_num("-"), None);
+        assert_eq!(parse_num("abc"), None);
     }
 
     #[test]
@@ -7824,17 +25838,898 @@ mod tests {
 
     #[test]
     fn base_scale_pad_vf_applies_adjust_before_pad() {
-        // 無調色：scale 後直接 pad
-        let plain = base_scale_pad_vf(1920, 1080, "");
+        // 無裁切無調色：scale 後直接 pad
+        let plain = base_scale_pad_vf(1920, 1080, "", "");
         assert!(plain.starts_with("scale=1920:1080:force_original_aspect_ratio=decrease,"));
         assert!(plain.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"));
 
         // 有調色：調色濾鏡必須在 pad 之前——否則補出的黑邊會被調亮成灰。
-        let adj = base_scale_pad_vf(1920, 1080, "eq=brightness=0.2000,");
+        let adj = base_scale_pad_vf(1920, 1080, "", "eq=brightness=0.2000,");
         let eq_at = adj.find("eq=brightness").expect("應含調色");
         let pad_at = adj.find("pad=").expect("應含補邊");
         assert!(eq_at < pad_at, "調色須在補邊之前（否則黑邊被調亮）：{adj}");
         // 補邊色恆為純黑
         assert!(adj.contains("color=black"));
+
+        // 有裁切：crop 必須在 scale 之前——順序反了會變成「切完留在原位」，
+        // 切出來的那塊不會放大填滿畫面
+        let cropped = base_scale_pad_vf(1920, 1080, "crop=iw*0.5:ih*0.5:iw*0.25:ih*0.25,", "");
+        let crop_at = cropped.find("crop=").expect("應含裁切");
+        let scale_at = cropped.find("scale=").expect("應含縮放");
+        assert!(crop_at < scale_at, "裁切須在縮放之前：{cropped}");
+    }
+
+    /// 追蹤鏡頭切下來的那一塊：比例要跟輸出一致（不然成品會補黑邊）、
+    /// 主體的寬與高都要塞得下、再大也不能超出整張畫布
+    #[test]
+    fn track_camera_box_matches_output_aspect_and_holds_the_subject() {
+        let canvas = (6000.0, 4000.0); // 3:2 的原圖
+        let aspect = 16.0 / 9.0; // 輸出 Full HD
+
+        let (w, h) = track_crop_box((0.08, 0.10), 3.0, canvas, aspect);
+        // 像素上的長寬比要等於輸出比例
+        let got = (w * canvas.0) / (h * canvas.1);
+        assert!((got - aspect).abs() < 1e-3, "切出來的比例是 {got}，應為 {aspect}");
+        // 主體整個框都要在裡面（這裡是直立的主體，寬度不能說了算）
+        assert!(w >= 0.08 * 3.0 - 1e-4 && h >= 0.10 * 3.0 - 1e-4, "主體被切掉了：{w} × {h}");
+
+        // 橫躺的主體換另一邊吃緊，同樣兩邊都要夠
+        let (w2, h2) = track_crop_box((0.30, 0.05), 2.0, canvas, aspect);
+        assert!(w2 >= 0.30 * 2.0 - 1e-4 && h2 >= 0.05 * 2.0 - 1e-4);
+
+        // 放大到塞不下時縮回整張畫布內，且比例仍然維持
+        let (w3, h3) = track_crop_box((0.5, 0.5), TRACK_ZOOM_MAX, canvas, aspect);
+        assert!(w3 <= 1.0 && h3 <= 1.0, "裁切框超出畫布：{w3} × {h3}");
+        assert!((w3 - 1.0).abs() < 1e-3 || (h3 - 1.0).abs() < 1e-3, "沒有塞好：{w3} × {h3}");
+        let got3 = (w3 * canvas.0) / (h3 * canvas.1);
+        assert!((got3 - aspect).abs() < 1e-3);
+    }
+
+    /// 自動選平滑度：軌跡乾淨時選得低（主體釘在正中央），
+    /// 軌跡有雜訊時自己選高一點把鏡頭的抖動壓下去
+    #[test]
+    fn smoothing_is_picked_to_balance_centring_against_shake() {
+        let crop = (0.3f32, 0.2f32);
+        // 乾淨的等速軌跡：不需要平滑，主體就該一直在正中央
+        let clean: Vec<(f32, f32)> = (0..40).map(|i| (0.2 + 0.01 * i as f32, 0.5)).collect();
+        assert_eq!(fit_smooth(&clean, crop), 0, "乾淨的軌跡不該被磨");
+
+        // 同一條線加上逐張跳動的雜訊：要選一個明顯的平滑度把它壓掉
+        let noisy: Vec<(f32, f32)> = (0..40)
+            .map(|i| {
+                let j = if i % 2 == 0 { 0.012 } else { -0.012 };
+                (0.2 + 0.01 * i as f32 + j, 0.5 - j)
+            })
+            .collect();
+        let s = fit_smooth(&noisy, crop);
+        assert!(s >= 25, "有雜訊卻幾乎不平滑（選了 {s}）");
+        assert!(s <= 90, "平滑過頭，主體會離開中央（選了 {s}）");
+    }
+
+    /// 沒框到的照片要用前後兩張內插補上，鏡頭才會順順地滑過去；
+    /// 頭尾的空檔沒有另一端可內插，沿用最近的那張
+    #[test]
+    fn gaps_are_filled_by_gliding_between_the_boxes() {
+        let pts = fill_gaps(&[
+            None,
+            Some((0.20, 0.50)),
+            None,
+            None,
+            Some((0.50, 0.80)),
+            None,
+        ]);
+        // 開頭沒框到：跟著第一張有框的
+        assert_eq!(pts[0], (0.20, 0.50));
+        // 中間兩張平均分布在 0.20 與 0.50 之間
+        assert!((pts[2].0 - 0.30).abs() < 1e-5 && (pts[3].0 - 0.40).abs() < 1e-5, "{pts:?}");
+        assert!((pts[2].1 - 0.60).abs() < 1e-5 && (pts[3].1 - 0.70).abs() < 1e-5, "{pts:?}");
+        // 結尾沒框到：停在最後一張有框的位置
+        assert_eq!(pts[5], (0.50, 0.80));
+        // 全部沒框到時退回畫面中央（呼叫端已擋掉，這裡只是防呆）
+        assert_eq!(fill_gaps(&[None, None]), vec![(0.5, 0.5); 2]);
+    }
+
+    /// 一段追蹤累積的漂移要沿路攤平：終點回到使用者框的位置，
+    /// 起點附近幾乎不動；但差太多時是「跟丟」不是「漂移」，原樣不動
+    #[test]
+    fn drift_is_spread_along_the_run_but_not_when_it_lost_track() {
+        let hit = |cx: f32| track::Hit { cx, cy: 0.5, score: 0.9, locked: true };
+        // 追出來一路往右偏，終點差了 0.04
+        let mut run: Vec<(usize, Option<track::Hit>)> =
+            (0..4).map(|i| (i, Some(hit(0.30 + 0.01 * i as f32)))).collect();
+        spread_drift(&mut run, (0.29, 0.5));
+        let end = run.last().unwrap().1.unwrap();
+        assert!((end.cx - 0.29).abs() < 1e-5, "終點沒回到使用者框的位置：{}", end.cx);
+        let first = run[0].1.unwrap();
+        assert!((first.cx - 0.30).abs() < 0.012, "起點被拉太多：{}", first.cx);
+
+        // 差了大半個畫面＝中途跟丟，硬攤只會把追對的幾張也拉歪
+        let mut lost: Vec<(usize, Option<track::Hit>)> =
+            (0..4).map(|i| (i, Some(hit(0.30 + 0.15 * i as f32)))).collect();
+        let before = lost.clone();
+        spread_drift(&mut lost, (0.29, 0.5));
+        for (a, b) in lost.iter().zip(&before) {
+            assert_eq!(a.1.unwrap().cx, b.1.unwrap().cx);
+        }
+    }
+
+    /// 裁切只在真的裁到東西時才產生濾鏡，且座標一律寫成 iw/ih 的比例——
+    /// 同一串濾鏡要能套在原圖與預覽縮圖上，切到的是同一塊
+    #[test]
+    fn crop_filter_is_relative_and_skipped_when_full() {
+        assert_eq!(Crop::default().filter(), None, "整張不該產生裁切濾鏡");
+        // 差幾個 10^-5 是拖回去時的誤差，不值得為它跑一次裁切
+        let almost = Crop { x0: 0.0001, y0: 0.0, x1: 1.0, y1: 0.9999, ..Default::default() };
+        assert_eq!(almost.filter(), None);
+
+        let c = Crop { x0: 0.25, y0: 0.1, x1: 0.75, y1: 0.6, ..Default::default() };
+        let f = c.filter().expect("有裁到就要有濾鏡");
+        assert_eq!(f, "crop=iw*0.500000:ih*0.500000:iw*0.250000:ih*0.100000");
+
+        // 只設裁切、十二條滑桿沒動：調色鏈要維持 None，
+        // 否則呼叫端會串出「scale=…,,pad=…」這種不合法的濾鏡
+        let only_crop = Adjustments { crop: c, ..Default::default() };
+        assert!(!only_crop.is_neutral(), "有裁切就不算沒動過");
+        assert!(only_crop.grade_is_neutral(), "十二條滑桿仍在原位");
+        assert_eq!(only_crop.filter_chain(1.0), None);
+    }
+
+    /// 反過來拖、拖出界、拖到剩一條線，都要被夾成合法的框
+    #[test]
+    fn crop_clamps_reversed_and_out_of_range_drags() {
+        let c = Crop { x0: 0.8, y0: 0.9, x1: 0.2, y1: 0.3, ..Default::default() }.clamped();
+        assert!(c.x0 < c.x1 && c.y0 < c.y1, "左上要在右下的左上：{c:?}");
+        let c = Crop { x0: -0.5, y0: -0.5, x1: 1.5, y1: 1.5, ..Default::default() }.clamped();
+        assert_eq!((c.x0, c.y0, c.x1, c.y1), (0.0, 0.0, 1.0, 1.0));
+        let thin = Crop { x0: 0.5, y0: 0.5, x1: 0.5, y1: 0.5, ..Default::default() }.clamped();
+        assert!(thin.w() >= CROP_MIN && thin.h() >= CROP_MIN, "不該退化成一個點");
+    }
+
+    /// 換像素尺寸時裁切框切到的仍是同一塊（相對座標的重點）
+    #[test]
+    fn crop_pixels_scale_with_the_image() {
+        let c = Crop { x0: 0.25, y0: 0.5, x1: 0.75, y1: 1.0, ..Default::default() };
+        assert_eq!(c.pixels(400, 200), (100, 100, 200, 100));
+        assert_eq!(c.pixels(4000, 2000), (1000, 1000, 2000, 1000));
+        // 邊界：切到最右下也不會超出影像
+        let edge = Crop { x0: 0.9, y0: 0.9, x1: 1.0, y1: 1.0, ..Default::default() };
+        let (x, y, w, h) = edge.pixels(101, 101);
+        assert!(x + w <= 101 && y + h <= 101, "不可超出影像：{x},{y},{w},{h}");
+    }
+
+    /// 「保留舊檔、自動改名」要真的挑到一個沒被佔用的名字，而且副檔名要留著
+    #[test]
+    fn next_free_path_skips_taken_names() {
+        let dir = std::env::temp_dir().join(format!("p2v_free_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let base = dir.join("照片_去煙.jpg");
+        // 還沒有人佔用：原樣回傳
+        let _ = std::fs::remove_file(&base);
+        assert_eq!(next_free_path(&base), base);
+
+        std::fs::write(&base, b"x").expect("寫得進暫存資料夾");
+        let n1 = next_free_path(&base);
+        assert_eq!(n1.file_name().unwrap(), "照片_去煙(1).jpg");
+
+        std::fs::write(&n1, b"x").expect("寫得進暫存資料夾");
+        let n2 = next_free_path(&base);
+        assert_eq!(n2.file_name().unwrap(), "照片_去煙(2).jpg");
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&n1);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 旋轉：整圈用 transpose（不會糊）、細角度才用 rotate，而且一定排在
+    /// crop 之前——裁切框的座標是對著轉完的畫布算的
+    #[test]
+    fn rotation_filters_come_before_the_crop() {
+        assert_eq!(Crop::default().rotate_filter(), None, "沒轉就不該有濾鏡");
+
+        let q = Crop { quarter: 1, ..Default::default() };
+        assert_eq!(q.rotate_filter().as_deref(), Some("transpose=1"));
+        let q2 = Crop { quarter: 3, ..Default::default() };
+        assert_eq!(
+            q2.rotate_filter().as_deref(),
+            Some("transpose=1,transpose=1,transpose=1"),
+            "逆時針 90° ＝ 順時針轉三圈"
+        );
+
+        // 細角度：撐成外接框、四角補黑
+        let a = Crop { angle: 5.0, ..Default::default() };
+        let f = a.rotate_filter().expect("有拉直就要有濾鏡");
+        assert!(f.starts_with("rotate="), "細角度用 rotate：{f}");
+        assert!(f.contains("ow=rotw(") && f.contains("oh=roth("), "畫布要撐成外接框：{f}");
+
+        // 串起來的順序：rotate 一定在 crop 前面
+        let both = Crop { x0: 0.1, y0: 0.1, x1: 0.9, y1: 0.9, angle: 3.0, quarter: 1 };
+        let vf = both.vf_prefix();
+        let rot = vf.find("transpose").expect("應含整圈旋轉");
+        let fine = vf.find("rotate=").expect("應含拉直");
+        let crop = vf.find("crop=").expect("應含裁切");
+        assert!(rot < fine && fine < crop, "順序要是 整圈→拉直→裁切：{vf}");
+        assert!(vf.ends_with(','), "要留結尾逗號給呼叫端接下一段：{vf}");
+    }
+
+    /// 轉過之後畫布會變大（外接框），裁切框的相對座標是對著它算的
+    #[test]
+    fn rotating_grows_the_canvas_to_the_bounding_box() {
+        let none = Crop::default();
+        assert_eq!(none.canvas(400.0, 200.0), (400.0, 200.0), "沒轉就是原尺寸");
+
+        // 轉 90°：長寬對調
+        let q = Crop { quarter: 1, ..Default::default() };
+        let (w, h) = q.canvas(400.0, 200.0);
+        assert!((w - 200.0).abs() < 0.01 && (h - 400.0).abs() < 0.01, "{w}×{h}");
+
+        // 轉 45°：外接框是 (400+200)/√2 的正方形
+        let a = Crop { angle: 45.0, ..Default::default() };
+        let (w, h) = a.canvas(400.0, 200.0);
+        let want = 600.0 / 2.0_f32.sqrt();
+        assert!((w - want).abs() < 0.5 && (h - want).abs() < 0.5, "{w}×{h}，應約 {want}");
+    }
+
+    /// 轉過之後整張框會切到四角補的黑，要能自動縮回照片裡
+    #[test]
+    fn crop_shrinks_to_stay_off_the_rotated_corners() {
+        let tilted = Crop { angle: 10.0, ..Default::default() };
+        assert!(!tilted.inside_photo(4000.0, 3000.0), "整張框一定會吃到黑角");
+
+        let fixed = tilted.shrunk_into_photo(4000.0, 3000.0);
+        assert!(fixed.inside_photo(4000.0, 3000.0), "縮完就不該再吃到黑角");
+        assert!(fixed.w() < 1.0 && fixed.h() < 1.0, "確實有縮小");
+        // 維持中心與長寬比
+        assert!(((fixed.x0 + fixed.x1) / 2.0 - 0.5).abs() < 1e-3);
+        assert!((fixed.w() / fixed.h() - 1.0).abs() < 1e-3, "原本是 1:1 的相對框");
+        assert_eq!(fixed.angle, 10.0, "角度不能被縮框弄丟");
+
+        // 沒轉的照片本來就在裡面，不該被動到
+        let plain = Crop { x0: 0.1, y0: 0.1, x1: 0.9, y1: 0.9, ..Default::default() };
+        assert_eq!(plain.shrunk_into_photo(4000.0, 3000.0), plain.clamped());
+    }
+
+    /// 只轉不裁時仍要算「動過」，而且調色鏈維持 None
+    #[test]
+    fn rotation_alone_still_counts_as_edited() {
+        let only_rot = Adjustments {
+            crop: Crop { quarter: 1, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(!only_rot.is_neutral(), "轉過就不算沒動過");
+        assert!(only_rot.grade_is_neutral(), "十二條滑桿仍在原位");
+        assert_eq!(only_rot.filter_chain(1.0), None);
+        assert_eq!(only_rot.crop.filter(), None, "沒裁就不該有 crop 濾鏡");
+        assert!(only_rot.crop.rotate_filter().is_some());
+    }
+
+    /// 指定長寬比時，換算回相對座標要把原圖的像素比考慮進去
+    #[test]
+    fn crop_to_ratio_accounts_for_the_pixel_aspect() {
+        // 3:2 的原圖上要一個 1:1 的框：相對座標的寬要是高的 2/3
+        let c = crop_to_ratio(Crop::default(), 1.0, Some((3000, 2000)));
+        assert!(
+            ((c.w() * 3000.0) / (c.h() * 2000.0) - 1.0).abs() < 0.01,
+            "像素上要是正方形：{:.1}×{:.1}",
+            c.w() * 3000.0,
+            c.h() * 2000.0
+        );
+        assert!(c.x0 >= 0.0 && c.y0 >= 0.0 && c.x1 <= 1.0 && c.y1 <= 1.0, "要塞得進畫面");
+    }
+
+    /// 自動判參數的優先序：動過滑桿的那張以使用者調的為準，
+    /// 其餘各套自己量出來的值，關掉自動就整批回到共用參數
+    #[test]
+    fn auto_values_yield_to_what_the_user_adjusted() {
+        let (a, b) = (PathBuf::from("a.jpg"), PathBuf::from("b.jpg"));
+        let mut s = SmokeTool {
+            photos: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+        s.auto.insert(
+            a.clone(),
+            dehaze::AutoParams {
+                strength: 51,
+                detail: 71,
+                sky_clean: 0,
+                sky_range: 40,
+            },
+        );
+        s.auto.insert(
+            b.clone(),
+            dehaze::AutoParams {
+                strength: 92,
+                detail: 62,
+                sky_clean: 30,
+                sky_range: 55,
+            },
+        );
+        // 各套自己的
+        assert_eq!(s.params_for(&a).strength, 51);
+        assert_eq!(s.params_for(&b).strength, 92);
+        assert_eq!(s.params_for(&b).sky_clean, 30);
+
+        // 在第一張上動滑桿：只寫成這張的個別設定，不碰第二張的自動值
+        let mut p = s.effective();
+        p.strength = 30;
+        s.set_params(p);
+        assert_eq!(s.params_for(&a).strength, 30);
+        assert_eq!(s.params_for(&b).strength, 92);
+
+        // 關掉自動就整批回到共用參數；已經調過的第一張仍保留使用者調的
+        s.auto_on = false;
+        let shared = SmokeParams::default().strength;
+        assert_eq!(s.params_for(&b).strength, shared);
+        assert_eq!(s.params_for(&a).strength, 30);
+    }
+
+    /// 自動值只蓋掉四條數值滑桿，遮色片與保護色仍沿用共用那一份——
+    /// 使用者框好的範圍不能因為換一張照片就消失
+    #[test]
+    fn auto_values_leave_the_mask_and_swatches_alone() {
+        let a = PathBuf::from("a.jpg");
+        let mut s = SmokeTool {
+            photos: vec![a.clone()],
+            ..Default::default()
+        };
+        s.params.add_protect([12, 34, 56]);
+        s.params.feather = 7;
+        s.auto.insert(
+            a.clone(),
+            dehaze::AutoParams {
+                strength: 88,
+                detail: 66,
+                sky_clean: 0,
+                sky_range: 40,
+            },
+        );
+        let p = s.params_for(&a);
+        assert_eq!((p.strength, p.detail), (88, 66));
+        assert_eq!(p.feather, 7);
+        assert_eq!(p.protect[0], Some([12, 34, 56]));
+    }
+
+    /// 「回自動預設值」只把四條數值滑桿放回這張量出來的值：
+    /// 自己畫的遮色片、吸的保護色要留著，別張也不受影響
+    #[test]
+    fn nothing_to_show_means_the_mask_view_is_not_available() {
+        // 「顯示遮色片」只有在真的畫了遮色片、或吸了保護色時才有東西可看。
+        //
+        // 沒有的話遮罩檢視會蓋出一片紅（那是「只處理天空」排除掉的地景，
+        // 不是使用者畫的東西），看起來就像遮色片清不掉——實際回報過的狀況。
+        // 這條驗的是那個「有沒有東西可看」的判斷本身
+        let a = PathBuf::from("a.jpg");
+        let mut s = SmokeTool {
+            photos: vec![a.clone()],
+            ..Default::default()
+        };
+        let can_show = |s: &SmokeTool| {
+            let e = s.effective();
+            e.has_shapes() || e.has_protect()
+        };
+        assert!(!can_show(&s), "什麼都沒有時不該能開遮罩檢視");
+
+        let mut v = s.effective();
+        assert!(v.add_shape(dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.1,
+            y0: 0.1,
+            x1: 0.9,
+            y1: 0.9,
+        })));
+        s.set_params(v);
+        assert!(can_show(&s), "畫了遮色片就該能看");
+
+        // 清掉之後又沒東西可看了——UI 會在這時把 show_mask 關掉，
+        // 否則畫面卡在遮罩檢視、開關卻已經變灰，使用者退不出來
+        let mut v = s.effective();
+        v.clear_shapes();
+        s.set_params(v);
+        assert!(!can_show(&s), "清掉之後就不該再能看");
+
+        // 只吸保護色、沒畫遮色片一樣算有東西可看
+        let mut v = s.effective();
+        assert!(v.add_protect([200, 120, 60]));
+        s.set_params(v);
+        assert!(can_show(&s), "只有保護色也要看得到它蓋住哪裡");
+    }
+
+    #[test]
+    fn clear_mask_button_actually_clears_it() {
+        // 「清除遮色片」那顆按鈕的完整流程：拿 effective()、clear_shapes()、寫回去。
+        // 這條路和使用者實際畫遮色片走的是同一組 API，所以照著跑一次
+        let a = PathBuf::from("a.jpg");
+        let mut s = SmokeTool {
+            photos: vec![a.clone()],
+            ..Default::default()
+        };
+        s.auto.insert(
+            a.clone(),
+            dehaze::AutoParams {
+                strength: 62,
+                detail: 71,
+                sky_clean: 20,
+                sky_range: 40,
+            },
+        );
+        let mut v = s.effective();
+        for x0 in [0.10f32, 0.18, 0.26] {
+            assert!(v.add_shape(dehaze::Shape::Rect(dehaze::Region {
+                x0,
+                y0: x0,
+                x1: 1.0 - x0,
+                y1: 1.0 - x0,
+            })));
+        }
+        s.set_params(v);
+        assert_eq!(s.effective().shapes.len(), 3, "測試前提：畫得上去");
+
+        // 按下「清除遮色片」
+        let mut v = s.effective();
+        v.clear_shapes();
+        s.set_params(v);
+        assert!(
+            !s.effective().has_shapes(),
+            "按了清除遮色片，畫面上就不該再有形狀"
+        );
+    }
+
+    #[test]
+    fn reset_clears_the_mask_this_photo_actually_sees() {
+        // 「清除所有修改內容」按下去，畫面上的遮色片框線就該不見。
+        //
+        // 踩過的坑：遮色片畫在整批共用的那一份裡，重設卻只把個別設定收掉——
+        // 共用那一份於是重新套回這張，框線看起來完全沒清掉
+        let (a, b) = (PathBuf::from("a.jpg"), PathBuf::from("b.jpg"));
+        let mut s = SmokeTool {
+            photos: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+        s.auto.insert(
+            a.clone(),
+            dehaze::AutoParams {
+                strength: 62,
+                detail: 71,
+                sky_clean: 20,
+                sky_range: 40,
+            },
+        );
+        // 共用那一份帶著使用者畫的遮色片（在自動值回來之前畫的就會落在這裡）
+        let rect = dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.1,
+            y0: 0.1,
+            x1: 0.9,
+            y1: 0.9,
+        });
+        assert!(s.params.add_shape(rect), "測試前提：共用那一份有遮色片");
+        assert!(s.params_for(&a).has_shapes(), "第一張看得到共用的遮色片");
+
+        s.cur = 0;
+        s.reset_params_for_current();
+        assert!(
+            !s.params_for(&a).has_shapes(),
+            "清除之後這張不該再看到遮色片"
+        );
+        // 量出來的值是「剛載進來」的一部分，不該被一起丟掉
+        assert_eq!(
+            (s.params_for(&a).strength, s.params_for(&a).detail),
+            (62, 71),
+            "自動判出來的值要留著"
+        );
+        // 別張照片仍照舊用共用的那一份
+        assert!(
+            s.params_for(&b).has_shapes(),
+            "只清這張，別張的遮色片不該跟著消失"
+        );
+    }
+
+    #[test]
+    fn finishing_an_edit_puts_every_tool_away() {
+        // 工具還勾著時預覽是「沒轉也沒裁的原圖」、左鍵也還在畫，可是工具那一排
+        // 捲下去就看不到——「完成編輯」要把這幾樣一次收乾淨，預覽才變回存檔
+        // 會拿到的樣子（實際回報過的狀況：框選一直勾著，以為預覽壞了）
+        let mut s = SmokeTool {
+            mask_tool: Some(MaskTool::Rect),
+            wipe_on: true,
+            picking: Some(PickTarget::Protect),
+            show_mask: true,
+            applied: Some(SmokeParams::default()),
+            ..Default::default()
+        };
+        assert!(s.source_tools_active(), "測試前提：現在算編輯中");
+        s.end_editing();
+        assert!(!s.source_tools_active(), "收起來之後就不該再算編輯中");
+        assert!(s.mask_tool.is_none());
+        assert!(!s.wipe_on);
+        assert!(s.picking.is_none());
+        assert!(!s.show_mask);
+        assert!(
+            s.applied.is_none(),
+            "遮罩檢視關掉要重畫一次，否則畫面停在那片紅色"
+        );
+    }
+
+    #[test]
+    fn a_fresh_stack_is_not_called_editing() {
+        // 遮罩檢視預設是開著的（畫好遮色片就直接看得到），可是它要專業模式＋
+        // 單層檢視＋真的畫過東西才蓋得出那片紅。少看這幾個條件的話，照片一
+        // 選進來就說在編輯——實際回報過的狀況
+        let s = StackTool::default();
+        assert!(s.show_mask, "測試前提：遮罩檢視預設就是開著的");
+        assert!(!s.editing(), "什麼都還沒做，不該說在編輯");
+
+        // 專業模式、切到單層，但這一層還沒畫遮色片：紅色蓋不出來，一樣不算
+        let s = StackTool {
+            pro: true,
+            view_layer: true,
+            photos: vec![PathBuf::from("a.jpg")],
+            ..Default::default()
+        };
+        assert!(!s.editing(), "沒畫遮色片就沒有東西可看，不算編輯中");
+
+        // 混合方式改成「濾色」＝疊出來的東西跟著不一樣，要提醒
+        let s = StackTool { pro: true, mode: stack::BlendMode::Screen, ..Default::default() };
+        assert!(s.editing(), "濾色不是預設，要算編輯中");
+        // 簡易模式一律用加亮，那時 mode 放著不算數
+        let s = StackTool { pro: false, mode: stack::BlendMode::Screen, ..Default::default() };
+        assert!(!s.editing(), "簡易模式根本不吃 mode，不該說在編輯");
+    }
+
+    #[test]
+    fn finishing_a_stack_edit_goes_back_to_the_stacked_result() {
+        // 疊圖這邊同一個道理：工具或「調整圖層」開著時畫面停在單層／左鍵在搬
+        // 圖層，看到的不是疊出來的成品。按「完成編輯」要一次收乾淨並切回結果
+        let mut s = StackTool {
+            tool: Some(MaskTool::Brush),
+            show_mask: true,
+            move_mode: true,
+            view_layer: true,
+            ..Default::default()
+        };
+        assert!(s.editing(), "測試前提：現在算編輯中");
+        s.end_editing();
+        assert!(!s.editing(), "收起來之後就不該再算編輯中");
+        assert!(s.tool.is_none());
+        assert!(!s.show_mask);
+        assert!(!s.move_mode);
+        assert!(!s.view_layer, "畫面要回到疊圖結果，不是停在單層");
+
+        // 「調整圖層」自己一個開著也算編輯中：那時左鍵是拿來搬圖層的
+        let mut s = StackTool { move_mode: true, ..Default::default() };
+        assert!(s.editing());
+        s.end_editing();
+        assert!(!s.editing());
+
+        // 濾色也算編輯中（提醒這個非預設的設定還開著），但「完成編輯」
+        // **不能**替使用者改回加亮：選了濾色就是要用濾色出圖。
+        // 按下去收的是提醒，不是設定
+        let mut s = StackTool {
+            pro: true,
+            mode: stack::BlendMode::Screen,
+            tool: Some(MaskTool::Rect),
+            ..Default::default()
+        };
+        assert!(s.editing());
+        s.end_editing();
+        assert!(s.tool.is_none(), "工具還是要收起來");
+        assert_eq!(s.mode, stack::BlendMode::Screen, "濾色不能被改掉");
+        assert!(!s.editing(), "提醒收下之後就不該再顯示編輯中");
+
+        // 再動一次混合方式，提醒就回來（UI 上按那兩顆時把旗標放掉）
+        s.blend_noted = false;
+        assert!(s.editing(), "又動過混合方式就該再提醒一次");
+    }
+
+    #[test]
+    fn the_stack_only_reloads_finer_layers_when_it_can_afford_them() {
+        // 疊圖得把**每一層**同時放在記憶體裡，所以精細底圖的上限跟張數走
+        let orig = 7283;
+        // 小視窗、符合視窗：工作縮圖就夠，不必多花那幾秒
+        assert_eq!(stack_fine_target(1200, orig, 3), None);
+        // 三張、放大一點：載到夠用就好（對齊級距，拉視窗才不會一直重載）
+        assert_eq!(stack_fine_target(2000, orig, 3), Some(2048));
+        // 三張拉到 1:1：吃到上限
+        assert_eq!(stack_fine_target(orig, orig, 3), Some(SMOKE_FINE_CAP));
+        // 張數多，預算除下來每張就小：仍然比工作縮圖細，但到不了上限
+        let many = stack_fine_target(orig, orig, 12).expect("十二張還載得動");
+        assert!(
+            (SMOKE_PREVIEW_MAX..SMOKE_FINE_CAP).contains(&many),
+            "十二張應該落在工作縮圖與上限之間，卻是 {many}"
+        );
+        // 再多就別載了：每張分到的比工作縮圖還小，載了也是白費
+        assert_eq!(stack_fine_target(orig, orig, 40), None);
+        // 照片本身沒那麼大就別憑空放大
+        assert_eq!(stack_fine_target(4000, 2400, 3), Some(2400));
+    }
+
+    #[test]
+    fn the_preview_only_gets_a_finer_base_when_it_actually_needs_one() {
+        // 顯示比例是照**原圖**算的，所以「畫面上佔幾個實體像素」就直接決定
+        // 底圖要多細：不夠細看到的是被放大的縮圖，煙火的線條會鈍一階
+        // （實際回報過的狀況）
+        let orig = 7283;
+        // 符合視窗（小視窗）：工作縮圖就夠，不必多花那幾秒
+        assert_eq!(fine_target(1200, orig), None);
+        assert_eq!(fine_target(SMOKE_PREVIEW_MAX, orig), None);
+        // 視窗大一點、或放大一級：解到夠用就好，且對齊級距，
+        // 免得拉個視窗就重解一次
+        assert_eq!(fine_target(1700, orig), Some(2048));
+        assert_eq!(fine_target(2048, orig), Some(2048));
+        assert_eq!(fine_target(2049, orig), Some(2560));
+        // 1:1：照片比上限還大，只能解到上限，剩下的靠內插
+        assert_eq!(fine_target(orig, orig), Some(SMOKE_FINE_CAP));
+        assert_eq!(fine_target(99_999, orig), Some(SMOKE_FINE_CAP));
+        // 照片本身沒那麼大就別憑空放大
+        assert_eq!(fine_target(4000, 2400), Some(2400));
+        assert_eq!(fine_target(4000, 1500), None, "比工作縮圖還小的照片不必再解");
+    }
+
+    #[test]
+    fn a_new_batch_drops_what_was_picked_from_the_old_one() {
+        // 「🖼 選擇照片」換成完全不同的照片時，共用那一份裡「對著上一批的
+        // 畫面才成立」的東西要跟著收掉：遮色片、保護色、雲色、夜空色與
+        // 調色文字。實際回報過的狀況——新選進來的兩張都只有某一塊沒被
+        // 處理，看起來像遮色片沒清掉。
+        // 只是增減幾張（與手上這批有交集）則一律留著，否則調好的一批
+        // 重選一次就白做
+        let (a, b, c) = (
+            PathBuf::from("a.jpg"),
+            PathBuf::from("b.jpg"),
+            PathBuf::from("c.jpg"),
+        );
+        let mut s = SmokeTool {
+            photos: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+        assert!(s.params.add_shape(dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.1,
+            y0: 0.1,
+            x1: 0.9,
+            y1: 0.9,
+        })));
+        assert!(s.params.add_protect([200, 120, 60]));
+        assert!(s.params.add_cloud([90, 90, 110]));
+        s.params.sky_color = Some([4, 6, 20]);
+        s.params.feather = 40;
+        s.finish.grade.dehaze = 60;
+
+        // 還是這批照片，只是增減幾張：什麼都不能動
+        assert!(!s.is_new_batch(&[a.clone(), b.clone(), c.clone()]));
+        assert!(!s.is_new_batch(&[a.clone()]));
+
+        // 手上還沒有照片＝第一次選（或剛按過清除），起始畫面先調好的
+        // 調色與文字要留著，不能當成換批抹掉
+        let empty = SmokeTool::default();
+        assert!(!empty.is_new_batch(&[a.clone()]));
+
+        // 換成完全不同的照片
+        assert!(s.is_new_batch(&[c.clone()]));
+        s.drop_batch_settings();
+        assert!(!s.params.has_shapes(), "遮色片是對著上一批畫的");
+        assert!(!s.params.has_protect(), "保護色是從上一批吸的");
+        assert!(!s.params.has_cloud(), "雲色是從上一批吸的");
+        assert_eq!(s.params.sky_color, None, "夜空色是從上一批吸的");
+        assert!(
+            s.finish == Finish::default(),
+            "上一批的調色與落款不該直接出現在新照片上"
+        );
+        // 手感留著：這幾條換一批照片仍然成立
+        assert_eq!(s.params.feather, 40, "羽化不必跟著重調");
+    }
+
+    #[test]
+    fn back_to_auto_restores_the_sliders_and_keeps_the_mask() {
+        let (a, b) = (PathBuf::from("a.jpg"), PathBuf::from("b.jpg"));
+        let mut s = SmokeTool {
+            photos: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+        s.auto.insert(
+            a.clone(),
+            dehaze::AutoParams {
+                strength: 62,
+                detail: 71,
+                sky_clean: 20,
+                sky_range: 40,
+            },
+        );
+        s.auto.insert(
+            b.clone(),
+            dehaze::AutoParams {
+                strength: 90,
+                detail: 60,
+                sky_clean: 35,
+                sky_range: 55,
+            },
+        );
+        assert!(!s.off_auto(), "還沒動過就沒有東西好回");
+
+        // 第一張：滑桿調過，也吸了自己的保護色、改了羽化
+        let mut p = s.params_for(&a);
+        p.strength = 20;
+        p.sky_clean = 0;
+        p.feather = 7;
+        p.add_protect([12, 34, 56]);
+        s.set_params(p);
+        assert!(s.off_auto(), "動過滑桿就該給得出「回自動預設值」");
+
+        s.back_to_auto();
+        let back = s.params_for(&a);
+        assert_eq!(
+            (back.strength, back.detail, back.sky_clean, back.sky_range),
+            (62, 71, 20, 40),
+            "四條滑桿沒回到量出來的值"
+        );
+        assert_eq!(back.protect[0], Some([12, 34, 56]), "保護色不該被收掉");
+        assert_eq!(back.feather, 7, "羽化不該被收掉");
+        assert!(!s.off_auto(), "回過之後就不必再顯示按鈕");
+        assert_eq!(s.params_for(&b).strength, 90, "別張的自動值不受影響");
+
+        // 第二張：只動滑桿、沒有別的個別設定，回自動值就該把覆寫整個收掉，
+        // 縮圖上才不會留著一個其實沒有差異的個別設定記號
+        s.cur = 1;
+        let mut q = s.params_for(&b);
+        q.detail = 10;
+        s.set_params(q);
+        assert!(s.has_own(&b));
+        s.back_to_auto();
+        assert!(!s.has_own(&b), "沒有別的個別設定就該把覆寫收掉");
+        assert_eq!(s.params_for(&b).detail, 60);
+    }
+
+    /// 存檔尺寸是「塞得進去」而不是拉成那個比例——照片的長寬比不能被改掉
+    #[test]
+    fn export_size_fits_inside_without_changing_the_aspect() {
+        let s = ExportSize {
+            on: true,
+            w: 2048,
+            h: 1400,
+            ..ExportSize::default()
+        };
+        // 3:2 的橫圖：寬先頂到 2048，高跟著等比縮
+        assert_eq!(s.target(6000, 4000), Some((2048, 1365)));
+        // 直式的則是高先頂到 1400
+        assert_eq!(s.target(4000, 6000), Some((933, 1400)));
+        // 正好塞得進去就不必重取樣
+        assert_eq!(s.target(2048, 1365), None);
+    }
+
+    #[test]
+    fn export_size_never_enlarges_unless_asked() {
+        let mut s = ExportSize {
+            on: true,
+            w: 4000,
+            h: 4000,
+            ..ExportSize::default()
+        };
+        assert_eq!(s.target(800, 600), None, "勾了不放大就該原樣輸出");
+        s.no_upscale = false;
+        assert_eq!(s.target(800, 600), Some((4000, 3000)), "取消勾選才放大");
+    }
+
+    #[test]
+    fn export_size_off_leaves_the_photo_alone() {
+        let s = ExportSize {
+            on: false,
+            ..ExportSize::default()
+        };
+        assert_eq!(s.target(6000, 4000), None);
+        let img = image::RgbImage::new(40, 30);
+        let out = fit_export(img, s);
+        assert_eq!((out.width(), out.height()), (40, 30));
+    }
+
+    #[test]
+    fn fit_export_resizes_to_the_target() {
+        let s = ExportSize {
+            on: true,
+            w: 100,
+            h: 100,
+            ..ExportSize::default()
+        };
+        let out = fit_export(image::RgbImage::new(400, 200), s);
+        assert_eq!((out.width(), out.height()), (100, 50));
+    }
+
+    /// 換成比較少的張數時，縮圖列上一幀的可視範圍會指到清單外
+    /// （實照上 46 張換成 3 張就當掉了，見 [`clamp_vis_range`]）
+    #[test]
+    fn a_stale_thumb_range_is_clamped_to_the_new_list() {
+        // 舊清單 46 張、可視 0~9；新清單只剩 3 張
+        let (first, last) = clamp_vis_range(Some((0, 9)), 3, 32);
+        assert!(last <= 3 && first <= last, "範圍沒夾回來：{first}~{last}");
+        // 連起點都超出去的情況（捲到很後面才換照片）
+        let (first, last) = clamp_vis_range(Some((30, 40)), 3, 32);
+        assert!(last <= 3 && first <= last, "範圍沒夾回來：{first}~{last}");
+        // 沒有範圍時抓開頭一段；照片比預取數少就到清單尾巴為止
+        assert_eq!(clamp_vis_range(None, 3, 32), (0, 3));
+        assert_eq!(clamp_vis_range(None, 100, 32), (0, 32));
+        // 正常範圍原樣通過
+        assert_eq!(clamp_vis_range(Some((5, 12)), 46, 32), (5, 12));
+    }
+
+    /// 存檔尺寸的開關不進設定檔：縮圖不可逆，上次勾過的不該讓今天的照片默默變小
+    #[test]
+    fn export_size_starts_off_but_remembers_the_numbers() {
+        let saved =
+            serde_json::json!({"w": 1600, "h": 900, "no_upscale": false, "custom": true});
+        // 直接驗 save 寫出去的欄位（不含 on）
+        let s = ExportSize {
+            on: true,
+            w: 1600,
+            h: 900,
+            no_upscale: false,
+            custom: true,
+        };
+        let written = serde_json::json!({
+            "w": s.clamped().w,
+            "h": s.clamped().h,
+            "no_upscale": s.clamped().no_upscale,
+            "custom": s.clamped().custom,
+        });
+        assert_eq!(written, saved, "存出去的只該有尺寸、不放大與自訂與否");
+        assert!(
+            written.get("on").is_none(),
+            "開關不該被寫進設定檔：{written}"
+        );
+    }
+
+    /// 影片去煙霧排了好幾支時：正在預覽的那支永遠排第一，其餘照加入的順序
+    #[test]
+    fn movie_jobs_put_the_previewed_one_first() {
+        let mut m = MovieTool::default();
+        assert!(m.jobs().is_empty(), "還沒選影片就沒有東西要跑");
+        m.src = Some(PathBuf::from("a.mp4"));
+        m.queue = vec![PathBuf::from("b.mp4"), PathBuf::from("c.mp4")];
+        assert_eq!(
+            m.jobs(),
+            vec![
+                PathBuf::from("a.mp4"),
+                PathBuf::from("b.mp4"),
+                PathBuf::from("c.mp4")
+            ]
+        );
+        // 換一支影片＝重來一批，排隊的那幾支跟著收掉
+        m.reset_for(Some(PathBuf::from("d.mp4")), None);
+        assert_eq!(m.jobs(), vec![PathBuf::from("d.mp4")], "換片時佇列沒清掉");
+    }
+
+    /// 換預覽＝把那一支調到最前面（輸出時先跑），其餘的相對順序不變
+    #[test]
+    fn previewing_a_queued_video_moves_it_to_the_front() {
+        let mut m = MovieTool::default();
+        m.src = Some(PathBuf::from("a.mp4"));
+        m.queue = vec![PathBuf::from("b.mp4"), PathBuf::from("c.mp4")];
+        // movie_show_queued 的重排邏輯（不含 probe 那一段）
+        let pick = m.queue.remove(1);
+        let mut rest = std::mem::take(&mut m.queue);
+        rest.insert(0, m.src.take().expect("本來就有一支"));
+        m.src = Some(pick);
+        m.queue = rest;
+        assert_eq!(
+            m.jobs(),
+            vec![
+                PathBuf::from("c.mp4"),
+                PathBuf::from("a.mp4"),
+                PathBuf::from("b.mp4")
+            ],
+            "選 c 之後應該是 c、a、b"
+        );
+    }
+
+    /// 拖曳排序：搬動之後清單順序＝輸出順序，第一支永遠是預覽中的那支
+    #[test]
+    fn reordering_the_batch_keeps_the_first_one_previewed() {
+        // movie_reorder 的重排邏輯（不含換預覽時的取格）
+        let reorder = |list: &[&str], from: usize, to: usize| -> Vec<String> {
+            let mut v: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+            let p = v.remove(from);
+            v.insert(to, p);
+            v
+        };
+        // 把最後一支拉到最前面：其餘往後推、相對順序不變
+        assert_eq!(reorder(&["a", "b", "c"], 2, 0), vec!["c", "a", "b"]);
+        // 把第一支拉到中間
+        assert_eq!(reorder(&["a", "b", "c"], 0, 1), vec!["b", "a", "c"]);
+        // 拉到最後
+        assert_eq!(reorder(&["a", "b", "c"], 0, 2), vec!["b", "c", "a"]);
     }
 }
