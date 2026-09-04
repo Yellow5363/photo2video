@@ -110,7 +110,7 @@ impl Module {
             Module::Video => "照片轉影片",
             Module::Dehaze => "去煙霧",
             Module::Stack => "煙火疊圖",
-            Module::Movie => "影片去煙霧",
+            Module::Movie => "煙火影片去煙霧",
             Module::Enhance => "優化影像",
         }
     }
@@ -4940,8 +4940,9 @@ struct EnhanceTool {
 
 impl Default for EnhanceTool {
     fn default() -> Self {
-        // 預設「一般風景」：三種裡最不挑照片的一種，選錯的代價最小
-        let preset = enhance::Preset::Landscape;
+        // 類型列現在只開放「鳥類」（見 [`enhance::Preset::UI`]），
+        // 預設就給它——否則一打開類型列會是一個都沒亮的樣子
+        let preset = enhance::Preset::Bird;
         Self {
             photos: Vec::new(),
             cur: 0,
@@ -5438,8 +5439,11 @@ impl App {
             enhance: {
                 let mut e = EnhanceTool::default();
                 // 上次挑的類型記在設定檔裡：拍鳥的人每次開程式都是拍鳥，
-                // 不該每次都先切一次
-                if let Some(p) = load_enhance_preset() {
+                // 不該每次都先切一次。已經從類型列收起來的那幾種就不還原了，
+                // 否則類型列會一個都沒亮（設定檔本身不動，放回去就又讀得到）
+                if let Some(p) =
+                    load_enhance_preset().filter(|p| enhance::Preset::UI.contains(p))
+                {
                     e.preset = p;
                     e.params = EnhanceParams::neutral(p);
                 }
@@ -19864,7 +19868,9 @@ impl App {
                     .size(SECTION_FONT)
                     .color(theme::TEXT),
             );
-            for p in enhance::Preset::ALL {
+            // 只列目前開放挑的那幾種（見 [`enhance::Preset::UI`]）；
+            // 收起來的那兩種程式碼都還在，加回那個陣列就會出現
+            for &p in enhance::Preset::UI {
                 let on = cur_preset == p;
                 if check_label(ui, on, p.label())
                     .on_hover_text(p.hint())
@@ -20301,7 +20307,7 @@ impl eframe::App for App {
                     .set_level(rfd::MessageLevel::Info)
                     .set_title("正在輸出影片")
                     .set_description(
-                        "影片去煙霧還在跑，請等它輸出完，或按「✖ 中止」再關閉。",
+                        "煙火影片去煙霧還在跑，請等它輸出完，或按「✖ 中止」再關閉。",
                     )
                     .show();
             } else if self.enhance.busy == EnhanceBusy::Saving {

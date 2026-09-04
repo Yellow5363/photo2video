@@ -63,6 +63,11 @@ impl Preset {
     /// 選單順序
     pub const ALL: [Preset; 3] = [Preset::Bird, Preset::Landscape, Preset::Portrait];
 
+    /// 介面上目前開放挑的類型。一般風景與風景人像先從類型列收起來，
+    /// **程式碼一律保留**：目標值、柔膚、`ALL`、`from_id` 都原封不動
+    /// （舊設定檔還讀得回來），要放回介面只要把它們加回這個陣列
+    pub const UI: &'static [Preset] = &[Preset::Bird];
+
     pub fn label(self) -> &'static str {
         match self {
             Preset::Bird => "鳥類",
