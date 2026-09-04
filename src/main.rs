@@ -13055,15 +13055,17 @@ impl App {
                     }
                     if let (Some(src), Some(info)) = (&self.movie.src, &self.movie.info) {
                         ui.separator();
+                        // 與去煙霧同一套：檔名放大一點，完整路徑用滑鼠停著看
                         ui.label(
                             egui::RichText::new(
                                 src.file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_default(),
                             )
-                            .size(12.0)
+                            .size(15.0)
                             .color(theme::TEXT),
-                        );
+                        )
+                        .on_hover_text(src.to_string_lossy().into_owned());
                         ui.label(
                             egui::RichText::new(format!(
                                 "{}×{} · {} · {:.0} fps · {}",
@@ -15721,12 +15723,22 @@ impl App {
                         } else {
                             format!("疊圖結果（{total} 張疊成）")
                         };
+                        // 與去煙霧同一套：這一列只寫得下檔名，完整路徑
+                        //（哪個資料夾來的）用滑鼠停著看
+                        let full = self
+                            .stack
+                            .view_layer
+                            .then(|| self.stack.current().map(|p| p.to_string_lossy().into_owned()))
+                            .flatten();
                         ui.label(
                             egui::RichText::new(format!("檢視：{viewing}"))
-                                .size(12.0)
+                                .size(15.0)
                                 .color(theme::TEXT),
                         )
-                        .on_hover_text("目前預覽顯示的是哪一張；點縮圖列可以切換");
+                        .on_hover_text(match &full {
+                            Some(p) => format!("{p}\n\n目前預覽顯示的是哪一張；點縮圖列可以切換"),
+                            None => "目前預覽顯示的是哪一張；點縮圖列可以切換".to_string(),
+                        });
                         // 還在編輯狀態時講明白：工具或「調整圖層」開著的時候，
                         // 畫面停在單層、左鍵也還在畫（或在搬圖層），那都不是成品
                         // 的樣子。開關在設定區下半段，捲下去就忘了自己還開著
@@ -16620,8 +16632,8 @@ impl App {
                                         let (mut px, mut py) = (x.dx * fw, x.dy * fh);
                                         let mut moved = false;
                                         for (salt, label, v, lim) in [
-                                            ("stack_layer_dx", "左右", &mut px, fw),
                                             ("stack_layer_dy", "上下", &mut py, fh),
+                                            ("stack_layer_dx", "左右", &mut px, fw),
                                         ] {
                                             ui.label(
                                                 egui::RichText::new(label)
@@ -17057,15 +17069,18 @@ impl App {
                         );
                     }
                     if let Some(src) = self.smoke.current() {
+                        // 檔名是這一列最常要看的東西，字級比旁邊的標記大一點；
+                        // 只寫得下檔名，完整路徑（哪個資料夾來的）用滑鼠停著看
                         ui.label(
                             egui::RichText::new(
                                 src.file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_default(),
                             )
-                            .size(12.0)
-                            .color(theme::TEXT_WEAK),
-                        );
+                            .size(15.0)
+                            .color(theme::TEXT),
+                        )
+                        .on_hover_text(src.to_string_lossy().into_owned());
                     }
                     // 這張有個別設定時明講，否則使用者會以為滑桿沒反應
                     if self
@@ -17089,6 +17104,48 @@ impl App {
                             egui::RichText::new("自動")
                                 .size(11.0)
                                 .color(theme::TEXT_WEAK),
+                        );
+                    }
+                    // 還在編輯狀態時講明白：遮色片工具或清除筆刷勾著的時候，
+                    // 預覽是沒轉也沒裁的原圖、左鍵也還在畫。工具那一排在設定區
+                    // 的下半段，捲下去就看不到，常常忘了自己還開著
+                    // （見 [`SmokeTool::end_editing`]）。與煙火疊圖一致，擺在
+                    // 最上面這一列的最右邊：位置固定，不會被設定區捲走
+                    if total > 0 {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if self.smoke.source_tools_active() {
+                                    // 右到左，所以先放的按鈕會在最右邊
+                                    if ui
+                                        .small_button("完成編輯")
+                                        .on_hover_text(
+                                            "收起遮色片工具、清除筆刷與吸色，\
+                                             預覽回到套了旋轉與裁切的成品樣子；\
+                                             左鍵也回到拖曳平移",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.smoke.end_editing();
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("✏ 編輯中")
+                                            .size(11.0)
+                                            .color(theme::TRACK),
+                                    )
+                                    .on_hover_text(
+                                        "還有工具開著：預覽顯示的是沒轉、沒裁的原圖，\
+                                         左鍵是拿來畫的。按右邊「完成編輯」收起來",
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("✔ 完成編輯")
+                                            .size(11.0)
+                                            .color(theme::TEXT_WEAK),
+                                    )
+                                    .on_hover_text("沒有工具開著，預覽就是存檔會拿到的樣子");
+                                }
+                            },
                         );
                     }
                 });
@@ -17621,48 +17678,6 @@ impl App {
                             {
                                 self.smoke.back_to_auto();
                             }
-                            // 還在編輯狀態時講明白：遮色片工具或清除筆刷勾著的時候，
-                            // 預覽是沒轉也沒裁的原圖、左鍵也還在畫。工具那一排在設定區
-                            // 的下半段，捲下去就看不到，常常忘了自己還開著
-                            // （見 [`SmokeTool::end_editing`]）。靠右擺才不會被
-                            // 前面那幾句擠掉，位置也固定
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if self.smoke.source_tools_active() {
-                                        // 右到左，所以先放的按鈕會在最右邊
-                                        if ui
-                                            .small_button("完成編輯")
-                                            .on_hover_text(
-                                                "收起遮色片工具、清除筆刷與吸色，\
-                                                 預覽回到套了旋轉與裁切的成品樣子；\
-                                                 左鍵也回到拖曳平移",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.smoke.end_editing();
-                                        }
-                                        ui.label(
-                                            egui::RichText::new("✏ 編輯中")
-                                                .size(11.0)
-                                                .color(theme::TRACK),
-                                        )
-                                        .on_hover_text(
-                                            "還有工具開著：預覽顯示的是沒轉、沒裁的原圖，\
-                                             左鍵是拿來畫的。按右邊「完成編輯」收起來",
-                                        );
-                                    } else {
-                                        ui.label(
-                                            egui::RichText::new("✔ 完成編輯")
-                                                .size(11.0)
-                                                .color(theme::TEXT_WEAK),
-                                        )
-                                        .on_hover_text(
-                                            "沒有工具開著，預覽就是存檔會拿到的樣子",
-                                        );
-                                    }
-                                },
-                            );
                         });
                         ui.add_enabled_ui(busy != SmokeBusy::Saving, |ui| {
                             let mut p = eff.clone();
@@ -19275,15 +19290,18 @@ impl App {
                         );
                     }
                     if let Some(src) = self.enhance.current() {
+                        // 與去煙霧同一套：檔名是這一列最常要看的東西，字級比旁邊的
+                        // 標記大一點；只寫得下檔名，完整路徑用滑鼠停著看
                         ui.label(
                             egui::RichText::new(
                                 src.file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_default(),
                             )
-                            .size(12.0)
-                            .color(theme::TEXT_WEAK),
-                        );
+                            .size(15.0)
+                            .color(theme::TEXT),
+                        )
+                        .on_hover_text(src.to_string_lossy().into_owned());
                     }
                     // 這張有個別設定時明講，否則使用者會以為滑桿沒反應
                     if self
