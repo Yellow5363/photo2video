@@ -2,6 +2,10 @@
 name = "photo2video"
 version = "0.14.0"
 edition = "2021"
+# 下面兩行會被 build.rs 經 winresource 讀到（未明寫時的 CompanyName、
+# FileDescription 來源）。空白的公司名稱是防毒啟發式掃描的加權指標之一
+authors = ["Yellow Huang"]
+description = "photo2video 照片轉影片、去煙霧與夜空後製工具"
 
 [dependencies]
 eframe = "0.31"
