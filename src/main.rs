@@ -45,7 +45,7 @@ const VIDEO_EXTS: &[&str] = &[
 const OUT_FPS: u32 = 30;
 
 /// GitHub 儲存庫（檢查更新與下載頁面用）
-const GITHUB_REPO: &str = "yellow5363/photo2video";
+const GITHUB_REPO: &str = "Yellow5363/photo2video";
 
 /// 全域配色：深色剪輯工具風格
 mod theme {
