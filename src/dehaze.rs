@@ -2442,6 +2442,39 @@ pub fn debug_sky_seed(img: &RgbImage, params: &SmokeParams) -> RgbImage {
     out
 }
 
+/// 天空範圍（[`sky_region`]）在多大的縮圖上算（長邊）。
+///
+/// 要與 GUI 的預覽底圖同一個尺寸、同一種縮圖濾波（Triangle，見 main.rs 的
+/// `shrink_long`）：範圍的種子是紋理判定，同一片岸邊在原尺寸與縮圖上量到的紋理
+/// 不是同一回事——實照 A1202725 的暗色漁港在 1600 縮圖上擋得住、原尺寸上擋不住，
+/// 原尺寸整張漏到底、被水平線切在 47%，預覽把煙扣乾淨、存檔卻整片留著。
+/// 原尺寸與預覽都縮到這個尺寸再算，兩邊算的就是同一張圖，結果自然一致；
+/// 範圍是大尺度的東西，算完放大回去就夠。
+/// （[`region_radii`] 把半徑照原圖換算，只能讓兩邊「量的尺度」一樣，
+/// 量的對象仍是不同解析度的影像，雜訊與銳利度不同，判定就會不同）
+const REGION_LONG_EDGE: u32 = 1600;
+
+/// 一張影像的天空範圍（原尺寸的權重平面）：縮到 [`REGION_LONG_EDGE`] 算、再放大回來。
+/// `source_long`＝原圖長邊、`sea`＝水平線，同 [`sky_region`]
+fn sky_region_of(img: &RgbImage, source_long: f32, sea: f32) -> Plane {
+    let (fw, fh) = (img.width() as usize, img.height() as usize);
+    let small = shrink(img, REGION_LONG_EDGE);
+    let (sw, sh) = (small.width() as usize, small.height() as usize);
+    let lut = srgb_lut();
+    let lin: Vec<[f32; 3]> = small
+        .pixels()
+        .map(|px| [lut[px[0] as usize], lut[px[1] as usize], lut[px[2] as usize]])
+        .collect();
+    let r = sky_region(&lin, sw, sh, source_long, sea);
+    if sw == fw && sh == fh {
+        r
+    } else {
+        upscale(&r, fw, fh)
+    }
+}
+
+/// `sea`＝水平線（佔畫面高度 0~1，見 [`SkyProbe::sea`]），天空不會比它再低多少；
+/// 給 1.0 就不設限
 fn sky_region(lin: &[[f32; 3]], fw: usize, fh: usize, source_long: f32, sea: f32) -> Plane {
     let (area, r_area) = region_seed(lin, fw, fh, source_long);
     // 從上緣往下傳播，但「上一列」看的是左右一整段而不是緊鄰的三格。
@@ -2475,7 +2508,11 @@ fn sky_region(lin: &[[f32; 3]], fw: usize, fh: usize, source_long: f32, sea: f32
     // 海口、河口擋不住：地景沒有橫貫整張時，天空從缺口流進水面，再沿著平坦的
     // 水面向左右鋪開，連地景正下方的水面都連得到，每一欄「最低的天空」於是都在
     // 畫面底。水平線由呼叫端量（見 [`SkyProbe::sea`]），比它低太多的欄一律拉
-    // 回來——要在向左右借之前做，缺口才不會把「一路到底」借給鄰欄
+    // 回來——要在向左右借之前做，缺口才不會把「一路到底」借給鄰欄。
+    //
+    // 每一欄都套：試過只拉「漏到畫面底」的欄、靠紋理擋住的欄不動（想把整片下半
+    // 天空都是煙的照片岸邊那截煙也涵蓋進來），被倒影擋在半途的水面欄位就漏掉了，
+    // 使用者裁定退回。水平線切太高的照片交給使用者自己用遮色片補
     let sea = (sea.clamp(0.0, 1.0) + REGION_SEA_MARGIN) * fh as f32;
     for h in horizon.iter_mut() {
         *h = h.min(sea);
@@ -2685,16 +2722,8 @@ pub fn sky_weights(img: &RgbImage, long: u32) -> (Vec<f32>, usize, usize) {
 }
 
 pub fn debug_sky_region(img: &RgbImage, params: &SmokeParams) -> RgbImage {
-    let (fw, fh) = (img.width() as usize, img.height() as usize);
-    let lut = srgb_lut();
-    let lin: Vec<[f32; 3]> = img
-        .pixels()
-        .map(|px| [lut[px[0] as usize], lut[px[1] as usize], lut[px[2] as usize]])
-        .collect();
-    let r = sky_region(
-        &lin,
-        fw,
-        fh,
+    let r = sky_region_of(
+        img,
         params.source_long(img.width().max(img.height())),
         sky_probe(img).sea,
     );
@@ -3366,13 +3395,8 @@ fn dehaze_to_linear(img: &RgbImage, p: &SmokeParams) -> (Vec<[f32; 3]>, Vec<f32>
     // 先探一次夜空：底色（相減以它為零點，見 [`floor_from`]）與水平線（天空範圍
     // 不比它低，見 [`SkyProbe::sea`]）
     let SkyProbe { floor, sea } = sky_probe(img);
-    let sky = (p.sky_only && p.strength > 0).then(|| {
-        let lin: Vec<[f32; 3]> = img
-            .pixels()
-            .map(|px| [lut[px[0] as usize], lut[px[1] as usize], lut[px[2] as usize]])
-            .collect();
-        sky_region(&lin, fw, fh, p.source_long(fw.max(fh) as u32), sea)
-    });
+    let sky = (p.sky_only && p.strength > 0)
+        .then(|| sky_region_of(img, p.source_long(fw.max(fh) as u32), sea));
     // 結果先留在線性空間：天空處理要在這上面做，最後才一次轉回 sRGB
     let mut buf: Vec<[f32; 3]> = vec![[0.0; 3]; fw * fh];
     // 每個像素的作用權重，天空處理要沿用（框外與保護色一樣不能動）
