@@ -6,8 +6,8 @@
 
 不想自己建置的話：
 
-- **最新版直接下載**：<https://github.com/kevin191211/photo2video/releases/latest/download/photo2video-windows-x64.zip>（永遠指向最新版）
-- [Releases 頁面](https://github.com/kevin191211/photo2video/releases/latest) 可看歷史版本與更新紀錄
+- **最新版直接下載**：<https://github.com/yellow5363/photo2video/releases/latest/download/photo2video-windows-x64.zip>（永遠指向最新版）
+- [Releases 頁面](https://github.com/yellow5363/photo2video/releases/latest) 可看歷史版本與更新紀錄
 
 zip 內含 `photo2video.exe`、`ffmpeg.exe` 與使用說明，解壓即可使用。程式啟動時會自動檢查更新並在視窗底部提示。
 
