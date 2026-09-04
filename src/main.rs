@@ -3523,23 +3523,108 @@ impl SmokeTool {
         self.brush_size as f32 / 200.0
     }
 
-    /// 寫回參數：依「只調這張」決定寫進覆寫還是共用。
-    /// 這張正在用自動值時也只能寫成個別設定——自動值是逐張的，
-    /// 寫進共用參數會被它蓋回去，看起來就像滑桿沒反應
+    /// 把 `before` → `after` 之間**真的動到**的欄位抄到 `dst` 上，其餘原樣不動。
+    /// 這一份是整批共用的那幾項：遮色片、色票、羽化、筆刷濃度、夜空色…
+    ///
+    /// 只搬變動的那幾項，不是整份蓋過去：別張為了自己的煙量調過的數值
+    /// 得留住，整份覆蓋等於把整批拉成同一組
+    fn carry_shared(before: &SmokeParams, after: &SmokeParams, dst: &mut SmokeParams) {
+        if after.restore_trails != before.restore_trails {
+            dst.restore_trails = after.restore_trails;
+        }
+        if after.sky_only != before.sky_only {
+            dst.sky_only = after.sky_only;
+        }
+        if after.shapes != before.shapes {
+            dst.shapes = after.shapes.clone();
+        }
+        if after.feather != before.feather {
+            dst.feather = after.feather;
+        }
+        if after.mask_density != before.mask_density {
+            dst.mask_density = after.mask_density;
+        }
+        if after.protect != before.protect {
+            dst.protect = after.protect;
+        }
+        if after.tolerance != before.tolerance {
+            dst.tolerance = after.tolerance;
+        }
+        if after.sky_color != before.sky_color {
+            dst.sky_color = after.sky_color;
+        }
+        if after.sky_tint != before.sky_tint {
+            dst.sky_tint = after.sky_tint;
+        }
+        if after.cloud != before.cloud {
+            dst.cloud = after.cloud;
+        }
+        if after.cloud_range != before.cloud_range {
+            dst.cloud_range = after.cloud_range;
+        }
+        // preview_of 與 fast 不在這裡：那是算圖時才填的，不是使用者調的設定
+    }
+
+    /// 同上，但搬的是自動判得出來的那四條（見 [`dehaze::AutoParams`]）
+    fn carry_auto(before: &SmokeParams, after: &SmokeParams, dst: &mut SmokeParams) {
+        if after.strength != before.strength {
+            dst.strength = after.strength;
+        }
+        if after.detail != before.detail {
+            dst.detail = after.detail;
+        }
+        if after.sky_clean != before.sky_clean {
+            dst.sky_clean = after.sky_clean;
+        }
+        if after.sky_range != before.sky_range {
+            dst.sky_range = after.sky_range;
+        }
+    }
+
+    /// 寫回參數：依「只調整這張」決定只改這張、還是整批一起改。
+    ///
+    /// 不勾「只調整這張」＝改動要套到全部照片，所以共用那一份與**每一張
+    /// 已經有個別設定的照片**都要跟著改。只寫共用那一份是不夠的：
+    /// `params_for` 看到個別設定就整份拿去用，先前為了某張的煙量調過參數的
+    /// 照片會從此收不到整批的遮色片與色票——實際回報過的狀況。
+    /// 搬過去的只有這一次真的動到的欄位（見 [`SmokeTool::carry_shared`]），
+    /// 別張自己調的數值才留得住。
+    ///
+    /// 例外是自動判得出來的那四條（去除煙霧、細節、去除雲朵、範圍）：
+    /// 自動判參數開著時它們本來就是逐張的，寫進共用那一份會被每張自己的
+    /// 自動值蓋回去，看起來就像滑桿沒反應——那四條仍然只寫成這張自己的
     fn set_params(&mut self, v: SmokeParams) {
         self.dirty = true;
-        let mine = self.per_photo
-            || self
-                .current()
-                .map(|p| self.auto_for(p).is_some())
-                .unwrap_or(false);
-        if mine {
-            if let Some(p) = self.current().cloned() {
-                self.overrides.insert(p, v);
-                return;
+        let Some(p) = self.current().cloned() else {
+            // 還沒選照片：起始畫面先調好的東西就是整批共用的那一份
+            self.params = v;
+            return;
+        };
+        if self.per_photo {
+            self.overrides.insert(p, v);
+            return;
+        }
+        let before = self.params_for(&p);
+        let on_auto = self.auto_for(&p).is_some();
+        if on_auto {
+            let mut mine = before.clone();
+            Self::carry_auto(&before, &v, &mut mine);
+            // 只動了遮色片這類整批的東西時不必替這張開一份個別設定，
+            // 縮圖上才不會冒出一個其實沒有差異的個別設定記號
+            if mine != before {
+                self.overrides.insert(p, mine);
             }
         }
-        self.params = v;
+        Self::carry_shared(&before, &v, &mut self.params);
+        if !on_auto {
+            Self::carry_auto(&before, &v, &mut self.params);
+        }
+        for own in self.overrides.values_mut() {
+            Self::carry_shared(&before, &v, own);
+            if !on_auto {
+                Self::carry_auto(&before, &v, own);
+            }
+        }
     }
 
     /// 目前這張的四條數值滑桿有沒有離開自動判出來的位置。
@@ -10262,9 +10347,9 @@ impl App {
         self.smoke_clear_photos();
     }
 
-    /// 回到「選擇照片」的起始狀態：清掉照片清單、預覽、縮圖與這一批的個別設定。
-    /// 個別設定（overrides / finish_overrides / wipes）與量好的自動值留著，
-    /// 同一批照片再選回來時不用重調、也不用重量
+    /// 回到「選擇照片」的起始狀態：清掉照片清單、預覽、縮圖，以及這一批
+    /// 調過的每一樣設定與開關。只有量好的自動值留著——它以檔案路徑為鍵，
+    /// 同一批照片再選回來時不用重量
     fn smoke_clear_photos(&mut self) {
         self.smoke.auto_cancel.store(true, Ordering::Relaxed);
         self.smoke.auto_rx = None;
@@ -10287,6 +10372,12 @@ impl App {
         self.smoke.wipes.clear();
         self.smoke.finish = Finish::default();
         self.smoke.params = SmokeParams::default();
+        // 「自動判參數」與「只調整這張」也是對著上一批才成立的選擇：
+        // 關掉自動是嫌上一批量出來的值不合意、只調這張是為了修上一批的
+        // 某一張。留著會悄悄跟進下一批——新照片的滑桿不再自己就位，
+        // 之後的改動也只落在目前這張，看起來就像整批設定失靈
+        self.smoke.auto_on = true;
+        self.smoke.per_photo = true;
         self.smoke.base = None;
         self.smoke.base_long = 0;
         self.smoke.tex_before = None;
@@ -26294,6 +26385,86 @@ mod tests {
             !s.effective().has_shapes(),
             "按了清除遮色片，畫面上就不該再有形狀"
         );
+    }
+
+    #[test]
+    fn unchecking_only_this_photo_spreads_the_mask_over_the_whole_batch() {
+        // 「只調整這張」不勾＝改動套用到全部照片。踩過的坑：自動判參數開著時
+        // **每一項**改動都被寫成這張自己的個別設定（那條規則本來只該管四條
+        // 自動滑桿），畫上去的遮色片於是只有目前這張看得到；而且照片一旦有了
+        // 個別設定，params_for 就整份拿去用，共用那一份的遮色片也永遠到不了它
+        let (a, b, c) = (
+            PathBuf::from("a.jpg"),
+            PathBuf::from("b.jpg"),
+            PathBuf::from("c.jpg"),
+        );
+        let mut s = SmokeTool {
+            photos: vec![a.clone(), b.clone(), c.clone()],
+            ..Default::default()
+        };
+        // 開檔就是這個狀態：三張各自量到自己的值
+        for (p, strength) in [(&a, 50), (&b, 60), (&c, 70)] {
+            s.auto.insert(
+                p.clone(),
+                dehaze::AutoParams {
+                    strength,
+                    detail: 60,
+                    sky_clean: 20,
+                    sky_range: 40,
+                },
+            );
+        }
+
+        // 先替第二張單獨調過去除煙霧（預設就是勾著「只調整這張」）
+        s.cur = 1;
+        let mut v = s.effective();
+        v.strength = 33;
+        s.set_params(v);
+        assert!(s.has_own(&b), "測試前提：第二張有自己的設定");
+
+        // 改成整批一起調，在第一張上畫遮色片
+        s.per_photo = false;
+        s.cur = 0;
+        let mut v = s.effective();
+        assert!(v.add_shape(dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.1,
+            y0: 0.1,
+            x1: 0.9,
+            y1: 0.9,
+        })));
+        s.set_params(v);
+        for p in [&a, &b, &c] {
+            assert!(
+                s.params_for(p).has_shapes(),
+                "不勾「只調整這張」畫的遮色片，每一張都要看得到"
+            );
+        }
+        assert_eq!(
+            s.params_for(&b).strength,
+            33,
+            "整批畫遮色片不該把別張自己調的數值蓋掉"
+        );
+        assert!(
+            !s.has_own(&a),
+            "只動了整批共用的東西，不該替這張多開一份個別設定"
+        );
+
+        // 四條自動滑桿仍然是逐張的：寫進共用那一份會被每張的自動值蓋回去
+        let mut v = s.effective();
+        v.strength = 10;
+        s.set_params(v);
+        assert_eq!(s.params_for(&a).strength, 10);
+        assert_eq!(s.params_for(&c).strength, 70, "別張仍照自己量到的值");
+
+        // 關掉自動判參數之後，四條滑桿也回到整批一起調
+        s.auto_on = false;
+        let mut v = s.effective();
+        v.detail = 22;
+        s.set_params(v);
+        for p in [&a, &b, &c] {
+            assert_eq!(s.params_for(p).detail, 22, "沒有自動值時細節就該整批一起改");
+        }
+        assert_eq!(s.params_for(&b).strength, 33, "第二張自己調的強度還在");
     }
 
     #[test]
