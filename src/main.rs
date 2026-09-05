@@ -2895,7 +2895,7 @@ enum SmokeBusy {
 }
 
 /// 遮色片工具：決定在照片上拖曳會畫出哪一種形狀（比照 Lightroom 的遮色片面板）
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum MaskTool {
     /// 矩形框選
     Rect,
@@ -3026,6 +3026,14 @@ struct SmokeTool {
     /// `applied` 那份預覽是拿多細的底圖算的。與現在手上最細的那份不同就
     /// 補算一次——但要等參數本身先停下來，拉滑桿的過程一律先用快的那份
     applied_long: u32,
+    /// 手上這份預覽算的是遮罩檢視（那片紅）還是成品。
+    ///
+    /// 它得跟著 [`SmokeTool::show_mask`] 一起進「要不要重算」的判斷：兩者是
+    /// **同一組參數的兩種畫面**，光比參數看不出差別。少了它的話，重算途中才
+    /// 打開遮罩檢視（畫出第一個形狀就會自動打開）的那一次會被吃掉——算完的
+    /// 是成品，`applied` 卻寫回了「參數沒變」，於是停在成品畫面，要再畫一筆
+    /// 才會亮（實際回報過的狀況）
+    applied_mask: bool,
     /// tex_before 是拿多細的底圖上傳的（對照時左右兩邊要一樣細）
     before_long: u32,
     /// 目前這張**原圖**的長邊。預覽是縮圖，估煙霧層時少了原尺寸的最小值池化，
@@ -3152,6 +3160,16 @@ struct SmokeTool {
     picking: Option<PickTarget>,
     /// 預覽改顯示遮色片（紅色蓋住的地方不會被去煙）
     show_mask: bool,
+    /// 選了遮色片工具，等有東西可看時就自動打開 [`SmokeTool::show_mask`]。
+    ///
+    /// 選工具的當下多半還沒畫任何形狀，那時遮罩檢視只會蓋出一整片紅
+    /// （沒有形狀＝整片天空都處理），所以那顆開關是停用的、也直接被關掉。
+    /// 這個旗標把「使用者要看遮罩」的意思先記著，畫出第一個形狀就跟著亮；
+    /// 亮過一次或自己動過那顆開關就收起來，同一張照片上不再自作主張。
+    ///
+    /// 換到還沒畫的下一張時會重新記一次（見 [`SmokeTool::sync_mask_view`]），
+    /// 所以每一張畫出第一個形狀都會亮
+    mask_view_armed: bool,
     /// 預覽的顯示比例；None＝縮到剛好塞滿畫面，
     /// Some(1.0)＝預覽底圖 1 像素對螢幕 1 個**實體像素**（不是 1 點，
     /// 否則 Windows 的顯示縮放會讓 100% 其實是 125%、150%）
@@ -3216,6 +3234,7 @@ impl Default for SmokeTool {
             fine_failed: false,
             want_long: 0,
             applied_long: 0,
+            applied_mask: false,
             before_long: 0,
             base_long: 0,
             params: SmokeParams::default(),
@@ -3272,6 +3291,7 @@ impl Default for SmokeTool {
             object_edge: 0,
             picking: None,
             show_mask: false,
+            mask_view_armed: false,
             zoom: None,
             zoom_back: None,
             pan: egui::pos2(0.5, 0.5),
@@ -3420,6 +3440,56 @@ impl SmokeTool {
         self.wipe_on = false;
         self.picking = None;
         self.show_mask = false;
+        self.mask_view_armed = false;
+    }
+
+    /// 點了遮色片工具那一排的某一顆：沒選的選起來、已經選著的再點一次收掉
+    /// （左鍵回到拖曳平移）。吸色與清除筆刷都靠同一片畫布的左鍵，
+    /// 不能同時開著，一併收掉。
+    ///
+    /// 選了工具就順便打開遮罩檢視：畫遮色片就是為了圈出哪裡不要去煙，
+    /// 不看那片紅根本不知道自己圈到哪。這時多半還沒畫任何形狀、開關還是
+    /// 停用的，那就先記著，畫出第一個就跟著亮（見 [`SmokeTool::mask_view_armed`]）
+    fn pick_mask_tool(&mut self, tool: MaskTool) {
+        let on = self.mask_tool == Some(tool);
+        self.mask_tool = (!on).then_some(tool);
+        self.picking = None;
+        self.wipe_on = false;
+        self.mask_view_armed = self.mask_tool.is_some();
+        if self.mask_view_armed && !self.show_mask {
+            self.show_mask = true;
+            // 遮色片與成品是兩種畫面，切換後要重畫
+            self.applied = None;
+        }
+    }
+
+    /// 每幀對一次遮罩檢視該不該開著；`can_show` ＝現在有沒有東西可看
+    /// （畫過遮色片或吸過保護色）。
+    ///
+    /// 沒東西可看時一律關掉：那時檢視只會蓋出一整片紅（沒有形狀＝整片天空
+    /// 都要處理），而開關已經跟著變灰，使用者反而退不出來。有東西可看、
+    /// 而且記著要看，就替他打開——兌現一次就收起旗標，同一張照片上他自己
+    /// 關掉的話不會又被打開。
+    ///
+    /// **每張照片各記一次**：遮色片是一張一張畫的，換到下一張又回到「還沒
+    /// 畫、沒東西可看」的狀態，這裡就重新記一次——所以每一張畫出第一個形狀
+    /// 都會自己亮起來，不是只有第一張（實際回報過的狀況）
+    fn sync_mask_view(&mut self, can_show: bool) {
+        if !can_show {
+            if self.show_mask {
+                self.show_mask = false;
+                self.applied = None;
+            }
+            // 這一張還沒東西可看：只要工具（或吸色）還開著，就當作他等一下
+            // 要在這張畫／吸，先記著。收掉工具就不再自作主張
+            self.mask_view_armed = self.mask_tool.is_some() || self.picking.is_some();
+            return;
+        }
+        if self.mask_view_armed && !self.show_mask {
+            self.show_mask = true;
+            self.applied = None;
+        }
+        self.mask_view_armed = false;
     }
 
     /// 預覽這一幀要照哪個裁切框顯示。
@@ -10560,6 +10630,11 @@ impl App {
         // 之後的改動也只落在目前這張，看起來就像整批設定失靈
         self.smoke.auto_on = true;
         self.smoke.per_photo = true;
+        // 遮色片工具、清除筆刷、吸色與遮罩檢視也是對著上一批才成立的：
+        // 留著的話下一批照片一選進來就處在編輯狀態——工具還勾著（左鍵在畫
+        // 而不是平移）、預覽退回沒轉也沒裁的原圖、右上角還寫著「編輯中」。
+        // 「清除」是回到起始狀態，這幾樣要跟著收乾淨（實際回報過的狀況）
+        self.smoke.end_editing();
         self.smoke.base = None;
         self.smoke.base_long = 0;
         self.smoke.tex_before = None;
@@ -10789,6 +10864,8 @@ impl App {
         // 「柱子」，存出來的成品卻沒有（見 [`dehaze::SmokeParams::preview_of`]）
         draw.preview_of = Some(self.smoke.base_long);
         let mask = self.smoke.show_mask;
+        // 這一趟算的是哪一種畫面先記下來：算完才對得出「現在要的是不是同一種」
+        self.smoke.applied_mask = mask;
         // 遮色片檢視是診斷用的畫面，手動清除與調色套上去只會看不清楚哪裡被蓋住
         let (grade, wipes) = if mask {
             (Adjustments::default(), Vec::new())
@@ -11195,7 +11272,10 @@ impl App {
         {
             // 精細那一趟要等參數先停下來：拉滑桿的每一步都先用工作縮圖回一張，
             // 停手之後才補算精細版換上去（見 [`SMOKE_FINE_CAP`]）
-            let settled = self.smoke.applied.as_ref() == Some(&self.smoke.effective());
+            // 遮罩檢視與成品是同一組參數的兩種畫面，光比參數分不出來，
+            // 要連「算的是哪一種」一起比（見 [`SmokeTool::applied_mask`]）
+            let settled = self.smoke.applied.as_ref() == Some(&self.smoke.effective())
+                && self.smoke.applied_mask == self.smoke.show_mask;
             // 手上最細的那份夠不夠這一幀用；不夠就先照舊，等更細的解好再說
             let fine_ready = fine_want.is_some_and(|want| self.smoke.fine_long >= want);
             if !settled {
@@ -12366,22 +12446,9 @@ impl App {
         // 會讓人以為那裡也能塗（不設就是系統原本的箭頭）
         if let Some(p) = pos.filter(inside) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-            let painter = ui.painter();
-            // 內圈＝實心核心的邊界（與 edit::wipe_one 的 inner 同一個算法），
-            // 兩圈之間那一圈就是羽化過渡的寬度——拉羽化時看得到它張開或收合，
-            // 不必塗一筆才知道邊緣多柔（比照 Lightroom 的筆刷游標）。
-            //
-            // 粗細分工：內圈畫粗，因為「這一筆實際清得掉多大一塊」看的是它；
-            // 外圈只是效果淡到 0 的最外緣，細細一條帶過就好，不搶注意力
-            let strong = egui::Stroke::new(1.4, theme::WIPE);
-            let faint = egui::Stroke::new(1.0, theme::WIPE.gamma_multiply(0.55));
+            // 內圈＝實心核心的邊界（與 edit::wipe_one 的 inner 同一個算法）
             let inner = screen_r * (1.0 - self.smoke.wipe_feather as f32 / 100.0);
-            // 羽化拉到 0 時兩圈會重疊，只畫外圈——這時它就是核心，要畫粗的
-            let show_inner = inner > 1.0 && screen_r - inner > 1.5;
-            painter.circle_stroke(p, screen_r, if show_inner { faint } else { strong });
-            if show_inner {
-                painter.circle_stroke(p, inner, strong);
-            }
+            paint_brush_cursor(ui.painter(), p, screen_r, inner);
         }
     }
 
@@ -12435,9 +12502,9 @@ impl App {
                     )
                 }
                 shapes => {
-                    for (i, s) in shapes.iter().enumerate() {
-                        paint_shape(ui, img, &shifted(i, s), eff.feather);
-                    }
+                    let shapes: Vec<dehaze::Shape> =
+                        shapes.iter().enumerate().map(|(i, s)| shifted(i, s)).collect();
+                    paint_shapes(ui, img, &shapes, eff.feather);
                 }
             }
         }
@@ -12622,7 +12689,7 @@ impl App {
                     None => {}
                 }
             }
-            // 筆刷游標：先看得到會刷多粗，才不會塗完才發現不對。
+            // 筆刷游標：先看得到會刷多粗、邊緣多柔，才不會塗完才發現不對。
             // 一樣只在照片上才換游標，移出去就回到箭頭
             if tool == Some(MaskTool::Brush) {
                 if let Some(p) = resp
@@ -12631,11 +12698,9 @@ impl App {
                 {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                     let r = radius * img.width().max(img.height());
-                    ui.painter().circle_stroke(
-                        p,
-                        r,
-                        egui::Stroke::new(1.2, theme::ACCENT),
-                    );
+                    // 內圈與 dehaze::stamp 的 inner 同一個算法
+                    let inner = r * (1.0 - self.smoke.feather() as f32 / 100.0);
+                    paint_brush_cursor(ui.painter(), p, r, inner);
                 }
             }
         }
@@ -15606,9 +15671,9 @@ impl App {
                     )
                 }
                 shapes => {
-                    for (i, s) in shapes.iter().enumerate() {
-                        paint_shape(ui, img, &shifted(i, s), self.stack.feather);
-                    }
+                    let shapes: Vec<dehaze::Shape> =
+                        shapes.iter().enumerate().map(|(i, s)| shifted(i, s)).collect();
+                    paint_shapes(ui, img, &shapes, self.stack.feather);
                 }
             }
         }
@@ -15728,7 +15793,7 @@ impl App {
                 None => {}
             }
         }
-        // 筆刷游標：先看得到會刷多粗，才不會塗完才發現不對
+        // 筆刷游標：先看得到會刷多粗、邊緣多柔，才不會塗完才發現不對
         if tool == Some(MaskTool::Brush) {
             if let Some(p) = resp
                 .hover_pos()
@@ -15736,11 +15801,9 @@ impl App {
             {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                 let r = radius * img.width().max(img.height());
-                ui.painter().circle_stroke(
-                    p,
-                    r,
-                    egui::Stroke::new(1.2, theme::ACCENT),
-                );
+                // 內圈與 dehaze::stamp 的 inner 同一個算法
+                let inner = r * (1.0 - self.stack.feather as f32 / 100.0);
+                paint_brush_cursor(ui.painter(), p, r, inner);
             }
         }
     }
@@ -18213,11 +18276,7 @@ impl App {
                             ] {
                                 let on = self.smoke.mask_tool == Some(tool);
                                 if check_label(ui, on, label).on_hover_text(tip).clicked() {
-                                    // 再點一次同一個工具就關掉，左鍵回到拖曳平移
-                                    self.smoke.mask_tool = (!on).then_some(tool);
-                                    // 吸色、清除與畫遮色片都靠同一片畫布，不能同時開著
-                                    self.smoke.picking = None;
-                                    self.smoke.wipe_on = false;
+                                    self.smoke.pick_mask_tool(tool);
                                 }
                             }
                             let n = eff.shapes.len();
@@ -18363,12 +18422,9 @@ impl App {
                             // 遮罩檢視只會蓋出一片紅（那是地景，不是使用者畫的東西），
                             // 看起來像「遮色片清不掉」。所以沒東西可看就停用它
                             let can_show = eff.has_shapes() || eff.has_protect();
-                            // 清掉最後一個形狀時它會自己關掉——否則畫面會卡在遮罩
-                            // 檢視，而開關已經變灰，使用者反而退不出來
-                            if !can_show && self.smoke.show_mask {
-                                self.smoke.show_mask = false;
-                                self.smoke.applied = None;
-                            }
+                            // 清掉最後一個形狀時它會自己關掉、畫出第一個形狀時
+                            // 又會自己亮起來（見 [`SmokeTool::sync_mask_view`]）
+                            self.smoke.sync_mask_view(can_show);
                             let mut show_mask = self.smoke.show_mask;
                             let r = ui.add_enabled_ui(can_show, |ui| {
                                 check_label(ui, show_mask, "顯示遮色片")
@@ -18380,6 +18436,8 @@ impl App {
                             if r.inner {
                                 show_mask = !show_mask;
                                 self.smoke.show_mask = show_mask;
+                                // 自己動過這顆就不再自作主張（尤其是關掉它之後）
+                                self.smoke.mask_view_armed = false;
                                 // 遮色片與成品是兩種畫面，切換後要重畫
                                 self.smoke.applied = None;
                             }
@@ -24090,13 +24148,25 @@ fn paint_shape(ui: &egui::Ui, img: egui::Rect, s: &dehaze::Shape, feather: i32) 
             feather,
             r.invert,
         ),
-        dehaze::Shape::Brush(b) => {
-            let pts: Vec<egui::Pos2> = b.pts.iter().map(|q| to_screen(q[0], q[1])).collect();
-            // 半徑存的是佔長邊的比例，照片是等比縮放的，換算回畫面長邊即可
-            let w = b.radius * 2.0 * img.width().max(img.height());
-            paint_brush(&p, &pts, w);
-        }
+        dehaze::Shape::Brush(b) => paint_brush_union(&p, img, &[(&b.pts, b.radius)], theme::WIPE),
         dehaze::Shape::Object(o) => paint_object(&p, img, o),
+    }
+}
+
+/// 把一張遮色片的形狀全部畫到預覽上：框、漸層與物件各自描邊（[`paint_shape`]），
+/// 筆刷的筆跡則整批一次塗（[`paint_brush_union`]）——筆與筆之間疊了幾層
+/// 要放在一起才數得出來，一筆一筆各自畫只會越疊越不透明
+fn paint_shapes(ui: &egui::Ui, img: egui::Rect, shapes: &[dehaze::Shape], feather: i32) {
+    let mut strokes: Vec<(&[[f32; 2]], f32)> = Vec::new();
+    for s in shapes {
+        match s {
+            dehaze::Shape::Brush(b) => strokes.push((&b.pts, b.radius)),
+            s => paint_shape(ui, img, s, feather),
+        }
+    }
+    if !strokes.is_empty() {
+        let p = ui.painter().with_clip_rect(img);
+        paint_brush_union(&p, img, &strokes, theme::WIPE);
     }
 }
 
@@ -24200,48 +24270,149 @@ fn paint_radial(p: &egui::Painter, c: egui::Pos2, r: egui::Vec2, feather: i32, i
     p.circle_filled(c, 3.0, theme::ACCENT);
 }
 
-/// 筆跡：用筆刷的粗細把走過的路徑塗出來。`w` 為畫面上的筆畫寬度
-fn paint_brush(p: &egui::Painter, pts: &[egui::Pos2], w: f32) {
-    let Some((&first, rest)) = pts.split_first() else {
-        return;
-    };
-    let base = theme::ACCENT;
-    let r = (w * 0.5).max(0.5);
-    // 一段一塊各自畫，不用 Shape::line 把整條路徑串成一條粗線。
-    //
-    // 串成一條的話，路徑急轉彎或自己交叉的地方，egui 的斜接會往外爆出長長的
-    // 尖刺，半透明再一疊就是一條條細紋——那正是畫面上看到的星芒與 X 形。
-    // 拆成「每段一個凸四邊形＋每個轉折點補一個圓」就沒有接縫可言，
-    // 每一塊自己也不會與自己重疊。
-    //
-    // 單塊的透明度取得比較低（0.18），相鄰兩塊在轉折處自然疊成兩層，
-    // 整體濃度與原本那條 0.3 的粗線差不多
-    let fill = base.gamma_multiply(0.18);
-    if rest.is_empty() {
-        p.circle_filled(first, r, fill);
+/// 筆刷游標：外圈是筆跡最外緣、內圈是實心核心的邊界（`inner` 為內圈半徑），
+/// 兩圈之間就是羽化過渡帶——拉羽化時看得到它張開或收合，不必塗一筆才知道
+/// 邊緣多柔（比照 Lightroom 的筆刷游標）。遮色片筆刷與清除筆刷共用同一個樣子。
+///
+/// 粗細分工：內圈畫粗，因為「這一筆實際蓋到多大一塊」看的是它；
+/// 外圈只是效果淡到 0 的最外緣，細細一條帶過就好，不搶注意力。
+/// 羽化拉到 0 時兩圈會重疊，只畫外圈——這時它就是核心，要畫粗的
+fn paint_brush_cursor(p: &egui::Painter, c: egui::Pos2, r: f32, inner: f32) {
+    let strong = egui::Stroke::new(1.4, theme::WIPE);
+    let faint = egui::Stroke::new(1.0, theme::WIPE.gamma_multiply(0.55));
+    let show_inner = inner > 1.0 && r - inner > 1.5;
+    p.circle_stroke(c, r, if show_inner { faint } else { strong });
+    if show_inner {
+        p.circle_stroke(c, inner, strong);
+    }
+}
+
+/// 遮色片筆跡疊幾層對應的透明度：第一層淡淡的、再疊上去深一點，
+/// 第三層起就不再加深——塗再多筆底圖都還看得見。
+/// 筆與筆之間相加、同一筆繞回來不變濃，與實際的權重算法一致
+/// （見 [`dehaze::Brush`]）
+const BRUSH_LAYER_ALPHA: [f32; 3] = [0.24, 0.34, 0.42];
+
+/// 筆跡掃描線一列的高度（邏輯像素）。用實體像素會更細，但列數
+/// 翻倍工作量也翻倍；1 個邏輯像素在一般縮放下邊緣已經夠平
+const BRUSH_ROW: f32 = 1.0;
+
+/// 把好幾筆遮色片筆跡當成同一塊區域塗出來。`strokes` 每一筆是
+/// （相對座標的路徑, 佔影像長邊比例的半徑）。
+///
+/// 不是一筆一塊各自蓋上去：那樣同一筆的段與段、筆與筆之間的半透明
+/// 會一直相乘，塗個幾遍就是一團實色，底圖整個看不見。這裡改成先把
+/// 每一筆的路徑補成一串圓，逐條掃描線算出「每一筆各自蓋到哪些 x 區間」
+/// （同一筆先取聯集），再數每個區間疊了幾筆，依 [`BRUSH_LAYER_ALPHA`]
+/// 上色——一列一塊直接組成一張網格，塗多少筆都是那幾個固定濃度
+fn paint_brush_union(
+    p: &egui::Painter,
+    img: egui::Rect,
+    strokes: &[(&[[f32; 2]], f32)],
+    color: egui::Color32,
+) {
+    let clip = p.clip_rect().intersect(img);
+    if !clip.is_positive() || strokes.is_empty() {
         return;
     }
-    let mut shapes: Vec<egui::Shape> = Vec::with_capacity(pts.len() * 2);
-    for seg in pts.windows(2) {
-        let (a, b) = (seg[0], seg[1]);
-        let d = b - a;
-        let len = d.length();
-        if len < 1e-3 {
+    let long = img.width().max(img.height());
+    let to_screen =
+        |q: &[f32; 2]| egui::pos2(img.left() + q[0] * img.width(), img.top() + q[1] * img.height());
+
+    // 掃描線對齊可視範圍的上緣，列數只算看得到的那幾列——放大之後照片
+    // 大半在畫面外，那些列不必算
+    let y0 = clip.top();
+    let rows = ((clip.height() / BRUSH_ROW).ceil() as usize).max(1);
+    // 每一列：(第幾筆, x 起, x 迄)
+    let mut buckets: Vec<Vec<(u16, f32, f32)>> = vec![Vec::new(); rows];
+    let mut disc = |k: u16, c: egui::Pos2, r: f32| {
+        if c.x + r < clip.left() || c.x - r > clip.right() {
+            return;
+        }
+        let lo = ((c.y - r - y0) / BRUSH_ROW).floor().max(0.0) as usize;
+        let hi = (((c.y + r - y0) / BRUSH_ROW).ceil().max(0.0) as usize).min(rows);
+        for i in lo..hi {
+            let yc = y0 + (i as f32 + 0.5) * BRUSH_ROW;
+            let dy = yc - c.y;
+            if dy.abs() >= r {
+                continue;
+            }
+            let half = (r * r - dy * dy).sqrt();
+            buckets[i].push((k, c.x - half, c.x + half));
+        }
+    };
+    for (k, (pts, radius)) in strokes.iter().enumerate() {
+        let r = (radius * long).max(0.75);
+        let k = k.min(u16::MAX as usize) as u16;
+        // 路徑補成一串圓，圓心間距不超過半徑的三成，串起來就是一條圓頭的
+        // 粗線（邊緣的起伏不到半徑的百分之一，看不出來）
+        let step = (r * 0.3).max(1.5);
+        let mut prev: Option<egui::Pos2> = None;
+        for q in pts.iter() {
+            let c = to_screen(q);
+            if let Some(a) = prev {
+                let d = c - a;
+                let n = (d.length() / step).ceil().max(1.0);
+                for j in 1..(n as usize) {
+                    disc(k, a + d * (j as f32 / n), r);
+                }
+            }
+            disc(k, c, r);
+            prev = Some(c);
+        }
+    }
+
+    let mut mesh = egui::Mesh::default();
+    let mut events: Vec<(f32, i32)> = Vec::new();
+    let by_x = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+    for (i, row) in buckets.iter_mut().enumerate() {
+        if row.is_empty() {
             continue;
         }
-        // 垂直於這一段、長度為半徑的向量：往兩側各推出去就是這一段的方塊
-        let n = egui::vec2(-d.y, d.x) / len * r;
-        shapes.push(egui::Shape::convex_polygon(
-            vec![a + n, b + n, b - n, a - n],
-            fill,
-            egui::Stroke::NONE,
-        ));
+        let top = y0 + i as f32 * BRUSH_ROW;
+        let bottom = (top + BRUSH_ROW).min(clip.bottom());
+        // 同一筆自己交疊的區間先併成一段（一筆之內取最大），之後才逐筆計數
+        row.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| by_x(&a.1, &b.1)));
+        events.clear();
+        let mut cur: Option<(u16, f32, f32)> = None;
+        for &(k, a, b) in row.iter() {
+            match cur.as_mut() {
+                Some(c) if c.0 == k && a <= c.2 => c.2 = c.2.max(b),
+                _ => {
+                    if let Some(c) = cur.replace((k, a, b)) {
+                        events.push((c.1, 1));
+                        events.push((c.2, -1));
+                    }
+                }
+            }
+        }
+        if let Some(c) = cur {
+            events.push((c.1, 1));
+            events.push((c.2, -1));
+        }
+        events.sort_by(|a, b| by_x(&a.0, &b.0));
+        // 由左往右掃：層數變了就把前一段畫掉
+        let mut depth = 0i32;
+        let mut from = f32::NAN;
+        for &(x, d) in events.iter() {
+            if depth > 0 && x > from {
+                let (l, r) = (from.max(clip.left()), x.min(clip.right()));
+                if r > l {
+                    let alpha =
+                        BRUSH_LAYER_ALPHA[(depth as usize - 1).min(BRUSH_LAYER_ALPHA.len() - 1)];
+                    mesh.add_colored_rect(
+                        egui::Rect::from_min_max(egui::pos2(l, top), egui::pos2(r, bottom)),
+                        color.gamma_multiply(alpha),
+                    );
+                }
+            }
+            depth += d;
+            from = x;
+        }
     }
-    // 轉折處與兩端補圓，方塊之間外側的缺口才會補起來、端點也才是圓的
-    for &q in pts {
-        shapes.push(egui::Shape::circle_filled(q, r, fill));
+    if !mesh.is_empty() {
+        p.add(egui::Shape::mesh(mesh));
     }
-    p.extend(shapes);
 }
 
 /// 手動清除的筆跡畫在預覽上的樣子（塗過的地方蓋一層淡色）。
@@ -27583,6 +27754,77 @@ mod tests {
             s.applied.is_none(),
             "遮罩檢視關掉要重畫一次，否則畫面停在那片紅色"
         );
+    }
+
+    #[test]
+    fn picking_a_mask_tool_turns_the_mask_view_on() {
+        // 選了遮色片工具就要看得到那片紅，否則不知道自己圈到哪。
+        // 選的當下多半還沒畫任何形狀（那時沒東西可看），所以要先記著、
+        // 畫出第一個形狀再亮起來
+        let mut s = SmokeTool::default();
+        s.pick_mask_tool(MaskTool::Brush);
+        assert_eq!(s.mask_tool, Some(MaskTool::Brush));
+        assert!(s.show_mask, "選了工具就該勾起「顯示遮色片」");
+
+        // 還沒畫東西：檢視只會蓋出一整片紅，這時要關著，但「要看」先記著
+        s.sync_mask_view(false);
+        assert!(!s.show_mask, "沒東西可看時不能開著，開關已經變灰會退不出來");
+        assert!(s.mask_view_armed, "還記著使用者要看遮罩");
+
+        // 畫出第一個形狀：自己亮起來，並且不再自作主張
+        s.sync_mask_view(true);
+        assert!(s.show_mask, "有東西可看了就該自己打開");
+        assert!(!s.mask_view_armed);
+        assert!(s.applied.is_none(), "切到遮罩檢視要重畫");
+
+        // 使用者自己關掉之後（UI 那顆開關會一起收掉旗標），
+        // 同一張照片再畫幾個形狀也不該又被打開
+        s.show_mask = false;
+        s.mask_view_armed = false;
+        s.sync_mask_view(true);
+        assert!(!s.show_mask, "他自己關掉的就別再自動打開");
+
+        // 換到下一張（還沒畫，沒東西可看）：重新記一次，
+        // 這張畫出第一個形狀一樣要亮——不能只有第一張會亮
+        s.sync_mask_view(false);
+        assert!(s.mask_view_armed, "換一張還沒畫的照片要重新記著");
+        s.sync_mask_view(true);
+        assert!(s.show_mask, "每一張畫出第一個形狀都該自己亮起來");
+
+        // 收掉工具之後就別再自作主張
+        s.show_mask = false;
+        s.mask_tool = None;
+        s.sync_mask_view(false);
+        assert!(!s.mask_view_armed, "工具都收了就不該再記著");
+        s.sync_mask_view(true);
+        assert!(!s.show_mask);
+
+        // 吸色也算：吸到第一個保護色時一樣要亮起來
+        s.picking = Some(PickTarget::Protect);
+        s.sync_mask_view(false);
+        assert!(s.mask_view_armed, "吸色開著時也要記著");
+        s.picking = None; // 吸完就離開吸色模式
+        s.sync_mask_view(true);
+        assert!(s.show_mask, "吸到第一個保護色也該自己亮起來");
+
+        // 再點一次同一顆＝收掉工具，記著的那份意思也跟著取消
+        s.pick_mask_tool(MaskTool::Brush);
+        s.pick_mask_tool(MaskTool::Brush);
+        assert!(s.mask_tool.is_none());
+        assert!(!s.mask_view_armed);
+    }
+
+    #[test]
+    fn a_mask_tool_puts_the_other_canvas_tools_away() {
+        // 吸色、清除筆刷與畫遮色片都靠同一片畫布的左鍵，不能同時開著
+        let mut s = SmokeTool {
+            wipe_on: true,
+            picking: Some(PickTarget::Cloud),
+            ..Default::default()
+        };
+        s.pick_mask_tool(MaskTool::Radial);
+        assert!(!s.wipe_on);
+        assert!(s.picking.is_none());
     }
 
     #[test]
