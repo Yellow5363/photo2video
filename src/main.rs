@@ -26177,12 +26177,13 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Photo2Video — 照片轉影片")
             .with_icon(load_app_icon())
-            // 起始就開最大化：側欄有四個區塊（調色、主體追蹤、文字、轉場與音樂），
-            // 1280×800 的視窗裝不下，後面兩個要捲動才看得到。最大化不必猜螢幕
-            // 多大、也不必擔心高 DPI 縮放後放不下（1440×900 是還原後的尺寸）
+            // 不最大化：一開就佔滿整個螢幕會蓋掉底下正在看的東西。1440×900
+            // 已經放得下側欄那四個區塊（調色、主體追蹤、文字、轉場與音樂），
+            // 要更大自己按最大化就好
             .with_inner_size([1440.0, 900.0])
-            .with_maximized(true)
             .with_min_inner_size([1024.0, 640.0]),
+        // 擺在螢幕正中間：沒指定位置的話系統會把視窗丟在左上角
+        centered: true,
         ..Default::default()
     };
     eframe::run_native(
