@@ -250,20 +250,21 @@ fn norm(p: &Path) -> PathBuf {
 /// - macOS 拷到外接碟時，每個檔案旁邊留的 `._原檔名` 附屬檔（AppleDouble，
 ///   存 Finder 標籤與資源分支），以及 `.DS_Store` 那一票索引／快取資料夾。
 /// - `Thumbs.db` 是 Windows 的縮圖快取，刪了會自己重建。
-/// - `desktop.ini` 記的是「這個資料夾在**這台電腦**上要長什麼樣」（圖示、
-///   排列方式），是本機的顯示設定而不是資料，不跟著備份走。
 /// - `$RECYCLE.BIN` 與 `System Volume Information`：目的挑到磁碟機根目錄時，
 ///   不能把整個回收筒與系統還原點算成「目的地多餘檔案」。
+///
+/// `desktop.ini` **要**跟著備份：它是資料夾自訂圖示的另一半（另一半是資料夾
+/// 的系統屬性，見 [`copy_dir_attrs`]），少了它 Lightroom 目錄庫備份出來的
+/// 圖示就不對
 fn is_junk(entry: &fs::DirEntry) -> bool {
     /// 名字對上就當作不存在（不分大小寫）
-    const JUNK: [&str; 9] = [
+    const JUNK: [&str; 8] = [
         ".DS_Store",
         ".fseventsd",
         ".Spotlight-V100",
         ".TemporaryItems",
         ".Trashes",
         "Thumbs.db",
-        "desktop.ini",
         "$RECYCLE.BIN",
         "System Volume Information",
     ];
@@ -274,8 +275,12 @@ fn is_junk(entry: &fs::DirEntry) -> bool {
 
 /// 把來源資料夾的隱藏／系統屬性帶到目的那一份。
 ///
-/// 備份出來的資料夾要和來源長得一樣——Lightroom 的 `xxx.lrcat-data` 帶的是
-/// 系統屬性，新建的目的資料夾預設是一般屬性，不補這一下兩邊就不同。
+/// Windows 要顯示資料夾的自訂圖示，靠的是「資料夾帶系統屬性 ＋ 裡面有
+/// `desktop.ini`」兩者俱全——Lightroom 的 `xxx.lrcat-data` 正是這樣。新建的
+/// 目的資料夾預設是一般屬性，不補這一下，備份出來的圖示就不對。
+///
+/// **每次都檢查、不是只在新建時補**：資料夾可能是上一版程式建的（那時還
+/// 沒補屬性），只在新建時處理的話那些永遠不會被修好。
 ///
 /// 檔案不必自己處理：Windows 的 `CopyFileW`（`fs::copy` 底下就是它）本來就會
 /// 把屬性一起帶過去。設不起來也不算錯誤，內容才是重點
@@ -290,15 +295,20 @@ fn copy_dir_attrs(from: &Path, to: &Path) {
     // 在 Windows 上另有含義（也是「我有自訂設定」的旗標之一），但它會讓
     // 某些程式誤判成不能寫，帶了風險大於好處
     const KEEP: u32 = 0x2 | 0x4;
-    let Ok(md) = fs::metadata(from) else { return };
-    let want = md.file_attributes() & KEEP;
-    if want == 0 {
+    let (Ok(src_md), Ok(dst_md)) = (fs::metadata(from), fs::metadata(to)) else {
+        return;
+    };
+    let want = src_md.file_attributes() & KEEP;
+    // 已經一樣就不必寫（每個檔案都會走過它的每一層，能省就省）
+    if want == dst_md.file_attributes() & KEEP {
         return;
     }
+    // 保留目的原本那些與顯示無關的旗標（封存、壓縮…），只換這兩個
+    let attrs = (dst_md.file_attributes() & !KEEP) | want;
     let mut wide: Vec<u16> = to.as_os_str().encode_wide().collect();
     wide.push(0);
     // SetFileAttributesW 會換掉整組屬性，但改不動 DIRECTORY 那種由系統維護的
-    unsafe { SetFileAttributesW(wide.as_ptr(), want) };
+    unsafe { SetFileAttributesW(wide.as_ptr(), attrs) };
 }
 
 #[cfg(not(windows))]
@@ -599,8 +609,8 @@ fn trash_item_name(item: &trash::TrashItem) -> std::ffi::OsString {
     name
 }
 
-/// 建出 `rel` 這個檔案需要的每一層目的資料夾，**新建的那幾層順便把來源的
-/// 屬性帶過去**（見 [`copy_dir_attrs`]）。已經存在的不動
+/// 建出 `rel` 這個檔案需要的每一層目的資料夾，並讓每一層的隱藏／系統屬性
+/// 跟來源那一層一致（見 [`copy_dir_attrs`]）
 fn create_dirs_for(src_root: &Path, dst_root: &Path, rel: &Path) -> Result<(), String> {
     let fail = |e: std::io::Error| format!("{}：無法建立資料夾（{e}）", rel.display());
     // 目的的根自己可能還不存在（第一次備份）
@@ -614,10 +624,9 @@ fn create_dirs_for(src_root: &Path, dst_root: &Path, rel: &Path) -> Result<(), S
     for comp in parent.components() {
         cur.push(comp);
         let d = dst_root.join(&cur);
-        if d.is_dir() {
-            continue;
+        if !d.is_dir() {
+            fs::create_dir(&d).map_err(fail)?;
         }
-        fs::create_dir(&d).map_err(fail)?;
         copy_dir_attrs(&src_root.join(&cur), &d);
     }
     Ok(())
@@ -902,9 +911,8 @@ mod tests {
         write_at(&dst.join("._A1208228.jpg"), "resource fork", 0);
         write_at(&dst.join(".DS_Store"), "finder", 0);
         // 隱藏屬性本身不是排除的理由：Lightroom 目錄庫裡的 PackageIcon.ico
-        // 是隱藏的，卻是那個資料夾的一部分，要照樣備份
+        // 與 desktop.ini 都是隱藏的，卻是那個資料夾的一部分，要照樣備份
         write_at(&dst.join("PackageIcon.ico"), "icon", 0);
-        // desktop.ini 相反：那是「這個資料夾在這台電腦上長什麼樣」的設定
         write_at(&dst.join("desktop.ini"), "[.ShellClassInfo]", 0);
         #[cfg(windows)]
         {
@@ -923,17 +931,18 @@ mod tests {
             Some(&Kind::Extra),
             "隱藏但有意義的檔案要照算"
         );
-        assert_eq!(got.len(), 2, "._ 附屬檔、.DS_Store 與 desktop.ini 不該出現在清單上");
-        assert_eq!(p.ignored, 3, "略過幾個要算出來給畫面交代");
+        assert_eq!(got.get("desktop.ini"), Some(&Kind::Extra), "自訂圖示的另一半");
+        assert_eq!(got.len(), 3, "._ 附屬檔與 .DS_Store 不該出現在清單上");
+        assert_eq!(p.ignored, 2, "略過幾個要算出來給畫面交代");
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(windows)]
     #[test]
-    fn a_catalog_folder_keeps_its_system_attribute_and_hidden_files() {
-        // Lightroom 目錄庫：資料夾帶系統屬性、裡面躺著隱藏的 PackageIcon.ico。
-        // 資料夾整包被跳過、或隱藏檔漏掉，備份出來的都不是完整的目錄庫
+    fn a_catalog_folder_keeps_its_custom_icon() {
+        // Lightroom 目錄庫的自訂圖示要兩個條件同時成立：資料夾帶系統屬性、
+        // 裡面有 desktop.ini（還有它指到的 PackageIcon.ico）。少一個就不對
         use std::os::windows::fs::MetadataExt;
         const SYSTEM: u32 = 0x4;
         let root = tmp("lrcat");
@@ -943,29 +952,28 @@ mod tests {
         write_at(&cat.join("db.bin"), "catalog", 0);
         write_at(&cat.join("PackageIcon.ico"), "icon", 0);
         write_at(&cat.join("desktop.ini"), "[.ShellClassInfo]", 0);
-        fs::create_dir_all(&dst).unwrap();
-        for (flag, path) in [("+S", &cat), ("+H", &cat.join("PackageIcon.ico"))] {
+        // 目的那一份先建成一般屬性的資料夾：上一版程式就是這樣留下來的，
+        // 屬性只在「新建時」補的話，這些永遠不會被修好
+        fs::create_dir_all(dst.join("spring.lrcat-data")).unwrap();
+        for (flag, path) in [("+S", &cat), ("+H", &cat.join("desktop.ini"))] {
             let out = std::process::Command::new("attrib").arg(flag).arg(path).output();
             assert!(out.is_ok(), "設定屬性失敗");
         }
 
         let cancel = AtomicBool::new(false);
         let p = plan(&src, &dst, true, &cancel).unwrap();
-        assert_eq!(p.actions.len(), 2, "db.bin 與 PackageIcon.ico 要備份");
+        assert_eq!(p.actions.len(), 3, "目錄庫的三個檔案都要備份");
         for a in &p.actions {
             apply(a, &src, &dst, true).unwrap();
         }
 
         let out = dst.join("spring.lrcat-data");
         assert_eq!(fs::read_to_string(out.join("db.bin")).unwrap(), "catalog");
-        assert!(
-            out.join("PackageIcon.ico").is_file(),
-            "隱藏的 PackageIcon.ico 要拷過去"
-        );
-        assert!(!out.join("desktop.ini").exists(), "desktop.ini 是本機的顯示設定");
+        assert!(out.join("PackageIcon.ico").is_file(), "圖示檔要拷過去");
+        assert!(out.join("desktop.ini").is_file(), "自訂圖示的設定檔要拷過去");
         assert!(
             fs::metadata(&out).unwrap().file_attributes() & SYSTEM != 0,
-            "資料夾的系統屬性要帶過去，兩邊才長得一樣"
+            "已經存在的資料夾也要補上系統屬性，否則自訂圖示不會生效"
         );
 
         let _ = fs::remove_dir_all(&root);
