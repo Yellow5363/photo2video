@@ -20592,7 +20592,7 @@ impl App {
                         ui.add_space(4.0);
                         ui.label(
                             egui::RichText::new(format!(
-                                "已處理 {done} / {total} 件（{:.0}%）",
+                                "已處理 {done} / {total} 項目（{:.0}%）",
                                 frac * 100.0
                             ))
                             .size(12.0)
@@ -20939,9 +20939,9 @@ impl App {
                     self.backup.busy = BackupBusy::Idle;
                     let cancelled = self.backup.cancel.load(Ordering::Relaxed);
                     let mut msg = if cancelled {
-                        format!("已中止，做完 {ok} 件")
+                        format!("已中止，做完 {ok} 項目")
                     } else {
-                        format!("備份完成，共 {ok} 件")
+                        format!("備份完成，共 {ok} 項目")
                     };
                     if !deleted.is_empty() {
                         msg.push_str(&format!("；{} 個檔案已移到資源回收筒", deleted.len()));
@@ -20949,10 +20949,10 @@ impl App {
                     self.backup.last_deleted = deleted;
                     self.backup.last_deleted_junk = deleted_junk;
                     if !errs.is_empty() {
-                        msg.push_str(&format!("；{} 件失敗", errs.len()));
+                        msg.push_str(&format!("；{} 項目失敗", errs.len()));
                         let shown: Vec<String> = errs.iter().take(3).cloned().collect();
                         let more = errs.len().saturating_sub(shown.len());
-                        let mut e = format!("{} 件失敗：{}", errs.len(), shown.join("；"));
+                        let mut e = format!("{} 項目失敗：{}", errs.len(), shown.join("；"));
                         if more > 0 {
                             e.push_str(&format!("…等另外 {more} 件"));
                         }
