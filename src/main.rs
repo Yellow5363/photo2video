@@ -15828,7 +15828,8 @@ impl App {
                  （停手幾秒後換上去，張數越多能載的越小）。\n\
                  存檔時是拿原尺寸重疊一次，不是把這張放大。\n\
                  滾輪縮放（開著筆刷時 Ctrl＋滾輪改筆刷粗細）；\n\
-                 沒選遮色片工具時左鍵可直接拖曳平移。",
+                 沒選遮色片工具、也沒在調整圖層或裁切時，左鍵可直接拖曳平移\n\
+                 （那幾樣開著時左鍵歸它們用，改用中鍵或右鍵拖曳平移）。",
                 fit_scale * 100.0
             ));
         });
@@ -16286,8 +16287,18 @@ impl App {
                         }
                         Some(z) => {
                             let size = canvas_size * (z / ppp);
-                            // 平移：中鍵或右鍵隨時可拖；沒選遮色片工具時左鍵也可以
-                            let left_pans = !layer_view || self.stack.active_tool().is_none();
+                            // 平移：中鍵或右鍵隨時可拖；左鍵要先讓給「拿左鍵做事」的
+                            // 那幾樣——單層檢視下的遮色片工具、成品上的裁切框與
+                            // 「調整圖層」。調整圖層時左鍵拖的是那一層，不是整個畫面；
+                            // 少排除它的話放大後一拖，地景會跟著圖層一起跑
+                            // （符合視窗時根本不走這條，所以只有放大時才看得到）
+                            let left_busy = if layer_view {
+                                self.stack.active_tool().is_some()
+                            } else {
+                                self.stack.crop_editing
+                                    || (self.stack.move_mode && self.stack.can_move_cur())
+                            };
+                            let left_pans = !left_busy;
                             if ui.rect_contains_pointer(full) {
                                 if left_pans {
                                     ui.ctx().set_cursor_icon(
