@@ -241,32 +241,68 @@ fn norm(p: &Path) -> PathBuf {
 /// 上，只會讓人以為程式壞了（`spring` 裡明明只有 3 張照片，卻說有 6 個檔案
 /// 要處理）。備份的是照片，這些雜檔本來就不必跟著搬。
 ///
-/// - **隱藏或系統屬性**：檔案總管預設就不顯示。macOS 拷到外接碟留下的
-///   `._原檔名` 附屬檔（AppleDouble，存 Finder 標籤與資源分支）帶的正是
-///   隱藏屬性，`.DS_Store`、`.fseventsd`、`.Spotlight-V100` 也是。
-///   `$RECYCLE.BIN` 與 `System Volume Information` 一樣靠這條擋掉——
-///   目的挑到磁碟機根目錄時才不會把整個回收筒算成「多餘的檔案」。
-/// - 屬性讀不到、或在沒有這套屬性的檔案系統上（網路碟、Linux）時，
-///   退回看名字：`._*`、`.DS_Store`、`Thumbs.db`、`desktop.ini`。
+/// 認的是**名字**，不是隱藏屬性。
+///
+/// 一度改成「帶隱藏屬性就當作不存在」，但隱藏不等於不重要：Lightroom 目錄庫
+/// 資料夾裡的 `PackageIcon.ico` 是隱藏的，卻是那個資料夾的一部分，備份漏掉
+/// 就不是完整的備份。名單列出來才管得住範圍。
+///
+/// - macOS 拷到外接碟時，每個檔案旁邊留的 `._原檔名` 附屬檔（AppleDouble，
+///   存 Finder 標籤與資源分支），以及 `.DS_Store` 那一票索引／快取資料夾。
+/// - `Thumbs.db` 是 Windows 的縮圖快取，刪了會自己重建。
+/// - `desktop.ini` 記的是「這個資料夾在**這台電腦**上要長什麼樣」（圖示、
+///   排列方式），是本機的顯示設定而不是資料，不跟著備份走。
+/// - `$RECYCLE.BIN` 與 `System Volume Information`：目的挑到磁碟機根目錄時，
+///   不能把整個回收筒與系統還原點算成「目的地多餘檔案」。
 fn is_junk(entry: &fs::DirEntry) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        // FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
-        const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
-        if let Ok(md) = entry.metadata() {
-            if md.file_attributes() & HIDDEN_OR_SYSTEM != 0 {
-                return true;
-            }
-        }
-    }
+    /// 名字對上就當作不存在（不分大小寫）
+    const JUNK: [&str; 9] = [
+        ".DS_Store",
+        ".fseventsd",
+        ".Spotlight-V100",
+        ".TemporaryItems",
+        ".Trashes",
+        "Thumbs.db",
+        "desktop.ini",
+        "$RECYCLE.BIN",
+        "System Volume Information",
+    ];
     let name = entry.file_name();
     let name = name.to_string_lossy();
-    name.starts_with("._")
-        || name.eq_ignore_ascii_case(".DS_Store")
-        || name.eq_ignore_ascii_case("Thumbs.db")
-        || name.eq_ignore_ascii_case("desktop.ini")
+    name.starts_with("._") || JUNK.iter().any(|j| name.eq_ignore_ascii_case(j))
 }
+
+/// 把來源資料夾的隱藏／系統屬性帶到目的那一份。
+///
+/// 備份出來的資料夾要和來源長得一樣——Lightroom 的 `xxx.lrcat-data` 帶的是
+/// 系統屬性，新建的目的資料夾預設是一般屬性，不補這一下兩邊就不同。
+///
+/// 檔案不必自己處理：Windows 的 `CopyFileW`（`fs::copy` 底下就是它）本來就會
+/// 把屬性一起帶過去。設不起來也不算錯誤，內容才是重點
+#[cfg(windows)]
+fn copy_dir_attrs(from: &Path, to: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    extern "system" {
+        fn SetFileAttributesW(path: *const u16, attrs: u32) -> i32;
+    }
+    // FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM。唯讀不帶：資料夾的唯讀
+    // 在 Windows 上另有含義（也是「我有自訂設定」的旗標之一），但它會讓
+    // 某些程式誤判成不能寫，帶了風險大於好處
+    const KEEP: u32 = 0x2 | 0x4;
+    let Ok(md) = fs::metadata(from) else { return };
+    let want = md.file_attributes() & KEEP;
+    if want == 0 {
+        return;
+    }
+    let mut wide: Vec<u16> = to.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SetFileAttributesW 會換掉整組屬性，但改不動 DIRECTORY 那種由系統維護的
+    unsafe { SetFileAttributesW(wide.as_ptr(), want) };
+}
+
+#[cfg(not(windows))]
+fn copy_dir_attrs(_from: &Path, _to: &Path) {}
 
 /// 掃到的一個檔案
 struct Found {
@@ -446,7 +482,10 @@ pub fn apply(
     let in_src = src_root.join(&act.rel);
     let in_dst = dst_root.join(&act.rel);
     match act.kind {
-        Kind::Copy | Kind::Update => copy_file(&in_src, &in_dst, &act.rel),
+        Kind::Copy | Kind::Update => {
+            create_dirs_for(src_root, dst_root, &act.rel)?;
+            copy_file(&in_src, &in_dst, &act.rel)
+        }
         Kind::Extra => {
             if keep_extra {
                 return Ok(());
@@ -560,10 +599,31 @@ fn trash_item_name(item: &trash::TrashItem) -> std::ffi::OsString {
     name
 }
 
-fn copy_file(from: &Path, to: &Path, rel: &Path) -> Result<(), String> {
-    if let Some(dir) = to.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("{}：無法建立資料夾（{e}）", rel.display()))?;
+/// 建出 `rel` 這個檔案需要的每一層目的資料夾，**新建的那幾層順便把來源的
+/// 屬性帶過去**（見 [`copy_dir_attrs`]）。已經存在的不動
+fn create_dirs_for(src_root: &Path, dst_root: &Path, rel: &Path) -> Result<(), String> {
+    let fail = |e: std::io::Error| format!("{}：無法建立資料夾（{e}）", rel.display());
+    // 目的的根自己可能還不存在（第一次備份）
+    if !dst_root.is_dir() {
+        fs::create_dir_all(dst_root).map_err(fail)?;
     }
+    let Some(parent) = rel.parent() else {
+        return Ok(());
+    };
+    let mut cur = PathBuf::new();
+    for comp in parent.components() {
+        cur.push(comp);
+        let d = dst_root.join(&cur);
+        if d.is_dir() {
+            continue;
+        }
+        fs::create_dir(&d).map_err(fail)?;
+        copy_dir_attrs(&src_root.join(&cur), &d);
+    }
+    Ok(())
+}
+
+fn copy_file(from: &Path, to: &Path, rel: &Path) -> Result<(), String> {
     // 舊檔帶唯讀屬性時 fs::copy 會失敗（從光碟或記憶卡拷出來的照片常帶著）。
     // 要覆蓋的既然是舊的那一份，先把旗標拿掉再蓋
     if let Ok(md) = fs::metadata(to) {
@@ -841,13 +901,16 @@ mod tests {
         write_at(&dst.join("A1208228.jpg"), "photo", 0);
         write_at(&dst.join("._A1208228.jpg"), "resource fork", 0);
         write_at(&dst.join(".DS_Store"), "finder", 0);
-        // Windows 上 macOS 的雜檔是靠隱藏屬性擋掉的，這裡把屬性補上，
-        // 才是真的在測那條路（名字那條退路另外由 .DS_Store 蓋到）
+        // 隱藏屬性本身不是排除的理由：Lightroom 目錄庫裡的 PackageIcon.ico
+        // 是隱藏的，卻是那個資料夾的一部分，要照樣備份
+        write_at(&dst.join("PackageIcon.ico"), "icon", 0);
+        // desktop.ini 相反：那是「這個資料夾在這台電腦上長什麼樣」的設定
+        write_at(&dst.join("desktop.ini"), "[.ShellClassInfo]", 0);
         #[cfg(windows)]
         {
             let out = std::process::Command::new("attrib")
                 .arg("+H")
-                .arg(dst.join("._A1208228.jpg"))
+                .arg(dst.join("PackageIcon.ico"))
                 .output();
             assert!(out.is_ok(), "設定隱藏屬性失敗");
         }
@@ -855,8 +918,84 @@ mod tests {
         let p = plan(&src, &dst, true, &AtomicBool::new(false)).unwrap();
         let got = kinds(&p);
         assert_eq!(got.get("A1208228.jpg"), Some(&Kind::Extra), "看得到的照片照列");
-        assert_eq!(got.len(), 1, "._ 附屬檔與 .DS_Store 不該出現在清單上");
-        assert_eq!(p.ignored, 2, "略過幾個要算出來給畫面交代");
+        assert_eq!(
+            got.get("PackageIcon.ico"),
+            Some(&Kind::Extra),
+            "隱藏但有意義的檔案要照算"
+        );
+        assert_eq!(got.len(), 2, "._ 附屬檔、.DS_Store 與 desktop.ini 不該出現在清單上");
+        assert_eq!(p.ignored, 3, "略過幾個要算出來給畫面交代");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_catalog_folder_keeps_its_system_attribute_and_hidden_files() {
+        // Lightroom 目錄庫：資料夾帶系統屬性、裡面躺著隱藏的 PackageIcon.ico。
+        // 資料夾整包被跳過、或隱藏檔漏掉，備份出來的都不是完整的目錄庫
+        use std::os::windows::fs::MetadataExt;
+        const SYSTEM: u32 = 0x4;
+        let root = tmp("lrcat");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        let cat = src.join("spring.lrcat-data");
+        write_at(&cat.join("db.bin"), "catalog", 0);
+        write_at(&cat.join("PackageIcon.ico"), "icon", 0);
+        write_at(&cat.join("desktop.ini"), "[.ShellClassInfo]", 0);
+        fs::create_dir_all(&dst).unwrap();
+        for (flag, path) in [("+S", &cat), ("+H", &cat.join("PackageIcon.ico"))] {
+            let out = std::process::Command::new("attrib").arg(flag).arg(path).output();
+            assert!(out.is_ok(), "設定屬性失敗");
+        }
+
+        let cancel = AtomicBool::new(false);
+        let p = plan(&src, &dst, true, &cancel).unwrap();
+        assert_eq!(p.actions.len(), 2, "db.bin 與 PackageIcon.ico 要備份");
+        for a in &p.actions {
+            apply(a, &src, &dst, true).unwrap();
+        }
+
+        let out = dst.join("spring.lrcat-data");
+        assert_eq!(fs::read_to_string(out.join("db.bin")).unwrap(), "catalog");
+        assert!(
+            out.join("PackageIcon.ico").is_file(),
+            "隱藏的 PackageIcon.ico 要拷過去"
+        );
+        assert!(!out.join("desktop.ini").exists(), "desktop.ini 是本機的顯示設定");
+        assert!(
+            fs::metadata(&out).unwrap().file_attributes() & SYSTEM != 0,
+            "資料夾的系統屬性要帶過去，兩邊才長得一樣"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_system_folder_that_is_not_hidden_still_gets_backed_up() {
+        // Lightroom 的 xxx Previews.lrdata、xxx.lrcat-data 是**資料夾**，帶著
+        // 系統屬性（資料夾要掛自訂圖示就得帶）但沒有隱藏屬性，在檔案總管裡
+        // 看得見。把「隱藏或系統」都當成不存在的話，整個目錄庫會悄悄漏掉
+        // 不備份——條件必須是「有隱藏屬性」才算
+        let root = tmp("sysdir");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        write_at(&src.join("spring.lrcat-data/db.bin"), "catalog", 0);
+        fs::create_dir_all(&dst).unwrap();
+        let out = std::process::Command::new("attrib")
+            .arg("+S")
+            .arg(src.join("spring.lrcat-data"))
+            .output();
+        assert!(out.is_ok(), "設定系統屬性失敗");
+
+        let p = plan(&src, &dst, true, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            kinds(&p).get("spring.lrcat-data/db.bin"),
+            Some(&Kind::Copy),
+            "看得見的系統資料夾要照樣備份"
+        );
+        assert_eq!(p.ignored, 0);
 
         let _ = fs::remove_dir_all(&root);
     }
