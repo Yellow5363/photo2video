@@ -18,6 +18,8 @@ use eframe::egui;
 use ffmpeg_sidecar::command::FfmpegCommand;
 use ffmpeg_sidecar::event::FfmpegEvent;
 
+mod backup;
+
 mod dehaze;
 use dehaze::SmokeParams;
 
@@ -93,16 +95,19 @@ enum Module {
     Movie,
     /// 優化影像（自動判斷該怎麼調色與強化主體，整批處理）
     Enhance,
+    /// 檔案管理（目前只有資料備份，之後再加別的）
+    Files,
 }
 
 impl Module {
     /// 模組列的顯示順序
-    const ALL: [Module; 5] = [
+    const ALL: [Module; 6] = [
         Module::Video,
         Module::Dehaze,
         Module::Stack,
         Module::Movie,
         Module::Enhance,
+        Module::Files,
     ];
 
     fn label(self) -> &'static str {
@@ -112,6 +117,7 @@ impl Module {
             Module::Stack => "煙火疊圖",
             Module::Movie => "煙火影片去煙霧",
             Module::Enhance => "優化影像",
+            Module::Files => "檔案管理",
         }
     }
 
@@ -122,6 +128,7 @@ impl Module {
             Module::Stack => "🎆",
             Module::Movie => "🎥",
             Module::Enhance => "✨",
+            Module::Files => "📂",
         }
     }
 
@@ -135,6 +142,7 @@ impl Module {
             Module::Enhance => {
                 "整批照片自動調色並強化主體：層次、光影、通透度一次調好，處理後另存新檔"
             }
+            Module::Files => "資料備份：把來源資料夾同步到目的，新的蓋掉舊的、缺的補齊",
         }
     }
 }
@@ -155,6 +163,7 @@ enum MenuAction {
     ClearStack,
     ClearMovie,
     ClearEnhance,
+    ClearBackup,
     Switch(Module),
     CheckUpdate,
     About,
@@ -1747,6 +1756,8 @@ enum LastDir {
     EnhancePhotos,
     /// 優化影像模組：「另存新檔」的存放資料夾
     EnhanceOutput,
+    // 資料備份的兩個資料夾**刻意不記**：備份會覆蓋、也可能刪檔，記住位置
+    // 等於下次一開對話框就停在那裡、按兩下就過去了。每次自己找一遍才安全
 }
 
 impl LastDir {
@@ -5305,6 +5316,107 @@ const ENHANCE_AMOUNT_MAX: i32 = 200;
 /// 瓶頸是解 JPEG，開太多只會跟預覽、縮圖搶 CPU
 const ENHANCE_AUTO_WORKERS: usize = 3;
 
+// ---------- 檔案管理 ----------
+
+/// 資料備份目前在背景做的事（同時間只會有一件）
+#[derive(PartialEq, Clone, Copy, Default)]
+enum BackupBusy {
+    #[default]
+    Idle,
+    /// 正在比對兩個資料夾（還沒動到任何檔案）
+    Scanning,
+    /// 正在照比對結果搬檔案
+    Running,
+}
+
+/// 背景執行緒回報給資料備份的訊息
+enum BackupMsg {
+    /// 比對完成（或失敗）
+    Planned(Result<backup::Plan, String>),
+    /// 搬檔進度：已處理幾件
+    Progress(usize),
+    /// 整批做完：成功幾件、失敗的訊息
+    Done(usize, Vec<String>),
+}
+
+/// 清單最多列幾筆。備份一次好幾萬個檔案是常事，全部畫出來只是把畫面
+/// 拖垮——看幾筆確認「挑對資料夾了」就夠，總數在上面的統計列
+const BACKUP_LIST_MAX: usize = 500;
+
+/// 每做幾件回報一次進度。一件一報的話，一批幾萬個小檔會讓 UI 執行緒
+/// 光是收訊息就忙不完（畫面也不需要一件一件跳）
+const BACKUP_PROGRESS_EVERY: usize = 16;
+
+/// 「檔案管理 ▸ 資料備份」的狀態：兩個資料夾、一份比對結果。
+/// 切到別的模組時整份留著，切回來就是剛才離開的樣子
+#[derive(Default)]
+struct BackupTool {
+    /// 來源資料夾
+    src: Option<PathBuf>,
+    /// 目的資料夾
+    dst: Option<PathBuf>,
+    /// 保留目的資料夾多出來的檔案。**預設勾著**：沒勾就是會刪東西，
+    /// 這種事不能是「沒注意到」就發生的
+    keep_extra: bool,
+    /// 連子資料夾一起備份
+    recursive: bool,
+    /// 上一次比對的結果；按下「開始備份」做的就是這一份。
+    /// 做完就清掉——檔案都動過了，那份清單已經不算數
+    plan: Option<backup::Plan>,
+    /// 按了「開始備份」，正在等比對結果：比對完接著把確認框叫出來、往下做
+    pending_run: bool,
+    /// 比對結果收到了，確認框排在**下一幀**跳。
+    ///
+    /// 系統對話框會擋住 UI 執行緒，而這一幀的畫面要等 update 跑完才送上
+    /// 螢幕——在收到結果的當下就跳，螢幕上會一直停在「正在比對兩個
+    /// 資料夾…」那一幀，看起來像比對卡在那裡
+    confirm_pending: bool,
+    busy: BackupBusy,
+    rx: Option<Receiver<BackupMsg>>,
+    cancel: Arc<AtomicBool>,
+    /// 搬檔進度（已處理幾件）與這一批總共幾件
+    done: usize,
+    total: usize,
+    error: Option<String>,
+    /// 最近一次做完的結果（畫面上留一行）
+    result: Option<String>,
+}
+
+impl BackupTool {
+    fn new() -> Self {
+        Self {
+            // 兩個資料夾**不**從設定檔還原：備份會覆蓋、也可能刪檔，
+            // 一開程式就已經填好兩個路徑，很容易在沒細看的情況下按下去，
+            // 而那兩個位置未必還是這次想備份的。每次自己挑一遍才安全
+            // （選資料夾的對話框仍會從上次的位置開始，見 [`LastDir`]）
+            keep_extra: true,
+            recursive: true,
+            ..Default::default()
+        }
+    }
+
+    /// 比對結果已經不算數了（換了資料夾、或剛搬完檔案）
+    fn invalidate(&mut self) {
+        self.plan = None;
+        self.done = 0;
+        self.total = 0;
+    }
+
+    /// 兩個資料夾都挑好了（可以比對，也可以直接開始備份）
+    fn ready(&self) -> bool {
+        self.src.is_some() && self.dst.is_some()
+    }
+
+    /// 檔案實際會被寫到哪個資料夾：挑的目的資料夾底下、與來源同名的那一個
+    /// （見 [`backup::target`]）
+    fn target(&self) -> Option<PathBuf> {
+        match (&self.src, &self.dst) {
+            (Some(s), Some(d)) => Some(backup::target(s, d)),
+            _ => None,
+        }
+    }
+}
+
 struct App {
     /// 目前停在哪個功能模組（右上角的模組列切換）。各模組的狀態各自留著，
     /// 切走再切回來就是離開時的樣子
@@ -5415,6 +5527,8 @@ struct App {
     movie: MovieTool,
     /// 「優化影像」工具的狀態
     enhance: EnhanceTool,
+    /// 「檔案管理 ▸ 資料備份」的狀態
+    backup: BackupTool,
 }
 
 impl App {
@@ -5534,6 +5648,7 @@ impl App {
                 }
                 e
             },
+            backup: BackupTool::new(),
         };
         // 監看 UI 執行緒有沒有卡住（見 spawn_ui_watchdog）
         spawn_ui_watchdog(&cc.egui_ctx);
@@ -7448,6 +7563,20 @@ impl App {
                                     ui.close_menu();
                                 }
                             }
+                            Module::Files => {
+                                if ui
+                                    .add_enabled(
+                                        (self.backup.src.is_some() || self.backup.dst.is_some())
+                                            && self.backup.busy == BackupBusy::Idle,
+                                        egui::Button::new("🗑  清除備份設定"),
+                                    )
+                                    .on_hover_text("放掉選好的來源與目的資料夾，以及比對結果")
+                                    .clicked()
+                                {
+                                    act = Some(MenuAction::ClearBackup);
+                                    ui.close_menu();
+                                }
+                            }
                         }
                     });
 
@@ -7566,6 +7695,13 @@ impl App {
             MenuAction::ClearStack => self.stack_clear_confirmed(),
             MenuAction::ClearMovie => self.movie.reset_for(None, None),
             MenuAction::ClearEnhance => self.enhance_clear_confirmed(),
+            MenuAction::ClearBackup => {
+                self.backup.src = None;
+                self.backup.dst = None;
+                self.backup.error = None;
+                self.backup.result = None;
+                self.backup.invalidate();
+            }
             MenuAction::Switch(m) => self.module = m,
             MenuAction::CheckUpdate => {
                 // 手動重新檢查時，讓新版通知條可以再次出現
@@ -7759,6 +7895,10 @@ impl App {
             Module::Enhance => {
                 self.ui_bottom_bar(ctx);
                 self.ui_enhance_module(ctx);
+            }
+            Module::Files => {
+                self.ui_bottom_bar(ctx);
+                self.ui_files_module(ctx);
             }
         }
     }
@@ -20154,6 +20294,477 @@ impl App {
         set_preset
     }
 
+    // ---------- 檔案管理 ----------
+
+    /// 「檔案管理」模組。底下的功能不只一項（之後還會再加），所以最上面
+    /// 留一條功能列；目前只有「1. 資料備份」這一項
+    fn ui_files_module(&mut self, ctx: &egui::Context) {
+        let mut pick_src = false;
+        let mut pick_dst = false;
+        let mut scan = false;
+        let mut run = false;
+        let mut stop = false;
+        let busy = self.backup.busy;
+        let idle = busy == BackupBusy::Idle;
+        let ready = self.backup.ready();
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::same(12)),
+            )
+            .show(ctx, |ui| {
+                // 功能列。之後多一項功能就在這裡多畫一顆，版面不必動
+                ui.horizontal(|ui| {
+                    files_tab(ui, "1. 資料備份", true);
+                });
+                ui.add_space(6.0);
+
+                if backup_dir_row(ui, "來源", self.backup.src.as_deref(), idle) {
+                    pick_src = true;
+                }
+                ui.add_space(4.0);
+                if backup_dir_row(ui, "目的", self.backup.dst.as_deref(), idle) {
+                    pick_dst = true;
+                }
+                // 挑的目的資料夾底下還會再套一層與來源同名的資料夾時，把真正
+                // 寫入的位置寫出來——光看上面兩列看不出多了一層。挑的那個自己
+                // 就是目標時（[`backup::target`]）不多這一行，說了也是廢話
+                let target = self.backup.target();
+                if let Some(t) = target.filter(|t| Some(t.as_path()) != self.backup.dst.as_deref())
+                {
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "→ 實際寫入 {}{}",
+                                t.to_string_lossy(),
+                                if t.is_dir() {
+                                    ""
+                                } else {
+                                    "（還不存在，備份時自動建立）"
+                                }
+                            ))
+                            .size(12.0)
+                            .color(theme::TEXT_WEAK),
+                        );
+                    });
+                }
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    // 換了範圍，剛才那份比對結果就不算數了
+                    if ui
+                        .add_enabled(
+                            idle,
+                            egui::Checkbox::new(&mut self.backup.recursive, "含子資料夾"),
+                        )
+                        .on_hover_text("整棵資料夾一起備份；關掉就只比對最上面那一層")
+                        .changed()
+                    {
+                        self.backup.invalidate();
+                    }
+                    ui.add_space(18.0);
+                    // 這一顆是唯一會刪到東西的開關，說明講白一點
+                    ui.add_enabled(
+                        idle,
+                        egui::Checkbox::new(
+                            &mut self.backup.keep_extra,
+                            "保留目的資料夾多餘的檔案",
+                        ),
+                    )
+                    .on_hover_text(
+                        "勾著：來源沒有的檔案原封不動留在目的資料夾。\n\
+                         取消勾選：目的資料夾會被整理成和來源一樣，多出來的檔案**會被刪掉**。",
+                    );
+                });
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(idle && ready, egui::Button::new("🔍  比對"))
+                        .on_hover_text("只是看看要做哪些事，這一步不會動到任何檔案")
+                        .clicked()
+                    {
+                        scan = true;
+                    }
+                    ui.add_space(6.0);
+                    // 「比對」不是必經的一步：按下去一定會自己先重新比對一次
+                    // （畫面上那份可能是幾分鐘前的，兩邊的檔案早就變了）。
+                    // 但已經比出「一件事都不用做」時就把它關掉——這時按下去
+                    // 只會再比一次然後什麼也沒發生，看起來像壞掉
+                    let todo = self
+                        .backup
+                        .plan
+                        .as_ref()
+                        .map(|p| p.todo(self.backup.keep_extra));
+                    if primary_button(ui, "▶  開始備份", idle && ready && todo != Some(0))
+                        .on_hover_text(if todo == Some(0) {
+                            "這兩個資料夾已經一樣，沒有東西要備份；\
+                             檔案有變動就按「🔍 比對」重新看一次"
+                        } else {
+                            "先重新比對一次，再把要做的事列出來給你確認"
+                        })
+                        .clicked()
+                    {
+                        run = true;
+                    }
+                    if !idle {
+                        ui.add_space(6.0);
+                        if ui.button("✖  中止").clicked() {
+                            stop = true;
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+
+                if let Some(e) = &self.backup.error {
+                    ui.label(
+                        egui::RichText::new(format!("✖ {e}"))
+                            .size(12.0)
+                            .color(theme::ERROR),
+                    );
+                    ui.add_space(6.0);
+                }
+                if let Some(r) = &self.backup.result {
+                    ui.label(
+                        egui::RichText::new(format!("✔ {r}"))
+                            .size(12.5)
+                            .color(theme::SUCCESS),
+                    );
+                    ui.add_space(6.0);
+                }
+
+                match busy {
+                    BackupBusy::Scanning => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new("正在比對兩個資料夾…")
+                                    .size(12.5)
+                                    .color(theme::TEXT),
+                            );
+                        });
+                    }
+                    BackupBusy::Running => {
+                        let (done, total) = (self.backup.done, self.backup.total);
+                        let frac = if total > 0 {
+                            done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_height(10.0)
+                                .fill(theme::ACCENT),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "已處理 {done} / {total} 件（{:.0}%）",
+                                frac * 100.0
+                            ))
+                            .size(12.0)
+                            .color(theme::TEXT),
+                        );
+                    }
+                    BackupBusy::Idle => {}
+                }
+
+                if idle {
+                    let write_to = self.backup.target().unwrap_or_default();
+                    match self.backup.plan.as_ref() {
+                        Some(plan) => {
+                            ui_backup_plan(ui, plan, self.backup.keep_extra, &write_to)
+                        }
+                        None if ready => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "可以直接按「▶ 開始備份」（一定會先重新比對一次，再列出要做的事讓你確認）；\
+                                     想先看看差在哪裡就按「🔍 比對」。\n\
+                                     同名的檔案，來源比較新就覆蓋掉目的那一份；\
+                                     目的沒有的直接拷過去。只會寫到目的資料夾，來源不會被動到。",
+                                )
+                                .size(12.5)
+                                .color(theme::TEXT_WEAK),
+                            );
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "先挑好來源與目的兩個資料夾（也可以直接把資料夾拖曳進來）。",
+                                )
+                                .size(12.5)
+                                .color(theme::TEXT_WEAK),
+                            );
+                        }
+                    }
+                }
+            });
+
+        if pick_src {
+            self.backup_pick_dir(true);
+        }
+        if pick_dst {
+            self.backup_pick_dir(false);
+        }
+        if scan {
+            self.backup_scan(ctx);
+        }
+        if run {
+            self.backup_start(ctx);
+        }
+        if stop {
+            self.backup.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 挑來源／目的資料夾。換過資料夾，剛才那份比對結果就不算數了。
+    ///
+    /// 這裡**不記**上次停在哪（別的模組都會記，見 [`LastDir`]）：備份會覆蓋、
+    /// 也可能刪檔，記住位置等於下次一開對話框就停在那裡、按兩下就過去了
+    fn backup_pick_dir(&mut self, is_src: bool) {
+        let title = if is_src {
+            "選擇來源資料夾（要備份出去的那一個）"
+        } else {
+            "選擇目的資料夾（備份要放進去的那一個）"
+        };
+        let Some(d) = file_dialog().set_title(title).pick_folder() else {
+            return;
+        };
+        if is_src {
+            self.backup.src = Some(d);
+        } else {
+            self.backup.dst = Some(d);
+        }
+        self.backup.error = None;
+        self.backup.result = None;
+        self.backup.invalidate();
+    }
+
+    /// 比對兩個資料夾。只是掃描與比較，這一步不動任何檔案
+    fn backup_scan(&mut self, ctx: &egui::Context) {
+        let (Some(src), Some(dst)) = (self.backup.src.clone(), self.backup.target()) else {
+            return;
+        };
+        if let Err(e) = backup::validate(&src, &dst) {
+            self.backup.error = Some(e);
+            self.backup.pending_run = false;
+            self.backup.invalidate();
+            return;
+        }
+        let recursive = self.backup.recursive;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.backup.cancel = cancel.clone();
+        self.backup.busy = BackupBusy::Scanning;
+        self.backup.error = None;
+        self.backup.result = None;
+        self.backup.invalidate();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.backup.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(BackupMsg::Planned(backup::plan(
+                &src, &dst, recursive, &cancel,
+            )));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 按下「開始備份」：**一定先重新比對一次**，比完才接著往下做
+    /// （見 [`App::poll_backup`]）。
+    ///
+    /// 畫面上那份清單可能是幾分鐘前比的，這期間兩邊的檔案都可能被動過——
+    /// 照舊清單做會拷到不存在的檔案、或漏掉剛改過的那幾個
+    fn backup_start(&mut self, ctx: &egui::Context) {
+        if !self.backup.ready() {
+            return;
+        }
+        self.backup.pending_run = true;
+        self.backup_scan(ctx);
+    }
+
+    /// 照比對結果把檔案搬過去。覆蓋與刪除都在這裡真的發生，
+    /// 所以動手前先把要做的事一條一條列出來給使用者按過
+    fn backup_run(&mut self, ctx: &egui::Context) {
+        let (Some(src), Some(dst)) = (self.backup.src.clone(), self.backup.target()) else {
+            return;
+        };
+        // 比對完到現在，資料夾可能已經被拔掉、改名或搬走，動手前再確認一次
+        if let Err(e) = backup::validate(&src, &dst) {
+            self.backup.error = Some(e);
+            self.backup.invalidate();
+            return;
+        }
+        let keep_extra = self.backup.keep_extra;
+        let recursive = self.backup.recursive;
+        let Some(plan) = self.backup.plan.as_ref() else {
+            return;
+        };
+        // 勾了「保留」的話，多出來的那幾件只是列出來給人看，不必排進這一批
+        let actions: Vec<backup::Action> = plan
+            .actions
+            .iter()
+            .filter(|a| !(keep_extra && a.kind == backup::Kind::Extra))
+            .cloned()
+            .collect();
+        if actions.is_empty() {
+            return;
+        }
+        let (copy, update, extra) = (
+            plan.count(backup::Kind::Copy),
+            plan.count(backup::Kind::Update),
+            plan.count(backup::Kind::Extra),
+        );
+
+        let mut lines = vec![
+            format!("來源：{}", src.display()),
+            format!("目的：{}", dst.display()),
+            String::new(),
+        ];
+        if copy > 0 {
+            lines.push(format!("· 拷貝 {copy} 個目的沒有的檔案"));
+        }
+        if update > 0 {
+            lines.push(format!("· 用來源覆蓋目的比較舊的 {update} 個檔案"));
+        }
+        if extra > 0 {
+            lines.push(match (keep_extra, recursive) {
+                (true, _) => format!("· 目的地多餘檔案 {extra} 個保留不動"),
+                // 沒勾「含子資料夾」時不去動子資料夾，也就不會清空殼
+                (false, false) => format!("· 刪除目的地多餘檔案 {extra} 個"),
+                (false, true) => {
+                    format!("· 刪除目的地多餘檔案 {extra} 個（連同清空後的資料夾）")
+                }
+            });
+        }
+        let dangerous = !keep_extra && extra > 0;
+        if !ask2(
+            if dangerous {
+                rfd::MessageLevel::Warning
+            } else {
+                rfd::MessageLevel::Info
+            },
+            "開始備份",
+            &lines.join("\n"),
+            "開始備份",
+            "取消",
+        ) {
+            return;
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.backup.cancel = cancel.clone();
+        self.backup.busy = BackupBusy::Running;
+        self.backup.error = None;
+        self.backup.result = None;
+        self.backup.done = 0;
+        self.backup.total = actions.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.backup.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let mut ok = 0usize;
+            let mut errs: Vec<String> = Vec::new();
+            for (i, act) in actions.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                match backup::apply(act, &src, &dst, keep_extra) {
+                    Ok(()) => ok += 1,
+                    Err(e) => errs.push(e),
+                }
+                // 一批動輒好幾萬個小檔，每件都送一次訊息只是在洗畫面；
+                // 隔一段送一次，最後一件一定送得到
+                if (i + 1) % BACKUP_PROGRESS_EVERY == 0 || i + 1 == actions.len() {
+                    let _ = tx.send(BackupMsg::Progress(i + 1));
+                    ctx.request_repaint();
+                }
+            }
+            // 多餘的檔案刪光後留下的空資料夾也一起收乾淨。沒勾「含子資料夾」
+            // 時不做——子資料夾這次根本沒在比對範圍裡，不能去動它
+            if !keep_extra && recursive && !cancel.load(Ordering::Relaxed) {
+                backup::prune_empty_dirs(&src, &dst, &cancel);
+            }
+            let _ = tx.send(BackupMsg::Done(ok, errs));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_backup(&mut self, ctx: &egui::Context) {
+        // 上一幀排下來的確認框。畫面已經更新成「比對完」的樣子了，現在才跳
+        if std::mem::take(&mut self.backup.confirm_pending) {
+            self.backup_run(ctx);
+        }
+        // 「按了開始備份」那條路：比對完把確認框排到下一幀（不能在收訊息的
+        // 迴圈裡就跳，對話框會擋住 UI 執行緒，通道要先收乾淨）
+        let mut run_now = false;
+        loop {
+            let Some(rx) = &self.backup.rx else { break };
+            match rx.try_recv() {
+                Ok(BackupMsg::Planned(res)) => {
+                    self.backup.rx = None;
+                    self.backup.busy = BackupBusy::Idle;
+                    let waiting = std::mem::take(&mut self.backup.pending_run);
+                    match res {
+                        Ok(p) => {
+                            if p.actions.is_empty() {
+                                self.backup.result =
+                                    Some(format!("兩個資料夾已經一樣（{} 個檔案）", p.same));
+                            } else {
+                                run_now = waiting;
+                            }
+                            self.backup.plan = Some(p);
+                        }
+                        Err(e) if e == backup::CANCELLED => {
+                            self.backup.result = Some("已中止比對".into())
+                        }
+                        Err(e) => self.backup.error = Some(e),
+                    }
+                }
+                // 搬檔中：只更新進度，通道要留著繼續收
+                Ok(BackupMsg::Progress(n)) => self.backup.done = n,
+                Ok(BackupMsg::Done(ok, errs)) => {
+                    self.backup.rx = None;
+                    self.backup.busy = BackupBusy::Idle;
+                    let cancelled = self.backup.cancel.load(Ordering::Relaxed);
+                    let mut msg = if cancelled {
+                        format!("已中止，做完 {ok} 件")
+                    } else {
+                        format!("備份完成，共 {ok} 件")
+                    };
+                    if !errs.is_empty() {
+                        msg.push_str(&format!("；{} 件失敗", errs.len()));
+                        let shown: Vec<String> = errs.iter().take(3).cloned().collect();
+                        let more = errs.len().saturating_sub(shown.len());
+                        let mut e = format!("{} 件失敗：{}", errs.len(), shown.join("；"));
+                        if more > 0 {
+                            e.push_str(&format!("…等另外 {more} 件"));
+                        }
+                        self.backup.error = Some(e);
+                    }
+                    self.backup.result = Some(msg);
+                    // 檔案都動過了，剛才那份清單已經不算數：要再看就重新比對
+                    self.backup.invalidate();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // 執行緒沒回結果就結束：清掉等待狀態，否則永遠卡在忙碌中
+                    self.backup.rx = None;
+                    self.backup.pending_run = false;
+                    self.backup.busy = BackupBusy::Idle;
+                    self.backup.error = Some("備份處理異常中斷".into());
+                    break;
+                }
+            }
+        }
+        if run_now {
+            self.backup.confirm_pending = true;
+            ctx.request_repaint();
+        }
+    }
+
     fn ui_drop_overlay(&self, ctx: &egui::Context) {
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
         if !hovering {
@@ -20189,6 +20800,13 @@ impl App {
                 (theme::TEXT_WEAK, "⏳", "存檔中，暫時無法加入照片")
             }
             Module::Enhance => (theme::ACCENT, "⬇", "放開滑鼠加入要優化的照片"),
+            Module::Files if self.backup.busy != BackupBusy::Idle => {
+                (theme::TEXT_WEAK, "⏳", "備份進行中，暫時不能換資料夾")
+            }
+            Module::Files if self.backup.src.is_none() => {
+                (theme::ACCENT, "⬇", "放開滑鼠設為來源資料夾")
+            }
+            Module::Files => (theme::ACCENT, "⬇", "放開滑鼠設為目的資料夾"),
         };
         p.rect_stroke(
             card,
@@ -20409,6 +21027,15 @@ impl eframe::App for App {
                     .set_title("正在存檔")
                     .set_description("優化影像正在把照片寫成檔案，請等這批存完再關閉。")
                     .show();
+            } else if self.backup.busy == BackupBusy::Running {
+                // 關掉會留下一個拷到一半的檔案，還看不出停在哪一件
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.module = Module::Files;
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Info)
+                    .set_title("正在備份")
+                    .set_description("資料備份還在搬檔案，請等它跑完，或按「✖ 中止」再關閉。")
+                    .show();
             } else {
                 // 專案與去煙霧各自可能有沒存的東西，一次講完再問一次就好
                 let mut pending: Vec<&str> = Vec::new();
@@ -20496,6 +21123,7 @@ impl eframe::App for App {
         self.poll_stack(ctx);
         self.poll_movie(ctx);
         self.poll_enhance(ctx);
+        self.poll_backup(ctx);
 
         // 支援直接拖曳檔案/資料夾進視窗
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -20608,6 +21236,35 @@ impl eframe::App for App {
                     self.enhance_set_photos(files, ctx);
                 } else {
                     self.enhance_append(files, ctx);
+                }
+            }
+        } else if !dropped.is_empty()
+            && self.module == Module::Files
+            && self.backup.busy == BackupBusy::Idle
+        {
+            // 檔案管理模組：拖資料夾進來就填進來源／目的。一次拖兩個就照
+            // 順序當成「來源、目的」；一次拖一個就填還空著的那一格
+            // （兩格都滿了就換掉來源——要換目的的人會從那一列自己挑）
+            let dirs: Vec<PathBuf> = dropped.iter().filter(|p| p.is_dir()).cloned().collect();
+            match dirs.len() {
+                0 => self.backup.error = Some("請拖曳「資料夾」進來，不是檔案".into()),
+                1 => {
+                    let d = dirs[0].clone();
+                    if self.backup.dst.is_none() && self.backup.src.is_some() {
+                        self.backup.dst = Some(d);
+                    } else {
+                        self.backup.src = Some(d);
+                    }
+                    self.backup.error = None;
+                    self.backup.result = None;
+                    self.backup.invalidate();
+                }
+                _ => {
+                    self.backup.src = Some(dirs[0].clone());
+                    self.backup.dst = Some(dirs[1].clone());
+                    self.backup.error = None;
+                    self.backup.result = None;
+                    self.backup.invalidate();
                 }
             }
         } else if !dropped.is_empty() && !self.is_working() {
@@ -22105,6 +22762,197 @@ fn module_tab(ui: &mut egui::Ui, m: Module, active: bool) -> egui::Response {
         );
     }
     resp.on_hover_text(m.hint())
+}
+
+/// 「檔案管理」底下的功能列上的一項（「1. 資料備份」）。與上面的模組列同一
+/// 套視覺：選中的亮起來並壓一條底線，字小一號表示它是模組底下的一層
+fn files_tab(ui: &mut egui::Ui, text: &str, active: bool) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        egui::FontId::proportional(13.0),
+        theme::TEXT,
+    );
+    let size = egui::vec2(galley.size().x + 12.0, galley.size().y + 10.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let p = ui.painter();
+    p.galley(
+        egui::pos2(rect.center().x - galley.size().x / 2.0, rect.top() + 2.0),
+        galley,
+        if active { theme::TEXT } else { theme::TEXT_WEAK },
+    );
+    if active {
+        let y = rect.bottom() - 2.0;
+        p.line_segment(
+            [
+                egui::pos2(rect.left() + 3.0, y),
+                egui::pos2(rect.right() - 3.0, y),
+            ],
+            egui::Stroke::new(2.0, theme::ACCENT),
+        );
+    }
+}
+
+/// 資料備份的一列資料夾：標題、選擇鈕、現在選到哪裡。
+///
+/// 路徑整條顯示不縮寫——備份挑錯資料夾的代價是「檔案被蓋掉」，
+/// 使用者要能一眼確認自己選的是哪一個。回傳 true＝按了「選擇」
+fn backup_dir_row(ui: &mut egui::Ui, title: &str, dir: Option<&Path>, enabled: bool) -> bool {
+    let mut pick = false;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("{title}資料夾"))
+                .size(13.0)
+                .strong()
+                .color(theme::TEXT),
+        );
+        if ui
+            .add_enabled(enabled, egui::Button::new("📂  選擇"))
+            .clicked()
+        {
+            pick = true;
+        }
+        match dir {
+            Some(d) => {
+                ui.label(
+                    egui::RichText::new(d.to_string_lossy().into_owned())
+                        .size(13.0)
+                        .color(theme::TEXT),
+                );
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new("尚未選擇")
+                        .size(13.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            }
+        }
+    });
+    pick
+}
+
+/// 比對結果：上面一列統計，下面列出要動到的檔案。
+///
+/// 「相同」的那幾個不列（也沒進清單，見 [`backup::Plan`]），要看的是
+/// 「這次會動到什麼」
+fn ui_backup_plan(ui: &mut egui::Ui, plan: &backup::Plan, keep_extra: bool, write_to: &Path) {
+    use backup::Kind;
+    ui.horizontal_wrapped(|ui| {
+        for (kind, color) in [
+            (Kind::Copy, theme::SUCCESS),
+            (Kind::Update, theme::ACCENT),
+            (Kind::Extra, if keep_extra { theme::TEXT_WEAK } else { theme::ERROR }),
+        ] {
+            let n = plan.count(kind);
+            if n == 0 {
+                continue;
+            }
+            // 多出來的那幾個，勾了保留就只是「列給你看」，別讓它看起來像要刪
+            let label = if kind == Kind::Extra && keep_extra {
+                format!("{} {n}（保留）", kind.label())
+            } else {
+                format!("{} {n}（{}）", kind.label(), backup::fmt_size(plan.bytes(kind)))
+            };
+            ui.label(egui::RichText::new(label).size(12.5).strong().color(color));
+            ui.add_space(10.0);
+        }
+        ui.label(
+            egui::RichText::new(format!("相同 {}", plan.same))
+                .size(12.5)
+                .color(theme::TEXT_WEAK),
+        );
+        // 目的比較新的那幾個不動，但也不是「相同」——不講一聲的話，
+        // 數字加起來對不上，看起來像漏掉了
+        if plan.newer_dst > 0 {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(format!("目的較新 {}（不動）", plan.newer_dst))
+                    .size(12.5)
+                    .color(theme::TEXT_WEAK),
+            )
+            .on_hover_text("這幾個檔案目的資料夾裡的比較新，備份只往目的寫，所以原封不動留著");
+        }
+    });
+    if !plan.skipped.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "⚠ 有 {} 個資料夾讀不到、已跳過（例如 {}）",
+                plan.skipped.len(),
+                plan.skipped[0]
+            ))
+            .size(11.5)
+            .color(theme::ERROR),
+        );
+    }
+    if plan.actions.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+    // 路徑寫的是完整位置（含磁碟機代號），橫向也要能捲——不然長路徑會被
+    // 折成兩行，一整排看下來反而分不清哪一段是哪一個檔案
+    egui::ScrollArea::both()
+        .id_salt("backup_list")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for a in plan.actions.iter().take(BACKUP_LIST_MAX) {
+                ui.horizontal(|ui| {
+                    let color = match a.kind {
+                        Kind::Copy => theme::SUCCESS,
+                        Kind::Update => theme::ACCENT,
+                        Kind::Extra => {
+                            if keep_extra {
+                                theme::TEXT_WEAK
+                            } else {
+                                theme::ERROR
+                            }
+                        }
+                    };
+                    // 動作那一欄對齊：路徑才不會參差不齊。寬度照最長的那個
+                    // 字串（「目的地多餘檔案」七個字）留
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(104.0, 16.0), egui::Sense::hover());
+                    ui.painter().text(
+                        egui::pos2(rect.left(), rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        a.kind.label(),
+                        egui::FontId::proportional(11.5),
+                        color,
+                    );
+                    // 三種動作寫的都是目的那一邊（拷過去、蓋過去、刪掉都在
+                    // 那裡發生），所以列完整路徑：哪一顆硬碟、哪一層資料夾，
+                    // 不必自己拿上面兩列的路徑接一次
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                write_to.join(&a.rel).to_string_lossy().into_owned(),
+                            )
+                            .size(12.0)
+                            .color(theme::TEXT),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                    ui.label(
+                        egui::RichText::new(backup::fmt_size(a.bytes))
+                            .size(11.0)
+                            .color(theme::TEXT_WEAK),
+                    );
+                });
+            }
+            if plan.actions.len() > BACKUP_LIST_MAX {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "…另外還有 {} 個（清單只列前 {BACKUP_LIST_MAX} 個，備份時全部都會做）",
+                        plan.actions.len() - BACKUP_LIST_MAX
+                    ))
+                    .size(11.5)
+                    .color(theme::TEXT_WEAK),
+                );
+            }
+        });
 }
 
 /// 前後對照時貼在每半邊上緣的標籤（「編輯前」／「編輯後」）。
