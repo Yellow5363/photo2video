@@ -1756,14 +1756,16 @@ enum LastDir {
     EnhancePhotos,
     /// 優化影像模組：「另存新檔」的存放資料夾
     EnhanceOutput,
-    // 資料備份的兩個資料夾**刻意不記**：備份會覆蓋、也可能刪檔，記住位置
-    // 等於下次一開對話框就停在那裡、按兩下就過去了。每次自己找一遍才安全
+    /// 檔案管理 ▸ 資料備份：來源資料夾
+    BackupSource,
+    /// 檔案管理 ▸ 資料備份：目的資料夾
+    BackupDest,
 }
 
 impl LastDir {
     /// 全部的用途。加新欄位時記得補進來——測試會拿它檢查沒有兩個用途
     /// 共用同一個 config 欄位
-    const ALL: [LastDir; 13] = [
+    const ALL: [LastDir; 15] = [
         LastDir::VideoPhotos,
         LastDir::VideoProject,
         LastDir::VideoMusic,
@@ -1777,6 +1779,8 @@ impl LastDir {
         LastDir::MovieOutput,
         LastDir::EnhancePhotos,
         LastDir::EnhanceOutput,
+        LastDir::BackupSource,
+        LastDir::BackupDest,
     ];
 
     /// config.json 裡的欄位名（改動會讓使用者的記錄重來一次，勿隨意更名）
@@ -1795,6 +1799,8 @@ impl LastDir {
             LastDir::MovieOutput => "dir_movie_output",
             LastDir::EnhancePhotos => "dir_enhance_photos",
             LastDir::EnhanceOutput => "dir_enhance_output",
+            LastDir::BackupSource => "dir_backup_source",
+            LastDir::BackupDest => "dir_backup_dest",
         }
     }
 }
@@ -5327,6 +5333,8 @@ enum BackupBusy {
     Scanning,
     /// 正在照比對結果搬檔案
     Running,
+    /// 正在把剛刪掉的那批從資源回收筒放回原位
+    Restoring,
 }
 
 /// 背景執行緒回報給資料備份的訊息
@@ -5335,8 +5343,16 @@ enum BackupMsg {
     Planned(Result<backup::Plan, String>),
     /// 搬檔進度：已處理幾件
     Progress(usize),
-    /// 整批做完：成功幾件、失敗的訊息
-    Done(usize, Vec<String>),
+    /// 整批做完：成功幾件、失敗的訊息、丟進資源回收筒的檔案
+    /// （看得見的／一起收掉的雜檔分開放，見 [`BackupTool::last_deleted`]）
+    Done {
+        ok: usize,
+        errs: Vec<String>,
+        deleted: Vec<PathBuf>,
+        deleted_junk: Vec<PathBuf>,
+    },
+    /// 從資源回收筒放回去做完了：放回幾個（只算看得見的）、失敗的訊息
+    Restored(usize, Vec<String>),
 }
 
 /// 清單最多列幾筆。備份一次好幾萬個檔案是常事，全部畫出來只是把畫面
@@ -5371,6 +5387,14 @@ struct BackupTool {
     /// 螢幕——在收到結果的當下就跳，螢幕上會一直停在「正在比對兩個
     /// 資料夾…」那一幀，看起來像比對卡在那裡
     confirm_pending: bool,
+    /// 最近一次備份丟進資源回收筒、而且**使用者看得見**的檔案（完整路徑）。
+    /// 有東西就顯示「還原」鈕；畫面上的數字也是數這個。
+    /// 放回去了、或下一次備份開始時清掉
+    last_deleted: Vec<PathBuf>,
+    /// 同一批裡跟著收掉的雜檔（`._` 附屬檔那些，見 [`backup::prune_empty_dirs`]）。
+    /// 還原時一起放回去，但**不算進數字**——檔案總管裡看不到的東西，
+    /// 說「刪除了 6 個」只會讓人以為算錯了
+    last_deleted_junk: Vec<PathBuf>,
     busy: BackupBusy,
     rx: Option<Receiver<BackupMsg>>,
     cancel: Arc<AtomicBool>,
@@ -5405,6 +5429,24 @@ impl BackupTool {
     /// 兩個資料夾都挑好了（可以比對，也可以直接開始備份）
     fn ready(&self) -> bool {
         self.src.is_some() && self.dst.is_some()
+    }
+
+    /// 按鈕與確認框上寫的字：**按下去實際上要做的事**。
+    ///
+    /// 一批全是刪除時還寫「開始備份」，會讓人以為是在拷東西，按了才發現
+    /// 是在刪。還沒比對過（不知道要做什麼）就照舊寫「開始備份」
+    fn verb(&self) -> &'static str {
+        let Some(plan) = &self.plan else {
+            return "開始備份";
+        };
+        let deleting = !self.keep_extra && plan.count(backup::Kind::Extra) > 0;
+        let copying =
+            plan.count(backup::Kind::Copy) + plan.count(backup::Kind::Update) > 0;
+        match (copying, deleting) {
+            (_, false) => "開始備份",
+            (true, true) => "備份並刪除",
+            (false, true) => "刪除檔案",
+        }
     }
 
     /// 檔案實際會被寫到哪個資料夾：挑的目的資料夾底下、與來源同名的那一個
@@ -20304,6 +20346,7 @@ impl App {
         let mut scan = false;
         let mut run = false;
         let mut stop = false;
+        let mut restore = false;
         let busy = self.backup.busy;
         let idle = busy == BackupBusy::Idle;
         let ready = self.backup.ready();
@@ -20399,7 +20442,8 @@ impl App {
                         .plan
                         .as_ref()
                         .map(|p| p.todo(self.backup.keep_extra));
-                    if primary_button(ui, "▶  開始備份", idle && ready && todo != Some(0))
+                    let label = format!("▶  {}", self.backup.verb());
+                    if primary_button(ui, &label, idle && ready && todo != Some(0))
                         .on_hover_text(if todo == Some(0) {
                             "這兩個資料夾已經一樣，沒有東西要備份；\
                              檔案有變動就按「🔍 比對」重新看一次"
@@ -20436,6 +20480,23 @@ impl App {
                     ui.add_space(6.0);
                 }
 
+                // 剛才那一批丟進回收筒的檔案：一顆鈕放回原位。勾錯開關按下去
+                // 的人得有路可退，不必自己去回收筒裡一個一個找
+                if idle && !self.backup.last_deleted.is_empty() {
+                    let n = self.backup.last_deleted.len();
+                    if ui
+                        .button(format!("↩  還原剛才刪除的 {n} 個檔案"))
+                        .on_hover_text(
+                            "從資源回收筒放回原來的位置（連同被收掉的空資料夾一起建回來）。\n\
+                             只認最近一次備份刪的那批；回收筒已經清空的話就放不回來了",
+                        )
+                        .clicked()
+                    {
+                        restore = true;
+                    }
+                    ui.add_space(6.0);
+                }
+
                 match busy {
                     BackupBusy::Scanning => {
                         ui.horizontal(|ui| {
@@ -20468,6 +20529,16 @@ impl App {
                             .size(12.0)
                             .color(theme::TEXT),
                         );
+                    }
+                    BackupBusy::Restoring => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new("正在從資源回收筒放回原位…")
+                                    .size(12.5)
+                                    .color(theme::TEXT),
+                            );
+                        });
                     }
                     BackupBusy::Idle => {}
                 }
@@ -20518,21 +20589,33 @@ impl App {
         if stop {
             self.backup.cancel.store(true, Ordering::Relaxed);
         }
+        if restore {
+            self.backup_restore(ctx);
+        }
     }
 
     /// 挑來源／目的資料夾。換過資料夾，剛才那份比對結果就不算數了。
     ///
-    /// 這裡**不記**上次停在哪（別的模組都會記，見 [`LastDir`]）：備份會覆蓋、
-    /// 也可能刪檔，記住位置等於下次一開對話框就停在那裡、按兩下就過去了
+    /// 來源與目的**各記各的**上次位置（見 [`LastDir`]）：不指定起始位置的話，
+    /// Windows 會拿它自己那份「這支程式上次用過的資料夾」
+    /// （登錄檔裡的 LastVisitedPidlMRU）頂上來——那是兩個用途共用的一份，
+    /// 挑來源時跳出上次挑目的的位置，比各自記還糟
     fn backup_pick_dir(&mut self, is_src: bool) {
-        let title = if is_src {
-            "選擇來源資料夾（要備份出去的那一個）"
+        let (which, title) = if is_src {
+            (
+                LastDir::BackupSource,
+                "選擇來源資料夾（要備份出去的那一個）",
+            )
         } else {
-            "選擇目的資料夾（備份要放進去的那一個）"
+            (
+                LastDir::BackupDest,
+                "選擇目的資料夾（備份要放進去的那一個）",
+            )
         };
-        let Some(d) = file_dialog().set_title(title).pick_folder() else {
+        let Some(d) = folder_dialog(which).set_title(title).pick_folder() else {
             return;
         };
+        remember_dir(which, &d);
         if is_src {
             self.backup.src = Some(d);
         } else {
@@ -20633,22 +20716,24 @@ impl App {
             lines.push(match (keep_extra, recursive) {
                 (true, _) => format!("· 目的地多餘檔案 {extra} 個保留不動"),
                 // 沒勾「含子資料夾」時不去動子資料夾，也就不會清空殼
-                (false, false) => format!("· 刪除目的地多餘檔案 {extra} 個"),
-                (false, true) => {
-                    format!("· 刪除目的地多餘檔案 {extra} 個（連同清空後的資料夾）")
-                }
+                (false, false) => format!("· 刪除目的地多餘檔案 {extra} 個（丟資源回收筒，可還原）"),
+                (false, true) => format!(
+                    "· 刪除目的地多餘檔案 {extra} 個（丟資源回收筒，可還原；連同清空後的資料夾）"
+                ),
             });
         }
-        let dangerous = !keep_extra && extra > 0;
+        // 按鈕上寫的是真的要做的事（見 ask2 的說明），與畫面上那顆同一套字
+        let deleting = !keep_extra && extra > 0;
+        let verb = self.backup.verb();
         if !ask2(
-            if dangerous {
+            if deleting {
                 rfd::MessageLevel::Warning
             } else {
                 rfd::MessageLevel::Info
             },
-            "開始備份",
+            verb,
             &lines.join("\n"),
-            "開始備份",
+            verb,
             "取消",
         ) {
             return;
@@ -20661,18 +20746,29 @@ impl App {
         self.backup.result = None;
         self.backup.done = 0;
         self.backup.total = actions.len();
+        // 「還原」只認最近一次：舊的那批還在回收筒，要撈得從 Windows 那邊撈
+        self.backup.last_deleted.clear();
         let (tx, rx) = std::sync::mpsc::channel();
         self.backup.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
             let mut ok = 0usize;
             let mut errs: Vec<String> = Vec::new();
+            // 真的丟進資源回收筒的那幾個，記完整路徑給「還原」用
+            let mut deleted: Vec<PathBuf> = Vec::new();
+            // 收資料夾時順手丟掉的 ._ 附屬檔那些：還原要放回去，但不計數
+            let mut deleted_junk: Vec<PathBuf> = Vec::new();
             for (i, act) in actions.iter().enumerate() {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 match backup::apply(act, &src, &dst, keep_extra) {
-                    Ok(()) => ok += 1,
+                    Ok(()) => {
+                        ok += 1;
+                        if act.kind == backup::Kind::Extra {
+                            deleted.push(dst.join(&act.rel));
+                        }
+                    }
                     Err(e) => errs.push(e),
                 }
                 // 一批動輒好幾萬個小檔，每件都送一次訊息只是在洗畫面；
@@ -20685,9 +20781,48 @@ impl App {
             // 多餘的檔案刪光後留下的空資料夾也一起收乾淨。沒勾「含子資料夾」
             // 時不做——子資料夾這次根本沒在比對範圍裡，不能去動它
             if !keep_extra && recursive && !cancel.load(Ordering::Relaxed) {
-                backup::prune_empty_dirs(&src, &dst, &cancel);
+                // 收資料夾時順手丟掉的雜檔也要記進去，「還原」才放得回來
+                deleted_junk = backup::prune_empty_dirs(&src, &dst, &cancel);
             }
-            let _ = tx.send(BackupMsg::Done(ok, errs));
+            let _ = tx.send(BackupMsg::Done {
+                ok,
+                errs,
+                deleted,
+                deleted_junk,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// 把最近一次備份丟進資源回收筒的檔案放回原位
+    fn backup_restore(&mut self, ctx: &egui::Context) {
+        if self.backup.last_deleted.is_empty() || self.backup.busy != BackupBusy::Idle {
+            return;
+        }
+        // 一起收掉的雜檔也放回去（不然照片回來了、旁邊的附屬檔沒回來），
+        // 但數字只報看得見的那幾個
+        let shown: HashSet<PathBuf> = self.backup.last_deleted.iter().cloned().collect();
+        let mut paths = self.backup.last_deleted.clone();
+        paths.extend(self.backup.last_deleted_junk.iter().cloned());
+        self.backup.busy = BackupBusy::Restoring;
+        self.backup.error = None;
+        self.backup.result = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.backup.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            #[cfg(any(windows, target_os = "linux"))]
+            let (back, errs) = backup::restore(&paths);
+            #[cfg(not(any(windows, target_os = "linux")))]
+            let (back, errs) = (
+                Vec::new(),
+                vec![format!(
+                    "這個平台不支援從資源回收筒放回（{} 個檔案）",
+                    paths.len()
+                )],
+            );
+            let n = back.iter().filter(|p| shown.contains(*p)).count();
+            let _ = tx.send(BackupMsg::Restored(n, errs));
             ctx.request_repaint();
         });
     }
@@ -20725,7 +20860,12 @@ impl App {
                 }
                 // 搬檔中：只更新進度，通道要留著繼續收
                 Ok(BackupMsg::Progress(n)) => self.backup.done = n,
-                Ok(BackupMsg::Done(ok, errs)) => {
+                Ok(BackupMsg::Done {
+                    ok,
+                    errs,
+                    deleted,
+                    deleted_junk,
+                }) => {
                     self.backup.rx = None;
                     self.backup.busy = BackupBusy::Idle;
                     let cancelled = self.backup.cancel.load(Ordering::Relaxed);
@@ -20734,6 +20874,11 @@ impl App {
                     } else {
                         format!("備份完成，共 {ok} 件")
                     };
+                    if !deleted.is_empty() {
+                        msg.push_str(&format!("；{} 個檔案已移到資源回收筒", deleted.len()));
+                    }
+                    self.backup.last_deleted = deleted;
+                    self.backup.last_deleted_junk = deleted_junk;
                     if !errs.is_empty() {
                         msg.push_str(&format!("；{} 件失敗", errs.len()));
                         let shown: Vec<String> = errs.iter().take(3).cloned().collect();
@@ -20746,6 +20891,25 @@ impl App {
                     }
                     self.backup.result = Some(msg);
                     // 檔案都動過了，剛才那份清單已經不算數：要再看就重新比對
+                    self.backup.invalidate();
+                }
+                Ok(BackupMsg::Restored(n, errs)) => {
+                    self.backup.rx = None;
+                    self.backup.busy = BackupBusy::Idle;
+                    self.backup.result = Some(format!("已從資源回收筒放回 {n} 個檔案"));
+                    if !errs.is_empty() {
+                        let shown: Vec<String> = errs.iter().take(3).cloned().collect();
+                        let more = errs.len().saturating_sub(shown.len());
+                        let mut e = format!("{} 個沒放回去：{}", errs.len(), shown.join("；"));
+                        if more > 0 {
+                            e.push_str(&format!("…等另外 {more} 個"));
+                        }
+                        self.backup.error = Some(e);
+                    }
+                    // 放回去了就不再認這一批（沒放回的那幾個回收筒裡也已經
+                    // 找不到或撞名，再按一次也是同樣結果）。目的那邊的內容
+                    // 變了，比對結果跟著作廢
+                    self.backup.last_deleted.clear();
                     self.backup.invalidate();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -21027,7 +21191,10 @@ impl eframe::App for App {
                     .set_title("正在存檔")
                     .set_description("優化影像正在把照片寫成檔案，請等這批存完再關閉。")
                     .show();
-            } else if self.backup.busy == BackupBusy::Running {
+            } else if matches!(
+                self.backup.busy,
+                BackupBusy::Running | BackupBusy::Restoring
+            ) {
                 // 關掉會留下一個拷到一半的檔案，還看不出停在哪一件
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.module = Module::Files;
@@ -21251,8 +21418,10 @@ impl eframe::App for App {
                 1 => {
                     let d = dirs[0].clone();
                     if self.backup.dst.is_none() && self.backup.src.is_some() {
+                        remember_dir(LastDir::BackupDest, &d);
                         self.backup.dst = Some(d);
                     } else {
+                        remember_dir(LastDir::BackupSource, &d);
                         self.backup.src = Some(d);
                     }
                     self.backup.error = None;
@@ -21260,6 +21429,8 @@ impl eframe::App for App {
                     self.backup.invalidate();
                 }
                 _ => {
+                    remember_dir(LastDir::BackupSource, &dirs[0]);
+                    remember_dir(LastDir::BackupDest, &dirs[1]);
                     self.backup.src = Some(dirs[0].clone());
                     self.backup.dst = Some(dirs[1].clone());
                     self.backup.error = None;
@@ -22871,6 +23042,19 @@ fn ui_backup_plan(ui: &mut egui::Ui, plan: &backup::Plan, keep_extra: bool, writ
                     .color(theme::TEXT_WEAK),
             )
             .on_hover_text("這幾個檔案目的資料夾裡的比較新，備份只往目的寫，所以原封不動留著");
+        }
+        // 隱藏檔沒被算進去，數字會跟檔案總管對不上，講一聲
+        if plan.ignored > 0 {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(format!("略過 {}", plan.ignored))
+                    .size(12.5)
+                    .color(theme::TEXT_WEAK),
+            )
+            .on_hover_text(
+                "隱藏檔、系統檔與 Mac 拷貝時留下的附屬檔（._開頭、.DS_Store）。\n\
+                 這些在檔案總管裡本來就看不到，備份也當作不存在",
+            );
         }
     });
     if !plan.skipped.is_empty() {

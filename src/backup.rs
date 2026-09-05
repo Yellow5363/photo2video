@@ -4,10 +4,14 @@
 //!
 //! 1. 同名的檔案，**來源比較新就覆蓋掉目的那一份**。
 //! 2. 目的沒有的檔案直接拷過去。
-//! 3. 目的地多餘的檔案（來源沒有的），勾了「保留」就不動，沒勾就刪掉。
+//! 3. 目的地多餘的檔案（來源沒有的），勾了「保留」就不動，沒勾就刪掉——
+//!    丟資源回收筒，剛刪的那批可以一鍵放回原位（見 [`restore`]）。
 //!
 //! 寫進去的位置是**目的資料夾底下、與來源同名的那一個**（見 [`target`]），
 //! 不存在就建起來。
+//!
+//! 隱藏／系統檔與 macOS 的雜檔一律當作不存在（見 [`is_junk`]）：使用者在
+//! 檔案總管看不到的東西，出現在待辦清單上只會讓人以為程式壞了。
 //!
 //! **只往目的資料夾寫**：目的那份比較新時就原封不動留著，不會反過來動到
 //! 來源。來源資料夾在整個過程中都是唯讀的。
@@ -88,6 +92,10 @@ pub struct Plan {
     pub newer_dst: usize,
     /// 掃描時讀不到、只好跳過的資料夾（權限不足、被別的程式鎖住之類）
     pub skipped: Vec<String>,
+    /// 當作不存在的隱藏／系統檔與 macOS 雜檔（兩邊加總，見 [`is_junk`]）。
+    /// 只是給畫面上講一聲用：檔案總管看到 3 個、程式說相同 3 個，
+    /// 中間少掉的那幾個去哪了要有個交代
+    pub ignored: usize,
 }
 
 impl Plan {
@@ -227,6 +235,39 @@ fn norm(p: &Path) -> PathBuf {
     }
 }
 
+/// 這個檔案／資料夾要不要**當作不存在**。
+///
+/// 判斷的標準是「使用者在檔案總管看不看得到」：看不到的東西出現在待辦清單
+/// 上，只會讓人以為程式壞了（`spring` 裡明明只有 3 張照片，卻說有 6 個檔案
+/// 要處理）。備份的是照片，這些雜檔本來就不必跟著搬。
+///
+/// - **隱藏或系統屬性**：檔案總管預設就不顯示。macOS 拷到外接碟留下的
+///   `._原檔名` 附屬檔（AppleDouble，存 Finder 標籤與資源分支）帶的正是
+///   隱藏屬性，`.DS_Store`、`.fseventsd`、`.Spotlight-V100` 也是。
+///   `$RECYCLE.BIN` 與 `System Volume Information` 一樣靠這條擋掉——
+///   目的挑到磁碟機根目錄時才不會把整個回收筒算成「多餘的檔案」。
+/// - 屬性讀不到、或在沒有這套屬性的檔案系統上（網路碟、Linux）時，
+///   退回看名字：`._*`、`.DS_Store`、`Thumbs.db`、`desktop.ini`。
+fn is_junk(entry: &fs::DirEntry) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+        const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
+        if let Ok(md) = entry.metadata() {
+            if md.file_attributes() & HIDDEN_OR_SYSTEM != 0 {
+                return true;
+            }
+        }
+    }
+    let name = entry.file_name();
+    let name = name.to_string_lossy();
+    name.starts_with("._")
+        || name.eq_ignore_ascii_case(".DS_Store")
+        || name.eq_ignore_ascii_case("Thumbs.db")
+        || name.eq_ignore_ascii_case("desktop.ini")
+}
+
 /// 掃到的一個檔案
 struct Found {
     /// 相對於資料夾根的路徑（原樣，寫檔時要用）
@@ -257,9 +298,10 @@ fn scan(
     root: &Path,
     recursive: bool,
     cancel: &AtomicBool,
-) -> Result<(HashMap<String, Found>, Vec<String>), String> {
+) -> Result<(HashMap<String, Found>, Vec<String>, usize), String> {
     let mut out: HashMap<String, Found> = HashMap::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut ignored = 0usize;
     // 待掃的子資料夾（相對路徑；空的那個＝根本身）
     let mut dirs: Vec<PathBuf> = vec![PathBuf::new()];
     let mut is_root = true;
@@ -286,6 +328,13 @@ fn scan(
             if ft.is_symlink() {
                 continue;
             }
+            // 檔案總管看不到的就當作不存在（macOS 的 ._ 附屬檔、回收筒…）
+            if is_junk(&e) {
+                if ft.is_file() {
+                    ignored += 1;
+                }
+                continue;
+            }
             let rel = rel_dir.join(e.file_name());
             if ft.is_dir() {
                 if recursive {
@@ -304,7 +353,7 @@ fn scan(
             }
         }
     }
-    Ok((out, skipped))
+    Ok((out, skipped, ignored))
 }
 
 /// `a` 是不是比 `b` 新。差在 [`MTIME_SLACK`] 以內回 `None`（當成一樣新）
@@ -320,14 +369,15 @@ fn newer(a: SystemTime, b: SystemTime) -> Option<bool> {
 /// 比對兩個資料夾，算出要做哪些事（這一步不動到任何檔案）
 pub fn plan(src: &Path, dst: &Path, recursive: bool, cancel: &AtomicBool) -> Result<Plan, String> {
     validate(src, dst)?;
-    let (a, mut skipped) = scan(src, recursive, cancel)?;
+    let (a, mut skipped, mut ignored) = scan(src, recursive, cancel)?;
     // 目的資料夾還沒建起來：當成空的，整批都是「新增」
-    let (b, skipped_dst) = if dst.is_dir() {
+    let (b, skipped_dst, ignored_dst) = if dst.is_dir() {
         scan(dst, recursive, cancel)?
     } else {
-        (HashMap::new(), Vec::new())
+        (HashMap::new(), Vec::new(), 0)
     };
     skipped.extend(skipped_dst);
+    ignored += ignored_dst;
 
     let mut actions: Vec<Action> = Vec::new();
     let mut same = 0usize;
@@ -380,6 +430,7 @@ pub fn plan(src: &Path, dst: &Path, recursive: bool, cancel: &AtomicBool) -> Res
         same,
         newer_dst,
         skipped,
+        ignored,
     })
 }
 
@@ -400,9 +451,113 @@ pub fn apply(
             if keep_extra {
                 return Ok(());
             }
-            fs::remove_file(&in_dst).map_err(|e| format!("{}：刪除失敗（{e}）", act.rel.display()))
+            // 丟資源回收筒，不直接砍：這是整個備份唯一會讓檔案消失的地方，
+            // 勾錯開關按下去的人得有路可退（見 [`restore`]）
+            trash::delete(&in_dst)
+                .map_err(|e| format!("{}：無法移到資源回收筒（{e}）", act.rel.display()))
         }
     }
+}
+
+/// 把剛才刪掉的那批檔案從資源回收筒放回原位。
+///
+/// 回收筒裡可能有同一個路徑刪了好幾次的舊版本，只拿**最近刪的那一份**；
+/// 找不到的（回收筒被清過）與放回去時撞到同名檔案的，各自列進錯誤。
+///
+/// 回傳（真的放回去的那幾個路徑, 錯誤訊息）。回的是路徑不是數字，
+/// 呼叫端才分得出裡面哪幾個是使用者看得見、該報進數字的
+#[cfg(any(windows, target_os = "linux"))]
+pub fn restore(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
+    use std::collections::HashMap;
+
+    let items = match trash::os_limited::list() {
+        Ok(items) => items,
+        Err(e) => return (Vec::new(), vec![format!("讀不到資源回收筒（{e}）")]),
+    };
+    // 要找的路徑 → 回收筒裡最近刪的那一份
+    let mut wanted: HashMap<PathBuf, Option<trash::TrashItem>> =
+        paths.iter().map(|p| (norm(p), None)).collect();
+    for mut item in items {
+        // 先把可能被藏掉的副檔名補回來（見 [`trash_item_name`]）：比對要靠它，
+        // 放回去時 trash 也是照這個名字命名，不補的話「照片.jpg」會變成「照片」
+        item.name = trash_item_name(&item);
+        let key = norm(&item.original_path());
+        if let Some(slot) = wanted.get_mut(&key) {
+            let newer = slot
+                .as_ref()
+                .is_none_or(|have| item.time_deleted > have.time_deleted);
+            if newer {
+                *slot = Some(item);
+            }
+        }
+    }
+    let mut errs: Vec<String> = Vec::new();
+    let mut picked: Vec<trash::TrashItem> = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        match wanted.get_mut(&norm(p)).and_then(|s| s.take()) {
+            Some(item) => picked.push(item),
+            // 同一個路徑在清單裡出現兩次時第二次會拿不到，那不算找不到
+            None if paths[..i].iter().any(|q| norm(q) == norm(p)) => {}
+            None => errs.push(format!("{}：資源回收筒裡找不到（可能已經被清空）", p.display())),
+        }
+    }
+    // 刪完檔案時空掉的資料夾也被收掉了，先把它們建回來——Windows 放回去
+    // 的動作是「搬到那個資料夾」，資料夾不在就會失敗
+    for item in &picked {
+        let _ = fs::create_dir_all(&item.original_parent);
+    }
+    let mut restored: Vec<PathBuf> = Vec::new();
+    // 撞到同名檔案時整批會停在那一個；把它挑掉再放一次，其餘的不該陪葬
+    loop {
+        if picked.is_empty() {
+            break;
+        }
+        let done: Vec<PathBuf> = picked.iter().map(|i| i.original_path()).collect();
+        match trash::os_limited::restore_all(picked.drain(..)) {
+            Ok(()) => {
+                restored.extend(done);
+                break;
+            }
+            Err(trash::Error::RestoreCollision {
+                path,
+                remaining_items,
+            }) => {
+                errs.push(format!("{}：原位置已經有同名檔案，沒有放回去", path.display()));
+                picked = remaining_items
+                    .into_iter()
+                    .filter(|i| i.original_path() != path)
+                    .collect();
+            }
+            Err(e) => {
+                errs.push(format!("放回原位失敗（{e}）"));
+                break;
+            }
+        }
+    }
+    (restored, errs)
+}
+
+/// 回收筒項目真正的檔名。
+///
+/// Windows 給的 `name` 是檔案總管的顯示名稱，會照「隱藏已知檔案類型的
+/// 副檔名」這個系統設定把 `.jpg`／`.txt` 去掉；但 `id`（回收筒裡那個
+/// `$R…` 檔的路徑）的副檔名是真的，從那邊補回來。名字本來就帶著同一個
+/// 副檔名（設定沒開）就原樣用
+#[cfg(any(windows, target_os = "linux"))]
+fn trash_item_name(item: &trash::TrashItem) -> std::ffi::OsString {
+    let Some(ext) = Path::new(&item.id).extension() else {
+        return item.name.clone();
+    };
+    let already = Path::new(&item.name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext));
+    if already {
+        return item.name.clone();
+    }
+    let mut name = item.name.clone();
+    name.push(".");
+    name.push(ext);
+    name
 }
 
 fn copy_file(from: &Path, to: &Path, rel: &Path) -> Result<(), String> {
@@ -432,14 +587,22 @@ fn copy_file(from: &Path, to: &Path, rel: &Path) -> Result<(), String> {
 }
 
 /// 刪完多餘的檔案後，把目的資料夾裡「來源沒有、而且已經空了」的資料夾也
-/// 收掉。只刪檔案會留下一地空殼，看起來像沒清乾淨
-pub fn prune_empty_dirs(src_root: &Path, dst_root: &Path, cancel: &AtomicBool) {
+/// 收掉。只刪檔案會留下一地空殼，看起來像沒清乾淨。
+///
+/// 「空了」包含**只剩隱藏／雜檔**的情況（見 [`is_junk`]）：那些檔案不進待辦
+/// 清單，所以刪完使用者看得到的東西之後，資料夾在檔案總管裡已經是空的，
+/// 卻因為裡面還有 `._原檔名` 這種東西而刪不掉——整個資料夾本來就要消失了，
+/// 那幾個也一起丟回收筒。
+///
+/// 回傳順手丟進資源回收筒的雜檔（「還原」要連它們一起放回去）
+pub fn prune_empty_dirs(src_root: &Path, dst_root: &Path, cancel: &AtomicBool) -> Vec<PathBuf> {
     // 先把所有子資料夾收齊，再由深到淺刪——巢狀的空殼才會一層一層收掉
+    let mut trashed: Vec<PathBuf> = Vec::new();
     let mut all: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
-            return;
+            return trashed;
         }
         let Ok(rd) = fs::read_dir(dst_root.join(&rel)) else {
             continue;
@@ -459,9 +622,32 @@ pub fn prune_empty_dirs(src_root: &Path, dst_root: &Path, cancel: &AtomicBool) {
         if src_root.join(&rel).is_dir() {
             continue;
         }
+        let dir = dst_root.join(&rel);
+        // 只剩雜檔時把它們也收掉。有任何一個「看得見」的東西（含子資料夾）
+        // 就整個放棄——底下的 remove_dir 會失敗，資料夾原樣留著
+        if let Ok(rd) = fs::read_dir(&dir) {
+            let mut junk: Vec<PathBuf> = Vec::new();
+            let only_junk = rd.flatten().all(|e| {
+                let is_file = e.file_type().is_ok_and(|ft| ft.is_file() && !ft.is_symlink());
+                if is_file && is_junk(&e) {
+                    junk.push(e.path());
+                    true
+                } else {
+                    false
+                }
+            });
+            if only_junk {
+                for p in junk {
+                    if trash::delete(&p).is_ok() {
+                        trashed.push(p);
+                    }
+                }
+            }
+        }
         // 裡面還有東西的話 remove_dir 自己會擋下來，失敗不必回報
-        let _ = fs::remove_dir(dst_root.join(&rel));
+        let _ = fs::remove_dir(&dir);
     }
+    trashed
 }
 
 #[cfg(test)]
@@ -564,25 +750,44 @@ mod tests {
     }
 
     #[test]
-    fn extra_files_are_only_deleted_when_keep_is_off() {
-        // 「保留目的資料夾多餘的檔案」是使用者唯一會踩到刪除的地方，
-        // 勾著的時候一個檔案都不能少
+    fn extra_files_go_to_the_recycle_bin_and_come_back() {
+        // 「保留目的資料夾多餘的檔案」是使用者唯一會踩到刪除的地方：
+        // 勾著的時候一個檔案都不能少；沒勾時刪掉的要進資源回收筒，
+        // 而且**連被收掉的空資料夾一起**放得回原位
         let root = tmp("extra");
         let src = root.join("src");
         let dst = root.join("dst");
         fs::create_dir_all(&src).unwrap();
-        write_at(&dst.join("多出來的.txt"), "x", 0);
+        let rel = PathBuf::from("spring").join("多出來的.txt");
+        let file = dst.join(&rel);
+        write_at(&file, "x", 0);
         let act = Action {
-            rel: PathBuf::from("多出來的.txt"),
+            rel,
             kind: Kind::Extra,
             bytes: 1,
         };
 
         apply(&act, &src, &dst, true).unwrap();
-        assert!(dst.join("多出來的.txt").exists(), "勾了保留就不能刪");
+        assert!(file.exists(), "勾了保留就不能刪");
 
         apply(&act, &src, &dst, false).unwrap();
-        assert!(!dst.join("多出來的.txt").exists(), "沒勾保留才刪掉");
+        assert!(!file.exists(), "沒勾保留才刪掉");
+        // 刪完連空掉的資料夾也收走，放回來時要自己把它建回去
+        prune_empty_dirs(&src, &dst, &AtomicBool::new(false));
+        assert!(!dst.join("spring").exists(), "測試前提：空資料夾已經被收掉");
+
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let (back, errs) = restore(&[file.clone()]);
+            assert_eq!(errs, Vec::<String>::new(), "放回去不該出錯");
+            assert_eq!(back, vec![file.clone()]);
+            assert_eq!(fs::read_to_string(&file).unwrap(), "x", "要從回收筒放回原位");
+
+            // 回收筒裡已經沒有它了：再放一次要講清楚找不到，不能裝作成功
+            let (back, errs) = restore(&[file.clone()]);
+            assert!(back.is_empty());
+            assert_eq!(errs.len(), 1, "找不到要有一條錯誤");
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -620,6 +825,38 @@ mod tests {
         // 挑的位置本身不見了（隨身碟被拔掉）就要擋
         let _ = fs::remove_dir_all(&picked);
         assert!(validate(&src, &dst).is_err(), "上一層都不在了要擋");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn files_the_explorer_hides_are_treated_as_absent() {
+        // 從 Mac 拷照片到外接碟，每張旁邊會多一個 ._原檔名 的附屬檔（帶隱藏
+        // 屬性，檔案總管看不到）。使用者在 spring 裡看到 3 張照片，程式卻說
+        // 有 6 個檔案要處理——看不到的東西不該進待辦清單
+        let root = tmp("junk");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        write_at(&dst.join("A1208228.jpg"), "photo", 0);
+        write_at(&dst.join("._A1208228.jpg"), "resource fork", 0);
+        write_at(&dst.join(".DS_Store"), "finder", 0);
+        // Windows 上 macOS 的雜檔是靠隱藏屬性擋掉的，這裡把屬性補上，
+        // 才是真的在測那條路（名字那條退路另外由 .DS_Store 蓋到）
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("attrib")
+                .arg("+H")
+                .arg(dst.join("._A1208228.jpg"))
+                .output();
+            assert!(out.is_ok(), "設定隱藏屬性失敗");
+        }
+
+        let p = plan(&src, &dst, true, &AtomicBool::new(false)).unwrap();
+        let got = kinds(&p);
+        assert_eq!(got.get("A1208228.jpg"), Some(&Kind::Extra), "看得到的照片照列");
+        assert_eq!(got.len(), 1, "._ 附屬檔與 .DS_Store 不該出現在清單上");
+        assert_eq!(p.ignored, 2, "略過幾個要算出來給畫面交代");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -695,11 +932,17 @@ mod tests {
         fs::create_dir_all(dst.join("兩邊都有")).unwrap();
         fs::create_dir_all(dst.join("多出來的/更裡面")).unwrap();
         write_at(&dst.join("還有東西/檔案.txt"), "x", 0);
+        // 照片刪光後只剩 Mac 留下的附屬檔：在檔案總管裡看起來已經是空的，
+        // 不把它們一起收掉的話 remove_dir 會失敗，資料夾就留在那裡
+        write_at(&dst.join("spring/._A1208228.jpg"), "resource fork", 0);
+        write_at(&dst.join("spring/.DS_Store"), "finder", 0);
 
-        prune_empty_dirs(&src, &dst, &AtomicBool::new(false));
+        let trashed = prune_empty_dirs(&src, &dst, &AtomicBool::new(false));
         assert!(dst.join("兩邊都有").is_dir(), "來源也有的空資料夾要留著");
         assert!(!dst.join("多出來的").exists(), "巢狀的空殼要一路收掉");
         assert!(dst.join("還有東西").is_dir(), "裡面有檔案的不能刪");
+        assert!(!dst.join("spring").exists(), "只剩雜檔的資料夾也要收掉");
+        assert_eq!(trashed.len(), 2, "順手丟掉的雜檔要回報，還原才放得回來");
 
         let _ = fs::remove_dir_all(&root);
     }

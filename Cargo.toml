@@ -26,6 +26,10 @@ arboard = { version = "3.6.1", default-features = false, features = ["image-data
 # VirtualAlloc，每一塊都要進核心、每一頁都要歸零，多執行緒下整批卡在同一把
 # 鎖上——實測 32 條執行緒的效率只剩 16%。mimalloc 各執行緒自己留著大區塊重用
 mimalloc = { version = "0.1", default-features = false }
+# 資料備份刪掉的「目的地多餘檔案」丟資源回收筒而不是直接砍掉，還能從
+# 回收筒把剛刪的那批放回原位（os_limited::list / restore_all）。
+# 不要 chrono（只是拿來把刪除時間轉成日期，用不到）
+trash = { version = "5", default-features = false, features = ["coinit_apartmentthreaded"] }
 
 [build-dependencies]
 winresource = "0.1"
