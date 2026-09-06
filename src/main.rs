@@ -5107,6 +5107,32 @@ impl Default for MovieTool {
 impl MovieTool {
     /// 換一支影片（或按了清除）時，除了參數以外全部歸零。
     /// 參數留著是刻意的：同一場煙火拍的好幾段，設定通常照搬
+    /// 換**一批**（選擇影片、清除、讀不到檔）：去煙的滑桿、遮色片、切的段、
+    /// 調的色與裁切框全部回到預設。
+    ///
+    /// 同一場拍的好幾段要照搬設定，靠的是把它們排進**同一批**（「➕ 加入影片」），
+    /// 批內換預覽什麼都留著（見 [`MovieTool::reset_for`]）；會走到這裡就是使用者
+    /// 明講要重來一批，那就給他乾淨的起點——上一批調到一半的數值留著，
+    /// 下一批只會莫名其妙（實際回報過的狀況）。
+    ///
+    /// 只有輸出區那兩項（尺寸、品質／速度）留著：那是「要輸出成什麼」的偏好，
+    /// 跟這一批的畫面沒有關係
+    fn reset_batch(&mut self, src: Option<PathBuf>, info: Option<VideoInfo>) {
+        let fast = self.params.fast;
+        self.params = SmokeParams::default();
+        self.params.fast = fast;
+        self.segments = vec![Segment::default()];
+        self.grade = MovieGrade::default();
+        self.crop = Crop::default();
+        self.crop_aspect = CropAspect::Free;
+        self.merge = false;
+        self.mask_target = MaskTarget::Dehaze;
+        self.close_mask_tools();
+        self.reset_for(src, info);
+    }
+
+    /// 換一支來源影片但**還是同一批**（點清單換預覽、拖曳排序、移除正在預覽的
+    /// 那支）：遮色片、分段、調色與裁切都留著——整批本來就共用同一組設定
     fn reset_for(&mut self, src: Option<PathBuf>, info: Option<VideoInfo>) {
         let at = info.as_ref().map(|i| i.secs * 0.5).unwrap_or(0.0);
         self.src = src;
@@ -5119,7 +5145,7 @@ impl MovieTool {
         self.graded = None;
         self.rendered = None;
         self.grabbed_at = None;
-        // 遮色片跟著參數留下來（同一場的好幾段多半同一個構圖），
+        // 遮色片留著（同一批共用同一組設定，見 [`MovieTool::reset_batch`]），
         // 但畫到一半的筆跡與舊底圖算的遮罩檢視要丟掉
         self.draft = None;
         self.moving = None;
@@ -5463,6 +5489,17 @@ impl MovieTool {
     fn tools_open(&self) -> bool {
         self.crop_editing
             || (self.pro && (self.mask_tool.is_some() || (self.show_mask && self.target_can_show())))
+    }
+
+    /// 動到「只有在成品上才看得出來」的設定（去煙的四條、調色的十二條）時，
+    /// 把遮罩檢視收起來。
+    ///
+    /// 那片紅整個蓋在畫面上，滑桿拖了半天也看不出差別——使用者會以為滑桿壞了
+    /// （實際回報過的狀況）。工具本身留著：畫完遮色片接著調色是常見的順序，
+    /// 收掉工具的話還要再點一次才能繼續畫
+    fn leave_mask_view(&mut self) {
+        self.show_mask = false;
+        self.mask_view_armed = false;
     }
 
     /// 遮色片工具與遮罩檢視收起來（畫到一半的也丟掉）
@@ -8401,7 +8438,7 @@ impl App {
             }
             MenuAction::ClearDehaze => self.smoke_clear_confirmed(),
             MenuAction::ClearStack => self.stack_clear_confirmed(),
-            MenuAction::ClearMovie => self.movie.reset_for(None, None),
+            MenuAction::ClearMovie => self.movie.reset_batch(None, None),
             MenuAction::ClearEnhance => self.enhance_clear_confirmed(),
             MenuAction::ClearBackup => {
                 self.backup.src = None;
@@ -13398,7 +13435,8 @@ impl App {
             return;
         };
         remember_dir(LastDir::MovieSource, &first);
-        self.movie_set_src(first, ctx);
+        // 「選擇影片」是整批換掉：上一批的遮色片、分段、調色與裁切跟著清掉
+        self.movie_set_src(first, true, ctx);
         // 第一支就讀不到時已經整個歸零，剩下的不必再排
         if self.movie.src.is_some() {
             self.movie_append(it.collect(), ctx);
@@ -13439,7 +13477,8 @@ impl App {
         if head_changed {
             let head = list[0].clone();
             let rest = std::mem::take(&mut self.movie.queue);
-            self.movie_set_src(head, ctx);
+            // 同一批裡換預覽的那支，設定要留著
+            self.movie_set_src(head, false, ctx);
             if self.movie.src.is_some() {
                 self.movie.queue = rest;
             }
@@ -13461,7 +13500,8 @@ impl App {
         if let Some(old) = self.movie.src.clone() {
             rest.insert(0, old);
         }
-        self.movie_set_src(pick, ctx);
+        // 同一批裡換預覽的那支，設定要留著
+        self.movie_set_src(pick, false, ctx);
         // 讀不到那一支時 movie_set_src 已經整個歸零，這時佇列也不必留
         if self.movie.src.is_some() {
             self.movie.queue = rest;
@@ -13473,7 +13513,8 @@ impl App {
         let mut it = picked.into_iter().filter(|p| is_video(p));
         if self.movie.src.is_none() {
             let Some(first) = it.next() else { return };
-            self.movie_set_src(first, ctx);
+            // 從空的開始＝新的一批（拖一疊進來、或還沒選片就按「加入影片」）
+            self.movie_set_src(first, true, ctx);
         }
         let before = self.movie.queue.len();
         for p in it {
@@ -13488,8 +13529,12 @@ impl App {
     }
 
     /// 換一支來源影片：先量出它的寬高、長度、影格率與有沒有聲音，
-    /// 之後的預覽與輸出都照這一份走
-    fn movie_set_src(&mut self, path: PathBuf, ctx: &egui::Context) {
+    /// 之後的預覽與輸出都照這一份走。
+    ///
+    /// `fresh`＝這是**新的一批**（選擇影片、拖曳一批進來）：上一批的遮色片、
+    /// 分段、調色與裁切跟著清掉（見 [`MovieTool::reset_batch`]）。同一批裡換
+    /// 預覽的那支（點檔名、拖曳排序）給 false，設定要留著
+    fn movie_set_src(&mut self, path: PathBuf, fresh: bool, ctx: &egui::Context) {
         if let Err(e) = ensure_ffmpeg(|| {}) {
             self.movie.error = Some(e);
             return;
@@ -13500,11 +13545,16 @@ impl App {
             .unwrap_or_default();
         match movie::probe(&path) {
             Ok(info) => {
-                self.movie.reset_for(Some(path), Some(info));
+                if fresh {
+                    self.movie.reset_batch(Some(path), Some(info));
+                } else {
+                    self.movie.reset_for(Some(path), Some(info));
+                }
                 ctx.request_repaint();
             }
             Err(e) => {
-                self.movie.reset_for(None, None);
+                // 讀不到就整個回到空的：這一批沒開成，留著上一批的遮色片沒有意義
+                self.movie.reset_batch(None, None);
                 self.movie.error = Some(format!("讀不到影片「{name}」：{e}"));
             }
         }
@@ -14369,7 +14419,8 @@ impl App {
         // 移除正在預覽的那支：下一支遞補上來預覽；沒有下一支就整個清空
         if drop_first {
             if self.movie.queue.is_empty() {
-                self.movie.reset_for(None, None);
+                // 這一批空了：遮色片、分段、調色與裁切跟著清掉
+                self.movie.reset_batch(None, None);
             } else {
                 self.movie_show_queued(0, ctx);
                 // 換上來之後，原本那支被排到佇列開頭，拿掉它
@@ -14379,7 +14430,7 @@ impl App {
             }
         }
         if clear {
-            self.movie.reset_for(None, None);
+            self.movie.reset_batch(None, None);
         }
         if export {
             self.movie_export(ctx);
@@ -14523,8 +14574,13 @@ impl App {
             // 列距收緊到與另外三個模組的調色面板相同（畫完再還原）
             let keep_gap = ui.spacing().item_spacing.y;
             ui.spacing_mut().item_spacing.y = ADJ_ROW_GAP;
+            let before = self.movie.grade.zones[tab].grade;
             adj_sliders(ui, &mut self.movie.grade.zones[tab].grade);
             ui.spacing_mut().item_spacing.y = keep_gap;
+            if self.movie.grade.zones[tab].grade != before {
+                // 調色的結果被那片紅整個蓋住，拖滑桿看不出差別（見 leave_mask_view）
+                self.movie.leave_mask_view();
+            }
         });
     }
 
@@ -14570,6 +14626,8 @@ impl App {
             });
             if p != self.movie.params {
                 self.movie.params = p;
+                // 遮罩檢視開著的話那片紅蓋著，滑桿拖了也看不出差別（見 leave_mask_view）
+                self.movie.leave_mask_view();
             }
         });
 
@@ -30545,6 +30603,105 @@ mod tests {
         assert_eq!(g.len(), 2, "滑桿沒歸零，兩區照樣作用");
         assert!(g[0].shapes.is_empty(), "第二段的遮色區 2 清掉了就是整格調");
         assert_eq!(g[1].shapes.len(), 1, "遮色區 3 的形狀還在");
+    }
+
+    /// 換一批（選擇影片、清除）要把遮色片、分段、調色與裁切一起清掉——那些都是
+    /// 對著上一批的畫面畫的；同一批裡換預覽的那支則要留著（整批共用同一組設定）
+    #[test]
+    fn a_new_batch_clears_the_masks_but_switching_within_one_keeps_them() {
+        let rect = dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.1,
+            y0: 0.1,
+            x1: 0.6,
+            y1: 0.6,
+        });
+        let edited = || {
+            let mut m = MovieTool::default();
+            m.pro = true;
+            m.src = Some(PathBuf::from("a.mp4"));
+            m.queue = vec![PathBuf::from("b.mp4")];
+            // 去煙的滑桿（換批要回到預設）
+            m.params.strength = 45;
+            m.params.sky_only = false;
+            m.params.restore_trails = false;
+            // 輸出區那兩項（換批要留著）
+            m.params.fast = true;
+            m.size = MovieSize::Short(1080);
+            // 遮色片、分段、調色、裁切（換批要清掉）
+            m.segments[0].shapes.push(rect.clone());
+            m.at = 20.0;
+            assert!(m.split_here());
+            m.segments[1].grade_shapes[2].push(rect.clone());
+            m.grade.zones[2].mask_on = true;
+            m.grade.zones[2].grade.exposure = 30;
+            m.grade.tab = 2;
+            m.crop = Crop { x0: 0.1, y0: 0.1, x1: 0.9, y1: 0.9, ..Crop::default() };
+            m.crop_aspect = CropAspect::Ratio(16, 9);
+            m.mask_target = MaskTarget::Grade(2);
+            m.mask_tool = Some(MaskTool::Brush);
+            m.show_mask = true;
+            m
+        };
+
+        // 同一批裡換預覽的那支：全部留著
+        let mut m = edited();
+        m.reset_for(Some(PathBuf::from("b.mp4")), None);
+        assert_eq!(m.segments.len(), 2, "同一批換預覽不該把段清掉");
+        assert_eq!(m.segments[0].shapes.len(), 1);
+        assert_eq!(m.segments[1].grade_shapes[2].len(), 1);
+        assert_eq!(m.grade.zones[2].grade.exposure, 30);
+        assert!(!m.crop.is_full(), "裁切框是整批共用的，換預覽要留著");
+        assert_eq!(m.params.strength, 45, "同一批換預覽，去煙的滑桿要留著");
+
+        // 換一批：遮色片、分段、調色、裁切都歸零，去煙的滑桿與輸出設定留著
+        let mut m = edited();
+        m.reset_batch(Some(PathBuf::from("c.mp4")), None);
+        assert_eq!(m.segments.len(), 1, "換一批要回到單一段");
+        assert!(m.segments[0].shapes.is_empty(), "去煙的遮色片沒清掉");
+        assert!(
+            m.segments[0].grade_shapes.iter().all(|s| s.is_empty()),
+            "調色的遮色片沒清掉"
+        );
+        assert!(m.grade == MovieGrade::default(), "三區的調色沒清掉");
+        assert!(m.crop.is_full() && m.crop_aspect == CropAspect::Free, "裁切沒清掉");
+        assert_eq!(m.mask_target, MaskTarget::Dehaze);
+        assert!(m.mask_tool.is_none() && !m.show_mask, "工具與遮罩檢視要一起收掉");
+        // 去煙的四條滑桿也要回到預設（上一批調到一半的值留著只會莫名其妙）
+        let d = SmokeParams::default();
+        assert_eq!(m.params.strength, d.strength, "去除煙霧沒回到預設");
+        assert_eq!(m.params.detail, d.detail, "細節沒回到預設");
+        assert!(m.params.restore_trails, "「補回煙裡的軌跡」沒回到預設");
+        assert!(m.params.sky_only, "「只處理天空」沒回到預設");
+        // 輸出區那兩項留著：那是「要輸出成什麼」，跟這一批的畫面無關
+        assert!(m.params.fast, "品質／速度是輸出區的偏好，不隨換批重設");
+        assert!(m.size == MovieSize::Short(1080), "輸出尺寸要留著");
+        assert!(m.pro, "簡易／專業是介面偏好，不隨換批重設");
+    }
+
+    /// 拖去煙或調色的滑桿時要把遮罩檢視收起來：那片紅蓋著就看不出滑桿有沒有作用
+    #[test]
+    fn dragging_a_slider_leaves_the_mask_view() {
+        let mut m = MovieTool::default();
+        m.pro = true;
+        m.segments[0].shapes.push(dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.1,
+            y0: 0.1,
+            x1: 0.6,
+            y1: 0.6,
+        }));
+        m.pick_mask_tool(MaskTarget::Dehaze, MaskTool::Rect);
+        m.sync_mask_view(m.target_can_show());
+        assert!(m.show_mask, "測試前提：遮罩檢視現在開著");
+
+        m.leave_mask_view();
+        assert!(!m.show_mask, "拖滑桿時那片紅要收起來");
+        assert!(m.mask_tool.is_some(), "工具留著：畫完接著調色是常見的順序");
+        // 收起來之後不會被 sync_mask_view 自己打開（旗標也一起收了）
+        m.sync_mask_view(m.target_can_show());
+        assert!(!m.show_mask, "收起來之後不該自己又亮回來");
+        // 再點一次工具就回來
+        m.pick_mask_tool(MaskTarget::Dehaze, MaskTool::Brush);
+        assert!(m.show_mask, "重新選工具時遮罩檢視要跟著回來");
     }
 
     /// 換預覽＝把那一支調到最前面（輸出時先跑），其餘的相對順序不變
