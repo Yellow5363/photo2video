@@ -20,8 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use ab_glyph::{Font as _, FontVec, GlyphId, PxScale, ScaleFont as _};
 use image::RgbImage;
 
-use crate::dehaze;
-use crate::{Adjustments, Crop, RegionGrade, SubtitleStyle};
+use crate::{Adjustments, Crop, SubtitleStyle};
 
 /// 一段疊在照片上的文字。位置是中心點在畫面上的比例（0~1），
 /// 大小以 1080p 高度為基準（與主畫面的文字同一個尺規），
@@ -494,116 +493,44 @@ fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     out
 }
 
-// ---------- 分區調色 ----------
+// ---------- 套遮色片的調色 ----------
 
-/// 算天際線用的縮圖長邊。天際線是大尺度的東西，算細節沒有意義，
-/// 而原尺寸影格攤成 f32 一格就要好幾百 MB。取樣回原尺寸時走雙線性內插
-/// （見 [`RegionMasks::sky_at`]），交界的過渡帶因此仍然是平滑的
-const REGION_LONG_EDGE: u32 = 512;
-
-/// 煙火與夜空的分界（sRGB 亮度 0~1）：暗過前一個數完全算夜空、
-/// 亮過後一個數完全算煙火，中間平滑過渡。
+/// 把調色只套在 `weights` 蓋到的地方（每個像素一個 0~1，逐列排列；
+/// 1＝全套、0＝一個像素都不動），影片去煙霧的「調色套用遮色片」走這一條。
 ///
-/// 判準是亮度而不是形狀——去完煙的夜空是黑的，天上還亮著的就是煙火與它的
-/// 光暈。過渡帶拉這麼寬是為了那圈光暈：餘光是連續變暗的，硬切會在每一朵
-/// 煙火周圍留下一圈看得見的環
-const FIRE_RANGE: (f32, f32) = (0.10, 0.40);
-
-/// 一格畫面上三個區各佔多少（地景、天空、煙火）。
-///
-/// 天空與地景的界線就是「只處理天空」用的那一條天際線
-/// （[`dehaze::sky_weights`]），所以兩邊講的「天空」是同一片；煙火再從
-/// 天空裡照亮度切出來。三區的權重相加恆為 1，交界處因此是兩區的漸變，
-/// 不會出現一條看得見的邊
-pub struct RegionMasks {
-    /// 天空權重（**含**煙火那一塊），在縮圖上算的
-    sky: Vec<f32>,
-    w: usize,
-    h: usize,
-}
-
-impl RegionMasks {
-    /// 量一格的天際線。要餵**去煙之後**的畫面：調色是套在去煙結果上的，
-    /// 分區也照同一張算，判定才會與眼睛看到的一致
-    pub fn new(img: &RgbImage) -> Self {
-        let (sky, w, h) = dehaze::sky_weights(img, REGION_LONG_EDGE);
-        Self { sky, w, h }
-    }
-
-    /// 天空權重，雙線性取樣回原尺寸。縮圖比影格小上十幾倍，就近取樣會把
-    /// 天際線的過渡帶切成一階一階的橫紋——兩區調得越不一樣，那幾條紋越明顯
-    fn sky_at(&self, x: usize, y: usize, iw: usize, ih: usize) -> f32 {
-        if self.w == 0 || self.h == 0 {
-            return 0.0;
-        }
-        let fx = ((x as f32 + 0.5) * self.w as f32 / iw.max(1) as f32 - 0.5).max(0.0);
-        let fy = ((y as f32 + 0.5) * self.h as f32 / ih.max(1) as f32 - 0.5).max(0.0);
-        let x0 = (fx.floor() as usize).min(self.w - 1);
-        let y0 = (fy.floor() as usize).min(self.h - 1);
-        let x1 = (x0 + 1).min(self.w - 1);
-        let y1 = (y0 + 1).min(self.h - 1);
-        let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
-        let at = |xx: usize, yy: usize| self.sky[yy * self.w + xx].clamp(0.0, 1.0);
-        let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
-        let bot = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
-        (top + (bot - top) * ty).clamp(0.0, 1.0)
-    }
-
-    /// 這一點三區各佔多少（照 `crate::Region::idx` 排，相加為 1）。
-    /// `px` 要傳**還沒調色**的那一點，分區才不會被調色本身牽著跑
-    fn weights(&self, x: usize, y: usize, iw: usize, ih: usize, px: [u8; 3]) -> [f32; 3] {
-        let sky = self.sky_at(x, y, iw, ih);
-        let y = luma([
-            px[0] as f32 / 255.0,
-            px[1] as f32 / 255.0,
-            px[2] as f32 / 255.0,
-        ]);
-        let fire = sky * smoothstep(FIRE_RANGE.0, FIRE_RANGE.1, y);
-        [1.0 - sky, sky - fire, fire]
-    }
-}
-
-/// 分區調色：勾起來的那幾區各自套自己的十二條滑桿，其他地方一個像素都不動。
-///
-/// 作法是「整張套一次調色，再照權重混回去」。調色的公式因此與另外三個模組
-/// 共用同一份（[`apply_grade`]），同一個數字在哪裡都是同一種效果，差別只在
-/// 混進去多少。代價是每多勾一區就多跑一趟調色——影片是逐格跑的，
-/// 這件事在畫面上有講（見 `App::ui_movie_grade`）。
-///
-/// `masks` 是那一格的三區權重（[`RegionMasks::new`]）：預覽拖滑桿時同一格
-/// 會重調很多次，權重算一次就能一直沿用
-pub fn apply_region_grade(img: &mut RgbImage, rg: &RegionGrade, masks: &RegionMasks) {
-    let active = rg.active();
-    if active.is_empty() {
+/// 作法是「整張套一次調色，再照權重混回去」：調色的公式因此與其他模組共用
+/// 同一份（[`apply_grade`]），同一個數字在哪裡都是同一種效果，差別只在混進去
+/// 多少。權重圖長度對不上時退回整張調——那是呼叫端的錯，但寧可調過頭也
+/// 不要默默什麼都沒做
+pub fn apply_grade_masked(img: &mut RgbImage, adj: &Adjustments, weights: &[f32]) {
+    let adj = adj.clamped();
+    if adj.grade_is_neutral() {
         return;
     }
     let (w, h) = (img.width() as usize, img.height() as usize);
     if w == 0 || h == 0 {
         return;
     }
-    // 每一區都拿「還沒調色的那一張」當底，各混各的再疊起來。
-    // 一區混完接著在結果上調下一區的話，交界處會被調到兩次
-    let orig = img.clone();
-    for (region, adj) in active {
-        let mut layer = orig.clone();
-        apply_grade(&mut layer, &adj);
-        let i = region.idx();
-        for y in 0..h {
-            for x in 0..w {
-                let o = orig.get_pixel(x as u32, y as u32).0;
-                let k = masks.weights(x, y, w, h, o)[i];
-                // 這一區在這一點幾乎沒份（半階都不到），混了也是原樣
-                if k <= 1.0 / 512.0 {
-                    continue;
-                }
-                let l = layer.get_pixel(x as u32, y as u32).0;
-                let d = img.get_pixel_mut(x as u32, y as u32);
-                for c in 0..3 {
-                    d[c] = (d[c] as f32 + k * (l[c] as f32 - o[c] as f32))
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                }
-            }
+    if weights.len() != w * h {
+        apply_grade(img, &adj);
+        return;
+    }
+    let mut layer = img.clone();
+    apply_grade(&mut layer, &adj);
+    for (i, (d, l)) in img.pixels_mut().zip(layer.pixels()).enumerate() {
+        let k = weights[i].clamp(0.0, 1.0);
+        // 這一點幾乎沒份（半階都不到），混了也是原樣
+        if k <= 1.0 / 512.0 {
+            continue;
+        }
+        if k >= 1.0 - 1.0 / 512.0 {
+            *d = *l;
+            continue;
+        }
+        for c in 0..3 {
+            d[c] = (d[c] as f32 + k * (l[c] as f32 - d[c] as f32))
+                .round()
+                .clamp(0.0, 255.0) as u8;
         }
     }
 }
@@ -1516,7 +1443,6 @@ fn blend(dst: &mut [f32; 3], color: [f32; 3], a: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Region;
 
     fn solid(w: u32, h: u32, c: [u8; 3]) -> RgbImage {
         RgbImage::from_pixel(w, h, image::Rgb(c))
@@ -2405,96 +2331,44 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// 分區調色的測試場景：上半乾淨夜空、天上一朵亮煙火、
-    /// 下段是橫貫整排、佈滿細節的城市（與 `dehaze` 判天際線的測試同一種景）
-    fn night_scene() -> RgbImage {
-        let (w, h) = (200u32, 160u32);
-        let mut img = solid(w, h, [30, 32, 45]);
-        for y in 110..h {
-            for x in 0..w {
-                let n = ((x * 7 + y * 13) % 90) as u8;
-                *img.get_pixel_mut(x, y) = image::Rgb([120 + n, 110 + n, 100 + n]);
-            }
-        }
+    #[test]
+    fn masked_grade_only_touches_where_the_weights_say() {
+        // 權重 1 的地方要與整張調色一模一樣、權重 0 的地方一個像素都不動、
+        // 中間的權重是兩者的混合——否則「套用遮色片」等於沒有作用
+        let img = solid(40, 20, [90, 100, 110]);
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let adj = Adjustments {
+            exposure: 60,
+            ..Adjustments::default()
+        };
+        let mut whole = img.clone();
+        apply_grade(&mut whole, &adj);
+        assert_ne!(whole.as_raw(), img.as_raw(), "測試前提：曝光 +60 要看得出差別");
+        // 左半 0、右半 1、中間一欄 0.5
+        let mut weights = vec![0.0f32; w * h];
         for y in 0..h {
             for x in 0..w {
-                let (dx, dy) = (x as f32 + 0.5 - 100.0, y as f32 + 0.5 - 45.0);
-                if dx * dx + dy * dy < 18.0 * 18.0 {
-                    *img.get_pixel_mut(x, y) = image::Rgb([240, 205, 130]);
-                }
+                weights[y * w + x] = if x < 19 {
+                    0.0
+                } else if x == 19 {
+                    0.5
+                } else {
+                    1.0
+                };
             }
         }
-        img
-    }
-
-    #[test]
-    fn region_grade_only_touches_the_region_it_is_checked_for() {
-        // 勾了「地景」卻連天空一起調，等於這三個勾選框沒有意義
-        let img = night_scene();
-        let masks = RegionMasks::new(&img);
-        // 一次只勾一區、把曝光拉起來，看實際動到誰。
-        // 回傳依序是：夜空、煙火的亮芯、地景各差了幾階（三通道相加）
-        let moved = |r: Region| {
-            let mut rg = RegionGrade::default();
-            rg.on[r.idx()] = true;
-            rg.grade[r.idx()].exposure = 60;
-            let mut out = img.clone();
-            apply_region_grade(&mut out, &rg, &masks);
-            let d = |x: u32, y: u32| {
-                let (a, b) = (img.get_pixel(x, y).0, out.get_pixel(x, y).0);
-                (0..3).map(|c| (a[c] as i32 - b[c] as i32).abs()).sum::<i32>()
-            };
-            [d(20, 20), d(100, 45), d(100, 145)]
-        };
-        // 三區的界線是軟的（交界處刻意做成漸變），所以判準不是「零」而是
-        // 「與那一區自己被調到的量相比小到看不出來」：至多一成
-        let spill_ok = |name: &str, got: [i32; 3], want: usize| {
-            let target = got[want];
-            assert!(target > 20, "{name}：該調的地方沒被調到（{got:?}）");
-            for (i, v) in got.iter().enumerate() {
-                assert!(
-                    i == want || v * 10 <= target,
-                    "{name}：不該調到的地方跟著動了（{got:?}）"
-                );
-            }
-        };
-        // 依序是：夜空、煙火的亮芯、地景
-        spill_ok("調天空", moved(Region::Sky), 0);
-        spill_ok("調煙火", moved(Region::Fire), 1);
-        spill_ok("調地景", moved(Region::Ground), 2);
-    }
-
-    #[test]
-    fn the_three_regions_add_up_to_one_everywhere() {
-        // 三區的權重相加要恰好是 1：少了會有地方沒人調（畫面上是一條沒調到
-        // 的縫），多了則是同一點被調兩次（交界處會比兩邊都重）
-        let img = night_scene();
-        let masks = RegionMasks::new(&img);
-        let (w, h) = (img.width() as usize, img.height() as usize);
-        for y in (0..h).step_by(7) {
-            for x in (0..w).step_by(7) {
-                let px = img.get_pixel(x as u32, y as u32).0;
-                let k = masks.weights(x, y, w, h, px);
-                let sum: f32 = k.iter().sum();
-                assert!((sum - 1.0).abs() < 1e-4, "({x},{y}) 的三區權重加起來是 {sum}：{k:?}");
-                assert!(k.iter().all(|v| *v >= -1e-6), "({x},{y}) 有負的權重：{k:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn grading_nothing_leaves_every_pixel_untouched() {
-        // 勾了三區但滑桿全歸零 = 什麼都沒調，一個像素都不該動
-        // （也不該白跑一趟調色，見 RegionGrade::active）
-        let img = night_scene();
-        let masks = RegionMasks::new(&img);
-        let rg = RegionGrade {
-            on: [true, true, true],
-            grade: [Adjustments::default(); 3],
-        };
-        assert!(rg.active().is_empty(), "滑桿全歸零時不該有任何一區要算");
         let mut out = img.clone();
-        apply_region_grade(&mut out, &rg, &masks);
+        apply_grade_masked(&mut out, &adj, &weights);
+        assert_eq!(out.get_pixel(5, 10).0, img.get_pixel(5, 10).0, "權重 0 的地方動了");
+        assert_eq!(out.get_pixel(30, 10).0, whole.get_pixel(30, 10).0, "權重 1 要與整張調色相同");
+        let (a, b, m) = (img.get_pixel(19, 10).0, whole.get_pixel(19, 10).0, out.get_pixel(19, 10).0);
+        for c in 0..3 {
+            let mid = (a[c] as f32 + b[c] as f32) / 2.0;
+            assert!((m[c] as f32 - mid).abs() <= 1.0, "權重 0.5 要落在兩者中間：{a:?} {b:?} {m:?}");
+        }
+        // 滑桿全歸零：不管權重畫成什麼，一個像素都不該動
+        let mut out = img.clone();
+        apply_grade_masked(&mut out, &Adjustments::default(), &weights);
         assert_eq!(out.as_raw(), img.as_raw());
     }
 }

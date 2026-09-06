@@ -4652,94 +4652,176 @@ impl MovieSize {
     }
 }
 
-/// 分區調色的三個區。一格畫面自己分成這三塊，各調各的
-/// （界線怎麼判見 [`edit::RegionMasks`]）
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Region {
-    /// 天際線以下：城市、岸邊燈火與水面
-    Ground,
-    /// 天際線以上、煙火以外的那一片夜空（含還沒扣乾淨的煙）
-    Sky,
-    /// 天空裡亮起來的：煙火本身與它的光暈
-    Fire,
-}
-
-impl Region {
-    const ALL: [Region; 3] = [Region::Ground, Region::Sky, Region::Fire];
-
-    /// 在 [`RegionGrade`] 的陣列與權重裡排第幾（與 [`edit::RegionMasks`] 一致）
-    fn idx(self) -> usize {
-        match self {
-            Region::Ground => 0,
-            Region::Sky => 1,
-            Region::Fire => 2,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Region::Ground => "地景",
-            Region::Sky => "天空",
-            Region::Fire => "煙火",
-        }
-    }
-
-    /// 滑鼠停在勾選框上時說明這一區是哪裡、通常拿來做什麼
-    fn hint(self) -> &'static str {
-        match self {
-            Region::Ground => {
-                "天際線以下那一片：城市、岸邊燈火與水面。\n\
-                 界線與「只處理天空」用的是同一條天際線。\n\
-                 常見的用法是壓暗一點、少一點黃，讓天空的煙火跳出來"
-            }
-            Region::Sky => {
-                "天際線以上、煙火以外的夜空（含去煙之後還留著的那一點煙）。\n\
-                 常見的用法是壓黑、降一點飽和，把殘煙與城市的光害壓下去"
-            }
-            Region::Fire => {
-                "天空裡亮起來的那些——煙火本身與周圍那圈光暈。\n\
-                 判準是亮度：去完煙的夜空是黑的，天上還亮著的就是煙火。\n\
-                 常見的用法是加鮮豔度與對比，讓線條的顏色更漂亮"
-            }
-        }
-    }
-}
-
-/// 影片去煙霧的分區調色：地景／天空／煙火各記一組滑桿，勾起來的才作用。
+/// 影片去煙霧的調色：一組滑桿套在去煙之後的每一格上，**整支影片共用一組**
+/// （與去煙參數同一個道理，見 [`MovieTool`]）。
 ///
-/// 整支影片共用一組（與去煙參數同一個道理，見 [`MovieTool`]）——逐格
-/// 各判各的會讓調色一格一格跳，看起來就是畫面在閃
-#[derive(Clone, PartialEq, Default)]
-struct RegionGrade {
-    /// 這一區要不要調（照 [`Region::idx`] 排）
-    on: [bool; 3],
-    /// 每一區自己的十二條滑桿
-    grade: [Adjustments; 3],
+/// 專業模式可以再勾「套用遮色片」，用與去煙同一套工具圈出**只要調色的地方**
+/// （例如只壓暗地景、只把某一朵煙火的顏色拉鮮豔）；這份遮色片與去煙的那份
+/// 是分開的兩份——去煙的範圍與想調色的範圍本來就不一定是同一塊
+#[derive(Clone, PartialEq)]
+struct MovieGrade {
+    /// 三個遮色區，各有各的滑桿與遮色片；照順序疊上去
+    zones: [GradeZone; GRADE_ZONES],
+    /// 面板現在顯示第幾區的設定（0 起算）。三區各十二條一起排下來要捲上老半天，
+    /// 所以一次只顯示一區
+    tab: usize,
 }
 
-/// 分區調色實際會動到畫面的那幾區：哪一區、套哪一組滑桿。
-///
-/// 拿它當「畫面上那張套的是什麼」的比對依據：勾了但滑桿全歸零的區
-/// 不在裡面，光是勾一下不會害預覽白跑一趟
-type ActiveGrade = Vec<(Region, Adjustments)>;
+impl Default for MovieGrade {
+    fn default() -> Self {
+        Self {
+            zones: Default::default(),
+            tab: 0,
+        }
+    }
+}
 
-impl RegionGrade {
-    /// 真的會動到畫面的那幾區（勾了、而且那一區的滑桿有動過）。
-    /// 裁切不參與分區調色（一格只有一個畫框），所以一律取 `grade_only`
-    fn active(&self) -> ActiveGrade {
-        Region::ALL
-            .into_iter()
-            .filter_map(|r| {
-                let g = self.grade[r.idx()].clamped().grade_only();
-                (self.on[r.idx()] && !g.grade_is_neutral()).then_some((r, g))
-            })
+/// 調色可以分成幾個遮色區。三個夠用了（例如天空、地景、某一朵煙火），
+/// 再多只是讓面板變長、每一格多跑幾趟
+const GRADE_ZONES: usize = 3;
+
+/// 調色的一個遮色區：一組滑桿加自己那份遮色片。
+///
+/// 滑桿全歸零＝這一區不作用（不必另外一個開關）；沒勾「套用遮色片」或
+/// 一個形狀都沒畫＝整格都調
+#[derive(Clone, PartialEq)]
+struct GradeZone {
+    /// 十二條滑桿
+    grade: Adjustments,
+    /// 套用遮色片：只調自己那份遮色片畫到的地方（專業模式限定；簡易模式一律整張）
+    mask_on: bool,
+    /// 反過來用：畫到的地方**不**調色，其餘都調（例如圈出煙火、只調夜空與地景）。
+    /// 一個形狀都沒畫時不管正反都是整張調——沒畫就把整張擋光只會莫名其妙
+    invert: bool,
+    /// 這一區遮色片的邊緣羽化 0~100 與筆刷濃度 0~100（每一區各記各的）。
+    /// 形狀本身是分段存的（見 [`Segment::grade_shapes`]）
+    feather: i32,
+    density: i32,
+}
+
+impl Default for GradeZone {
+    fn default() -> Self {
+        Self {
+            grade: Adjustments::default(),
+            mask_on: false,
+            invert: false,
+            feather: 25,
+            density: 80,
+        }
+    }
+}
+
+/// 實際會套到每一格上的調色：滑桿與（可能為空的）遮色片。
+///
+/// 拿它當「畫面上那張套的是什麼」的比對依據：滑桿全歸零就是 None，
+/// 光是勾一下套用遮色片不會害預覽白跑一趟。`shapes` 空的＝整張都調
+#[derive(Clone, PartialEq)]
+struct ActiveGrade {
+    grade: Adjustments,
+    /// 已經整理過的形狀（退化的剔除、上限截掉）；空的＝整張都調
+    shapes: Vec<dehaze::Shape>,
+    feather: i32,
+    density: i32,
+    /// 畫到的地方不調、其餘都調（見 [`MovieGrade::invert`]）
+    invert: bool,
+}
+
+impl GradeZone {
+    /// 這一區真的會動到畫面的那一份（滑桿有動過才算）。`shapes` 是那一段裡
+    /// 這一區的遮色片；`pro`＝false 時不套遮色片（畫過的形狀留著，切回專業
+    /// 就回來，與去煙的遮色片同一個規則）。
+    /// 裁切不參與（一格只有一個畫框），所以一律取 `grade_only`
+    fn active(&self, pro: bool, shapes: &[dehaze::Shape]) -> Option<ActiveGrade> {
+        let g = self.grade.clamped().grade_only();
+        if g.grade_is_neutral() {
+            return None;
+        }
+        let shapes = if pro && self.mask_on {
+            shapes
+                .iter()
+                .filter_map(dehaze::Shape::cleaned)
+                .take(dehaze::MAX_SHAPES)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(ActiveGrade {
+            grade: g,
+            shapes,
+            feather: self.feather.clamp(0, 100),
+            density: self.density.clamp(0, 100),
+            invert: self.invert,
+        })
+    }
+}
+
+impl MovieGrade {
+    /// 真的會動到畫面的那幾區（照 1、2、3 的順序，**依序**疊上去：
+    /// 第二區看得到第一區的結果，重疊的地方兩區都會作用）
+    fn active(&self, pro: bool, seg: &Segment) -> Vec<ActiveGrade> {
+        self.zones
+            .iter()
+            .enumerate()
+            .filter_map(|(i, z)| z.active(pro, &seg.grade_shapes[i]))
             .collect()
     }
+}
 
-    /// 有沒有哪一區真的會被調
-    fn is_active(&self) -> bool {
-        !self.active().is_empty()
+/// 影片去煙霧有兩份遮色片：去煙的與調色的。工具列、遮罩檢視一次只對著其中一份
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MaskTarget {
+    /// 去煙的遮色片（存在 [`Segment::shapes`]）：畫到的地方才去煙
+    Dehaze,
+    /// 第幾個調色遮色區的遮色片（存在 [`Segment::grade_shapes`]）：
+    /// 畫到的地方才套那一區的調色
+    Grade(usize),
+}
+
+impl MaskTarget {
+    /// 這份遮色片圈的是要做什麼（說明文字用）
+    fn verb(self) -> &'static str {
+        match self {
+            MaskTarget::Dehaze => "去煙",
+            MaskTarget::Grade(_) => "調色",
+        }
     }
+
+    /// 這份遮色片叫什麼（提示訊息用）
+    fn label(self) -> String {
+        match self {
+            MaskTarget::Dehaze => "去煙的遮色片".into(),
+            MaskTarget::Grade(i) => format!("遮色區 {}", i + 1),
+        }
+    }
+}
+
+/// 遮罩檢視是照哪一份遮色片、哪一組形狀、哪個時間點算的
+/// （見 [`MovieTool::mask_for`]）；與現在的不同就要重算
+#[derive(Clone, PartialEq)]
+struct MaskKey {
+    target: MaskTarget,
+    shapes: Vec<dehaze::Shape>,
+    feather: i32,
+    density: i32,
+    /// 紅色要蓋在畫到的地方（反選的調色遮色片）而不是畫到以外的地方
+    invert: bool,
+    at: f64,
+}
+
+/// 影片的一段：從 `start` 秒起（到下一段開始為止）用這一組遮色片。
+///
+/// 鏡頭會動的影片，一份遮色片撐不完整支——在鏡頭移動的地方切一刀、
+/// 每一段各畫各的。其餘設定（去煙滑桿、調色滑桿、羽化與濃度）仍是整支共用：
+/// 那些跟鏡頭在哪沒關係，一段一組反而讓人搞不清楚現在改的是哪一段
+#[derive(Clone, PartialEq, Default)]
+struct Segment {
+    /// 這一段從第幾秒開始（第一段永遠是 0）
+    start: f64,
+    /// 去煙的遮色片：畫到的地方才去煙
+    shapes: Vec<dehaze::Shape>,
+    /// 三個調色遮色區各自的遮色片：畫到的地方才套那一區的調色
+    /// （或反過來，見 [`GradeZone::invert`]）
+    grade_shapes: [Vec<dehaze::Shape>; GRADE_ZONES],
 }
 
 /// 影片去煙霧目前在背景做的事（同時間只會有一件）
@@ -4750,8 +4832,49 @@ enum MovieBusy {
     Grabbing,
     /// 正在算預覽
     Rendering,
+    /// 正在準備試播的那一小段（抓格＋逐格去煙）
+    Preparing,
     /// 正在把整支影片跑完
     Exporting,
+}
+
+/// 試播那一小段的畫面長邊。整支輸出的尺寸拿來即時播是算不動的，
+/// 縮到這裡幾秒鐘就算完，看煙散得對不對也夠了
+const CLIP_MAX_LONG: u32 = 720;
+
+/// 試播的影格率上限。60p 的片子照原樣算要兩倍的格數，看動態 20 格/秒就夠
+const CLIP_FPS_CAP: f32 = 20.0;
+
+/// 試播最多抓幾格：原始與處理後各一份都放在記憶體裡（720p 一格不到 1MB，
+/// 兩份 160 格約 280MB），再多就不划算
+const CLIP_MAX_FRAMES: usize = 160;
+
+/// 試播那一小段是照哪一組設定產生的：來源、起點、長度、輸出尺寸與每一段的
+/// 設定。任何一項改了，畫面上就標「設定已變更」，再按試播就重新產生
+#[derive(Clone, PartialEq)]
+struct ClipKey {
+    src: PathBuf,
+    at: f64,
+    secs: f64,
+    size: MovieSize,
+    crop: Crop,
+    segs: Vec<movie::ExportSeg>,
+}
+
+/// 影片裁切可選的比例（沒有「原圖」——影片不轉，原比例就是不裁）
+const MOVIE_CROP_ASPECTS: [CropAspect; 6] = [
+    CropAspect::Free,
+    CropAspect::Ratio(16, 9),
+    CropAspect::Ratio(16, 10),
+    CropAspect::Ratio(4, 3),
+    CropAspect::Ratio(1, 1),
+    CropAspect::Ratio(9, 16),
+];
+
+/// 準備好的試播片段（見 [`movie::prepare_clip`]）
+struct MovieClip {
+    key: ClipKey,
+    frames: movie::ClipFrames,
 }
 
 /// 「影片去煙霧」模組的狀態：一支影片、一組參數，輸出成另一支影片。
@@ -4775,20 +4898,18 @@ struct MovieTool {
     after_tex: Option<egui::TextureHandle>,
     /// 去煙參數（整支影片共用一組）
     params: SmokeParams,
-    /// 分區調色：地景／天空／煙火各一組滑桿（整支影片共用一組）
-    grade: RegionGrade,
-    /// 調色區塊展開著沒（三區的滑桿佔掉一大截，預設收起來）
+    /// 調色：一組滑桿加（專業模式）調色的遮色片設定（整支影片共用一組）
+    grade: MovieGrade,
+    /// 照時間切成幾段，每段各有自己的兩份遮色片（見 [`Segment`]）。
+    /// 永遠至少一段、照 `start` 排好、第一段從 0 起
+    segments: Vec<Segment>,
+    /// 調色區塊展開著沒（十二條滑桿佔掉一大截，預設收起來）
     grade_open: bool,
-    /// 滑桿現在在調哪一區。三區各十二條一起排下來要捲上老半天，
-    /// 所以一次只顯示一區
-    grade_tab: Region,
-    /// 畫面上那張預覽套的是哪幾區的調色；與現在相同就不必重算。
+    /// 畫面上那張預覽套的是哪幾區的調色；與現在相同就不必重算
+    /// （None＝還沒套過任何東西，與「套過、但一區都不作用」不同）。
     /// 與去煙分開是刻意的——去煙要算上一秒，調色是零點幾秒的事，
     /// 拖調色滑桿時只重跑調色那一段（與去煙霧模組同一個作法）
-    graded: ActiveGrade,
-    /// 預覽那一格的三區權重。天際線只跟去煙結果有關，拖調色滑桿時
-    /// 沿用同一份就好，不必每動一下重量一次
-    masks: Option<Arc<edit::RegionMasks>>,
+    graded: Option<Vec<ActiveGrade>>,
     /// 輸出尺寸
     size: MovieSize,
     /// 畫面上那張預覽是用哪一組參數、哪一個時間點算出來的；
@@ -4797,8 +4918,82 @@ struct MovieTool {
     /// 底圖是哪個時間點取回來的（含取失敗的那次）：與 `at` 不同就去取一格。
     /// 拖時間軸時同時只會有一個在跑，拖到哪就從那裡續，不會排一長串
     grabbed_at: Option<f64>,
-    /// 預覽顯示的是原始畫面（按著看前後對照）
+    /// 預覽顯示的是原始畫面（單張檢視時按著看前後對照）
     show_before: bool,
+    /// 前後對照：左邊原始畫面、右邊處理後並排（與去煙霧、煙火疊圖同一套）。
+    /// **預設開著**——調參數時兩張同時看得到，不必按住滑鼠
+    compare: bool,
+    /// 使用者用把手拖出來的預覽高度差額（正＝比自動高）；連點兩下歸零
+    img_extra: f32,
+    /// 預覽下面那幾列控制項上一幀量到的高度，算預覽高度用（不用公式估，
+    /// 視窗窄到換行時才會跟著對）
+    ctrl_h: f32,
+    /// 預覽的顯示比例；None＝符合視窗，Some(1.0)＝成品 1 像素對螢幕 1 個
+    /// **實體像素**（與另外幾個模組同一個尺規，不隨 Windows 的顯示縮放跑掉）。
+    /// 滾輪縮放，或按檢視列的 50%／100%
+    zoom: Option<f32>,
+    /// 放大後畫面中央對到影格的哪個位置（相對座標 0~1）
+    pan: egui::Pos2,
+    /// 目前的顯示比例（%，照成品尺寸算），畫預覽時量的、給檢視列顯示
+    zoom_pct: Option<f32>,
+    /// 試播：準備好的那一小段（設定改了仍留著，標「已變更」，再按試播才重做）
+    clip: Option<MovieClip>,
+    /// 試播要抓幾秒（2／5／10）
+    clip_secs: f64,
+    /// 準備試播的進度：處理完幾格、總共幾格
+    clip_done: usize,
+    clip_total: usize,
+    /// 取消準備試播的旗標
+    clip_cancel: Arc<AtomicBool>,
+    /// 預覽現在顯示的是試播的格（播放中或暫停著），不是停著的那一格
+    show_clip: bool,
+    /// 試播正在播（false＝暫停）
+    playing: bool,
+    /// 試播播到第幾秒（循環）
+    play_pos: f64,
+    /// 上一次推進播放時間的時刻（暫停時 None）
+    play_tick: Option<Instant>,
+    /// 目前上傳成貼圖的是第幾格，以及那兩張貼圖（原始、處理後）
+    clip_frame: Option<usize>,
+    clip_tex: Option<egui::TextureHandle>,
+    clip_base_tex: Option<egui::TextureHandle>,
+    /// 裁切範圍（相對座標；只裁不轉）。整支影片（含同一批的其他支）共用一個框，
+    /// 在去煙**之前**裁：與縮小同一個道理，裁掉的地方不必花力氣去煙
+    crop: Crop,
+    /// 裁切要固定成哪個長寬比
+    crop_aspect: CropAspect,
+    /// 正在調整裁切範圍：預覽改顯示整格並畫出可拖曳的裁切框
+    /// （那時預覽底圖不裁，見 [`MovieTool::set_crop_editing`]）
+    crop_editing: bool,
+    /// 專業模式（預設關著＝簡易模式）。開了才有遮色片：簡易模式一律整片
+    /// 天空都去煙、**不套遮色片**——畫過的形狀仍留在 `params.shapes` 裡，
+    /// 切回專業就回來（與煙火疊圖的簡易／專業同一個規則）
+    pro: bool,
+    /// 工具與遮罩檢視現在對著哪一份遮色片（去煙的或調色的）
+    mask_target: MaskTarget,
+    /// 目前選用的遮色片工具（畫進 `mask_target` 那一份）；
+    /// None＝沒選（左鍵回到「按住看原圖」）
+    mask_tool: Option<MaskTool>,
+    /// 正在畫面上拖曳、還沒放開的形狀；放開才寫進參數觸發重算
+    draft: Option<Draft>,
+    /// 正在用拖的搬移的遮色片形狀：(第幾個, 目前累積的位移)
+    moving: Option<(usize, egui::Vec2)>,
+    /// 筆刷粗細：筆跡直徑佔畫面長邊的百分比（與去煙霧同一個尺規）
+    brush_size: i32,
+    /// 新畫的放射性漸層要不要反轉（改成橢圓外才去煙）
+    radial_invert: bool,
+    /// 「物件」工具的羽化 0~100 與邊緣 −100~100（見 [`SmokeTool::object_feather`]）
+    object_feather: i32,
+    object_edge: i32,
+    /// 預覽改顯示遮色片（紅色蓋住的地方不會被去煙）
+    show_mask: bool,
+    /// 選了工具、等畫出第一個形狀就自動打開遮罩檢視
+    /// （與 [`SmokeTool::mask_view_armed`] 同一個用意）
+    mask_view_armed: bool,
+    /// 遮罩檢視的貼圖，以及它是照哪一份遮色片、哪一組形狀、哪個時間點算的；
+    /// 與現在相同就不必重算
+    mask_tex: Option<egui::TextureHandle>,
+    mask_for: Option<MaskKey>,
     busy: MovieBusy,
     rx: Option<Receiver<MovieMsg>>,
     /// 輸出進度：已經處理完幾格
@@ -4838,15 +5033,48 @@ impl Default for MovieTool {
             base_tex: None,
             after_tex: None,
             params: SmokeParams::default(),
-            grade: RegionGrade::default(),
+            grade: MovieGrade::default(),
+            segments: vec![Segment::default()],
             grade_open: false,
-            grade_tab: Region::Fire,
-            graded: Vec::new(),
-            masks: None,
+            graded: None,
             size: MovieSize::Source,
             rendered: None,
             grabbed_at: None,
             show_before: false,
+            compare: true,
+            img_extra: 0.0,
+            ctrl_h: 96.0,
+            zoom: None,
+            pan: egui::pos2(0.5, 0.5),
+            zoom_pct: None,
+            clip: None,
+            clip_secs: 5.0,
+            clip_done: 0,
+            clip_total: 0,
+            clip_cancel: Arc::new(AtomicBool::new(false)),
+            show_clip: false,
+            playing: false,
+            play_pos: 0.0,
+            play_tick: None,
+            clip_frame: None,
+            clip_tex: None,
+            clip_base_tex: None,
+            crop: Crop::default(),
+            crop_aspect: CropAspect::Free,
+            crop_editing: false,
+            pro: false,
+            mask_target: MaskTarget::Dehaze,
+            mask_tool: None,
+            draft: None,
+            moving: None,
+            brush_size: 10,
+            radial_invert: false,
+            object_feather: dehaze::OBJECT_FEATHER,
+            object_edge: 0,
+            show_mask: false,
+            mask_view_armed: false,
+            mask_tex: None,
+            mask_for: None,
             busy: MovieBusy::Idle,
             rx: None,
             done: 0,
@@ -4878,10 +5106,25 @@ impl MovieTool {
         self.after = None;
         self.base_tex = None;
         self.after_tex = None;
-        self.graded.clear();
-        self.masks = None;
+        self.graded = None;
         self.rendered = None;
         self.grabbed_at = None;
+        // 遮色片跟著參數留下來（同一場的好幾段多半同一個構圖），
+        // 但畫到一半的筆跡與舊底圖算的遮罩檢視要丟掉
+        self.draft = None;
+        self.moving = None;
+        self.mask_tex = None;
+        self.mask_for = None;
+        // 試播的那一小段是對著上一支抓的，連同縮放一起歸零
+        self.clip = None;
+        self.stop_clip();
+        self.clip_frame = None;
+        self.clip_tex = None;
+        self.clip_base_tex = None;
+        self.zoom = None;
+        self.pan = egui::pos2(0.5, 0.5);
+        // 裁切框跟著設定留下來（同一批共用），但調整中的狀態是對著上一支的
+        self.crop_editing = false;
         self.busy = MovieBusy::Idle;
         self.rx = None;
         self.done = 0;
@@ -4898,6 +5141,335 @@ impl MovieTool {
         self.batch_errs.clear();
     }
 
+    /// 某一段真的會拿去算的去煙參數：滑桿整支共用，遮色片是那一段自己的；
+    /// 簡易模式不套遮色片（畫過的形狀仍留在段裡，切回專業就回來）
+    fn effective_for(&self, seg: &Segment) -> SmokeParams {
+        let mut p = self.params.clone();
+        p.shapes = if self.pro { seg.shapes.clone() } else { Vec::new() };
+        p
+    }
+
+    /// 預覽這一刻（時間軸停著的那一段）真的會拿去算的去煙參數
+    fn effective(&self) -> SmokeParams {
+        self.effective_for(self.seg())
+    }
+
+    /// 預覽這一刻真的會套的調色（見 [`MovieGrade::active`]）
+    fn active_grade(&self) -> Vec<ActiveGrade> {
+        self.grade.active(self.pro, self.seg())
+    }
+
+    /// 輸出用：每一段各帶自己的遮色片，其餘設定整支共用
+    fn export_segs(&self) -> Vec<movie::ExportSeg> {
+        self.segments
+            .iter()
+            .map(|s| movie::ExportSeg {
+                start: s.start,
+                params: self.effective_for(s),
+                grades: self.grade.active(self.pro, s),
+            })
+            .collect()
+    }
+
+    /// 目前預覽的時間點落在第幾段（最後一段 `start` ≤ `at` 的；第一段從 0 起，
+    /// 所以一定找得到）
+    fn seg_idx(&self) -> usize {
+        self.segments
+            .iter()
+            .rposition(|s| s.start <= self.at + 1e-6)
+            .unwrap_or(0)
+    }
+
+    /// 目前預覽的時間點所在的那一段
+    fn seg(&self) -> &Segment {
+        &self.segments[self.seg_idx()]
+    }
+
+    /// 第 `i` 段的起訖（秒）；最後一段到片尾 `secs`
+    fn seg_span(&self, i: usize, secs: f64) -> (f64, f64) {
+        let s = self.segments.get(i).map(|s| s.start).unwrap_or(0.0);
+        let e = self.segments.get(i + 1).map(|s| s.start).unwrap_or(secs);
+        (s, e.max(s))
+    }
+
+    /// 在目前的時間點切一刀：從這裡起算新的一段。新的一段**先照抄這一段的
+    /// 遮色片**——鏡頭多半只是移了一點，照抄再拖著搬比從頭畫快。
+    /// 已經貼著某一段的起點就不再切（回傳 false）
+    fn split_here(&mut self) -> bool {
+        const MIN_GAP: f64 = 0.05;
+        if self.segments.iter().any(|s| (s.start - self.at).abs() < MIN_GAP) {
+            return false;
+        }
+        let i = self.seg_idx();
+        let mut seg = self.segments[i].clone();
+        seg.start = self.at;
+        self.segments.insert(i + 1, seg);
+        true
+    }
+
+    /// 把目前這一段併回前一段：這段時間改用前一段的遮色片（這一段畫的就沒了）。
+    /// 第一段沒有前一段可併（回傳 false）
+    fn merge_here(&mut self) -> bool {
+        let i = self.seg_idx();
+        if i == 0 {
+            return false;
+        }
+        self.segments.remove(i);
+        true
+    }
+
+    /// 預覽現在要看的是不是遮罩檢視（專業模式限定）
+    fn mask_shown(&self) -> bool {
+        self.pro && self.show_mask
+    }
+
+    /// 筆刷半徑（佔畫面長邊的比例）。粗細滑桿調的是直徑
+    fn brush_radius(&self) -> f32 {
+        self.brush_size as f32 / 200.0
+    }
+
+    /// 目前這一段的某一份遮色片：（形狀, 邊緣羽化, 筆刷濃度）。
+    /// 形狀是那一段自己的，羽化與濃度整支共用
+    fn mask_of(&self, target: MaskTarget) -> (&[dehaze::Shape], i32, i32) {
+        let seg = self.seg();
+        match target {
+            MaskTarget::Dehaze => (&seg.shapes, self.params.feather, self.params.mask_density),
+            MaskTarget::Grade(i) => {
+                let z = &self.grade.zones[i];
+                (&seg.grade_shapes[i], z.feather, z.density)
+            }
+        }
+    }
+
+    /// 目前這一段的某一份遮色片，可以改的版本：（形狀, 邊緣羽化, 筆刷濃度）
+    fn mask_mut(&mut self, target: MaskTarget) -> (&mut Vec<dehaze::Shape>, &mut i32, &mut i32) {
+        let i = self.seg_idx();
+        match target {
+            MaskTarget::Dehaze => (
+                &mut self.segments[i].shapes,
+                &mut self.params.feather,
+                &mut self.params.mask_density,
+            ),
+            MaskTarget::Grade(z) => (
+                &mut self.segments[i].grade_shapes[z],
+                &mut self.grade.zones[z].feather,
+                &mut self.grade.zones[z].density,
+            ),
+        }
+    }
+
+    /// 把一個形狀疊到工具正對著的那一份遮色片上；已經滿了就回傳 false
+    fn push_shape(&mut self, s: dehaze::Shape) -> bool {
+        let (shapes, _, _) = self.mask_mut(self.mask_target);
+        if shapes.len() >= dehaze::MAX_SHAPES {
+            return false;
+        }
+        shapes.push(s);
+        true
+    }
+
+    /// 工具正對著的那一份遮色片現在有沒有東西可看（遮罩檢視要有東西才開得起來）。
+    /// 調色那份還要「套用遮色片」勾著才算——沒勾的話形狀根本不會生效
+    fn target_can_show(&self) -> bool {
+        let has = self
+            .mask_of(self.mask_target)
+            .0
+            .iter()
+            .any(|s| s.cleaned().is_some());
+        match self.mask_target {
+            MaskTarget::Dehaze => has,
+            MaskTarget::Grade(i) => has && self.grade.zones[i].mask_on,
+        }
+    }
+
+    /// 某一份遮色片是不是反過來用的（只有調色那份有這個選項）
+    fn mask_inverted(&self, target: MaskTarget) -> bool {
+        match target {
+            MaskTarget::Dehaze => false,
+            MaskTarget::Grade(i) => self.grade.zones[i].invert,
+        }
+    }
+
+    /// 遮罩檢視現在該照什麼算（見 [`MovieTool::mask_for`]）
+    fn mask_key(&self) -> MaskKey {
+        let (shapes, feather, density) = self.mask_of(self.mask_target);
+        MaskKey {
+            target: self.mask_target,
+            shapes: shapes.to_vec(),
+            feather,
+            density,
+            invert: self.mask_inverted(self.mask_target),
+            at: self.at,
+        }
+    }
+
+    /// 試播那一小段是照哪一組設定產生的（見 [`ClipKey`]）
+    fn clip_key(&self) -> ClipKey {
+        ClipKey {
+            src: self.src.clone().unwrap_or_default(),
+            at: self.at,
+            secs: self.clip_secs,
+            size: self.size,
+            crop: self.crop.clamped(),
+            segs: self.export_segs(),
+        }
+    }
+
+    /// 停止試播、畫面回到停著的那一格。片段本身留著，設定沒變的話再按試播
+    /// 立刻就能播，不必重算
+    fn stop_clip(&mut self) {
+        self.show_clip = false;
+        self.playing = false;
+        self.play_tick = None;
+    }
+
+    /// 裁切後的來源尺寸（還沒縮）：裁切框套在解碼出來的那一格上
+    fn cropped_dims(&self) -> Option<(u32, u32)> {
+        let i = self.info.as_ref()?;
+        let (_, _, w, h) = self.crop.pixels(i.w, i.h);
+        Some((w, h))
+    }
+
+    /// 裁切的 ffmpeg 濾鏡（沒裁就 None）；取格、試播與輸出都套同一條
+    fn crop_filter(&self) -> Option<String> {
+        self.crop.filter()
+    }
+
+    /// 預覽畫布的尺寸（成品尺度）：調整裁切範圍時是裁切前的**整格**（裁切那塊
+    /// 剛好等於成品，這樣 100% 仍是成品 1:1），其餘就是成品本身
+    /// （那時預覽底圖已經是裁好的）
+    fn canvas_dims(&self) -> Option<egui::Vec2> {
+        let (ow, oh) = self.out_dims()?;
+        if self.crop_editing {
+            let c = self.crop.clamped();
+            Some(egui::vec2(
+                ow as f32 / c.w().max(CROP_MIN),
+                oh as f32 / c.h().max(CROP_MIN),
+            ))
+        } else {
+            Some(egui::vec2(ow as f32, oh as f32))
+        }
+    }
+
+    /// 預覽底圖對應到成品尺度時的長邊（折算強度與天空範圍用，
+    /// 見 `dehaze::preview_strength`）：調整裁切範圍時底圖是整格，基準跟著是整格
+    fn preview_ref_long(&self) -> Option<u32> {
+        self.canvas_dims()
+            .map(|c| c.x.max(c.y).round() as u32)
+            .filter(|l| *l > 0)
+    }
+
+    /// 進出「調整裁切範圍」、改了裁切或輸出尺寸：預覽底圖要照新的範圍重取，
+    /// 舊的那幾張長寬比不對，留著只會被拉變形
+    fn invalidate_frame(&mut self) {
+        self.base = None;
+        self.after = None;
+        self.base_tex = None;
+        self.after_tex = None;
+        self.mask_tex = None;
+        self.mask_for = None;
+        self.rendered = None;
+        self.graded = None;
+        self.grabbed_at = None;
+    }
+
+    /// 開／關「調整裁切範圍」。開著時預覽底圖改抓**整格**（要看得到全部才拖得到框），
+    /// 關掉就抓裁好的那一塊；兩種底圖不同，切換都要重取。左鍵歸裁切框用，
+    /// 遮色片工具與試播先收掉
+    fn set_crop_editing(&mut self, on: bool) {
+        if self.crop_editing == on {
+            return;
+        }
+        self.crop_editing = on;
+        if on {
+            self.close_mask_tools();
+            self.stop_clip();
+        }
+        self.invalidate_frame();
+    }
+
+    /// 切換簡易／專業。切回簡易時工具、遮罩檢視與畫到一半的東西一起收掉，
+    /// 否則畫面會停在一個簡易模式看不到、也改不動的狀態
+    fn set_pro(&mut self, pro: bool) {
+        self.pro = pro;
+        if !pro {
+            self.end_editing();
+        }
+    }
+
+    /// 點了某一份遮色片工具列的某一顆：沒選的選起來、已經選著的再點一次收掉。
+    /// 點的是另一份的工具列就整個換過去（工具、遮罩檢視都跟著換）。
+    /// 選了工具就順便打開遮罩檢視（多半還沒畫東西、開關還是停用的，
+    /// 那就先記著，畫出第一個就跟著亮，見 [`MovieTool::sync_mask_view`]）
+    fn pick_mask_tool(&mut self, target: MaskTarget, tool: MaskTool) {
+        let on = self.mask_target == target && self.mask_tool == Some(tool);
+        self.mask_target = target;
+        self.mask_tool = (!on).then_some(tool);
+        self.draft = None;
+        self.moving = None;
+        // 遮色片是對著停住的那一格畫的，試播的畫面在動，畫不準
+        self.stop_clip();
+        self.mask_view_armed = self.mask_tool.is_some();
+        if self.mask_view_armed && !self.show_mask {
+            self.show_mask = true;
+        }
+    }
+
+    /// 按了某一份的「顯示遮色片」：對著同一份就是開關；對著另一份就換過去看
+    /// 那一份（工具是對著原本那份畫的，一併收掉，免得接下來畫進不對的那份）
+    fn toggle_mask_view(&mut self, target: MaskTarget) {
+        // 遮罩檢視畫在停住的那一格上，試播先停
+        self.stop_clip();
+        if self.mask_target != target {
+            self.mask_target = target;
+            self.mask_tool = None;
+            self.draft = None;
+            self.moving = None;
+            self.show_mask = true;
+        } else {
+            self.show_mask = !self.show_mask;
+        }
+        // 自己動過這顆就不再自作主張（尤其是關掉它之後）
+        self.mask_view_armed = false;
+    }
+
+    /// 每幀對一次遮罩檢視該不該開著；`can_show`＝對著的那份遮色片有東西可看沒有。
+    /// 沒東西可看時一律關掉（那時檢視只會蓋出一整片紅）；有東西可看、
+    /// 而且記著要看，就替他打開——兌現一次就收起旗標
+    fn sync_mask_view(&mut self, can_show: bool) {
+        if !can_show {
+            self.show_mask = false;
+            self.mask_view_armed = self.mask_tool.is_some();
+            return;
+        }
+        if self.mask_view_armed && !self.show_mask {
+            self.show_mask = true;
+        }
+        self.mask_view_armed = false;
+    }
+
+    /// 還在編輯狀態：工具選著（左鍵是拿來畫的）、遮罩檢視開著
+    /// （畫面上那片紅不會出現在成品裡），或正在調整裁切範圍（畫面是整格，不是成品）
+    fn tools_open(&self) -> bool {
+        self.crop_editing
+            || (self.pro && (self.mask_tool.is_some() || (self.show_mask && self.target_can_show())))
+    }
+
+    /// 遮色片工具與遮罩檢視收起來（畫到一半的也丟掉）
+    fn close_mask_tools(&mut self) {
+        self.mask_tool = None;
+        self.draft = None;
+        self.moving = None;
+        self.show_mask = false;
+        self.mask_view_armed = false;
+    }
+
+    /// 結束編輯：工具、遮罩檢視與裁切框都收起來，畫面回到去煙後（裁好）的樣子
+    fn end_editing(&mut self) {
+        self.close_mask_tools();
+        self.set_crop_editing(false);
+    }
+
     /// 這一批要處理的全部影片（正在預覽的那支排第一）
     fn jobs(&self) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = self.src.iter().cloned().collect();
@@ -4907,21 +5479,31 @@ impl MovieTool {
 
     /// 這次會輸出幾乘幾（還沒選影片時為 None）
     fn out_dims(&self) -> Option<(u32, u32)> {
-        self.info.as_ref().map(|i| self.size.apply(i.w, i.h))
+        // 先裁再縮，與輸出的濾鏡同一個順序（見 movie::export）
+        let (w, h) = self.cropped_dims()?;
+        Some(self.size.apply(w, h))
     }
 
     /// 預覽需不需要重算（參數或時間點與畫面上那張不同）
     fn needs_render(&self) -> bool {
         match &self.rendered {
-            Some((p, t)) => *p != self.params || (*t - self.at).abs() > 1e-6,
+            Some((p, t)) => *p != self.effective() || (*t - self.at).abs() > 1e-6,
             None => true,
         }
     }
 
-    /// 預覽的調色要不要重跑（去煙結果沒變，只是換了調色）。
-    /// 去煙那一段照舊由 [`MovieTool::needs_render`] 顧
+    /// 遮罩檢視需不需要重算（開著、而且對著的那份形狀或時間點與畫面上那張不同）
+    fn needs_mask_view(&self) -> bool {
+        self.mask_shown()
+            && self.base.is_some()
+            && self.mask_for.as_ref().is_none_or(|k| *k != self.mask_key())
+    }
+
+    /// 預覽的調色要不要重跑（去煙結果沒變，只是換了調色或調色的遮色片）。
+    /// 去煙那一段照舊由 [`MovieTool::needs_render`] 顧；
+    /// 遮罩檢視是診斷用的畫面，調色套上去只會看不清楚哪裡被蓋住
     fn needs_grade(&self) -> bool {
-        self.after.is_some() && self.graded != self.grade.active()
+        !self.mask_shown() && self.after.is_some() && self.graded != Some(self.active_grade())
     }
 }
 
@@ -4934,8 +5516,8 @@ impl MovieTool {
 /// 另外用一個記憶體預算夾住：同時攤開的是「送進去的一批」加上「算出來的一批」，
 /// 一格 4K 就要 25MB，核心多的機器才不會一次吃掉好幾 GB。
 ///
-/// `graded` 是「有沒有勾分區調色」：調色那一段還要把整格攤成 f32、外加
-/// 模糊用的暫存與混色用的兩份備份（見 [`edit::apply_region_grade`]），
+/// `graded` 是「有沒有調色」：調色那一段還要把整格攤成 f32、外加
+/// 模糊用的暫存與套遮色片時混色用的備份（見 [`edit::apply_grade_masked`]），
 /// 一格 4K 就多吃將近 200MB。不算進來的話，4K 開 16 條會直接吃掉三、四 GB
 fn movie_workers(w: u32, h: u32, graded: bool) -> usize {
     const MAX_WORKERS: usize = 16;
@@ -12900,10 +13482,23 @@ impl App {
         // 強度之後會照這個縮放折算回去（見 dehaze::preview_strength）。
         //
         // 選了比較小的輸出尺寸時，預覽也不該比成品還大——去煙的結果本來就
-        // 跟尺寸有關（見 dehaze 的工作解析度），預覽比成品細就會看到成品沒有的東西
-        let (ow, oh) = self.movie.out_dims().unwrap_or((info.w, info.h));
-        let cap = SMOKE_PREVIEW_MAX.min(ow.max(oh));
-        let max_long = (info.long() > cap).then_some(cap);
+        // 跟尺寸有關（見 dehaze 的工作解析度），預覽比成品細就會看到成品沒有的東西。
+        //
+        // 裁切：平常抓的就是裁好的那一塊（與成品同一塊，去煙結果才一致）；
+        // 調整裁切範圍時抓整格（要看得到全部才拖得到框），尺度也照整格算
+        let editing = self.movie.crop_editing;
+        let crop = (!editing).then(|| self.movie.crop_filter()).flatten();
+        let ref_long = self.movie.preview_ref_long().unwrap_or(info.long());
+        let src_long = if editing {
+            info.long()
+        } else {
+            self.movie
+                .cropped_dims()
+                .map(|(w, h)| w.max(h))
+                .unwrap_or(info.long())
+        };
+        let cap = SMOKE_PREVIEW_MAX.min(ref_long);
+        let max_long = (src_long > cap).then_some(cap);
         self.movie.busy = MovieBusy::Grabbing;
         self.movie.grabbed_at = Some(self.movie.at);
         let want = self.movie.at;
@@ -12911,7 +13506,7 @@ impl App {
         self.movie.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let r = movie::preview_frame(&src, at, max_long);
+            let r = movie::preview_frame(&src, at, max_long, crop.as_deref());
             let _ = tx.send(MovieMsg::Grabbed(want, r));
             ctx.request_repaint();
         });
@@ -12922,22 +13517,24 @@ impl App {
         let (Some(base), Some(info)) = (self.movie.base.clone(), self.movie.info.clone()) else {
             return;
         };
-        let params = self.movie.params.clone();
+        // 簡易模式不套遮色片（見 MovieTool::effective）
+        let params = self.movie.effective();
         let at = self.movie.at;
         // 預覽是縮圖，估煙霧層時少了原尺寸的最小值池化，同樣的強度會去得比
         // 成品乾淨；畫之前先折算回去，滑桿上的數字才代表成品的程度
         //
         // 折算的基準是**成品**的長邊而不是來源的：縮小是在去煙之前做的，
-        // 真正被去煙的那一格就是成品尺寸
-        let (ow, oh) = self.movie.out_dims().unwrap_or((info.w, info.h));
+        // 真正被去煙的那一格就是成品尺寸（調整裁切範圍時底圖是整格，
+        // 基準就跟著是整格換成成品尺度的長邊，見 MovieTool::preview_ref_long）
+        let ref_long = self.movie.preview_ref_long().unwrap_or(info.long());
         let mut draw = params.clone();
         draw.strength = dehaze::preview_strength(
             params.strength,
-            ow.max(oh),
+            ref_long,
             base.width().max(base.height()),
         );
         // 天空範圍的尺度同樣照成品的那一格換算（見 SmokeParams::preview_of）
-        draw.preview_of = Some(ow.max(oh));
+        draw.preview_of = Some(ref_long);
         self.movie.busy = MovieBusy::Rendering;
         let (tx, rx) = std::sync::mpsc::channel();
         self.movie.rx = Some(rx);
@@ -12947,6 +13544,129 @@ impl App {
             let _ = tx.send(MovieMsg::Preview(params, at, out));
             ctx.request_repaint();
         });
+    }
+
+    /// 專業模式的遮罩檢視：把預覽底圖上「不會去煙／不會調色」的地方蓋上紅色
+    /// （與去煙霧模組同一種畫法，見 [`dehaze::shape_overlay`]）。
+    /// 形狀存的是相對座標，縮圖上直接算就對得上成品
+    fn spawn_movie_mask_view(&mut self, ctx: &egui::Context) {
+        let Some(base) = self.movie.base.clone() else {
+            return;
+        };
+        let key = self.movie.mask_key();
+        self.movie.busy = MovieBusy::Rendering;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.movie.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let out = dehaze::shape_overlay(&base, &key.shapes, key.feather, key.density, key.invert);
+            let _ = tx.send(MovieMsg::MaskView(key, out));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 試播：從目前的時間點抓一小段、用現在的設定逐格算好，算完就在預覽區
+    /// 循環播（見 [`movie::prepare_clip`]）。整支輸出動輒幾十分鐘，
+    /// 想知道「動起來」對不對不該等那麼久
+    fn spawn_movie_clip(&mut self, ctx: &egui::Context) {
+        let (Some(src), Some(info)) = (self.movie.src.clone(), self.movie.info.clone()) else {
+            return;
+        };
+        let at = self.movie.at.clamp(0.0, (info.secs - 0.1).max(0.0));
+        // 片尾不夠長就抓到片尾為止
+        let secs = self.movie.clip_secs.min((info.secs - at).max(0.1));
+        let fps = info.fps.clamp(1.0, CLIP_FPS_CAP);
+        // 強度與天空範圍照**成品**的尺寸折算（與預覽同一個道理，見 spawn_movie_render）
+        // 試播看的是成品：裁切框調到一半也先收起來，抓的是裁好的那一塊
+        self.movie.set_crop_editing(false);
+        let (ow, oh) = self.movie.out_dims().unwrap_or((info.w, info.h));
+        let out_long = ow.max(oh);
+        let max_long = CLIP_MAX_LONG.min(out_long);
+        let segs = self.movie.export_segs();
+        let crop = self.movie.crop_filter();
+        let graded = segs.iter().any(|s| !s.grades.is_empty());
+        let workers = movie_workers(max_long, max_long, graded);
+        let key = self.movie.clip_key();
+        self.movie.stop_clip();
+        self.movie.clip_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&self.movie.clip_cancel);
+        self.movie.busy = MovieBusy::Preparing;
+        self.movie.clip_done = 0;
+        self.movie.clip_total = ((secs * fps as f64).round() as usize).clamp(1, CLIP_MAX_FRAMES);
+        self.movie.error = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.movie.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let report = {
+                let tx = tx.clone();
+                let ctx = ctx.clone();
+                move |done: usize, total: usize| {
+                    let _ = tx.send(MovieMsg::ClipProgress(done, total));
+                    ctx.request_repaint();
+                }
+            };
+            let r = movie::prepare_clip(
+                &src,
+                at,
+                secs,
+                fps,
+                max_long,
+                CLIP_MAX_FRAMES,
+                &segs,
+                crop.as_deref(),
+                out_long,
+                workers,
+                &cancel,
+                &report,
+            );
+            let _ = tx.send(MovieMsg::ClipReady(key, r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 每幀推進試播：照實際經過的時間換算播到第幾格，換格才重新上傳貼圖。
+    /// 沒在試播就什麼都不做
+    fn movie_tick_clip(&mut self, ctx: &egui::Context) {
+        if !self.movie.show_clip {
+            self.movie.play_tick = None;
+            return;
+        }
+        let Some((fps, n)) = self
+            .movie
+            .clip
+            .as_ref()
+            .map(|c| (c.frames.fps.max(1e-3) as f64, c.frames.after.len()))
+        else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        if self.movie.playing {
+            let now = Instant::now();
+            if let Some(prev) = self.movie.play_tick {
+                self.movie.play_pos += now.duration_since(prev).as_secs_f64();
+            }
+            self.movie.play_tick = Some(now);
+            let len = n as f64 / fps;
+            if self.movie.play_pos >= len {
+                self.movie.play_pos %= len;
+            }
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            self.movie.play_tick = None;
+        }
+        let i = ((self.movie.play_pos * fps) as usize).min(n - 1);
+        if self.movie.clip_frame != Some(i) {
+            if let Some(c) = self.movie.clip.as_ref() {
+                self.movie.clip_tex =
+                    Some(load_rgb_texture(ctx, "movie_clip_after", &c.frames.after[i]));
+                self.movie.clip_base_tex =
+                    Some(load_rgb_texture(ctx, "movie_clip_base", &c.frames.base[i]));
+            }
+            self.movie.clip_frame = Some(i);
+        }
     }
 
     /// 整支影片跑完並輸出成新檔。排了好幾支時就一支接一支跑完，
@@ -13049,10 +13769,14 @@ impl App {
             outs.clone()
         };
 
-        let params = self.movie.params.clone();
-        // 分區調色與去煙參數一樣，整批共用一組
-        let grade = self.movie.grade.clone();
+        // 每一段各帶自己的遮色片，其餘設定整批共用；簡易模式不套遮色片
+        // （見 MovieTool::export_segs）
+        let segs = self.movie.export_segs();
+        let graded = segs.iter().any(|s| !s.grades.is_empty());
         let size = self.movie.size;
+        // 裁切整批共用同一個框（相對座標，套在每一支自己的尺寸上）
+        let crop = self.movie.crop.clamped();
+        let crop_filter = self.movie.crop_filter();
         self.movie.cancel = Arc::new(AtomicBool::new(false));
         let cancel = Arc::clone(&self.movie.cancel);
         self.movie.busy = MovieBusy::Exporting;
@@ -13114,11 +13838,21 @@ impl App {
                 ctx.request_repaint();
                 // 尺寸、工作執行緒數都照**這一支**自己的來：一批裡混著
                 // 4K 與 1080p 時，記憶體預算不能拿第一支的去套全部
-                let (ow, oh) = size.apply(info.w, info.h);
-                let scale = ((ow, oh) != (info.w, info.h)).then_some((ow, oh));
-                let workers = movie_workers(ow, oh, grade.is_active());
+                // 先裁再縮（與預覽的 out_dims 同一個算法）
+                let (_, _, cw, ch) = crop.pixels(info.w, info.h);
+                let (ow, oh) = size.apply(cw, ch);
+                let scale = ((ow, oh) != (cw, ch)).then_some((ow, oh));
+                let workers = movie_workers(ow, oh, graded);
                 match movie::export(
-                    src, out, &info, &params, &grade, scale, &codec, workers, &cancel,
+                    src,
+                    out,
+                    &info,
+                    &segs,
+                    crop_filter.as_deref(),
+                    scale,
+                    &codec,
+                    workers,
+                    &cancel,
                     &report,
                 ) {
                     Ok(()) => {
@@ -13201,9 +13935,10 @@ impl App {
                             self.movie.after = None;
                             self.movie.after_tex = None;
                             self.movie.rendered = None;
-                            // 換了一格：調色與天際線都要照新的那一格重算
-                            self.movie.graded.clear();
-                            self.movie.masks = None;
+                            // 換了一格：調色與遮罩檢視都要照新的那一格重算
+                            self.movie.graded = None;
+                            self.movie.mask_tex = None;
+                            self.movie.mask_for = None;
                             self.movie.error = None;
                         }
                         Err(e) => self.movie.error = Some(e),
@@ -13212,30 +13947,55 @@ impl App {
                 }
                 MovieMsg::Preview(params, at, img) => {
                     // 算的過程中又動了滑桿：這張已經過期，等下一輪
-                    if params == self.movie.params && (at - self.movie.at).abs() <= 1e-6 {
+                    if params == self.movie.effective() && (at - self.movie.at).abs() <= 1e-6 {
                         // 先把去煙的結果貼上去，調色接著在下一輪自己補上
                         // （勾了調色時會再換一張，見 [`App::movie_regrade`]）
                         self.movie.after_tex =
                             Some(load_rgb_texture(ctx, "movie_after", &img));
                         self.movie.after = Some(Arc::new(img));
                         self.movie.rendered = Some((params, at));
-                        self.movie.graded.clear();
-                        self.movie.masks = None;
+                        self.movie.graded = None;
                     }
                     self.movie.busy = MovieBusy::Idle;
                 }
-                MovieMsg::Graded(grade, at, img, masks) => {
-                    // 這一格的天際線與去煙結果綁在一起，只要還停在同一格
-                    // 就留著（就算調色本身已經過期，權重仍然算數）
-                    if (at - self.movie.at).abs() <= 1e-6 && !self.movie.needs_render() {
-                        self.movie.masks = Some(masks);
-                        if grade == self.movie.grade.active() {
-                            self.movie.after_tex =
-                                Some(load_rgb_texture(ctx, "movie_after", &img));
-                            self.movie.graded = grade;
-                        }
+                MovieMsg::MaskView(key, img) => {
+                    // 算的過程中又畫了一筆、或換去看另一份：這張已經過期，等下一輪
+                    if key == self.movie.mask_key() {
+                        self.movie.mask_tex = Some(load_rgb_texture(ctx, "movie_mask", &img));
+                        self.movie.mask_for = Some(key);
                     }
                     self.movie.busy = MovieBusy::Idle;
+                }
+                MovieMsg::Graded(grades, at, img) => {
+                    // 算的過程中又動了調色、換了格或去煙的參數：這張已經過期
+                    if (at - self.movie.at).abs() <= 1e-6
+                        && !self.movie.needs_render()
+                        && grades == self.movie.active_grade()
+                    {
+                        self.movie.after_tex = Some(load_rgb_texture(ctx, "movie_after", &img));
+                        self.movie.graded = Some(grades);
+                    }
+                    self.movie.busy = MovieBusy::Idle;
+                }
+                MovieMsg::ClipProgress(done, total) => {
+                    self.movie.clip_done = done;
+                    self.movie.clip_total = total;
+                }
+                MovieMsg::ClipReady(key, res) => {
+                    self.movie.busy = MovieBusy::Idle;
+                    match res {
+                        Ok(frames) => {
+                            self.movie.clip = Some(MovieClip { key, frames });
+                            self.movie.clip_frame = None;
+                            self.movie.play_pos = 0.0;
+                            self.movie.play_tick = None;
+                            self.movie.show_clip = true;
+                            self.movie.playing = true;
+                        }
+                        // 空訊息＝使用者自己按了取消，不是出事
+                        Err(e) if e.is_empty() => {}
+                        Err(e) => self.movie.error = Some(format!("試播失敗：{e}")),
+                    }
                 }
                 MovieMsg::Progress(done) => self.movie.done = done,
                 MovieMsg::Started(i, name, frames) => {
@@ -13279,6 +14039,13 @@ impl App {
         }
         if self.movie.grabbed_at != Some(self.movie.at) {
             self.spawn_movie_grab(ctx);
+        } else if self.movie.mask_shown() {
+            // 遮罩檢視開著時只算那片紅，不去煙：畫形狀時每一筆都要立刻看到
+            // 圈到哪，去煙一趟要一秒，插在中間只會讓筆跡慢半拍
+            // （與去煙霧模組同一個作法）。關掉檢視時再把去煙補上
+            if self.movie.needs_mask_view() {
+                self.spawn_movie_mask_view(ctx);
+            }
         } else if self.movie.base.is_some() && self.movie.needs_render() {
             self.spawn_movie_render(ctx);
         } else if self.movie.needs_grade() {
@@ -13286,39 +14053,48 @@ impl App {
         }
     }
 
-    /// 預覽的分區調色：去煙結果沿用快取，只重跑調色那一段
-    /// （拖調色滑桿、勾選三區時走這一條，見 [`edit::apply_region_grade`]）
+    /// 預覽的調色：去煙結果沿用快取，只重跑調色那一段
+    /// （拖調色滑桿、畫調色的遮色片時走這一條，見 [`movie::apply_active_grade`]）
     fn movie_regrade(&mut self, ctx: &egui::Context) {
         let Some(after) = self.movie.after.clone() else {
             return;
         };
-        let want = self.movie.grade.active();
-        // 三區全部取消了：去煙的結果本來就在手上，直接貼回畫面，
+        let grades = self.movie.active_grade();
+        // 一區都沒作用：去煙的結果本來就在手上，直接貼回畫面，
         // 不必為了「什麼都不調」再開一條執行緒
-        if want.is_empty() {
+        if grades.is_empty() {
             self.movie.after_tex = Some(load_rgb_texture(ctx, "movie_after", &after));
-            self.movie.graded.clear();
+            self.movie.graded = Some(Vec::new());
             return;
         }
-        let grade = self.movie.grade.clone();
         let at = self.movie.at;
-        // 天際線只跟去煙結果有關：同一格拖滑桿時沿用上次量好的那一份
-        let masks = self.movie.masks.clone();
         self.movie.busy = MovieBusy::Rendering;
         let (tx, rx) = std::sync::mpsc::channel();
         self.movie.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let masks = masks.unwrap_or_else(|| Arc::new(edit::RegionMasks::new(&after)));
             let mut out = (*after).clone();
-            edit::apply_region_grade(&mut out, &grade, &masks);
-            let _ = tx.send(MovieMsg::Graded(want, at, out, masks));
+            let (w, h) = (out.width() as usize, out.height() as usize);
+            // 三區依序疊上去，與輸出同一個順序（見 movie::dehaze_batch）
+            for g in &grades {
+                let weights = movie::grade_weights(g, w, h);
+                movie::apply_active_grade(&mut out, g, weights.as_deref());
+            }
+            let _ = tx.send(MovieMsg::Graded(grades, at, out));
             ctx.request_repaint();
         });
     }
 
     /// 「影片去煙霧」模組：整支影片逐格套上同一組去煙參數，輸出成新影片
     fn ui_movie_module(&mut self, ctx: &egui::Context) {
+        // Y 切換前後對照（沿用 Lightroom 的習慣，與去煙霧、煙火疊圖相同）；
+        // 讓給有焦點的輸入元件
+        if self.movie.base.is_some()
+            && ctx.memory(|m| m.focused().is_none())
+            && ctx.input(|i| i.key_pressed(egui::Key::Y))
+        {
+            self.movie.compare = !self.movie.compare;
+        }
         let mut pick = false;
         // 「➕ 加入影片」：排進這一批，全部套同一組設定
         let mut add = false;
@@ -13395,6 +14171,32 @@ impl App {
                     {
                         clear = true;
                     }
+                    if self.movie.src.is_some() {
+                        ui.separator();
+                        // 簡易／專業：預設簡易，就是原本那四項設定加調色；
+                        // 專業多了遮色片（與煙火疊圖的兩段式同一個做法）
+                        ui.add_enabled_ui(!exporting, |ui| {
+                            let pro = self.movie.pro;
+                            if check_label(ui, !pro, "簡易")
+                                .on_hover_text(
+                                    "去煙的四項設定、分區調色與輸出：整片天空都去煙\n\
+                                     （專業模式畫過的遮色片會留著，切回去就回來）",
+                                )
+                                .clicked()
+                            {
+                                self.movie.set_pro(false);
+                            }
+                            if check_label(ui, pro, "專業")
+                                .on_hover_text(
+                                    "多了遮色片：用框選、筆刷、漸層或物件圈出只要去煙的地方，\n\
+                                     整支影片每一格都套同一份（適合腳架固定拍的影片）",
+                                )
+                                .clicked()
+                            {
+                                self.movie.set_pro(true);
+                            }
+                        });
+                    }
                     if let (Some(src), Some(info)) = (&self.movie.src, &self.movie.info) {
                         ui.separator();
                         // 與去煙霧同一套：檔名放大一點，完整路徑用滑鼠停著看
@@ -13424,6 +14226,34 @@ impl App {
                             .size(11.5)
                             .color(theme::TEXT_WEAK),
                         );
+                    }
+                    // 還在編輯狀態時講明白：工具選著時左鍵是拿來畫的、遮罩檢視
+                    // 開著時畫面上那片紅不會出現在成品裡。開關在右欄，
+                    // 捲下去就忘了自己還開著（與煙火疊圖同一個提醒）
+                    if self.movie.tools_open() {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("✏ 編輯中")
+                                .size(12.0)
+                                .color(theme::TRACK),
+                        )
+                        .on_hover_text(if self.movie.crop_editing {
+                            "正在調整裁切範圍（畫面是整格，不是成品；左鍵歸裁切框用）"
+                        } else if self.movie.mask_tool.is_some() {
+                            "遮色片工具還選著（左鍵是拿來畫的）"
+                        } else {
+                            "遮罩檢視開著（畫面上那片紅不會出現在成品裡）"
+                        });
+                        if ui
+                            .small_button("完成編輯")
+                            .on_hover_text(
+                                "收起遮色片工具、遮罩檢視與裁切框，畫面回到去煙後（裁好）的樣子；\
+                                 左鍵回到「按住看原圖」",
+                            )
+                            .clicked()
+                        {
+                            self.movie.end_editing();
+                        }
                     }
                 });
                 // 這一批有哪幾支：點檔名換預覽、拖曳調順序、點 ✕ 拿掉。
@@ -13520,23 +14350,28 @@ impl App {
         }
     }
 
-    /// 「影片去煙霧」的分區調色：地景／天空／煙火各記一組滑桿，勾起來的
-    /// 那幾區才會被調（界線怎麼判見 [`edit::RegionMasks`]）。
+    /// 「影片去煙霧」的調色：**三個遮色區**，每一區各有自己的十二條滑桿與
+    /// 自己那份遮色片，照 1、2、3 的順序疊在去煙之後的每一格上（整支影片共用）。
+    /// 滑桿與另外三個模組完全相同（[`adj_sliders`]）。
     ///
-    /// 滑桿與另外三個模組完全相同（[`adj_sliders`]），差別只在它作用的
-    /// 範圍是自動分出來的那一區，而不是整張畫面
+    /// 專業模式的每一區都可以再勾「套用遮色片」：用與去煙同一套工具圈出只要
+    /// 調色（或不要調色）的地方，其餘一個像素都不動（見 [`GradeZone`]）
     fn ui_movie_grade(&mut self, ui: &mut egui::Ui, exporting: bool) {
         // 按下去只記旗標，畫完這一列才跳確認框（見 ui_adjust_section 的說明）
         let mut ask_clear = false;
+        let tab = self.movie.grade.tab.min(GRADE_ZONES - 1);
+        self.movie.grade.tab = tab;
         ui.horizontal(|ui| {
             section_toggle(ui, "調色", &mut self.movie.grade_open);
-            let dirty = self.movie.grade != RegionGrade::default();
+            let dirty = self.movie.grade.zones[tab].grade != Adjustments::default();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 輸出中一律鎖住，與這個模組其他設定一樣
                 if dirty
                     && ui
-                        .add_enabled(!exporting, egui::Button::new("↺ 清除調色").small())
-                        .on_hover_text("三區的勾選與滑桿一次全部歸零（去煙的設定不受影響）")
+                        .add_enabled(!exporting, egui::Button::new("↺ 清除這一區").small())
+                        .on_hover_text(
+                            "把這一區的十二條滑桿歸零（另外兩區、去煙的設定與遮色片都不受影響）",
+                        )
                         .clicked()
                 {
                     ask_clear = true;
@@ -13546,89 +14381,111 @@ impl App {
         if ask_clear
             && ask2(
                 rfd::MessageLevel::Warning,
-                "清除調色",
-                "將清除分區調色（三區的勾選取消、滑桿全部歸零）。\n\
-                 去煙的設定不受影響。",
+                "清除這一區的調色",
+                &format!(
+                    "將把「遮色區 {}」的十二條滑桿全部歸零。\n\
+                     另外兩區、去煙的設定與遮色片都不受影響。",
+                    tab + 1
+                ),
                 "清除",
                 "取消",
             )
         {
-            self.movie.grade = RegionGrade::default();
+            self.movie.grade.zones[tab].grade = Adjustments::default();
         }
         if !self.movie.grade_open {
             return;
         }
         ui.label(
             egui::RichText::new(
-                "去煙之後才套用。三區是每一格自己分的：天際線以上算天空、\
-                 天空裡亮起來的算煙火，其餘是地景",
+                "去煙之後才套用，整支影片共用同一組。三個遮色區各調各的，\
+                 照 1、2、3 的順序疊上去",
             )
             .size(11.0)
             .color(theme::TEXT_WEAK),
         );
         ui.add_space(4.0);
         ui.add_enabled_ui(!exporting, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for r in Region::ALL {
-                    ui.checkbox(&mut self.movie.grade.on[r.idx()], r.label())
-                        .on_hover_text(r.hint());
-                }
-            });
-            let on: Vec<Region> = Region::ALL
-                .into_iter()
-                .filter(|r| self.movie.grade.on[r.idx()])
-                .collect();
-            let Some(&first) = on.first() else {
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new("勾一區才有滑桿可以調")
-                        .size(11.0)
-                        .color(theme::TEXT_WEAK),
-                );
-                return;
-            };
-            // 三區各十二條一起排下來要捲上老半天，所以一次只顯示一區的滑桿。
+            // 三區各十二條一起排下來要捲上老半天，所以一次只顯示一區的設定。
             // 沒顯示的那幾區照樣記著自己的數字，切回去就在
-            if !on.contains(&self.movie.grade_tab) {
-                self.movie.grade_tab = first;
-            }
-            if on.len() > 1 {
-                ui.add_space(2.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new("調哪一區")
-                            .size(12.5)
-                            .color(theme::TEXT_WEAK),
-                    );
-                    for r in on {
-                        // 動過的那幾區標一下，才不會以為別區的設定不見了
-                        let touched = !self.movie.grade.grade[r.idx()].grade_is_neutral();
-                        let text = if touched {
-                            format!("{}（已調）", r.label())
-                        } else {
-                            r.label().to_string()
-                        };
-                        if check_label(ui, self.movie.grade_tab == r, text).clicked() {
-                            self.movie.grade_tab = r;
+            ui.horizontal_wrapped(|ui| {
+                for i in 0..GRADE_ZONES {
+                    // 調過的那幾區標一下，才不會以為別區的設定不見了
+                    let z = &self.movie.grade.zones[i];
+                    let touched = !z.grade.grade_is_neutral();
+                    let text = if touched {
+                        format!("遮色區 {}（已調）", i + 1)
+                    } else {
+                        format!("遮色區 {}", i + 1)
+                    };
+                    if check_label(ui, tab == i, text)
+                        .on_hover_text(
+                            "每一區各有自己的十二條滑桿與遮色片；\n\
+                             滑桿全歸零的區不作用（不必另外關掉）",
+                        )
+                        .clicked()
+                    {
+                        self.movie.grade.tab = i;
+                        // 工具正對著別區的遮色片時跟著換過來，接下來畫的才是這一區的
+                        if matches!(self.movie.mask_target, MaskTarget::Grade(_)) {
+                            self.movie.mask_target = MaskTarget::Grade(i);
                         }
                     }
-                });
+                }
+            });
+            let tab = self.movie.grade.tab;
+            ui.add_space(2.0);
+            // 套用遮色片是專業模式限定：簡易模式一律整張調
+            if self.movie.pro {
+                let mut on = self.movie.grade.zones[tab].mask_on;
+                if ui
+                    .checkbox(&mut on, "套用遮色片")
+                    .on_hover_text(
+                        "只調畫到的地方（或反過來：畫到的地方不調），其餘一個像素都不動；\n\
+                         不勾就是整個畫面一起調。每一區各有一份，與上面去煙的那份也是分開的",
+                    )
+                    .changed()
+                {
+                    self.movie.grade.zones[tab].mask_on = on;
+                    // 收掉的話，正對著這份畫的工具與檢視也一起收，否則畫面會停在
+                    // 一個看不到設定、也改不動的狀態
+                    if !on && self.movie.mask_target == MaskTarget::Grade(tab) {
+                        self.movie.end_editing();
+                    }
+                }
+                if self.movie.grade.zones[tab].mask_on {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new("畫到的是")
+                                .size(12.5)
+                                .color(theme::TEXT_WEAK),
+                        );
+                        let inv = self.movie.grade.zones[tab].invert;
+                        if check_label(ui, !inv, "調色的區域")
+                            .on_hover_text("畫到的地方才調色，其餘不動")
+                            .clicked()
+                        {
+                            self.movie.grade.zones[tab].invert = false;
+                        }
+                        if check_label(ui, inv, "不調色的區域")
+                            .on_hover_text(
+                                "反過來：畫到的地方**不**調色，其餘都調\n\
+                                 （例如圈住煙火，只調夜空與地景）",
+                            )
+                            .clicked()
+                        {
+                            self.movie.grade.zones[tab].invert = true;
+                        }
+                    });
+                    self.ui_movie_mask_tools(ui, MaskTarget::Grade(tab));
+                }
+                ui.add_space(6.0);
             }
-            let tab = self.movie.grade_tab;
             // 列距收緊到與另外三個模組的調色面板相同（畫完再還原）
             let keep_gap = ui.spacing().item_spacing.y;
             ui.spacing_mut().item_spacing.y = ADJ_ROW_GAP;
-            adj_sliders(ui, &mut self.movie.grade.grade[tab.idx()]);
+            adj_sliders(ui, &mut self.movie.grade.zones[tab].grade);
             ui.spacing_mut().item_spacing.y = keep_gap;
-            ui.add_space(4.0);
-            if !self.movie.grade.grade[tab.idx()].grade_is_neutral()
-                && ui
-                    .small_button(format!("↺ {} 歸零", tab.label()))
-                    .on_hover_text("只把這一區的滑桿歸零，另外兩區不動")
-                    .clicked()
-            {
-                self.movie.grade.grade[tab.idx()] = Adjustments::default();
-            }
         });
     }
 
@@ -13637,6 +14494,10 @@ impl App {
     fn ui_movie_side(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
         let (mut export, mut stop) = (false, false);
         let exporting = self.movie.busy == MovieBusy::Exporting;
+        // 清掉最後一個形狀時遮罩檢視自己關掉、畫出第一個形狀時又自己亮起來
+        // （對著哪一份遮色片就看哪一份，見 [`MovieTool::sync_mask_view`]）
+        let can_show = self.movie.target_can_show();
+        self.movie.sync_mask_view(can_show);
 
         ui.label(
             egui::RichText::new("去煙霧")
@@ -13683,10 +14544,23 @@ impl App {
             .color(theme::TEXT_WEAK),
         );
 
+        // 遮色片是專業模式限定：簡易模式整片天空都去煙，沒有東西可圈
+        if self.movie.pro {
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(8.0);
+            self.ui_movie_mask(ui, exporting);
+        }
+
         ui.add_space(14.0);
         ui.separator();
         ui.add_space(8.0);
         self.ui_movie_grade(ui, exporting);
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+        self.ui_movie_crop(ui, exporting);
 
         ui.add_space(14.0);
         ui.separator();
@@ -13717,16 +14591,18 @@ impl App {
                     // 預覽底圖的大小跟著輸出尺寸走，換了就要重取一格
                     self.movie.grabbed_at = None;
                 }
-                if let (Some((ow, oh)), Some(i)) = (self.movie.out_dims(), self.movie.info.as_ref())
+                if let (Some((ow, oh)), Some((cw, ch))) =
+                    (self.movie.out_dims(), self.movie.cropped_dims())
                 {
-                    let same = (ow, oh) == (i.w, i.h);
+                    // 與裁切後的那一塊比：有裁切時「不縮」指的是裁完不再縮
+                    let same = (ow, oh) == (cw, ch);
                     ui.label(
                         egui::RichText::new(format!("{ow}×{oh}"))
                             .size(11.5)
                             .color(if same { theme::TEXT_WEAK } else { theme::ACCENT }),
                     )
                     .on_hover_text(if same {
-                        "與來源同尺寸，不縮"
+                        "與來源（裁切後）同尺寸，不縮"
                     } else {
                         "縮小在去煙之前做，所以畫面愈小跑得愈快\n\
                          （像素少一半，時間大約也少一半）"
@@ -13768,7 +14644,16 @@ impl App {
         };
         let total = info.frames();
         let (ow, oh) = self.movie.size.apply(info.w, info.h);
-        let workers = movie_workers(ow, oh, self.movie.grade.is_active());
+        // 任何一段有調色，輸出時就要多攤開調色的記憶體。
+        // 順便算出最多有幾區要跑（下面的說明要講「每一格多跑幾趟」）
+        let zones = self
+            .movie
+            .segments
+            .iter()
+            .map(|s| self.movie.grade.active(self.movie.pro, s).len())
+            .max()
+            .unwrap_or(0);
+        let workers = movie_workers(ow, oh, zones > 0);
 
         if exporting {
             let done = self.movie.done;
@@ -13832,10 +14717,9 @@ impl App {
             }
             ui.ctx().request_repaint_after(Duration::from_millis(300));
         } else {
-            // 勾了調色的話，每一格在去煙之後還要照勾了幾區各跑一趟調色，
+            // 有調色的話，每一格在去煙之後還要照有幾區各跑一趟調色，
             // 一萬格乘下來不是小數目，先講在前面
-            let graded = self.movie.grade.active().len();
-            let extra = match graded {
+            let extra = match zones {
                 0 => String::new(),
                 n => format!("調色有 {n} 區，每一格去完煙還要再跑 {n} 趟調色。"),
             };
@@ -13921,48 +14805,811 @@ impl App {
         (export, stop)
     }
 
+    /// 專業模式的「遮色片」區塊：選一種工具直接在預覽上畫，只有畫到的地方
+    /// 會去煙。控制項與去煙霧模組那一組相同（工具列、各工具的選項、
+    /// 羽化與濃度、遮罩檢視），差別只在這裡畫的一份是**整支影片每一格共用**的
+    fn ui_movie_mask(&mut self, ui: &mut egui::Ui, exporting: bool) {
+        ui.label(
+            egui::RichText::new("🎭 遮色片")
+                .size(SECTION_FONT)
+                .strong()
+                .color(theme::TEXT),
+        );
+        ui.add_space(4.0);
+        // 輸出中一律鎖住，與這個模組其他設定一樣
+        ui.add_enabled_ui(!exporting, |ui| {
+            self.ui_movie_mask_tools(ui, MaskTarget::Dehaze);
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "沒分段就是整支每一格都套同一份遮色片（腳架固定拍的影片就這樣即可）。\
+                 鏡頭會動的話，用時間軸下面的「✂ 在此分段」在鏡頭移動的地方切一刀，\
+                 每一段各畫各的；多拉幾個時間點確認圈到的位置一路都對",
+            )
+            .size(11.0)
+            .color(theme::TEXT_WEAK),
+        );
+    }
+
+    /// 某一份遮色片的工具列與選項：五種工具、還原／清除、各工具自己的選項、
+    /// 邊緣羽化與筆刷濃度、顯示遮色片。去煙的那份與調色的那份長得一模一樣，
+    /// 差別只在畫進哪一份、以及說明文字講的是「去煙」還是「調色」
+    fn ui_movie_mask_tools(&mut self, ui: &mut egui::Ui, target: MaskTarget) {
+        let verb = target.verb();
+        // 工具列的高亮只認「對著這一份」的工具：另一份的工具選著時這排全暗
+        let mine = self.movie.mask_target == target;
+        let tool = if mine { self.movie.mask_tool } else { None };
+        // 切了段就講清楚現在畫的是哪一段的：拖時間軸換到別段，形狀會跟著換
+        let n = self.movie.segments.len();
+        if n > 1 {
+            let k = self.movie.seg_idx();
+            let secs = self.movie.info.as_ref().map(|i| i.secs).unwrap_or(0.0);
+            let (s0, s1) = self.movie.seg_span(k, secs);
+            ui.label(
+                egui::RichText::new(format!(
+                    "現在畫的是第 {}/{} 段（{}～{}）的遮色片",
+                    k + 1,
+                    n,
+                    fmt_video_len(s0),
+                    fmt_video_len(s1)
+                ))
+                .size(11.0)
+                .color(theme::TRACK),
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (t, label, tip) in [
+                (MaskTool::Rect, "框選", format!("拖曳框出一塊，只有框內{verb}")),
+                (
+                    MaskTool::Brush,
+                    "筆刷",
+                    format!("在畫面上塗，塗到的地方才{verb}；同一塊想更濃就再塗一遍"),
+                ),
+                (
+                    MaskTool::Linear,
+                    "線性漸層",
+                    "從起點全效果、沿著拖曳方向漸弱，到終點完全不動".to_string(),
+                ),
+                (
+                    MaskTool::Radial,
+                    "放射性漸層",
+                    format!("由中心往外拖出橢圓，圓內{verb}；可反轉成只處理圓外"),
+                ),
+                (
+                    MaskTool::Object,
+                    "物件",
+                    "框住要選的東西（一朵煙火、一團煙），\n\
+                     程式會自動找出框裡那個東西的輪廓。\n\
+                     框得貼近一點選得越準；選完可再調羽化與邊緣"
+                        .to_string(),
+                ),
+            ] {
+                if check_label(ui, tool == Some(t), label).on_hover_text(tip).clicked() {
+                    self.movie.pick_mask_tool(target, t);
+                }
+            }
+            let n = self.movie.mask_of(target).0.len();
+            if n > 0 {
+                ui.separator();
+                if ui
+                    .small_button("↩ 還原一個")
+                    .on_hover_text("拿掉這份遮色片最後畫上去的那個形狀")
+                    .clicked()
+                {
+                    self.movie.mask_mut(target).0.pop();
+                }
+                if ui
+                    .small_button("清除遮色片")
+                    .on_hover_text(format!(
+                        "只清「{}」這一段的形狀，其他遮色片與別段不受影響",
+                        target.label()
+                    ))
+                    .clicked()
+                {
+                    self.movie.mask_mut(target).0.clear();
+                }
+                ui.label(
+                    egui::RichText::new(format!("（{n} 個形狀）"))
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            }
+        });
+        // 還沒畫遮色片時的說明自己佔一行（跟在按鈕後面會被擠成兩截）
+        if self.movie.mask_of(target).0.is_empty() {
+            let whole = match target {
+                MaskTarget::Dehaze => "整片天空都去煙",
+                MaskTarget::Grade(_) => "整個畫面都調",
+            };
+            ui.label(
+                egui::RichText::new(if tool.is_some() {
+                    format!("直接在畫面上拖曳；不畫就是{whole}。畫好的框、漸層可以直接拖著搬")
+                } else {
+                    match target {
+                        MaskTarget::Dehaze => {
+                            "預設不用遮色片（整片天空都去煙，地景與水面不動）；要再縮小範圍才選一種工具"
+                                .to_string()
+                        }
+                        MaskTarget::Grade(_) => {
+                            "還沒畫就是整個畫面一起調；要只調（或只放過）某一塊才選一種工具"
+                                .to_string()
+                        }
+                    }
+                })
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+        }
+
+        // 各工具自己的選項（與去煙霧同一組、同一個順序）
+        match tool {
+            Some(MaskTool::Brush) => {
+                slider_row(ui, &mut self.movie.brush_size, 1, 40, "尺寸");
+            }
+            Some(MaskTool::Radial) => {
+                ui.horizontal(|ui| {
+                    let mut inv = self.movie.radial_invert;
+                    if ui.checkbox(&mut inv, "反轉（只處理橢圓外）").changed() {
+                        self.movie.radial_invert = inv;
+                        // 剛畫好就想反轉是最常見的用法，直接改在最後那個上面
+                        if let Some(dehaze::Shape::Radial(r)) =
+                            self.movie.mask_mut(target).0.last_mut()
+                        {
+                            r.invert = inv;
+                        }
+                    }
+                });
+            }
+            Some(MaskTool::Object) => {
+                let (f0, e0) = (self.movie.object_feather, self.movie.object_edge);
+                let (mut f, mut e) = (f0, e0);
+                slider_row(ui, &mut f, 0, 100, "羽化");
+                slider_row(ui, &mut e, -100, 100, "邊緣");
+                if (f, e) != (f0, e0) {
+                    self.movie.object_feather = f;
+                    self.movie.object_edge = e;
+                    // 剛框完就想調鬆一點是最常見的用法，直接改在最後選的那一個上面
+                    self.movie_refine_object(f, e);
+                }
+                ui.label(
+                    egui::RichText::new(OBJECT_HINT)
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            }
+            _ => {}
+        }
+        // 羽化與濃度：這一份遮色片共用。「物件」兩條都不吃（見去煙霧那邊的說明）
+        if tool != Some(MaskTool::Object) {
+            let (_, feather, density) = self.movie.mask_mut(target);
+            slider_row(ui, feather, 0, 100, "邊緣羽化");
+            slider_row(ui, density, 0, 100, "筆刷濃度");
+            ui.label(
+                egui::RichText::new(MASK_HINT)
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
+            );
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            // 沒有形狀時這顆沒有意義：遮罩檢視只會蓋出一片紅（或整片乾淨），
+            // 看不出使用者畫了什麼，所以沒東西可看就停用它
+            let can_show = self
+                .movie
+                .mask_of(target)
+                .0
+                .iter()
+                .any(|s| s.cleaned().is_some());
+            let shown = mine && self.movie.show_mask;
+            let r = ui.add_enabled_ui(can_show, |ui| {
+                check_label(ui, shown, "顯示遮色片")
+                    .on_hover_text(format!("紅色蓋住的地方不會被{verb}"))
+                    .clicked()
+            });
+            r.response
+                .on_disabled_hover_text("先畫一個遮色片才有東西可看");
+            if r.inner {
+                self.movie.toggle_mask_view(target);
+            }
+        });
+    }
+
+    /// 影片預覽上的遮色片繪製與搬移（專業模式）。`img` 是畫面實際畫出來的矩形，
+    /// `hit` 是可以動手的範圍。與去煙霧模組的畫布是同一套操作：選了工具就用
+    /// 左鍵拖著畫，遮罩檢視開著時按在既有的框、漸層上可以把它搬走
+    fn ui_movie_mask_interaction(
+        &mut self,
+        ui: &mut egui::Ui,
+        resp: &egui::Response,
+        img: egui::Rect,
+        hit: egui::Rect,
+    ) {
+        // 畫面座標→相對座標（0~1）：用相對座標存才能同時套用在預覽縮圖
+        // 與成品尺寸的每一格上
+        let to_norm = |p: egui::Pos2| {
+            egui::pos2(
+                ((p.x - img.left()) / img.width()).clamp(0.0, 1.0),
+                ((p.y - img.top()) / img.height()).clamp(0.0, 1.0),
+            )
+        };
+        let to_screen = |p: egui::Pos2| {
+            egui::pos2(img.left() + p.x * img.width(), img.top() + p.y * img.height())
+        };
+        let inside = |p: egui::Pos2| img.contains(p) && hit.contains(p);
+
+        // 工具與檢視正對著哪一份遮色片，就畫哪一份、改哪一份
+        let target = self.movie.mask_target;
+        let (_, feather, _) = self.movie.mask_of(target);
+        // 已經畫上去的形狀先畫，正在拖的那個才蓋在上面。輪廓由「顯示遮色片」
+        // 說了算（與去煙霧同一個規則）；正在拖的那一筆仍有即時回饋
+        let outlines = self.movie.show_mask;
+        if outlines {
+            let shapes: Vec<dehaze::Shape> = self
+                .movie
+                .mask_of(target)
+                .0
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match self.movie.moving {
+                    // 搬移中的那一個畫在暫時的位置，放開才真的寫回去
+                    Some((mi, d)) if mi == i => shape_moved(s, d),
+                    _ => s.clone(),
+                })
+                .collect();
+            match shapes.as_slice() {
+                [dehaze::Shape::Rect(r)]
+                    if self.movie.draft.is_none() && self.movie.moving.is_none() =>
+                {
+                    paint_selection(
+                        ui,
+                        img,
+                        egui::Rect::from_two_pos(
+                            to_screen(egui::pos2(r.x0, r.y0)),
+                            to_screen(egui::pos2(r.x1, r.y1)),
+                        ),
+                    )
+                }
+                shapes => paint_shapes(ui, img, shapes, feather),
+            }
+        }
+
+        let tool = self.movie.mask_tool;
+        let radius = self.movie.brush_radius();
+        if tool == Some(MaskTool::Object) && resp.hover_pos().is_some_and(inside) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        // 按在已經畫好的形狀上＝把它整個搬走，不是再畫一個
+        if resp.drag_started() && outlines {
+            let shapes = self.movie.mask_of(target).0;
+            self.movie.moving = resp
+                .interact_pointer_pos()
+                .filter(|p| hit.contains(*p))
+                .and_then(|p| shape_at(shapes, p, img))
+                .filter(|&i| shape_movable(&shapes[i]))
+                .map(|i| (i, egui::Vec2::ZERO));
+        }
+        // 拖到一半視窗失焦之類的情況不會送 drag_stopped，沒有這道保險就會永遠卡在搬移狀態
+        if self.movie.moving.is_some() && !resp.dragged() && !resp.drag_stopped() {
+            self.movie.moving = None;
+        }
+        if self.movie.moving.is_some() {
+            let d = resp.drag_delta();
+            if let Some((_, acc)) = self.movie.moving.as_mut() {
+                *acc += egui::vec2(d.x / img.width(), d.y / img.height());
+            }
+            if resp.drag_stopped() {
+                if let Some((i, acc)) = self.movie.moving.take() {
+                    let shapes = self.movie.mask_mut(target).0;
+                    if let Some(s) = shapes.get(i).cloned() {
+                        shapes[i] = shape_moved(&s, acc);
+                    }
+                }
+            }
+            // 搬移中不再開新的 draft，也不處理下面那一整段
+            self.movie.draft = None;
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            return;
+        }
+        if resp.drag_started() {
+            self.movie.draft = tool.and_then(|tool| {
+                resp.interact_pointer_pos()
+                    .filter(|p| inside(*p))
+                    .map(to_norm)
+                    .map(|p| match tool {
+                        MaskTool::Rect => Draft::Rect(p, p),
+                        MaskTool::Linear => Draft::Linear(p, p),
+                        MaskTool::Radial => Draft::Radial(p, p),
+                        MaskTool::Brush => Draft::Brush(vec![[p.x, p.y]]),
+                        MaskTool::Object => Draft::Object(p, p),
+                    })
+            });
+        }
+        // 游標停在既有形狀上時先講清楚「這個抓得動」
+        if self.movie.draft.is_none() && outlines {
+            if let Some(p) = resp.hover_pos().filter(|p| hit.contains(*p)) {
+                let shapes = self.movie.mask_of(target).0;
+                if shape_at(shapes, p, img).is_some_and(|i| shape_movable(&shapes[i])) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+            }
+        }
+        let now = resp.interact_pointer_pos().map(to_norm);
+        if let (Some(d), Some(now)) = (self.movie.draft.as_mut(), now) {
+            let stopped = resp.drag_stopped();
+            match d {
+                Draft::Rect(_, b) | Draft::Linear(_, b) | Draft::Radial(_, b) | Draft::Object(_, b) => {
+                    *b = now
+                }
+                Draft::Brush(pts) => {
+                    // 取樣點太密只是把資料撐大；放開的那一下不論多近都要收進來
+                    let far = pts.last().is_none_or(|l| {
+                        let (dx, dy) = (now.x - l[0], now.y - l[1]);
+                        dx * dx + dy * dy > BRUSH_STEP * BRUSH_STEP
+                    });
+                    if pts.len() < MAX_BRUSH_PTS && (far || stopped) {
+                        pts.push([now.x, now.y]);
+                    }
+                }
+            }
+        }
+        let invert = self.movie.radial_invert;
+        if let Some(d) = &self.movie.draft {
+            match d {
+                // 框選沿用「框外壓暗」的即時回饋；物件也是拉一個框
+                Draft::Rect(a, b) | Draft::Object(a, b) => paint_selection(
+                    ui,
+                    img,
+                    egui::Rect::from_two_pos(to_screen(*a), to_screen(*b)),
+                ),
+                d => {
+                    if let Some(s) = d.to_shape(radius, invert) {
+                        paint_shape(ui, img, &s, feather)
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            match self.movie.draft.take() {
+                // 物件：框只講「東西在這一塊裡」，輪廓要從畫面內容算出來
+                Some(Draft::Object(a, b)) => self.movie_pick_object(a, b),
+                Some(d) => {
+                    if let Some(shape) = d.to_shape(radius, invert).and_then(|s| s.cleaned()) {
+                        if self.movie.push_shape(shape) {
+                            self.movie.error = None;
+                        } else {
+                            self.movie.error = Some(format!(
+                                "遮色片最多 {} 個形狀，請先清除再畫",
+                                dehaze::MAX_SHAPES
+                            ));
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        // 筆刷游標：先看得到會刷多粗、邊緣多柔，才不會塗完才發現不對
+        if tool == Some(MaskTool::Brush) {
+            if let Some(p) = resp.hover_pos().filter(|p| inside(*p)) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                let r = radius * img.width().max(img.height());
+                // 內圈與 dehaze::stamp 的 inner 同一個算法
+                let inner = r * (1.0 - feather as f32 / 100.0);
+                paint_brush_cursor(ui.painter(), p, r, inner);
+            }
+        }
+    }
+
+    /// 「物件」工具：在預覽那一格上找出框住的那一塊裡面那個東西的輪廓，
+    /// 圈成一個遮色片形狀（與 [`App::smoke_pick_object`] 同一套）
+    fn movie_pick_object(&mut self, a: egui::Pos2, b: egui::Pos2) {
+        let Some(base) = self.movie.base.clone() else {
+            return;
+        };
+        // 手滑點了一下就當作沒這回事（見 [`OBJECT_MIN_BOX`]）
+        if (b.x - a.x).abs() < OBJECT_MIN_BOX || (b.y - a.y).abs() < OBJECT_MIN_BOX {
+            return;
+        }
+        let sel = Draft::region(a, b);
+        let (f, e) = (self.movie.object_feather, self.movie.object_edge);
+        match dehaze::select_object(&base, sel, f, e) {
+            Some(o) => {
+                if self.movie.push_shape(dehaze::Shape::Object(o)) {
+                    self.movie.error = None;
+                } else {
+                    self.movie.error =
+                        Some(format!("遮色片最多疊 {} 個形狀", dehaze::MAX_SHAPES));
+                }
+            }
+            None => {
+                self.movie.error =
+                    Some("這個框裡分不出東西——把框拉得貼近要選的那個東西再框一次".into())
+            }
+        }
+    }
+
+    /// 就地改剛選好的那個物件的羽化／邊緣（不重跑分割，見 [`dehaze::Object::refined`]）。
+    /// 改的是工具正對著的那一份遮色片裡最後那一個
+    fn movie_refine_object(&mut self, feather: i32, edge: i32) {
+        let target = self.movie.mask_target;
+        if let Some(dehaze::Shape::Object(o)) = self.movie.mask_mut(target).0.last_mut() {
+            *o = o.refined(feather, edge);
+        }
+    }
+
+    /// 「裁切」：整支影片共用一個裁切框，在去煙之前裁（與縮小同一個道理：
+    /// 裁掉的地方不必花力氣去煙，輸出也跟著小）。比例與裁切框的操作
+    /// 與另外幾個模組相同（[`crop_overlay`]），只是影片只裁不轉
+    fn ui_movie_crop(&mut self, ui: &mut egui::Ui, exporting: bool) {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("裁切")
+                    .size(SECTION_FONT)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !self.movie.crop.is_full()
+                    && ui
+                        .add_enabled(!exporting, egui::Button::new("↺ 重設裁切").small())
+                        .on_hover_text("回到整格輸出")
+                        .clicked()
+                {
+                    self.movie.crop = Crop::default();
+                    self.movie.crop_aspect = CropAspect::Free;
+                    // 底圖是照舊的框抓的，重取一格
+                    self.movie.invalidate_frame();
+                }
+            });
+        });
+        ui.add_space(4.0);
+        let src = self.movie.info.as_ref().map(|i| (i.w, i.h));
+        ui.add_enabled_ui(!exporting && self.movie.info.is_some(), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let editing = self.movie.crop_editing;
+                if check_label(ui, editing, "✂ 調整裁切範圍")
+                    .on_hover_text(
+                        "開著時預覽會顯示整格，直接拖曳四角、四邊或框內移動。\n\
+                         裁好後在畫面上連點兩下（或再按這顆）就收工，改看裁好的樣子。\n\
+                         輸出時才真的切下去，原始影片不會被更動",
+                    )
+                    .clicked()
+                {
+                    self.movie.set_crop_editing(!editing);
+                }
+                match (self.movie.cropped_dims(), src) {
+                    (Some((w, h)), Some((sw, sh))) if !self.movie.crop.is_full() => {
+                        let pct = (w as f32 * h as f32) / (sw as f32 * sh as f32) * 100.0;
+                        ui.label(
+                            egui::RichText::new(format!("{w} × {h}（原本的 {pct:.0}%）"))
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                        );
+                    }
+                    _ => {
+                        ui.label(
+                            egui::RichText::new("目前沒有裁切（整格輸出）")
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                        );
+                    }
+                }
+            });
+            // 比例只有在調整裡才有意義（不調整時看不到框，按了也沒有回饋）
+            if self.movie.crop_editing {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("比例")
+                            .size(12.5)
+                            .color(theme::TEXT_WEAK),
+                    );
+                    for preset in MOVIE_CROP_ASPECTS {
+                        // 按過「⇄ 轉向」之後存的是對調過的比例，那一顆要仍然亮著
+                        let on = self.movie.crop_aspect == preset
+                            || self.movie.crop_aspect == preset.flipped();
+                        if check_label(ui, on, preset.label()).clicked() {
+                            self.movie.crop_aspect = preset;
+                            // 換比例就立刻把現有的框調成那個比例，不必再自己拖一次
+                            if let Some(r) = preset.ratio(src) {
+                                self.movie.crop = crop_to_ratio(self.movie.crop, r, src);
+                            }
+                        }
+                    }
+                    let flippable = matches!(self.movie.crop_aspect, CropAspect::Ratio(a, b) if a != b);
+                    if ui
+                        .add_enabled(flippable, egui::Button::new("⇄ 轉向").small())
+                        .on_hover_text("直式與橫式對調（例如 16:9 換成 9:16）")
+                        .clicked()
+                    {
+                        self.movie.crop_aspect = self.movie.crop_aspect.flipped();
+                        if let Some(r) = self.movie.crop_aspect.ratio(src) {
+                            self.movie.crop = crop_to_ratio(self.movie.crop, r, src);
+                        }
+                    }
+                });
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "裁切在去煙之前做：裁掉的地方不必算，輸出也跟著小。\
+                 整支影片（含同一批的其他支）共用同一個框",
+            )
+            .size(11.0)
+            .color(theme::TEXT_WEAK),
+        );
+    }
+
     /// 中央的預覽：一格畫面加下面那條時間軸
     fn ui_movie_preview(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_size();
-        // 底下留給時間軸那一列
-        let img_h = (avail.y - 40.0).max(100.0);
+        // 預覽的高度：可用高度扣掉下面那幾列控制項（上一幀量到的實際高度）與
+        // 拖曳把手，再加上使用者用把手拖出來的差額（見 MovieTool::img_extra）
+        const BAR_H: f32 = 10.0;
+        let want = avail.y - self.movie.ctrl_h - BAR_H - 12.0;
+        let img_min = (avail.y * 0.30).max(120.0);
+        // 上限不是 want：拉得比自動配高還高時，下面那幾列改成可以捲
+        // （見下面的 ScrollArea），所以往下拖也真的會變高，不會卡在自動配高
+        // 那裡動不了、往回拖卻立刻縮（實際回報過的狀況）。至少留一列的高度
+        let img_max = (avail.y - BAR_H - 40.0).max(img_min);
+        let img_h = (want + self.movie.img_extra).clamp(img_min, img_max);
+        // 夾住的結果只在「往回收」時寫回去（與去煙霧、煙火疊圖同一個作法）
+        let settled = img_h - want;
+        if settled.abs() < self.movie.img_extra.abs() {
+            self.movie.img_extra = settled;
+        }
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(avail.x, img_h),
             egui::Sense::click_and_drag(),
         );
         ui.painter().rect_filled(rect, 8, theme::PREVIEW_BG);
 
-        // 壓著看原圖：與去煙霧模組的習慣一致（放開就回到處理後的樣子）
-        self.movie.show_before = resp.is_pointer_button_down_on();
-        let showing_before = self.movie.show_before || self.movie.after_tex.is_none();
-        let tex = if showing_before {
-            self.movie.base_tex.as_ref()
+        // 試播：播放中（或暫停著）畫的是那一小段的格，不是停著的那一格
+        self.movie_tick_clip(ui.ctx());
+        let clip_on = self.movie.show_clip && self.movie.clip_tex.is_some();
+
+        let compare = self.movie.compare;
+        // 專業模式選了遮色片工具、或開著遮罩檢視時，左鍵是拿來畫（搬）形狀的，
+        // 「按住看原圖」讓開；前後對照時兩張都在畫面上，也用不著按。
+        // 試播中畫面在動，遮色片與按住看原圖都先讓開
+        // 調整裁切範圍時左鍵歸裁切框用，畫面也是整格（不是成品）
+        let cropping = self.movie.crop_editing;
+        let mask_canvas = !clip_on
+            && !cropping
+            && self.movie.pro
+            && (self.movie.mask_tool.is_some() || self.movie.show_mask);
+        self.movie.show_before = !compare
+            && !mask_canvas
+            && !clip_on
+            && !cropping
+            && resp.is_pointer_button_down_on();
+        let mask_view = !clip_on && self.movie.mask_shown() && self.movie.mask_tex.is_some();
+        let base_t = if clip_on {
+            self.movie.clip_base_tex.as_ref()
         } else {
-            self.movie.after_tex.as_ref()
+            self.movie.base_tex.as_ref()
         };
-        if let Some(t) = tex {
-            let r = fit_rect(t.size_vec2(), rect.shrink(6.0));
-            ui.painter().image(
-                t.id(),
-                r,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
+        // 「處理後」那一張：遮罩檢視優先；還沒算出結果時先放原圖，畫面才不會空著
+        let result_t = if clip_on {
+            self.movie.clip_tex.as_ref()
+        } else if mask_view {
+            self.movie.mask_tex.as_ref()
+        } else {
+            self.movie.after_tex.as_ref().or(base_t)
+        };
+        // 勾了調色就講清楚畫面上這張已經連調色一起套過了
+        let graded = !self.movie.active_grade().is_empty();
+        let result_tag = if clip_on {
+            if graded {
+                "去煙霧＋調色後（試播）"
+            } else {
+                "去煙霧後（試播）"
+            }
+        } else if mask_view {
+            match self.movie.mask_target {
+                MaskTarget::Dehaze => "遮色片（紅色不去煙）",
+                MaskTarget::Grade(i) => grade_mask_tag(i),
+            }
+        } else if self.movie.after_tex.is_none() {
+            "原始畫面"
+        } else if graded {
+            "去煙霧＋調色後"
+        } else {
+            "去煙霧後"
+        };
+        let base_tag = if clip_on { "原始畫面（試播）" } else { "原始畫面" };
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+
+        // 左右兩格（單張時只有右邊那一格，佔滿）。前後對照時左原始、右處理後，
+        // 中間留一條縫；遮色片畫在右邊那格上（與去煙霧模組一致）
+        let gap = 8.0;
+        let (left_view, view) = if compare {
+            let half = (rect.width() - gap) / 2.0;
+            (
+                Some(egui::Rect::from_min_size(rect.min, egui::vec2(half, rect.height()))),
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.min.x + half + gap, rect.min.y),
+                    egui::vec2(half, rect.height()),
+                ),
+            )
+        } else {
+            (None, rect)
+        };
+
+        let ppp = ui.ctx().pixels_per_point();
+        // 顯示尺度以**成品**為準：100%＝成品 1 像素對螢幕 1 個實體像素
+        // （與另外幾個模組同一個尺規）。畫布是成品尺度的那一格——調整裁切範圍時
+        // 是裁切前的整格（裁切那塊剛好等於成品），其餘就是成品本身；
+        // 兩格的貼圖同一個長寬比，共用同一個畫布
+        let nominal = self
+            .movie
+            .canvas_dims()
+            .or_else(|| result_t.or(base_t).map(|t| t.size_vec2()))
+            .unwrap_or(egui::vec2(16.0, 9.0));
+        // 「符合視窗」時的比例（照右邊那格算；兩格一樣大）
+        let fit_scale = fit_rect(nominal, view.shrink(6.0)).width() / nominal.x * ppp;
+        // 滾輪縮放：以 1.25 為級距，縮到比「符合視窗」還小就回到符合視窗
+        let wheel = if ui.rect_contains_pointer(rect) {
+            ui.input(|i| i.raw_scroll_delta.y)
+        } else {
+            0.0
+        };
+        if wheel != 0.0 {
+            let z = self.movie.zoom.unwrap_or(fit_scale);
+            let next = z * if wheel > 0.0 { 1.25 } else { 1.0 / 1.25 };
+            self.movie.zoom = (next > fit_scale * 1.02).then_some(next.min(16.0));
+        }
+        let zoom = self.movie.zoom;
+        // 依縮放與平移算出那一格畫在 `view` 裡的矩形
+        let place = |view: egui::Rect, pan: egui::Pos2| -> egui::Rect {
+            match zoom {
+                None => fit_rect(nominal, view.shrink(6.0)),
+                Some(z) => {
+                    let size = nominal * (z / ppp);
+                    snap_to_pixels(
+                        egui::Rect::from_min_size(
+                            view.center() - egui::vec2(pan.x * size.x, pan.y * size.y),
+                            size,
+                        ),
+                        ppp,
+                    )
+                }
+            }
+        };
+        // 放大後拖著平移：中鍵、右鍵一律可以；左鍵在沒被遮色片工具或裁切框佔用時
+        // 也可以。兩格的貼圖同一個畫布，共用同一個位置就會一起動
+        match zoom {
+            Some(z) => {
+                let size = nominal * (z / ppp);
+                if ui.rect_contains_pointer(rect) {
+                    let left_pans = !mask_canvas && !cropping;
+                    if left_pans {
+                        ui.ctx().set_cursor_icon(if ui.input(|i| i.pointer.primary_down()) {
+                            egui::CursorIcon::Grabbing
+                        } else {
+                            egui::CursorIcon::Grab
+                        });
+                    }
+                    let d = ui.input(|i| {
+                        if i.pointer.middle_down()
+                            || i.pointer.secondary_down()
+                            || (left_pans && i.pointer.primary_down())
+                        {
+                            i.pointer.delta()
+                        } else {
+                            egui::Vec2::ZERO
+                        }
+                    });
+                    if d != egui::Vec2::ZERO {
+                        self.movie.pan.x -= d.x / size.x;
+                        self.movie.pan.y -= d.y / size.y;
+                    }
+                }
+                // 夾住：畫面比那格窄的方向置中，寬的方向不讓邊緣拖進畫面裡
+                let half = egui::vec2(view.width() / size.x, view.height() / size.y) * 0.5;
+                let clamp_axis = |v: f32, h: f32| if h >= 0.5 { 0.5 } else { v.clamp(h, 1.0 - h) };
+                self.movie.pan.x = clamp_axis(self.movie.pan.x, half.x);
+                self.movie.pan.y = clamp_axis(self.movie.pan.y, half.y);
+            }
+            None => self.movie.pan = egui::pos2(0.5, 0.5),
+        }
+        let pan = self.movie.pan;
+        // 目前的顯示比例（成品尺度；還沒有畫面時算不出來）
+        self.movie.zoom_pct = (base_t.is_some() || result_t.is_some())
+            .then(|| zoom.unwrap_or(fit_scale) * 100.0);
+
+        // 可以畫遮色片的那一張畫在哪（放大後會超出那一格，畫的時候要裁）
+        let mut img: Option<egui::Rect> = None;
+        if let (Some(lv), Some(t)) = (left_view, base_t) {
+            let r = place(lv, pan);
+            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(lv));
+            c.set_clip_rect(lv);
+            c.painter().image(t.id(), r, uv, egui::Color32::WHITE);
+            pane_label(ui, r.intersect(lv), base_tag);
+        }
+        let (t, tag) = if !compare && self.movie.show_before {
+            (base_t, base_tag)
+        } else {
+            (result_t, result_tag)
+        };
+        if let Some(t) = t {
+            let r = place(view, pan);
+            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(view));
+            c.set_clip_rect(view);
+            c.painter().image(t.id(), r, uv, egui::Color32::WHITE);
+            pane_label(ui, r.intersect(view), tag);
+            img = Some(r);
+        }
+        if compare {
+            ui.painter().vline(
+                rect.center().x,
+                rect.y_range(),
+                egui::Stroke::new(1.0, theme::DIVIDER),
             );
-            // 勾了調色就講清楚畫面上這張已經連調色一起套過了
-            let tag = match (showing_before, self.movie.grade.is_active()) {
-                (true, _) => "原始畫面",
-                (false, true) => "去煙霧＋調色後",
-                (false, false) => "去煙霧後",
-            };
-            pane_label(ui, r, tag);
+        }
+        // 專業模式：在畫面上畫遮色片、搬形狀（與去煙霧模組同一套操作）。
+        // 輪廓與筆刷游標一樣只畫在那一格裡面
+        if let (true, Some(img)) = (mask_canvas, img) {
+            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(view));
+            c.set_clip_rect(view);
+            self.ui_movie_mask_interaction(&mut c, &resp, img, view);
+        }
+        // 調整裁切範圍：畫面是整格，裁切框畫在右邊那格（單張時就是唯一那格）上，
+        // 與另外幾個模組同一顆元件；連點兩下＝裁好了，改看裁好的樣子
+        if let (true, Some(img)) = (cropping, img) {
+            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(view));
+            c.set_clip_rect(view);
+            let cur = self.movie.crop;
+            let src = self.movie.info.as_ref().map(|i| (i.w, i.h));
+            let ratio = self.movie.crop_aspect.ratio(src);
+            let (next, done) = crop_overlay(&mut c, &resp, img, cur, ratio);
+            if next != cur {
+                self.movie.crop = next;
+            }
+            if done {
+                self.movie.set_crop_editing(false);
+            }
         }
         // 還在忙就講一句，不然畫面停著不動像當掉
-        let note = match self.movie.busy {
-            MovieBusy::Grabbing => Some("讀取畫面…"),
-            MovieBusy::Rendering => Some("計算中…"),
-            MovieBusy::Exporting => Some("輸出中，預覽暫停更新"),
+        let note: Option<String> = match self.movie.busy {
+            MovieBusy::Grabbing => Some("讀取畫面…".into()),
+            MovieBusy::Rendering => Some("計算中…".into()),
+            MovieBusy::Preparing => Some(format!(
+                "準備試播中：{} / {} 格…",
+                self.movie.clip_done, self.movie.clip_total
+            )),
+            MovieBusy::Exporting => Some("輸出中，預覽暫停更新".into()),
+            MovieBusy::Idle if clip_on => Some(
+                if self.movie.playing {
+                    "試播中：循環播放這一小段（滾輪縮放、拖曳平移）"
+                } else {
+                    "試播暫停"
+                }
+                .into(),
+            ),
+            MovieBusy::Idle if cropping => Some(
+                "拖曳四角、四邊或框內調整裁切範圍；連點兩下畫面就是裁好了".into(),
+            ),
+            MovieBusy::Idle if mask_canvas && self.movie.mask_tool.is_some() => Some(
+                if compare {
+                    "在右邊的畫面上拖曳畫遮色片；畫好的框、漸層可以拖著搬"
+                } else {
+                    "直接在畫面上拖曳畫遮色片；畫好的框、漸層可以拖著搬"
+                }
+                .into(),
+            ),
+            MovieBusy::Idle if mask_canvas => Some(
+                match self.movie.mask_target {
+                    MaskTarget::Dehaze => "遮罩檢視：紅色蓋住的地方不會被去煙",
+                    MaskTarget::Grade(_) => "遮罩檢視：紅色蓋住的地方不會被調色",
+                }
+                .into(),
+            ),
+            MovieBusy::Idle if !compare && self.movie.after_tex.is_some() => {
+                Some("按住畫面看原本的樣子；滾輪縮放、拖曳平移".into())
+            }
             MovieBusy::Idle if self.movie.after_tex.is_some() => {
-                Some("按住畫面看原本的樣子")
+                Some("滾輪縮放、拖曳平移".into())
             }
             MovieBusy::Idle => None,
         };
@@ -13975,16 +15622,44 @@ impl App {
                 theme::TEXT_WEAK,
             );
         }
-        if matches!(self.movie.busy, MovieBusy::Grabbing | MovieBusy::Rendering) {
+        if matches!(
+            self.movie.busy,
+            MovieBusy::Grabbing | MovieBusy::Rendering | MovieBusy::Preparing
+        ) {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
 
-        ui.add_space(6.0);
-        // 時間軸：挑一個時間點看設定的效果。輸出中不給動——那時候
-        // CPU 全給輸出了，拖了也不會有反應
-        let secs = self.movie.info.as_ref().map(|i| i.secs).unwrap_or(0.0);
-        ui.add_enabled_ui(self.movie.busy != MovieBusy::Exporting && secs > 0.0, |ui| {
-            ui.horizontal(|ui| {
+        // 預覽與下面控制列之間的把手：上下拖曳改預覽高度，連點兩下回自動配高
+        // （與去煙霧、煙火疊圖同一顆）
+        let (bar, bar_resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), BAR_H),
+            egui::Sense::click_and_drag(),
+        );
+        if bar_resp.dragged() {
+            self.movie.img_extra += bar_resp.drag_delta().y;
+        }
+        if bar_resp.double_clicked() {
+            self.movie.img_extra = 0.0;
+        }
+        let hot = bar_resp.hovered() || bar_resp.dragged();
+        if hot {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        let grip = egui::Rect::from_center_size(bar.center(), egui::vec2(54.0, 3.0));
+        ui.painter()
+            .rect_filled(grip, 1.5, if hot { theme::ACCENT } else { theme::BORDER });
+        bar_resp.on_hover_text("上下拖曳可調整預覽區高度；連點兩下回到自動");
+        // 下面這幾列放在可以捲的區域裡：預覽拉得比自動配高還高時，這幾列還捲得到
+        // （見上面 img_max 的說明）。它們的實際高度量起來給下一幀算預覽高度用
+        // （見 MovieTool::ctrl_h）
+        let mut start_clip = false;
+        let rows = egui::ScrollArea::vertical()
+            .id_salt("movie_rows")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+            // 檢視：單張或前後對照（與去煙霧、煙火疊圖同一組控制項，Y 鍵也能切），
+            // 加上目前的顯示比例
+            ui.horizontal_wrapped(|ui| {
                 let (r, _) = ui.allocate_exact_size(
                     egui::vec2(SLIDER_LABEL_W, 18.0),
                     egui::Sense::hover(),
@@ -13992,29 +15667,328 @@ impl App {
                 ui.painter().text(
                     r.left_center(),
                     egui::Align2::LEFT_CENTER,
-                    "時間",
+                    "檢視",
                     egui::FontId::proportional(12.5),
                     theme::TEXT_WEAK,
                 );
-                let mut t = self.movie.at;
-                ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(80.0);
-                if ui
-                    .add(
+                if check_label(ui, !compare, "單張")
+                    .on_hover_text("只看處理後的畫面，畫得比較大；按住畫面可以看原本的樣子（Y 鍵切換）")
+                    .clicked()
+                {
+                    self.movie.compare = false;
+                }
+                if check_label(ui, compare, "原始／去煙後")
+                    .on_hover_text(
+                        "左邊原始畫面、右邊處理後，並排即時對照，不必按住滑鼠（Y 鍵切換）。\n\
+                         專業模式的遮色片畫在右邊那張上",
+                    )
+                    .clicked()
+                {
+                    self.movie.compare = true;
+                }
+                ui.separator();
+                if check_label(ui, self.movie.zoom.is_none(), "符合視窗")
+                    .on_hover_text("整格塞進畫面；滾輪往上放大、往下縮小，放大後可以拖著平移")
+                    .clicked()
+                {
+                    self.movie.zoom = None;
+                }
+                // 固定比例（與煙火疊圖同一組）：以成品為準，100%＝成品 1 像素對
+                // 螢幕 1 個實體像素
+                for z in [0.5f32, 1.0] {
+                    let on = self.movie.zoom.is_some_and(|v| (v - z).abs() < 0.001);
+                    if check_label(ui, on, format!("{:.0}%", z * 100.0))
+                        .on_hover_text(if z == 1.0 {
+                            "成品 1 像素對螢幕 1 個實體像素（不隨 Windows 的顯示縮放變動）"
+                        } else {
+                            "成品的一半大小"
+                        })
+                        .clicked()
+                    {
+                        // 剛從符合視窗放大則從中心開始，本來就放大著就維持現在看的位置
+                        if self.movie.zoom.is_none() {
+                            self.movie.pan = egui::pos2(0.5, 0.5);
+                        }
+                        self.movie.zoom = Some(z);
+                    }
+                }
+                if let Some(pct) = self.movie.zoom_pct {
+                    ui.label(
+                        egui::RichText::new(if self.movie.zoom.is_none() {
+                            format!("目前 {pct:.0}%（符合視窗）")
+                        } else {
+                            format!("目前 {pct:.0}%")
+                        })
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                    )
+                    .on_hover_text(
+                        "100%＝成品 1 像素對螢幕 1 個實體像素。\n\
+                         預覽底圖是縮圖，放很大會糊，成品不會",
+                    );
+                }
+            });
+            // 時間軸：挑一個時間點看設定的效果。輸出中不給動——那時候
+            // CPU 全給輸出了，拖了也不會有反應
+            let secs = self.movie.info.as_ref().map(|i| i.secs).unwrap_or(0.0);
+            ui.add_enabled_ui(self.movie.busy != MovieBusy::Exporting && secs > 0.0, |ui| {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(
+                        egui::vec2(SLIDER_LABEL_W, 18.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().text(
+                        r.left_center(),
+                        egui::Align2::LEFT_CENTER,
+                        "時間",
+                        egui::FontId::proportional(12.5),
+                        theme::TEXT_WEAK,
+                    );
+                    let mut t = self.movie.at;
+                    ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(80.0);
+                    let sr = ui.add(
                         egui::Slider::new(&mut t, 0.0..=secs.max(0.001))
                             .show_value(false)
                             .trailing_fill(true),
-                    )
-                    .changed()
-                {
-                    self.movie.at = t;
+                    );
+                    if sr.changed() {
+                        self.movie.at = t;
+                        // 換了時間點就回到停著的那一格（試播的片段是對著原本那個點抓的）
+                        self.movie.stop_clip();
+                    }
+                    // 專業模式：段與段的分界畫在時間軸上，才知道拖到哪會換一份遮色片
+                    if self.movie.pro && self.movie.segments.len() > 1 {
+                        // 滑桿的軌道兩端各縮進一個把手半徑（與 egui 的 Slider 同一個算法）
+                        let hr = sr.rect.height() / 2.5;
+                        let (x0, x1) = (sr.rect.left() + hr, sr.rect.right() - hr);
+                        // 設定是整批共用的：換到比較短的一支時，落在片尾之後的分界
+                        // 畫不進軌道，跳過（那幾段在這支上本來就碰不到）
+                        for s in self.movie.segments[1..].iter().filter(|s| s.start < secs) {
+                            let x = x0 + (s.start / secs.max(0.001)) as f32 * (x1 - x0);
+                            ui.painter().vline(
+                                x,
+                                sr.rect.y_range(),
+                                egui::Stroke::new(2.0, theme::TRACK),
+                            );
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{:.1}s", self.movie.at))
+                            .size(12.0)
+                            .color(theme::TEXT_WEAK),
+                    );
+                });
+                // 試播：抓目前時間點起的幾秒、用現在的設定算好，在預覽區循環播。
+                // 整支輸出動輒幾十分鐘，想看「動起來」對不對不該等那麼久
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    let (r, _) = ui.allocate_exact_size(
+                        egui::vec2(SLIDER_LABEL_W, 18.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().text(
+                        r.left_center(),
+                        egui::Align2::LEFT_CENTER,
+                        "試播",
+                        egui::FontId::proportional(12.5),
+                        theme::TEXT_WEAK,
+                    );
+                    if self.movie.busy == MovieBusy::Preparing {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "準備中 {} / {} 格…",
+                                self.movie.clip_done, self.movie.clip_total
+                            ))
+                            .size(12.0)
+                            .color(theme::TEXT),
+                        );
+                        if ui
+                            .small_button("✖ 取消")
+                            .on_hover_text("不試播了，回到停著的那一格")
+                            .clicked()
+                        {
+                            self.movie.clip_cancel.store(true, Ordering::Relaxed);
+                        }
+                    } else {
+                        let stale = self
+                            .movie
+                            .clip
+                            .as_ref()
+                            .is_some_and(|c| c.key != self.movie.clip_key());
+                        // 預覽還在取格／算圖時先不搶：那兩件事與試播共用同一條回報通道
+                        let can = self.movie.base.is_some() && self.movie.busy == MovieBusy::Idle;
+                        if ui
+                            .add_enabled(
+                                can,
+                                egui::Button::new(format!("▶ 試播 {:.0} 秒", self.movie.clip_secs))
+                                    .small(),
+                            )
+                            .on_hover_text(format!(
+                                "從目前的時間點抓 {:.0} 秒，用現在的設定逐格算好，在預覽區循環播放。\n\
+                                 畫面縮到長邊 {CLIP_MAX_LONG}、最多 {CLIP_FPS_CAP:.0} 格/秒，幾秒鐘就算完；\n\
+                                 強度照成品尺寸折算，看到的程度與成品一致。\n\
+                                 改了設定要再按一次才會重新產生",
+                                self.movie.clip_secs
+                            ))
+                            .on_disabled_hover_text("等預覽算完再試播")
+                            .clicked()
+                        {
+                            // 設定沒變就直接重播，不必重算
+                            if self.movie.clip.is_some() && !stale {
+                                self.movie.show_clip = true;
+                                self.movie.playing = true;
+                                self.movie.play_pos = 0.0;
+                                self.movie.play_tick = None;
+                            } else {
+                                start_clip = true;
+                            }
+                        }
+                        egui::ComboBox::from_id_salt("movie_clip_secs")
+                            .selected_text(format!("{:.0} 秒", self.movie.clip_secs))
+                            .width(70.0)
+                            .show_ui(ui, |ui| {
+                                for s in [2.0f64, 5.0, 10.0] {
+                                    check_value(ui, &mut self.movie.clip_secs, s, format!("{s:.0} 秒"))
+                                        .on_hover_text(if s >= 10.0 {
+                                            "10 秒兩份共約 280MB 記憶體，算的時間也最久"
+                                        } else {
+                                            "抓幾秒來試播"
+                                        });
+                                }
+                            });
+                        if self.movie.show_clip && self.movie.clip.is_some() {
+                            ui.separator();
+                            if self.movie.playing {
+                                if ui.small_button("⏸ 暫停").clicked() {
+                                    self.movie.playing = false;
+                                }
+                            } else if ui.small_button("▶ 繼續").clicked() {
+                                self.movie.playing = true;
+                                self.movie.play_tick = None;
+                            }
+                            if ui
+                                .small_button("■ 停止")
+                                .on_hover_text("回到停著的那一格（片段留著，設定沒變的話再按試播就直接播）")
+                                .clicked()
+                            {
+                                self.movie.stop_clip();
+                            }
+                            let len = self
+                                .movie
+                                .clip
+                                .as_ref()
+                                .map(|c| c.frames.after.len() as f64 / c.frames.fps.max(1e-3) as f64)
+                                .unwrap_or(0.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.1} / {:.1} 秒",
+                                    self.movie.play_pos.min(len),
+                                    len
+                                ))
+                                .size(12.0)
+                                .color(theme::TEXT_WEAK),
+                            );
+                        }
+                        if stale {
+                            ui.label(
+                                egui::RichText::new("設定已變更，再按「試播」重新產生")
+                                    .size(11.0)
+                                    .color(theme::TRACK),
+                            );
+                        }
+                    }
+                });
+                // 分段：鏡頭會動的影片，一份遮色片撐不完整支——在鏡頭移動的地方
+                // 切一刀，每一段各畫各的（見 [`Segment`]）。遮色片是專業模式的東西，
+                // 這一列也只在專業模式出現
+                if self.movie.pro {
+                    ui.add_space(2.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let (r, _) = ui.allocate_exact_size(
+                            egui::vec2(SLIDER_LABEL_W, 18.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().text(
+                            r.left_center(),
+                            egui::Align2::LEFT_CENTER,
+                            "分段",
+                            egui::FontId::proportional(12.5),
+                            theme::TEXT_WEAK,
+                        );
+                        let n = self.movie.segments.len();
+                        let k = self.movie.seg_idx();
+                        let (s0, s1) = self.movie.seg_span(k, secs);
+                        if ui
+                            .small_button("✂ 在此分段")
+                            .on_hover_text(
+                                "從現在這個時間點起算新的一段：鏡頭移動之後的畫面改用另一份遮色片。\n\
+                                 新的一段先照抄這一段的遮色片，拖著搬到新位置即可",
+                            )
+                            .clicked()
+                            && !self.movie.split_here()
+                        {
+                            self.movie.error = Some("這裡已經是一段的起點了，換個時間點再切".into());
+                        }
+                        if ui
+                            .add_enabled(k > 0, egui::Button::new("✕ 併入前一段").small())
+                            .on_hover_text("拿掉這一段：這段時間改用前一段的遮色片（這一段畫的就沒了）")
+                            .on_disabled_hover_text("第一段沒有前一段可併")
+                            .clicked()
+                        {
+                            self.movie.merge_here();
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "第 {}/{} 段 · {}～{}",
+                                k + 1,
+                                n,
+                                fmt_video_len(s0),
+                                fmt_video_len(s1)
+                            ))
+                            .size(12.0)
+                            .color(theme::TEXT),
+                        );
+                        if n > 1 {
+                            if ui
+                                .add_enabled(k > 0, egui::Button::new("◀").small())
+                                .on_hover_text("跳到前一段的起點")
+                                .clicked()
+                            {
+                                self.movie.at = self.movie.segments[k - 1].start;
+                                self.movie.stop_clip();
+                            }
+                            if ui
+                                .add_enabled(k + 1 < n, egui::Button::new("▶").small())
+                                .on_hover_text("跳到下一段的起點")
+                                .clicked()
+                            {
+                                self.movie.at = self.movie.segments[k + 1].start;
+                                self.movie.stop_clip();
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(if n > 1 {
+                                "每一段各有自己的兩份遮色片；去煙與調色的滑桿仍是整支共用"
+                            } else {
+                                "鏡頭會動的話，在鏡頭移動的地方切一段，每一段各畫各的遮色片"
+                            })
+                            .size(11.0)
+                            .color(theme::TEXT_WEAK),
+                        );
+                    });
                 }
-                ui.label(
-                    egui::RichText::new(format!("{:.1}s", self.movie.at))
-                        .size(12.0)
-                        .color(theme::TEXT_WEAK),
-                );
             });
         });
+        // 這幾列真正的高度畫完才知道；記下來給下一幀算預覽高度用，
+        // 與這一幀用的值不同就再排一次重畫，版面立刻校正回來
+        let used = rows.content_size.y;
+        if (used - self.movie.ctrl_h).abs() > 0.5 {
+            self.movie.ctrl_h = used;
+            ui.ctx().request_repaint();
+        }
+        if start_clip {
+            self.spawn_movie_clip(ui.ctx());
+        }
     }
 
     // ---------- 煙火疊圖工具 ----------
@@ -23210,6 +25184,16 @@ fn ui_backup_plan(ui: &mut egui::Ui, plan: &backup::Plan, keep_extra: bool, writ
 
 /// 前後對照時貼在每半邊上緣的標籤（「編輯前」／「編輯後」）。
 /// 半透明底色壓在照片上，亮色照片也讀得到字
+/// 遮罩檢視看的是第幾個調色遮色區，標在預覽左上角。
+/// 三區各一個字串常數，省得為了一行標籤每幀配置一次 String
+fn grade_mask_tag(zone: usize) -> &'static str {
+    match zone {
+        0 => "遮色區 1 的遮色片（紅色不調色）",
+        1 => "遮色區 2 的遮色片（紅色不調色）",
+        _ => "遮色區 3 的遮色片（紅色不調色）",
+    }
+}
+
 fn pane_label(ui: &egui::Ui, pane: egui::Rect, text: &str) {
     let galley = ui.painter().layout_no_wrap(
         text.to_string(),
@@ -28171,6 +30155,254 @@ mod tests {
         // 換一支影片＝重來一批，排隊的那幾支跟著收掉
         m.reset_for(Some(PathBuf::from("d.mp4")), None);
         assert_eq!(m.jobs(), vec![PathBuf::from("d.mp4")], "換片時佇列沒清掉");
+    }
+
+    /// 影片去煙霧的簡易／專業：簡易模式不套遮色片，但畫過的形狀要留著，
+    /// 切回專業就回來；切回簡易時工具與遮罩檢視要一起收掉
+    #[test]
+    fn movie_simple_mode_ignores_the_mask_but_keeps_it() {
+        let mut m = MovieTool::default();
+        assert!(!m.pro, "程式一開是簡易模式");
+        m.set_pro(true);
+        m.segments[0].shapes.push(dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.1,
+            y0: 0.1,
+            x1: 0.6,
+            y1: 0.6,
+        }));
+        m.pick_mask_tool(MaskTarget::Dehaze, MaskTool::Brush);
+        m.sync_mask_view(m.target_can_show());
+        assert!(m.effective().has_shapes(), "專業模式要套遮色片");
+        assert!(m.show_mask, "選了工具、也畫了東西，遮罩檢視要自己亮起來");
+        assert!(m.tools_open());
+
+        m.set_pro(false);
+        assert!(!m.effective().has_shapes(), "簡易模式不套遮色片");
+        assert!(!m.segments[0].shapes.is_empty(), "畫過的形狀要留著");
+        assert!(m.mask_tool.is_none() && !m.show_mask, "切回簡易要把工具與檢視收掉");
+        assert!(!m.tools_open());
+
+        m.set_pro(true);
+        assert!(m.effective().has_shapes(), "切回專業，遮色片就回來");
+    }
+
+    /// 分段：形狀跟著時間點所在的那一段走，切一刀先照抄、併回去就沒了；
+    /// 輸出時每一段各帶自己的形狀
+    #[test]
+    fn movie_segments_pick_the_mask_by_time() {
+        let mut m = MovieTool::default();
+        m.pro = true;
+        let rect = dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.1,
+            y0: 0.1,
+            x1: 0.6,
+            y1: 0.6,
+        });
+        m.segments[0].shapes.push(rect.clone());
+        m.at = 40.0;
+        assert!(m.split_here(), "40 秒處還沒有分界，要切得下去");
+        assert_eq!(m.segments.len(), 2);
+        assert_eq!(m.segments[1].shapes, m.segments[0].shapes, "新的一段先照抄前一段");
+        assert!(!m.split_here(), "同一個點不切第二刀");
+        m.at = 10.0;
+        assert_eq!(m.seg_idx(), 0);
+        m.at = 40.0;
+        assert_eq!(m.seg_idx(), 1, "剛好在分界上算後面那一段");
+        m.at = 99.0;
+        assert_eq!(m.seg_idx(), 1);
+        assert_eq!(m.seg_span(0, 100.0), (0.0, 40.0));
+        assert_eq!(m.seg_span(1, 100.0), (40.0, 100.0));
+
+        m.segments[1].shapes.clear();
+        m.at = 50.0;
+        assert!(m.effective().shapes.is_empty(), "第二段的遮色片清掉了，就該是空的");
+        m.at = 10.0;
+        assert_eq!(m.effective().shapes.len(), 1, "第一段的還在");
+        let segs = m.export_segs();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].params.shapes.len(), 1);
+        assert!(segs[1].params.shapes.is_empty());
+        assert_eq!(segs[1].start, 40.0);
+
+        m.at = 5.0;
+        assert!(!m.merge_here(), "第一段沒有前一段可併");
+        m.at = 60.0;
+        assert!(m.merge_here());
+        assert_eq!(m.segments.len(), 1);
+        assert_eq!(m.effective().shapes.len(), 1, "併回去之後這段時間用前一段的遮色片");
+    }
+
+    /// 裁切：先裁再縮決定成品尺寸；調整裁切範圍時畫布是整格（成品尺度），
+    /// 進出調整都要重取底圖，遮色片工具與試播要讓開
+    #[test]
+    fn movie_crop_shrinks_the_output_and_editing_shows_the_whole_frame() {
+        let mut m = MovieTool::default();
+        m.info = Some(VideoInfo {
+            w: 1920,
+            h: 1080,
+            fps: 30.0,
+            secs: 10.0,
+            audio: None,
+        });
+        assert_eq!(m.out_dims(), Some((1920, 1080)), "沒裁就是整格");
+        assert!(m.crop_filter().is_none(), "沒裁就不必掛濾鏡");
+        m.crop = Crop {
+            x0: 0.25,
+            y0: 0.0,
+            x1: 0.75,
+            y1: 1.0,
+            ..Crop::default()
+        };
+        assert_eq!(m.cropped_dims(), Some((960, 1080)), "裁掉左右各四分之一");
+        assert_eq!(m.out_dims(), Some((960, 1080)));
+        assert!(m.crop_filter().is_some());
+        // 再縮到 720p：短邊是裁切後的 960
+        m.size = MovieSize::Short(720);
+        assert_eq!(m.out_dims(), Some((720, 810)));
+        assert_eq!(
+            m.canvas_dims(),
+            Some(egui::vec2(720.0, 810.0)),
+            "沒在調整時畫布就是成品"
+        );
+        // 調整裁切範圍：畫布是整格換成成品尺度（裁切那塊剛好等於成品）
+        m.pro = true;
+        m.pick_mask_tool(MaskTarget::Dehaze, MaskTool::Brush);
+        m.grabbed_at = Some(1.0);
+        m.set_crop_editing(true);
+        let c = m.canvas_dims().expect("有影片就算得出畫布");
+        assert!((c.x - 1440.0).abs() < 0.5 && (c.y - 810.0).abs() < 0.5, "畫布 {c:?}");
+        assert!(m.grabbed_at.is_none(), "進入調整要重取整格的底圖");
+        assert!(m.mask_tool.is_none(), "左鍵歸裁切框用，遮色片工具要收掉");
+        assert!(m.tools_open(), "調整裁切範圍算編輯中");
+        // 再開一次不算改變，不該再重取
+        m.grabbed_at = Some(2.0);
+        m.set_crop_editing(true);
+        assert_eq!(m.grabbed_at, Some(2.0));
+        m.end_editing();
+        assert!(!m.crop_editing && m.grabbed_at.is_none(), "完成編輯要收掉裁切框並重取裁好的底圖");
+        // 裁切進試播的比對鍵：框改了就算設定變了
+        let k1 = m.clip_key();
+        m.crop.x1 = 0.9;
+        assert!(k1 != m.clip_key(), "裁切框改了，試播的片段就過期了");
+    }
+
+    /// 切換模式等於換了一組要算的參數：畫面上那張要重算，遮罩檢視也一樣
+    #[test]
+    fn switching_movie_mode_rerenders_the_preview() {
+        let mut m = MovieTool::default();
+        m.pro = true;
+        m.segments[0].shapes.push(dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.2,
+            y0: 0.2,
+            x1: 0.8,
+            y1: 0.8,
+        }));
+        m.rendered = Some((m.effective(), m.at));
+        assert!(!m.needs_render(), "剛算好的就是現在要的");
+        m.set_pro(false);
+        assert!(m.needs_render(), "簡易模式的畫面沒有遮色片，要重算");
+        // 遮罩檢視只有專業模式、開著、而且有底圖才算需要
+        m.set_pro(true);
+        m.show_mask = true;
+        assert!(!m.needs_mask_view(), "還沒有底圖就沒東西可蓋");
+        m.base = Some(Arc::new(image::RgbImage::new(4, 4)));
+        assert!(m.needs_mask_view());
+        m.mask_for = Some(m.mask_key());
+        assert!(!m.needs_mask_view(), "已經照這組形狀算過了");
+        assert!(!m.needs_grade(), "遮罩檢視開著時不套調色");
+        // 換去看調色那份：形狀不同，要重算一次
+        m.grade.zones[0].mask_on = true;
+        m.toggle_mask_view(MaskTarget::Grade(0));
+        assert!(m.show_mask && m.mask_target == MaskTarget::Grade(0));
+        assert!(m.needs_mask_view(), "換了一份遮色片，檢視要照那份重算");
+    }
+
+    /// 調色的遮色片：勾了「套用遮色片」才生效、簡易模式一律整張、
+    /// 反選要跟著帶出去；滑桿全歸零時不管畫了什麼都不算要調色
+    #[test]
+    fn movie_grade_mask_only_counts_when_applied_in_pro_mode() {
+        let mut m = MovieTool::default();
+        m.pro = true;
+        assert!(m.active_grade().is_empty(), "滑桿沒動就不該算要調色");
+        m.grade.zones[0].grade.exposure = 30;
+        m.segments[0].grade_shapes[0].push(dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.1,
+            y0: 0.1,
+            x1: 0.5,
+            y1: 0.5,
+        }));
+        // 沒勾套用：畫了也當作整張調
+        let g = m.active_grade();
+        assert_eq!(g.len(), 1, "動過滑桿的那一區才算");
+        assert!(g[0].shapes.is_empty(), "沒勾「套用遮色片」時形狀不該生效");
+        m.grade.zones[0].mask_on = true;
+        m.grade.zones[0].invert = true;
+        let g = m.active_grade();
+        assert_eq!(g[0].shapes.len(), 1);
+        assert!(g[0].invert, "反選要一起帶出去");
+        // 簡易模式：整張調，形狀不算
+        m.pro = false;
+        let g = m.active_grade();
+        assert_eq!(g.len(), 1, "簡易模式照樣調色");
+        assert!(g[0].shapes.is_empty(), "簡易模式不套調色的遮色片");
+        m.pro = true;
+        // 對著調色那份的工具：沒勾套用就沒東西可看，勾了才有
+        m.mask_target = MaskTarget::Grade(0);
+        assert!(m.target_can_show());
+        m.grade.zones[0].mask_on = false;
+        assert!(!m.target_can_show(), "沒勾套用遮色片，形狀根本不會生效，沒東西可看");
+    }
+
+    /// 三個遮色區各調各的：形狀、反選、羽化都是各區自己的，
+    /// 作用的那幾區照 1、2、3 的順序排；沒動過的區不占位
+    #[test]
+    fn movie_grade_zones_are_independent() {
+        let mut m = MovieTool::default();
+        m.pro = true;
+        let rect = |x0: f32| {
+            dehaze::Shape::Rect(dehaze::Region {
+                x0,
+                y0: 0.1,
+                x1: x0 + 0.2,
+                y1: 0.5,
+            })
+        };
+        // 只動第 2、3 區：第 1 區不作用，出來的順序仍是 2、3
+        for z in [1usize, 2] {
+            m.grade.zones[z].grade.exposure = 10 * (z as i32 + 1);
+            m.grade.zones[z].mask_on = true;
+            m.segments[0].grade_shapes[z].push(rect(0.1 * z as f32));
+        }
+        m.grade.zones[2].invert = true;
+        m.grade.zones[2].feather = 60;
+        let g = m.active_grade();
+        assert_eq!(g.len(), 2, "只有動過滑桿的那兩區作用");
+        assert_eq!(g[0].grade.exposure, 20, "第一個應該是遮色區 2");
+        assert_eq!(g[1].grade.exposure, 30, "第二個應該是遮色區 3");
+        assert!(!g[0].invert && g[1].invert, "反選各記各的");
+        assert_eq!(g[1].feather, 60, "羽化各記各的");
+        assert_eq!(g[0].shapes.len(), 1);
+        assert_eq!(g[1].shapes.len(), 1);
+        assert_ne!(g[0].shapes, g[1].shapes, "兩區畫的是不同的形狀");
+        // 工具與遮罩檢視各認各的那一區
+        m.mask_target = MaskTarget::Grade(0);
+        assert!(!m.target_can_show(), "第 1 區還沒畫東西，沒得看");
+        m.mask_target = MaskTarget::Grade(2);
+        assert!(m.target_can_show());
+        assert!(m.mask_inverted(MaskTarget::Grade(2)));
+        assert!(!m.mask_inverted(MaskTarget::Grade(1)));
+        assert_eq!(m.mask_of(MaskTarget::Grade(2)).1, 60);
+        // 每一段各有三份形狀：切一段之後照抄，改了不會動到前一段
+        m.at = 5.0;
+        assert!(m.split_here());
+        m.segments[1].grade_shapes[1].clear();
+        m.at = 0.0;
+        assert_eq!(m.active_grade().len(), 2, "第一段兩區都還在");
+        m.at = 6.0;
+        let g = m.active_grade();
+        assert_eq!(g.len(), 2, "滑桿沒歸零，兩區照樣作用");
+        assert!(g[0].shapes.is_empty(), "第二段的遮色區 2 清掉了就是整格調");
+        assert_eq!(g[1].shapes.len(), 1, "遮色區 3 的形狀還在");
     }
 
     /// 換預覽＝把那一支調到最前面（輸出時先跑），其餘的相對順序不變

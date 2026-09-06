@@ -2682,6 +2682,50 @@ pub fn mask_overlay(img: &RgbImage, params: &SmokeParams) -> RgbImage {
     out
 }
 
+/// 只看形狀的遮色片預覽：把形狀**沒蓋到**的地方疊上紅色（`invert` 為 true 時
+/// 反過來，蓋到的地方紅），影片去煙霧的兩份遮色片都用它。
+/// 與 [`mask_overlay`] 同一種畫法，差別只在不看保護色。
+/// 一個形狀都沒畫時整張都算蓋到（去煙那邊的意思），所以不會塗紅
+#[allow(dead_code)]
+pub fn shape_overlay(
+    img: &RgbImage,
+    shapes: &[Shape],
+    feather: i32,
+    density: i32,
+    invert: bool,
+) -> RgbImage {
+    let (fw, fh) = (img.width() as usize, img.height() as usize);
+    let cleaned: Vec<Shape> = shapes
+        .iter()
+        .filter_map(Shape::cleaned)
+        .take(MAX_SHAPES)
+        .collect();
+    let mask = ShapeMask::new(&cleaned, feather.clamp(0, 100), density, fw, fh);
+    let mut out = img.clone();
+    for y in 0..fh {
+        for x in 0..fw {
+            let mut inside = mask.at(x, y);
+            // 反選：只有真的畫了形狀才反過來（沒畫時整張都算蓋到，反過來會整張紅）
+            if invert && mask.any_add {
+                inside = 1.0 - inside;
+            }
+            let covered = 1.0 - inside;
+            if covered <= 0.0 {
+                continue;
+            }
+            let px = out.get_pixel_mut(x as u32, y as u32);
+            let a = covered * 0.55;
+            const RED: [f32; 3] = [220.0, 40.0, 60.0];
+            for c in 0..3 {
+                px[c] = (px[c] as f32 * (1.0 - a) + RED[c] * a)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
 /// 診斷用（smoke_cli）：把天空遮罩輸出成灰階影像（白＝判定為天空）
 #[allow(dead_code)]
 /// 去煙作用範圍的灰階圖（白＝會去煙的天空、黑＝地景一個像素都不動）。
