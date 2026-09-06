@@ -484,38 +484,197 @@ pub fn prepare_clip(
     let fps_f = fps.max(1e-3) as f64;
     let mut after: Vec<RgbImage> = Vec::with_capacity(total);
     let mut done = 0usize;
-    for chunk in base.chunks(workers.max(1)) {
+    for chunk in base.chunks(batch_frames(workers, w, h)) {
         if cancel.load(Ordering::Relaxed) {
             return Err(String::new());
         }
-        let outs: Vec<Option<RgbImage>> = thread::scope(|s| {
-            let handles: Vec<_> = chunk
-                .iter()
-                .enumerate()
-                .map(|(j, img)| {
-                    let idx = done + j;
-                    let per_seg = &per_seg;
-                    s.spawn(move || {
-                        let k = seg_at(segs, at + idx as f64 / fps_f);
-                        let (p, wt) = &per_seg[k];
-                        let mut out = dehaze::remove_smoke(img, p);
-                        // 三區依序疊上去，與輸出、預覽同一個順序
-                        for (z, g) in segs[k].grades.iter().enumerate() {
-                            apply_active_grade(&mut out, g, wt[z].as_deref());
-                        }
-                        out
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().ok()).collect()
-        });
-        for o in outs {
+        let jobs: Vec<FrameJob> = (0..chunk.len())
+            .map(|j| {
+                let k = seg_at(segs, at + (done + j) as f64 / fps_f);
+                let (p, wt) = &per_seg[k];
+                FrameJob {
+                    params: p,
+                    grades: &segs[k].grades,
+                    weights: wt,
+                }
+            })
+            .collect();
+        for o in dehaze_frames(chunk, &jobs, interp_stride(fps)) {
             after.push(o.ok_or_else(|| "影格處理失敗".to_string())?);
         }
         done += chunk.len();
         progress(done, total);
     }
     Ok(ClipFrames { fps, base, after })
+}
+
+/// 一格要怎麼處理：哪一組去煙參數、哪幾區調色（權重圖照區排，None＝那區整張調）
+struct FrameJob<'a> {
+    params: &'a SmokeParams,
+    grades: &'a [ActiveGrade],
+    weights: &'a [Option<Vec<f32>>],
+}
+
+/// 奇數格能不能用前後兩格內插的門檻：縮圖上「中間那格與前後平均的差」佔亮度的
+/// 比例。腳架固定拍的煙火在這個尺度上幾乎不變（線條在區塊最小值裡消失，只剩煙的
+/// 亮度慢慢飄），快速搖鏡或切換畫面則整張都對不上
+const INTERP_MAX_DIFF: f64 = 0.12;
+
+/// 判斷畫面變動用的縮圖：亮度的**區塊最小值**（64 格寬，1080p 上一格約 30 像素
+/// 見方），與估煙霧層的最小值池化同一個道理——煙火線條在這裡消失，
+/// 留下的是煙的亮度與地景，正是內插會出錯的那部分
+fn luma_thumb(img: &RgbImage) -> Vec<f32> {
+    const COLS: usize = 64;
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let rows = (COLS * h / w).clamp(1, COLS);
+    let mut out = vec![1.0f32; COLS * rows];
+    for (y, row) in img.rows().enumerate() {
+        let ty = (y * rows / h).min(rows - 1);
+        for (x, px) in row.enumerate() {
+            let tx = (x * COLS / w).min(COLS - 1);
+            let l = (px[0] as u32 * 77 + px[1] as u32 * 150 + px[2] as u32 * 29) as f32
+                / (256.0 * 255.0);
+            let o = &mut out[ty * COLS + tx];
+            if l < *o {
+                *o = l;
+            }
+        }
+    }
+    out
+}
+
+/// 這一格與「前後兩個錨點照距離 `t` 內插出來的畫面」差多少，佔亮度的比例
+/// （拿去跟 [`INTERP_MAX_DIFF`] 比）。縮圖對不上（尺寸不同）就回無限大＝不能內插
+fn frame_diff(prev: &[f32], cur: &[f32], next: &[f32], t: f64) -> f64 {
+    if prev.len() != cur.len() || next.len() != cur.len() || cur.is_empty() {
+        return f64::INFINITY;
+    }
+    let t = t.clamp(0.0, 1.0) as f32;
+    let (mut diff, mut level) = (0.0f64, 0.0f64);
+    for i in 0..cur.len() {
+        let mid = prev[i] + (next[i] - prev[i]) * t;
+        diff += (cur[i] - mid).abs() as f64;
+        level += cur[i] as f64;
+    }
+    let n = cur.len() as f64;
+    // 分母補一截夜空的底：全黑的畫面雜訊除出來也不會是個大數
+    diff / n / (level / n + 0.02)
+}
+
+/// 慢變的場每隔幾格算一份（見 [`dehaze_frames`]）：60p 的片子每三格一份，
+/// 場的更新率仍有 20 Hz；30p 以下每兩格一份，不讓兩個錨點差超過 100 ms
+pub fn interp_stride(fps: f32) -> usize {
+    if fps >= 48.0 {
+        3
+    } else {
+        2
+    }
+}
+
+/// 一批幾格一起處理：執行緒數的**兩倍**。去煙分兩階段（見 [`dehaze_frames`]），
+/// 第一階段只有錨點在算——一批 16 格只有 6 個錨點，16 核有一半閒著；批次加倍，
+/// 錨點就多一倍，第二階段多開幾條執行緒也沒關係（那一段輕）。
+/// 記憶體照「進出兩份加場」夾住（每像素約 12 位元組），4K 也撐得住
+fn batch_frames(workers: usize, w: u32, h: u32) -> usize {
+    let workers = workers.max(1);
+    let px = (w as u64 * h as u64).max(1);
+    let by_mem = (1_500_000_000u64 / (px * 12)).max(1) as usize;
+    (workers * 2).min(by_mem).max(workers)
+}
+
+/// 一批**連續**的格一起去煙（有調色就順手一起調完），回傳與傳進來同一個順序。
+///
+/// 去煙裡最貴的是估煙霧層、探夜空與判天空範圍（一格 1080p 的八成時間），而這
+/// 幾樣跟著整個畫面慢慢變，相鄰幾格幾乎一樣：每隔 `stride` 格挑一個「錨點」照算，
+/// 中間的格改用前後兩個錨點照距離內插（[`dehaze::SmokeField::lerp`]），只有跟細節
+/// 有關的部分（補回軌跡、亮芯、逐像素相減）逐格算，煙火線條一格都不含糊。
+/// 畫面變動大的那一格（快速搖鏡、切換）不內插、照算——用縮圖比一比就知道
+/// （見 [`frame_diff`]）；批次尾端沒有下一個錨點可借的格也照算。
+/// `MOVIE_INTERP_DEBUG=1` 會把每一格的判定印到 stderr
+fn dehaze_frames(imgs: &[RgbImage], jobs: &[FrameJob], stride: usize) -> Vec<Option<RgbImage>> {
+    let n = imgs.len().min(jobs.len());
+    if n == 0 {
+        return Vec::new();
+    }
+    let stride = stride.max(1);
+    let debug = std::env::var_os("MOVIE_INTERP_DEBUG").is_some();
+    let thumbs: Vec<Vec<f32>> = imgs[..n].iter().map(luma_thumb).collect();
+    // 錨點：每隔 stride 格自己算一份；中間的格照它離兩個錨點多遠內插
+    let anchor = |i: usize| i - i % stride;
+    // 哪幾格要自己算：錨點、尾端沒有下一個錨點的、前後錨點算的不是同一種場的，
+    // 以及畫面變動太大的
+    let exact: Vec<bool> = (0..n)
+        .map(|i| {
+            let a = anchor(i);
+            if a == i {
+                return true;
+            }
+            let b = a + stride;
+            if b >= n {
+                return true;
+            }
+            if !dehaze::same_field_params(jobs[a].params, jobs[i].params)
+                || !dehaze::same_field_params(jobs[i].params, jobs[b].params)
+            {
+                return true;
+            }
+            let t = (i - a) as f64 / stride as f64;
+            let d = frame_diff(&thumbs[a], &thumbs[i], &thumbs[b], t);
+            if debug {
+                eprintln!(
+                    "  [內插] 第 {i} 格（錨點 {a}→{b}）差 {d:.3} → {}",
+                    if d > INTERP_MAX_DIFF { "照算" } else { "內插" }
+                );
+            }
+            d > INTERP_MAX_DIFF
+        })
+        .collect();
+    // 第一階段：要自己算的那幾格平行估場
+    let fields: Vec<Option<dehaze::SmokeField>> = thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let (img, p, e) = (&imgs[i], jobs[i].params, exact[i]);
+                s.spawn(move || e.then(|| dehaze::smoke_field(img, p)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(None))
+            .collect()
+    });
+    // 第二階段：每一格套上自己的（或前後內插出來的）那份，再調色
+    thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let (img, job, fields) = (&imgs[i], &jobs[i], &fields);
+                s.spawn(move || {
+                    let mixed;
+                    let field = match &fields[i] {
+                        Some(f) => f,
+                        None => {
+                            let (a, b) = (anchor(i), anchor(i) + stride);
+                            let t = (i - a) as f32 / stride as f32;
+                            mixed = fields[a].as_ref()?.lerp(fields[b].as_ref()?, t);
+                            &mixed
+                        }
+                    };
+                    let mut out = dehaze::remove_smoke_with(img, job.params, field);
+                    // 調色套在去煙結果上，三區依序疊，與預覽同一個順序
+                    for (z, g) in job.grades.iter().enumerate() {
+                        apply_active_grade(&mut out, g, job.weights.get(z).and_then(|w| w.as_deref()));
+                    }
+                    Some(out)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(None))
+            .collect()
+    })
 }
 
 /// 第 `t` 秒落在哪一段（最後一段 `start` ≤ t 的；第一段從 0 起，一定找得到）
@@ -541,34 +700,28 @@ fn dehaze_batch(
     segs: &[ExportSeg],
     weights: &[Vec<Option<Vec<f32>>>],
 ) -> Result<Vec<Vec<u8>>, String> {
+    let stride = interp_stride(fps);
     let fps = fps.max(1e-3) as f64;
-    // 一格一條執行緒：批次大小本來就是照核心數決定的（見 crate::movie_workers），
-    // 這裡不必再自己排班
-    let out: Vec<Option<Vec<u8>>> = thread::scope(|s| {
-        let handles: Vec<_> = frames
-            .into_iter()
-            .enumerate()
-            .map(|(j, d)| {
-                s.spawn(move || {
-                    let img = RgbImage::from_raw(w, h, d)?;
-                    let k = seg_at(segs, (first + j as u64) as f64 / fps);
-                    let seg = &segs[k];
-                    let mut out = dehaze::remove_smoke(&img, &seg.params);
-                    // 調色套在去煙結果上，三區依序疊，與預覽同一個順序
-                    for (z, g) in seg.grades.iter().enumerate() {
-                        let wt = weights.get(k).and_then(|w| w.get(z)).and_then(|w| w.as_deref());
-                        apply_active_grade(&mut out, g, wt);
-                    }
-                    Some(out.into_raw())
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or(None))
-            .collect()
-    });
-    out.into_iter()
+    let imgs: Vec<RgbImage> = frames
+        .into_iter()
+        .map(|d| RgbImage::from_raw(w, h, d))
+        .collect::<Option<_>>()
+        .ok_or_else(|| "影格資料長度不對".to_string())?;
+    // 每一格照它落在哪一段拿參數與調色；一批一條執行緒一格
+    // （批次大小本來就是照核心數決定的，見 crate::movie_workers）
+    let jobs: Vec<FrameJob> = (0..imgs.len())
+        .map(|j| {
+            let k = seg_at(segs, (first + j as u64) as f64 / fps);
+            FrameJob {
+                params: &segs[k].params,
+                grades: &segs[k].grades,
+                weights: weights.get(k).map(Vec::as_slice).unwrap_or(&[]),
+            }
+        })
+        .collect();
+    dehaze_frames(&imgs, &jobs, stride)
+        .into_iter()
+        .map(|o| o.map(RgbImage::into_raw))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| "影格處理失敗".to_string())
 }
@@ -611,7 +764,8 @@ pub fn export(
         .iter()
         .map_err(|e| format!("FFmpeg 輸出讀取失敗：{e}"))?;
 
-    let batch_size = workers.max(1);
+    // 一批幾格：尺寸要等第一格到手才知道，那之前先照執行緒數（見 batch_frames）
+    let mut batch_size = workers.max(1);
     let mut enc: Option<Encoder> = None;
     // 真正解碼出來的尺寸：第一格到手才知道（旋轉過的影片，檔頭寫的是轉之前的）
     let mut dims: Option<(u32, u32)> = None;
@@ -642,6 +796,7 @@ pub fn export(
                     // 才作準（旋轉過的影片檔頭寫的是轉之前的）
                     if enc.is_none() {
                         dims = Some((f.width, f.height));
+                        batch_size = batch_frames(workers, f.width, f.height);
                         match Encoder::start(
                             src,
                             dst,
@@ -795,5 +950,102 @@ pub fn concat(parts: &[PathBuf], dst: &Path) -> Result<(), String> {
         } else {
             errs.join("\n")
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(w: u32, h: u32, f: impl Fn(u32, u32) -> u8) -> RgbImage {
+        RgbImage::from_fn(w, h, |x, y| {
+            let v = f(x, y);
+            image::Rgb([v, v, v])
+        })
+    }
+
+    /// 內插與否的判定看的是區塊最小值的縮圖：一條細亮線（煙火線條）不會讓它變，
+    /// 整張平移過（搖鏡）就差很多；尺寸不同的縮圖對不上，一律照算
+    #[test]
+    fn frame_diff_ignores_thin_streaks_but_catches_a_pan() {
+        let base = |x: u32, y: u32| ((x / 8 + y / 8) % 7 * 30 + 20) as u8;
+        let a = luma_thumb(&frame(256, 144, base));
+        // 中間那格多一條細線：區塊最小值不變，差是 0
+        let streak = luma_thumb(&frame(256, 144, |x, y| if y == 70 { 255 } else { base(x, y) }));
+        let d = frame_diff(&a, &streak, &a, 0.5);
+        assert!(d < 1e-6, "細線不該改變區塊最小值：{d}");
+        // 整張平移 40 像素：差很多，要照算
+        let panned = luma_thumb(&frame(256, 144, |x, y| base(x + 40, y)));
+        let d = frame_diff(&a, &panned, &a, 0.5);
+        assert!(d > INTERP_MAX_DIFF, "平移過的畫面該判成要照算：{d}");
+        // 長寬比不同的縮圖格數不同，對不上
+        let other = luma_thumb(&frame(256, 192, base));
+        assert!(frame_diff(&a, &other, &a, 0.5).is_infinite());
+        // 60p 每三格一份場、30p 每兩格
+        assert_eq!(interp_stride(59.94), 3);
+        assert_eq!(interp_stride(29.97), 2);
+    }
+
+    /// 內插到底差多少（平常不跑，要手動點名；ffmpeg 要在 PATH 上）：
+    /// `P2V_BENCH_VIDEO=<影片> cargo test --release --bin photo2video -- --ignored movie_interp_error --nocapture`
+    /// 從影片中段抓連續四格，中間兩格各用「自己算」與「前後錨點內插」去煙，
+    /// 印出兩者的 PSNR 與最大差——改門檻或內插方式前後各跑一次
+    #[test]
+    #[ignore]
+    fn movie_interp_error() {
+        let Some(src) = std::env::var_os("P2V_BENCH_VIDEO").map(PathBuf::from) else {
+            eprintln!("沒設 P2V_BENCH_VIDEO，跳過");
+            return;
+        };
+        let info = probe(&src).expect("讀不到影片");
+        let (w, h, raws) =
+            grab_clip(&src, info.secs * 0.5, 1.0, info.fps, info.long(), 4, None).expect("抓不到格");
+        let imgs: Vec<RgbImage> = raws
+            .into_iter()
+            .map(|d| RgbImage::from_raw(w, h, d).expect("影格資料長度不對"))
+            .collect();
+        assert!(imgs.len() >= 4, "要四格才有頭尾錨點與中間兩格");
+        let p = SmokeParams::default();
+        // 兩張的差異：PSNR、均方根、最大差與它的位置、差超過 32 與 8 的像素各有幾個
+        let stats = |label: &str, a: &RgbImage, b: &RgbImage| {
+            let (mut se, mut mx, mut at, mut n32, mut n8) = (0f64, 0u8, (0u32, 0u32), 0usize, 0usize);
+            for (i, (x, y)) in a.as_raw().iter().zip(b.as_raw()).enumerate() {
+                let d = x.abs_diff(*y);
+                se += (d as f64).powi(2);
+                if d > mx {
+                    mx = d;
+                    let px = (i / 3) as u32;
+                    at = (px % a.width(), px / a.width());
+                }
+                n32 += (d > 32) as usize;
+                n8 += (d > 8) as usize;
+            }
+            let n = a.as_raw().len();
+            let mse = se / n as f64;
+            let psnr = if mse > 0.0 {
+                10.0 * (255.0f64.powi(2) / mse).log10()
+            } else {
+                f64::INFINITY
+            };
+            eprintln!(
+                "  {label}：PSNR {psnr:.1} dB，均方根 {:.3}/255，最大差 {mx} 在 ({}, {})，\
+                 差 >32 的佔 {:.4}%、>8 的佔 {:.3}%",
+                mse.sqrt(),
+                at.0,
+                at.1,
+                n32 as f64 / n as f64 * 100.0,
+                n8 as f64 / n as f64 * 100.0
+            );
+        };
+        let f0 = dehaze::smoke_field(&imgs[0], &p);
+        let f3 = dehaze::smoke_field(&imgs[3], &p);
+        let exact: Vec<RgbImage> = imgs.iter().map(|im| dehaze::remove_smoke(im, &p)).collect();
+        for i in 1..=2 {
+            let interp = dehaze::remove_smoke_with(&imgs[i], &p, &f0.lerp(&f3, i as f32 / 3.0));
+            eprintln!("[內插誤差] 第 {i} 格");
+            stats("內插 vs 自己算", &exact[i], &interp);
+            // 對照：相鄰兩格都自己算，本來就差多少（畫面自己在動）
+            stats("自己算 vs 下一格自己算", &exact[i], &exact[i + 1]);
+        }
     }
 }

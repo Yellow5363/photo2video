@@ -5526,6 +5526,9 @@ impl MovieTool {
 /// 另外用一個記憶體預算夾住：同時攤開的是「送進去的一批」加上「算出來的一批」，
 /// 一格 4K 就要 25MB，核心多的機器才不會一次吃掉好幾 GB。
 ///
+/// 去煙隔格估的那幾樣（煙霧層三張加天空範圍一張 f32 平面，見 `dehaze::SmokeField`）
+/// 一批裡有一半的格要留著給鄰格內插，平均每格再多 8 位元組／像素。
+///
 /// `graded` 是「有沒有調色」：調色那一段還要把整格攤成 f32、外加
 /// 模糊用的暫存與套遮色片時混色用的備份（見 [`edit::apply_grade_masked`]），
 /// 一格 4K 就多吃將近 200MB。不算進來的話，4K 開 16 條會直接吃掉三、四 GB
@@ -5533,8 +5536,9 @@ fn movie_workers(w: u32, h: u32, graded: bool) -> usize {
     const MAX_WORKERS: usize = 16;
     let cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let px = w as u64 * h as u64;
-    // 進出兩份，加上調色期間多攤開的那幾份（每像素約 30 位元組）
-    let per_frame = (px * 3 * 2 + if graded { px * 30 } else { 0 }).max(1);
+    // 進出兩份、隔格留著的場（平均每格 8 位元組／像素），
+    // 加上調色期間多攤開的那幾份（每像素約 30 位元組）
+    let per_frame = (px * 3 * 2 + px * 8 + if graded { px * 30 } else { 0 }).max(1);
     // 總共不超過約 1.5GB
     let by_mem = (1_500_000_000u64 / per_frame).max(1) as usize;
     cores.min(by_mem).min(MAX_WORKERS).max(1)
@@ -14653,7 +14657,10 @@ impl App {
             ui.horizontal(|ui| {
                 let fast = self.movie.params.fast;
                 if check_label(ui, !fast, "品質優先")
-                    .on_hover_text("與「去煙霧」模組處理照片時完全相同的算法")
+                    .on_hover_text(
+                        "煙霧層在原尺寸估，與「去煙霧」模組處理照片時同一套算法\n\
+                         （兩種模式都會隔幾格估一次煙霧層、中間內插，畫面變動大的格照算）",
+                    )
                     .clicked()
                 {
                     self.movie.params.fast = false;
@@ -30579,5 +30586,54 @@ mod tests {
         assert_eq!(reorder(&["a", "b", "c"], 0, 1), vec!["b", "a", "c"]);
         // 拉到最後
         assert_eq!(reorder(&["a", "b", "c"], 0, 2), vec!["b", "c", "a"]);
+    }
+
+    /// 整支輸出的速度基準（平常不跑，要手動點名）：
+    /// `P2V_BENCH_VIDEO=<影片> cargo test --release --bin photo2video -- --ignored movie_export_bench --nocapture`
+    /// （ffmpeg 要在 PATH 上，例如把 dist 加進去；`P2V_BENCH_FAST=1` 改測速度優先）。
+    /// 印出每秒處理幾格。改去煙的效能前後各跑一次，數字才有依據
+    #[test]
+    #[ignore]
+    fn movie_export_bench() {
+        let Some(src) = std::env::var_os("P2V_BENCH_VIDEO").map(PathBuf::from) else {
+            eprintln!("沒設 P2V_BENCH_VIDEO，跳過");
+            return;
+        };
+        let info = movie::probe(&src).expect("讀不到影片");
+        let mut params = SmokeParams::default();
+        params.fast = std::env::var_os("P2V_BENCH_FAST").is_some();
+        let segs = vec![movie::ExportSeg {
+            start: 0.0,
+            params,
+            grades: Vec::new(),
+        }];
+        let out = std::env::temp_dir().join("p2v_bench_out.mp4");
+        let workers = movie_workers(info.w, info.h, false);
+        let codec = detect_h264_encoder().codec_args();
+        let cancel = AtomicBool::new(false);
+        let done = std::sync::Mutex::new(0u64);
+        let t0 = Instant::now();
+        movie::export(
+            &src,
+            &out,
+            &info,
+            &segs,
+            None,
+            None,
+            &codec,
+            workers,
+            &cancel,
+            &|n| *done.lock().unwrap() = n,
+        )
+        .expect("輸出失敗");
+        let secs = t0.elapsed().as_secs_f64();
+        let n = *done.lock().unwrap();
+        eprintln!(
+            "[bench] {}×{}，{n} 格、{workers} 條執行緒：{secs:.1} 秒 → {:.2} 格/秒",
+            info.w,
+            info.h,
+            n as f64 / secs
+        );
+        let _ = std::fs::remove_file(&out);
     }
 }

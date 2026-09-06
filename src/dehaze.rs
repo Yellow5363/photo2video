@@ -1199,6 +1199,22 @@ fn srgb_lut() -> [f32; 256] {
     lut
 }
 
+/// 診斷用：`SMOKE_TIMING=1` 時把去煙各階段花的時間印到 stderr
+/// （拿 smoke_cli 跑一張 1080p 看瓶頸在哪；影片是逐格跑這一套，
+/// 這裡省下一成整支就快一成）
+fn timing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SMOKE_TIMING").is_some())
+}
+
+/// 印出上一個 `tick` 到現在花的時間並重新計時（見 [`timing_on`]）
+fn tick(label: &str, t: &mut std::time::Instant) {
+    if timing_on() {
+        eprintln!("  [去煙] {label}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        *t = std::time::Instant::now();
+    }
+}
+
 /// 半徑 r 的方框均值（積分圖，O(n)）。邊界以實際覆蓋面積正規化，
 /// 不做 padding，避免邊緣被拉暗。
 fn box_mean(p: &Plane, r: usize) -> Plane {
@@ -1423,15 +1439,19 @@ struct Guide<'a> {
 
 impl<'a> Guide<'a> {
     fn new(g: &'a Plane, r: usize) -> Self {
+        let mut t = std::time::Instant::now();
         let mut ii = Plane::new(g.w, g.h);
         for (v, s) in ii.d.iter_mut().zip(&g.d) {
             *v = s * s;
         }
+        let mean_i = box_mean(g, r);
+        let mean_ii = box_mean(&ii, r);
+        tick("    Guide::new（2 次 box_mean）", &mut t);
         Self {
             g,
             r,
-            mean_i: box_mean(g, r),
-            mean_ii: box_mean(&ii, r),
+            mean_i,
+            mean_ii,
         }
     }
 
@@ -1667,7 +1687,9 @@ fn estimate_smoke(img: &RgbImage, p: &SmokeParams, lut: &[f32; 256]) -> Vec<Plan
     // 用「最小值池化」而非平均縮圖：平均會把煙火線條的亮度抹進背景，
     // 讓煙霧層被高估、煙火簇整團被當成煙霧削掉。取區塊最小值則等同先做一次
     // 腐蝕，細線在這一步就消失，只有連續的煙霧面留下來。
+    let mut t = std::time::Instant::now();
     let blocks = downsample(img, lut, ww, wh);
+    tick(&format!("downsample → {ww}×{wh}"), &mut t);
     let lin = &blocks.min;
 
     // --- 2. 形態學開運算的結構元素 ---
@@ -1703,7 +1725,7 @@ fn estimate_smoke(img: &RgbImage, p: &SmokeParams, lut: &[f32; 256]) -> Vec<Plan
         resid.push(ch);
     }
     let mut layer = vec![Plane::new(ww, wh); 3];
-    for _ in 0..PEEL {
+    for round in 0..PEEL {
         // 這一輪三個通道共用同一張導引圖，只跟它有關的那幾項先算好（見 [`Guide`]）
         let g = Guide::new(&guide, r_guide);
         for c in 0..3 {
@@ -1719,6 +1741,7 @@ fn estimate_smoke(img: &RgbImage, p: &SmokeParams, lut: &[f32; 256]) -> Vec<Plan
         for i in 0..ww * wh {
             guide.d[i] = 0.2126 * resid[0].d[i] + 0.7152 * resid[1].d[i] + 0.0722 * resid[2].d[i];
         }
+        tick(&format!("peel 第 {} 輪合計", round + 1), &mut t);
     }
 
     // --- 5. 把沒收斂完的那截補上 ---
@@ -1743,8 +1766,11 @@ fn estimate_smoke(img: &RgbImage, p: &SmokeParams, lut: &[f32; 256]) -> Vec<Plan
             *v += r;
         }
     }
+    tick("rest（3 次 open_filter）", &mut t);
 
-    layer.iter().map(|s| upscale(s, fw, fh)).collect()
+    let out: Vec<Plane> = layer.iter().map(|s| upscale(s, fw, fh)).collect();
+    tick("upscale ×3", &mut t);
+    out
 }
 
 /// 估煙霧層的工作尺寸：長邊縮到 [`WORK_LONG_EDGE`]，比這還小的照片就原尺寸做
@@ -1857,8 +1883,11 @@ fn streak_fill(b: &Blocks, r: usize) -> Plane {
 /// 取一個通道的「平滑下包絡」：開運算掃掉細亮結構，導引濾波把方塊邊緣抹平
 /// 並貼回原圖的邊緣，最後夾在原值以下
 fn envelope(ch: &Plane, guide: &Guide, r_open: usize, eps: f32) -> Plane {
+    let mut t = std::time::Instant::now();
     let opened = open_filter(ch, r_open);
+    tick("    envelope/open_filter", &mut t);
     let mut s = guide.filter(&opened, eps);
+    tick("    envelope/guided（4 次 box_mean）", &mut t);
     for i in 0..s.d.len() {
         s.d[i] = s.d[i].clamp(0.0, ch.d[i]);
     }
@@ -2893,7 +2922,8 @@ pub fn debug_sky_mask(img: &RgbImage, params: &SmokeParams) -> RgbImage {
     let p = params.clamped();
     let (fw, fh) = (img.width() as usize, img.height() as usize);
     // 天空判定是在去煙後的影像上做的，診斷也要走同一條路才看得準
-    let (buf, _, _) = dehaze_to_linear(img, &p);
+    let field = field_of(img, &p);
+    let (buf, _, _) = dehaze_to_linear(img, &p, &field);
     let sky = sky_mask(
         &buf,
         fw,
@@ -3282,21 +3312,165 @@ pub fn auto_params(img: &RgbImage, source_long: u32) -> AutoParams {
     }
 }
 
-/// 移除照片中的煙霧，保留煙火細節
-pub fn remove_smoke(img: &RgbImage, params: &SmokeParams) -> RgbImage {
+/// 把使用者給的參數整理成真的拿去算的那一份：夾住範圍；「速度優先」的工作解析度
+/// 比較小，同樣的強度會扣得少一點，照 pool_gain 的模型折算回來，兩種模式下同一個
+/// 滑桿數字才是同一種效果（見 [`pool_gain_at`]）
+fn normalized(params: &SmokeParams, img: &RgbImage) -> SmokeParams {
     let mut p = params.clamped();
-    if p.is_neutral() {
-        return img.clone();
-    }
-    // 「速度優先」的工作解析度比較小，同樣的強度會扣得少一點；照 pool_gain 的
-    // 模型折算回來，兩種模式下同一個滑桿數字才是同一種效果（見 [`pool_gain_at`]）
     if p.fast {
         let long = img.width().max(img.height());
         let k = pool_gain_at(long, FAST_WORK_EDGE) / pool_gain_at(long, WORK_LONG_EDGE);
         p.strength = ((p.strength as f32 * k).round() as i32).clamp(0, 100);
     }
+    p
+}
+
+/// 去煙裡「跟著整個畫面慢慢變」的那幾樣，事先算好的一份：煙霧層、夜空底色、
+/// 天空範圍。它們佔掉一格八成的時間（1080p 實測 585＋116＋68 ms，其餘不到 110 ms）。
+///
+/// 照片一張算一次就用掉（[`remove_smoke`]）；影片相鄰兩格幾乎一樣，這幾樣可以隔格
+/// 算、中間那格用前後兩格的內插（[`SmokeField::lerp`]，見 `movie::dehaze_frames`），
+/// 跟細節有關的部分（補回軌跡、亮芯、逐像素相減）仍逐格算，煙火線條一格都不含糊
+#[derive(Clone)]
+pub struct SmokeField {
+    /// 三通道煙霧層（線性光，原尺寸）；強度 0 時是空的
+    smoke: Vec<Plane>,
+    /// 夜空底色（見 [`floor_from`]）
+    floor: [f32; 3],
+    /// 天際線以上的權重（原尺寸）；沒勾「只處理天空」時是 None
+    sky: Option<Plane>,
+    /// 影像尺寸（內插前確認兩份對得上）
+    w: usize,
+    h: usize,
+}
+
+impl SmokeField {
+    /// 兩份的中間：`t`＝0 是自己、1 是 `other`。兩份要同尺寸、同一組參數算的
+    /// （見 [`same_field_params`]）；對不上就直接回自己那份
+    pub fn lerp(&self, other: &Self, t: f32) -> Self {
+        if self.w != other.w
+            || self.h != other.h
+            || self.smoke.len() != other.smoke.len()
+            || self.sky.is_some() != other.sky.is_some()
+        {
+            return self.clone();
+        }
+        let t = t.clamp(0.0, 1.0);
+        let mix = |a: &Plane, b: &Plane| {
+            let mut o = Plane::new(a.w, a.h);
+            for ((o, a), b) in o.d.iter_mut().zip(&a.d).zip(&b.d) {
+                *o = a + (b - a) * t;
+            }
+            o
+        };
+        SmokeField {
+            smoke: self
+                .smoke
+                .iter()
+                .zip(&other.smoke)
+                .map(|(a, b)| mix(a, b))
+                .collect(),
+            floor: std::array::from_fn(|c| self.floor[c] + (other.floor[c] - self.floor[c]) * t),
+            sky: self
+                .sky
+                .as_ref()
+                .zip(other.sky.as_ref())
+                .map(|(a, b)| mix(a, b)),
+            w: self.w,
+            h: self.h,
+        }
+    }
+}
+
+/// 兩組參數算出來的 [`SmokeField`] 是不是同一種。遮色片、保護色與強度的大小都
+/// 不影響那幾樣（強度只在相減時用），只有這幾項會：內插只能在同一種之間做
+pub fn same_field_params(a: &SmokeParams, b: &SmokeParams) -> bool {
+    a.detail == b.detail
+        && a.sky_only == b.sky_only
+        && a.fast == b.fast
+        && a.preview_of == b.preview_of
+        && (a.strength > 0) == (b.strength > 0)
+}
+
+/// 先把慢慢變的那幾樣算好（見 [`SmokeField`]）
+pub fn smoke_field(img: &RgbImage, params: &SmokeParams) -> SmokeField {
+    field_of(img, &normalized(params, img))
+}
+
+/// 用事先算好的那份 [`SmokeField`] 去煙。與 [`remove_smoke`] 的差別只在那幾樣
+/// 是誰算的：同一格自己算的那份餵進來，結果逐位元相同
+pub fn remove_smoke_with(img: &RgbImage, params: &SmokeParams, field: &SmokeField) -> RgbImage {
+    let p = normalized(params, img);
+    if p.is_neutral() {
+        return img.clone();
+    }
     let (fw, fh) = (img.width() as usize, img.height() as usize);
-    let (mut buf, weight, floor) = dehaze_to_linear(img, &p);
+    // 尺寸對不上的那份不能用（呼叫端配錯了），寧可自己重算也不要拿錯的去扣
+    let own;
+    let field = if field.w == fw && field.h == fh {
+        field
+    } else {
+        own = field_of(img, &p);
+        &own
+    };
+    finish_with(img, &p, field)
+}
+
+/// 移除照片中的煙霧，保留煙火細節
+pub fn remove_smoke(img: &RgbImage, params: &SmokeParams) -> RgbImage {
+    let p = normalized(params, img);
+    if p.is_neutral() {
+        return img.clone();
+    }
+    let field = field_of(img, &p);
+    finish_with(img, &p, &field)
+}
+
+/// [`SmokeField`] 的實作：煙霧層、夜空探測、天空範圍。`p` 要先過 [`normalized`]
+fn field_of(img: &RgbImage, p: &SmokeParams) -> SmokeField {
+    let (fw, fh) = (img.width() as usize, img.height() as usize);
+    if p.is_neutral() {
+        return SmokeField {
+            smoke: Vec::new(),
+            floor: [0.0; 3],
+            sky: None,
+            w: fw,
+            h: fh,
+        };
+    }
+    let lut = srgb_lut();
+    let mut t = std::time::Instant::now();
+    // 只想清雲或改夜空色時強度會是 0，這時不必花時間估煙霧層
+    let smoke = if p.strength > 0 {
+        estimate_smoke(img, p, &lut)
+    } else {
+        Vec::new()
+    };
+    tick("estimate_smoke 合計", &mut t);
+    // 先探一次夜空：底色（相減以它為零點，見 [`floor_from`]）與水平線（天空範圍
+    // 不比它低，見 [`SkyProbe::sea`]）
+    let SkyProbe { floor, sea } = sky_probe(img);
+    tick("sky_probe", &mut t);
+    // 只在天空去煙：地景與水面沒有煙，卻一樣估得出「煙霧層」，
+    // 扣下去只是把岸邊與倒影整片壓暗（見 [`sky_region`]）。強度 0 時不必算
+    let sky = (p.sky_only && p.strength > 0)
+        .then(|| sky_region_of(img, p.source_long(fw.max(fh) as u32), sea));
+    tick("sky_region_of", &mut t);
+    SmokeField {
+        smoke,
+        floor,
+        sky,
+        w: fw,
+        h: fh,
+    }
+}
+
+/// 去煙的後半：拿算好的場逐像素相減，再做天空處理、轉回 sRGB。`p` 要先過 [`normalized`]
+fn finish_with(img: &RgbImage, p: &SmokeParams, field: &SmokeField) -> RgbImage {
+    let (fw, fh) = (img.width() as usize, img.height() as usize);
+    let mut t = std::time::Instant::now();
+    let (mut buf, weight, floor) = dehaze_to_linear(img, p, field);
+    tick("dehaze_to_linear 合計", &mut t);
 
     if p.touches_sky() {
         // 線條判據要拿原圖算：去煙後的影像線條已經被改過，
@@ -3311,6 +3485,7 @@ pub fn remove_smoke(img: &RgbImage, params: &SmokeParams) -> RgbImage {
             Some(&streak_plane(img, p.work_edge())),
             floor,
         );
+        tick("apply_sky", &mut t);
     }
 
     let mut out = RgbImage::new(fw as u32, fh as u32);
@@ -3327,6 +3502,7 @@ pub fn remove_smoke(img: &RgbImage, params: &SmokeParams) -> RgbImage {
                 .clamp(0.0, 255.0) as u8,
         ]);
     }
+    tick("線性→sRGB 輸出", &mut t);
     out
 }
 
@@ -3428,15 +3604,18 @@ fn sky_probe(img: &RgbImage) -> SkyProbe {
 /// 去煙的主體：回傳線性光的結果、每個像素的作用權重
 /// （框選範圍外與命中保護色處為 0，天空處理要沿用同一份權重），
 /// 以及這張的夜空底色（清雲要往它壓、不是往黑壓）
-fn dehaze_to_linear(img: &RgbImage, p: &SmokeParams) -> (Vec<[f32; 3]>, Vec<f32>, [f32; 3]) {
+fn dehaze_to_linear(
+    img: &RgbImage,
+    p: &SmokeParams,
+    field: &SmokeField,
+) -> (Vec<[f32; 3]>, Vec<f32>, [f32; 3]) {
     let (fw, fh) = (img.width() as usize, img.height() as usize);
     let lut = srgb_lut();
-    // 只想清雲或改夜空色時強度會是 0，這時不必花時間估煙霧層
-    let smoke = if p.strength > 0 {
-        estimate_smoke(img, p, &lut)
-    } else {
-        Vec::new()
-    };
+    let mut t = std::time::Instant::now();
+    // 煙霧層、夜空底色與天空範圍都在 field 裡先算好了（見 [`SmokeField`]）
+    let smoke = &field.smoke;
+    let floor = field.floor;
+    let sky = field.sky.as_ref();
 
     // --- 4. 相減：J = I − k·S ---
     // 煙霧散射光是加性的，直接扣掉即可；煙火線條的亮度是自身發光，
@@ -3460,6 +3639,7 @@ fn dehaze_to_linear(img: &RgbImage, p: &SmokeParams) -> (Vec<[f32; 3]>, Vec<f32>
         }
         y
     });
+    tick("lum", &mut t);
     // 亮芯的「一帶有多亮」（見 [`CORE_KEEP_AREA`]），已換算成保護權重 0~1，
     // 平台再往外暈開一圈（見 [`CORE_SKIRT`]）
     let core_area = lum.as_ref().map(|y| {
@@ -3495,6 +3675,7 @@ fn dehaze_to_linear(img: &RgbImage, p: &SmokeParams) -> (Vec<[f32; 3]>, Vec<f32>
         }
         s
     });
+    tick("core_area（4 次 box_mean）", &mut t);
     // 補回煙裡的軌跡：先量出每個像素「比周圍高出多少」
     let excess = (p.restore_trails && p.strength > 0).then(|| {
         let long = fw.max(fh) as f32;
@@ -3546,11 +3727,7 @@ fn dehaze_to_linear(img: &RgbImage, p: &SmokeParams) -> (Vec<[f32; 3]>, Vec<f32>
         }
         y
     });
-    // 先探一次夜空：底色（相減以它為零點，見 [`floor_from`]）與水平線（天空範圍
-    // 不比它低，見 [`SkyProbe::sea`]）
-    let SkyProbe { floor, sea } = sky_probe(img);
-    let sky = (p.sky_only && p.strength > 0)
-        .then(|| sky_region_of(img, p.source_long(fw.max(fh) as u32), sea));
+    tick("excess（補回軌跡：box_mean + open_filter）", &mut t);
     // 結果先留在線性空間：天空處理要在這上面做，最後才一次轉回 sRGB
     let mut buf: Vec<[f32; 3]> = vec![[0.0; 3]; fw * fh];
     // 每個像素的作用權重，天空處理要沿用（框外與保護色一樣不能動）
@@ -3704,6 +3881,7 @@ fn dehaze_to_linear(img: &RgbImage, p: &SmokeParams) -> (Vec<[f32; 3]>, Vec<f32>
             buf[idx] = [rgb[0] + floor[0], rgb[1] + floor[1], rgb[2] + floor[2]];
         }
     }
+    tick("逐像素相減", &mut t);
     (buf, weight, floor)
 }
 
@@ -3768,6 +3946,80 @@ fn apply_sky(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 測試用的夜景：上半漸層的夜空罩著一層煙、一顆亮球，下段是有紋理的地景
+    fn field_scene(shift: u8) -> RgbImage {
+        let (w, h) = (160u32, 96u32);
+        RgbImage::from_fn(w, h, |x, y| {
+            let mut v = if y < 60 {
+                // 煙：由上往下變亮的一片灰
+                40 + (y * 2) as u8
+            } else {
+                // 地景：格子紋理
+                (60 + ((x / 6 + y / 6) % 5) as u8 * 25) as u8
+            };
+            let (dx, dy) = (x as i32 - 80, y as i32 - 30);
+            if dx * dx + dy * dy < 100 {
+                v = 240;
+            }
+            let v = v.saturating_add(shift);
+            Rgb([v, v.saturating_sub(5), v.saturating_sub(10)])
+        })
+    }
+
+    /// 事先算好的場餵回去，要與一氣呵成的 remove_smoke 逐位元相同；
+    /// 兩份場的內插要落在中間；尺寸對不上的兩份不能混，回自己那份
+    #[test]
+    fn a_precomputed_field_reproduces_remove_smoke_exactly() {
+        let img = field_scene(0);
+        let p = SmokeParams {
+            strength: 70,
+            detail: 50,
+            ..SmokeParams::default()
+        };
+        let direct = remove_smoke(&img, &p);
+        let field = smoke_field(&img, &p);
+        let via = remove_smoke_with(&img, &p, &field);
+        assert_eq!(direct.as_raw(), via.as_raw(), "同一格自己算的場餵回去結果該一模一樣");
+        assert_eq!(field.smoke.len(), 3, "強度大於 0 要有三通道煙霧層");
+        assert!(field.sky.is_some(), "預設只處理天空，要有天空範圍");
+
+        // 內插：亮一點的同一景，中間那份的每一項都要落在兩者中間
+        let other = smoke_field(&field_scene(30), &p);
+        let mid = field.lerp(&other, 0.5);
+        for c in 0..3 {
+            let want = (field.floor[c] + other.floor[c]) / 2.0;
+            assert!((mid.floor[c] - want).abs() < 1e-6, "底色沒內插到中間");
+        }
+        let i = 20 * 160 + 80;
+        let want = (field.smoke[1].d[i] + other.smoke[1].d[i]) / 2.0;
+        assert!((mid.smoke[1].d[i] - want).abs() < 1e-5, "煙霧層沒內插到中間");
+        assert!((field.lerp(&other, 0.0).smoke[1].d[i] - field.smoke[1].d[i]).abs() < 1e-6);
+        assert!((field.lerp(&other, 1.0).smoke[1].d[i] - other.smoke[1].d[i]).abs() < 1e-6);
+
+        // 尺寸不同的兩份對不上：回自己那份
+        let small = smoke_field(
+            &image::imageops::resize(&img, 80, 48, image::imageops::FilterType::Triangle),
+            &p,
+        );
+        let kept = field.lerp(&small, 0.5);
+        assert_eq!((kept.w, kept.h), (160, 96));
+        assert_eq!(kept.smoke[0].d, field.smoke[0].d);
+
+        // 哪些參數不影響場：遮色片、保護色與強度的大小；細節、只處理天空、速度優先會
+        let mut q = p.clone();
+        q.strength = 30;
+        q.shapes.push(Shape::Rect(Region {
+            x0: 0.1,
+            y0: 0.1,
+            x1: 0.5,
+            y1: 0.5,
+        }));
+        assert!(same_field_params(&p, &q));
+        assert!(!same_field_params(&p, &SmokeParams { detail: 51, ..p.clone() }));
+        assert!(!same_field_params(&p, &SmokeParams { sky_only: false, ..p.clone() }));
+        assert!(!same_field_params(&p, &SmokeParams { strength: 0, ..p.clone() }));
+    }
 
     /// 產生一張純色圖
     fn solid(w: u32, h: u32, c: [u8; 3]) -> RgbImage {
