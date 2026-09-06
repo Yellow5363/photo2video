@@ -13209,6 +13209,8 @@ impl App {
                             MaskTool::Radial => Some(Draft::Radial(p, p)),
                             MaskTool::Brush => Some(Draft::Brush(vec![[p.x, p.y]])),
                             MaskTool::Object => Some(Draft::Object(p, p)),
+                            // 天空不用拖：點工具的當下就圈好了
+                            MaskTool::Sky => None,
                         })
                 });
             }
@@ -17818,6 +17820,8 @@ impl App {
                         MaskTool::Radial => Some(Draft::Radial(p, p)),
                         MaskTool::Brush => Some(Draft::Brush(vec![[p.x, p.y]])),
                         MaskTool::Object => Some(Draft::Object(p, p)),
+                        // 天空不用拖：點工具的當下就圈好了
+                        MaskTool::Sky => None,
                     })
             });
         }
