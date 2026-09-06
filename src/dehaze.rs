@@ -2765,6 +2765,116 @@ pub fn sky_weights(img: &RgbImage, long: u32) -> (Vec<f32>, usize, usize) {
     (r.d, sw as usize, sh as usize)
 }
 
+/// 「天空」遮色片的工作解析度（長邊）。天際線本身是大尺度的東西，幾百像素
+/// 就描得夠貼；但這張遮色片還要**避開煙火的線條**，線條是細的，縮太小就糊成
+/// 一片認不出來，所以取與預覽天空範圍相同的尺寸（見 [`REGION_LONG_EDGE`]）
+const SKY_SELECT_EDGE: u32 = REGION_LONG_EDGE;
+
+/// 逐點判「這裡是煙火紋路」的相對對比門檻（見 [`sky_points`]）：
+/// 與 [`sky_mask`] 拉滿範圍時那組相同——那組已經調到「線條與星點擋掉、
+/// 被煙火照亮的平順煙霧留著」，亮度則不看（煙火照亮的煙比夜空亮上兩個數量級）
+const SKY_POINT_CONTRAST: (f32, f32) = (
+    SKY_PT_CONTRAST.0 + SKY_PT_CONTRAST.1,
+    (SKY_PT_CONTRAST.0 + SKY_PT_CONTRAST.1) * 0.25,
+);
+
+/// 逐點的「不是煙火紋路」權重：1＝平順（夜空、煙、雲），0＝線條或星點。
+///
+/// 只看紋理不看亮度：細節＝與很小範圍平均的落差，換算成相對於自己亮度的對比，
+/// 煙火線條與星點相對它周圍暗得多的天空對比極高，被煙火照亮的煙霧再亮也是平的。
+/// 線條往外撐一圈再抹平：遮色片的邊界要離線條一點距離，羽化時才不會又暈回去
+fn sky_points(lin: &[[f32; 3]], fw: usize, fh: usize) -> Plane {
+    let long = fw.max(fh) as f32;
+    let mut y = Plane::new(fw, fh);
+    for (i, c) in lin.iter().enumerate() {
+        y.d[i] = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    }
+    // 半徑與 sky_mask 的 r_hi 同一個算法，兩邊認的「細節」才是同一種東西
+    let r_hi = ((long * 0.0015).round() as usize).clamp(1, 6);
+    let blur_hi = box_mean(&y, r_hi);
+    let mut detail = Plane::new(fw, fh);
+    for i in 0..fw * fh {
+        detail.d[i] = (y.d[i] - blur_hi.d[i]).abs();
+    }
+    let detail_pt = box_mean(&detail, r_hi);
+    let (dp1, dp0) = SKY_POINT_CONTRAST;
+    let mut streak = Plane::new(fw, fh);
+    for i in 0..fw * fh {
+        let contrast = detail_pt.d[i] / (blur_hi.d[i] + SKY_CONTRAST_FLOOR);
+        streak.d[i] = smoothstep(dp0, dp1, contrast);
+    }
+    let streak = box_mean(&max_filter(&streak, r_hi), r_hi);
+    let mut out = Plane::new(fw, fh);
+    for i in 0..fw * fh {
+        out.d[i] = 1.0 - streak.d[i];
+    }
+    out
+}
+
+/// 自動選取天空：一鍵把「天際線以上」整片圈成一個遮色片形狀
+/// （比照 Lightroom 的「選取天空」）。
+///
+/// 界線用的是「只處理天空」那一套判定（[`sky_region`] 加上水平線
+/// [`SkyProbe::sea`]）：從畫面上緣一路連得下來的平順區域算天空，橫貫整排、
+/// 佈滿細節的岸邊地景與水面倒影擋在外面。
+///
+/// **煙火的紋路要避開**（使用者裁定）：天際線以上再乘一次逐點的判定
+/// （[`sky_points`]）——煙火的線條與星點擋掉，線條之間與周圍的煙霧、
+/// 被煙火照亮的天空都照樣選進來。只避開線條本身、不避開整團煙火與它的光暈：
+/// 煙火周圍那團煙正是最該處理的地方。
+/// 結果存成一個鋪滿整張的 [`Object`]，羽化與邊緣兩條滑桿照物件那套調
+///
+/// * `img` 是預覽底圖（原圖等比縮小的那張就夠）
+/// * `source_long` 是原圖的長邊：判定天空的統計半徑要照原圖換算，預覽與
+///   成品才會圈到同一條線。手上就是原圖（或不知道）時傳 0，照這張自己算
+/// * `feather`、`edge` 見 [`Object`]
+///
+/// 整張都是地景（或整張都是煙、分不出天際線）時回 None
+pub fn select_sky(img: &RgbImage, source_long: u32, feather: i32, edge: i32) -> Option<Object> {
+    if img.width() < 32 || img.height() < 32 {
+        return None;
+    }
+    let small = shrink(img, SKY_SELECT_EDGE);
+    let (w, h) = (small.width() as usize, small.height() as usize);
+    let lut = srgb_lut();
+    let lin: Vec<[f32; 3]> = small
+        .pixels()
+        .map(|px| [lut[px[0] as usize], lut[px[1] as usize], lut[px[2] as usize]])
+        .collect();
+    let source_long = if source_long == 0 {
+        img.width().max(img.height())
+    } else {
+        source_long.max(img.width().max(img.height()))
+    };
+    // 水平線在整張上量（與去煙時同一個值），天空才不會沿著水面鋪到畫面底
+    let sea = sky_probe(img).sea;
+    let region = sky_region(&lin, w, h, source_long as f32, sea);
+    // 避開煙火紋路：逐點擋掉線條與星點，煙與夜空留著
+    let points = sky_points(&lin, w, h);
+    let raw: Vec<u8> = region
+        .d
+        .iter()
+        .zip(points.d.iter())
+        .map(|(&a, &b)| ((a * b).clamp(0.0, 1.0) * 255.0).round() as u8)
+        .collect();
+    let (feather, edge) = (feather.clamp(0, 100), edge.clamp(-100, 100));
+    let o = Object {
+        mask: std::sync::Arc::new(refine_object(&raw, w, h, feather, edge)),
+        raw: std::sync::Arc::new(raw),
+        w,
+        h,
+        area: Region {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 1.0,
+            y1: 1.0,
+        },
+        feather,
+        edge,
+    };
+    o.is_usable().then_some(o)
+}
+
 pub fn debug_sky_region(img: &RgbImage, params: &SmokeParams) -> RgbImage {
     let r = sky_region_of(
         img,
@@ -4150,6 +4260,44 @@ mod tests {
             "地景一個像素都不該動，卻有 {}",
             at(120, 190)
         );
+    }
+
+    #[test]
+    fn select_sky_keeps_the_sky_but_skips_the_fireworks_lines_and_the_ground() {
+        // 與上面同一張合成圖：上半平順的天空、中間細線交錯的煙火、
+        // 下段佈滿細節的地景。「天空」遮色片要圈到天空與煙火下方的天空、
+        // 避開煙火的線條本身、不碰地景
+        let (w, h) = (240u32, 200u32);
+        let mut img = solid(w, h, [40, 42, 55]);
+        for y in 0..h {
+            for x in 0..w {
+                let p = img.get_pixel_mut(x, y);
+                let noisy = |seed: u32| ((seed.wrapping_mul(2654435761)) >> 24) as u8;
+                if y >= 150 {
+                    let n = noisy(x * 7 + y * 13);
+                    *p = Rgb([n, n / 2 + 60, n / 3 + 80]);
+                } else if (100..140).contains(&x) && (60..100).contains(&y) {
+                    let v = if (x + y) % 3 == 0 { 230 } else { 45 };
+                    *p = Rgb([v, v, v]);
+                }
+            }
+        }
+        let o = select_sky(&img, 0, 0, 0).expect("有天空的照片要選得出來");
+        let at = |x: u32, y: u32| o.at(x as f32 / w as f32, y as f32 / h as f32);
+        assert!(at(20, 20) > 0.8, "上方的天空要選進來，卻只有 {}", at(20, 20));
+        assert!(
+            at(120, 130) > 0.7,
+            "煙火下方的天空不該被它擋住，卻只有 {}",
+            at(120, 130)
+        );
+        // 煙火那一塊：線條交錯的地方要避開
+        assert!(at(120, 80) < 0.3, "煙火的紋路要避開，卻有 {}", at(120, 80));
+        assert!(at(120, 190) < 0.2, "地景不該選進來，卻有 {}", at(120, 190));
+
+        // 羽化與邊緣照物件那套調：換一組不重跑分割，鋪滿整張的範圍不變
+        let soft = o.refined(50, 0);
+        assert_eq!((soft.w, soft.h), (o.w, o.h));
+        assert_eq!(soft.area, o.area);
     }
 
     #[test]

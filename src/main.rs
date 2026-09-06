@@ -2907,6 +2907,8 @@ enum MaskTool {
     Radial,
     /// 物件：框住要選的東西，程式沿著它自己的輪廓圈出來
     Object,
+    /// 天空：不用拖，點下去就把天際線以上整片圈起來（見 [`dehaze::select_sky`]）
+    Sky,
 }
 
 /// 正在照片上拖曳、還沒放開的形狀（座標都是影像的相對座標 0~1）
@@ -2979,6 +2981,14 @@ const MASK_HINT: &str = "邊緣羽化＝疊完那一整片的邊界多柔 · 筆
 const OBJECT_HINT: &str = "拖曳框住要選的東西，程式會自動找出框裡那個東西的輪廓\n\
                            羽化＝邊界多柔 · 邊緣＝整圈往內收（−）或往外擴（＋）；\
                            拉這兩條會直接套到剛框好的那一個";
+
+/// 「天空」工具那兩條滑桿底下的一句話。與「物件」同一組滑桿，只是不必框
+const SKY_HINT: &str = "已自動圈出天際線以上整片（煙火的線條與星點避開，線條之間與周圍的煙都在內；岸邊地景與水面不在）\n\
+                        羽化＝邊界多柔 · 邊緣＝整圈往內收（−）或往外擴（＋）；\
+                        圈得不對可「還原一個」後再用別的工具補";
+
+/// 三個模組共用：點「天空」時底圖上分不出天際線的那句話
+const SKY_NONE: &str = "這張分不出天際線（整張都是地景或整張都是煙）——改用框選或筆刷自己圈";
 
 /// 一筆筆跡最多記幾個點：再密也看不出差別，卻會讓參數比對與重繪變慢
 const MAX_BRUSH_PTS: usize = 400;
@@ -13329,6 +13339,29 @@ impl App {
         }
     }
 
+    /// 「天空」工具：在預覽底圖上自動圈出天際線以上整片（避開煙火），
+    /// 圈成一個遮色片形狀。不用拖，點工具的當下就做
+    fn smoke_pick_sky(&mut self) {
+        let Some(base) = self.smoke.base.clone() else {
+            return;
+        };
+        let (f, e) = (self.smoke.object_feather, self.smoke.object_edge);
+        // 判定天空的統計半徑要照原圖換算，預覽與存檔才圈到同一條線
+        match dehaze::select_sky(&base, self.smoke.base_long, f, e) {
+            Some(o) => {
+                let mut v = self.smoke.effective();
+                if v.add_shape(dehaze::Shape::Object(o)) {
+                    self.smoke.error = None;
+                    self.smoke.set_params(v);
+                } else {
+                    self.smoke.error =
+                        Some(format!("遮色片最多疊 {} 個形狀", dehaze::MAX_SHAPES));
+                }
+            }
+            None => self.smoke.error = Some(SKY_NONE.into()),
+        }
+    }
+
     /// 取預覽底圖上某個相對座標的顏色
     fn smoke_color_at(&self, p: egui::Pos2) -> Option<[u8; 3]> {
         let base = self.smoke.base.as_ref()?;
@@ -14884,9 +14917,21 @@ impl App {
                      框得貼近一點選得越準；選完可再調羽化與邊緣"
                         .to_string(),
                 ),
+                (
+                    MaskTool::Sky,
+                    "天空",
+                    format!(
+                        "不用拖，點一下就自動圈出天際線以上整片（避開煙火紋路），\n\
+                         只有那一片{verb}；岸邊地景與水面不在內。選完可再調羽化與邊緣"
+                    ),
+                ),
             ] {
                 if check_label(ui, tool == Some(t), label).on_hover_text(tip).clicked() {
                     self.movie.pick_mask_tool(target, t);
+                    // 天空是一鍵的：工具點亮的當下就圈好，不必再到畫面上拖
+                    if t == MaskTool::Sky && self.movie.mask_tool == Some(t) {
+                        self.movie_pick_sky();
+                    }
                 }
             }
             let n = self.movie.mask_of(target).0.len();
@@ -14973,15 +15018,19 @@ impl App {
                     self.movie_refine_object(f, e);
                 }
                 ui.label(
-                    egui::RichText::new(OBJECT_HINT)
-                        .size(11.0)
-                        .color(theme::TEXT_WEAK),
+                    egui::RichText::new(if tool == Some(MaskTool::Sky) {
+                        SKY_HINT
+                    } else {
+                        OBJECT_HINT
+                    })
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
                 );
             }
             _ => {}
         }
         // 羽化與濃度：這一份遮色片共用。「物件」兩條都不吃（見去煙霧那邊的說明）
-        if tool != Some(MaskTool::Object) {
+        if !matches!(tool, Some(MaskTool::Object | MaskTool::Sky)) {
             let (_, feather, density) = self.movie.mask_mut(target);
             slider_row(ui, feather, 0, 100, "邊緣羽化");
             slider_row(ui, density, 0, 100, "筆刷濃度");
@@ -15116,12 +15165,14 @@ impl App {
                 resp.interact_pointer_pos()
                     .filter(|p| inside(*p))
                     .map(to_norm)
-                    .map(|p| match tool {
-                        MaskTool::Rect => Draft::Rect(p, p),
-                        MaskTool::Linear => Draft::Linear(p, p),
-                        MaskTool::Radial => Draft::Radial(p, p),
-                        MaskTool::Brush => Draft::Brush(vec![[p.x, p.y]]),
-                        MaskTool::Object => Draft::Object(p, p),
+                    .and_then(|p| match tool {
+                        MaskTool::Rect => Some(Draft::Rect(p, p)),
+                        MaskTool::Linear => Some(Draft::Linear(p, p)),
+                        MaskTool::Radial => Some(Draft::Radial(p, p)),
+                        MaskTool::Brush => Some(Draft::Brush(vec![[p.x, p.y]])),
+                        MaskTool::Object => Some(Draft::Object(p, p)),
+                        // 天空不用拖：點工具的當下就圈好了
+                        MaskTool::Sky => None,
                     })
             });
         }
@@ -15234,6 +15285,28 @@ impl App {
         let target = self.movie.mask_target;
         if let Some(dehaze::Shape::Object(o)) = self.movie.mask_mut(target).0.last_mut() {
             *o = o.refined(feather, edge);
+        }
+    }
+
+    /// 「天空」工具：在預覽那一格上自動圈出天際線以上整片（避開煙火），
+    /// 圈成一個遮色片形狀（與 [`App::smoke_pick_sky`] 同一套）
+    fn movie_pick_sky(&mut self) {
+        let Some(base) = self.movie.base.clone() else {
+            return;
+        };
+        // 判定天空的統計半徑要照原始影格換算，預覽與輸出才圈到同一條線
+        let long = self.movie.info.as_ref().map_or(0, |i| i.w.max(i.h));
+        let (f, e) = (self.movie.object_feather, self.movie.object_edge);
+        match dehaze::select_sky(&base, long, f, e) {
+            Some(o) => {
+                if self.movie.push_shape(dehaze::Shape::Object(o)) {
+                    self.movie.error = None;
+                } else {
+                    self.movie.error =
+                        Some(format!("遮色片最多疊 {} 個形狀", dehaze::MAX_SHAPES));
+                }
+            }
+            None => self.movie.error = Some(SKY_NONE.into()),
         }
     }
 
@@ -17117,6 +17190,27 @@ impl App {
         }
     }
 
+    /// 「天空」工具：在目前看的那一層上自動圈出天際線以上整片（避開煙火）
+    fn stack_pick_sky(&mut self) {
+        let Some(path) = self.stack.current().cloned() else {
+            return;
+        };
+        let Some(base) = self.stack.bases.get(&path).cloned() else {
+            return;
+        };
+        // 判定天空的統計半徑要照原圖換算，預覽與存檔才圈到同一條線
+        let long = self
+            .stack
+            .src_dims
+            .get(&path)
+            .map_or(0, |&(w, h)| w.max(h));
+        let (f, e) = (self.stack.object_feather, self.stack.object_edge);
+        match dehaze::select_sky(&base, long, f, e) {
+            Some(o) => self.stack_add_shape(dehaze::Shape::Object(o)),
+            None => self.stack.error = Some(SKY_NONE.into()),
+        }
+    }
+
     /// 把一個形狀加到目前這一層的遮色片上
     fn stack_add_shape(&mut self, s: dehaze::Shape) {
         let mut v = self.stack.cur_mask().to_vec();
@@ -17399,6 +17493,12 @@ impl App {
                          程式會自動找出框裡那個東西的輪廓。\n\
                          框得貼近一點選得越準；選完可再調羽化與邊緣",
                     ),
+                    (
+                        MaskTool::Sky,
+                        "天空",
+                        "不用拖，點一下就自動圈出這一層天際線以上整片（避開煙火紋路），\n\
+                         擋掉那一片；岸邊地景與水面不在內。選完可再調羽化與邊緣",
+                    ),
                 ] {
                     let on = self.stack.tool == Some(tool);
                     if check_label(ui, on, label).on_hover_text(tip).clicked() {
@@ -17408,6 +17508,10 @@ impl App {
                         if self.stack.tool.is_some() {
                             self.stack.view_layer = true;
                             self.stack.compare = false;
+                        }
+                        // 天空是一鍵的：工具點亮的當下就圈好，不必再到照片上拖
+                        if self.stack.tool == Some(MaskTool::Sky) {
+                            self.stack_pick_sky();
                         }
                     }
                 }
@@ -17496,7 +17600,13 @@ impl App {
                         self.stack_refine_object(f, e);
                     }
                     ui.label(
-                        egui::RichText::new(OBJECT_HINT).size(11.0).color(theme::TEXT_WEAK),
+                        egui::RichText::new(if self.stack.tool == Some(MaskTool::Sky) {
+                            SKY_HINT
+                        } else {
+                            OBJECT_HINT
+                        })
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
                     );
                 }
                 _ => {}
@@ -17507,7 +17617,7 @@ impl App {
             // **選著「物件」時不顯示**：這兩條它都不吃——邊界柔不柔由它自己
             // 那條「羽化」決定，濃度也一律 100%。擺在那裡只會讓人以為要調，
             // 而且畫面上會同時出現「羽化」與「邊緣羽化」兩條，更難分
-            if self.stack.tool != Some(MaskTool::Object) {
+            if !matches!(self.stack.tool, Some(MaskTool::Object | MaskTool::Sky)) {
                 let (f0, d0) = (self.stack.feather, self.stack.mask_density);
                 let (mut f, mut d) = (f0, d0);
                 slider_row(ui, &mut f, 0, 100, "邊緣羽化");
@@ -20247,10 +20357,22 @@ impl App {
                                      程式會自動找出框裡那個東西的輪廓。\n\
                                      框得貼近一點選得越準；選完可再調羽化與邊緣",
                                 ),
+                                (
+                                    MaskTool::Sky,
+                                    "天空",
+                                    "不用拖，點一下就自動圈出天際線以上整片（避開煙火紋路），\n\
+                                     只有那一片去煙；岸邊地景與水面不在內。選完可再調羽化與邊緣",
+                                ),
                             ] {
                                 let on = self.smoke.mask_tool == Some(tool);
                                 if check_label(ui, on, label).on_hover_text(tip).clicked() {
                                     self.smoke.pick_mask_tool(tool);
+                                    // 天空是一鍵的：工具點亮的當下就圈好，不必再到照片上拖
+                                    if tool == MaskTool::Sky
+                                        && self.smoke.mask_tool == Some(tool)
+                                    {
+                                        self.smoke_pick_sky();
+                                    }
                                 }
                             }
                             let n = eff.shapes.len();
@@ -20333,9 +20455,15 @@ impl App {
                                     self.smoke_refine_object(f, e);
                                 }
                                 ui.label(
-                                    egui::RichText::new(OBJECT_HINT)
-                                        .size(11.0)
-                                        .color(theme::TEXT_WEAK),
+                                    egui::RichText::new(
+                                        if self.smoke.mask_tool == Some(MaskTool::Sky) {
+                                            SKY_HINT
+                                        } else {
+                                            OBJECT_HINT
+                                        },
+                                    )
+                                    .size(11.0)
+                                    .color(theme::TEXT_WEAK),
                                 );
                             }
                             _ => {}
@@ -20349,7 +20477,10 @@ impl App {
                         // 唯一的例外是「物件」：這兩條它都不吃——邊界柔不柔由它
                         // 自己那條「羽化」決定，濃度也一律 100%。擺在那裡只會讓人
                         // 以為要調，而且會同時出現「羽化」與「邊緣羽化」兩條
-                        if self.smoke.mask_tool != Some(MaskTool::Object) {
+                        if !matches!(
+                            self.smoke.mask_tool,
+                            Some(MaskTool::Object | MaskTool::Sky)
+                        ) {
                             let mut v = eff.clone();
                             slider_row(ui, &mut v.feather, 0, 100, "邊緣羽化");
                             slider_row(ui, &mut v.mask_density, 0, 100, "筆刷濃度");

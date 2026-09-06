@@ -1,0 +1,24 @@
+name: CI
+
+# 每次推到 master（或開 PR）都建置一次並跑測試：這台開發機沒有 Rust 工具鏈，
+# 改完的程式在這裡先確認編得過、測試沒紅，再打 tag 發版
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust 建置快取
+        uses: Swatinem/rust-cache@v2
+
+      - name: 建置並跑測試
+        run: cargo test
