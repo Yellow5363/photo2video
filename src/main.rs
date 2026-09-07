@@ -4970,6 +4970,15 @@ struct MovieTool {
     /// 裁切範圍（相對座標；只裁不轉）。整支影片（含同一批的其他支）共用一個框，
     /// 在去煙**之前**裁：與縮小同一個道理，裁掉的地方不必花力氣去煙
     crop: Crop,
+    /// 自動判參數的開關（預設開著）。關掉就照滑桿上調好的那組跑
+    auto_on: bool,
+    /// 預覽那一格量到的建議值（見 [`dehaze::auto_params`]）。
+    ///
+    /// **整支影片只用一組**：逐格各判會讓扣掉的量一格一格跳，看起來就是畫面在閃
+    /// （見 [`MovieTool`] 的說明）。所以量的是「時間軸現在停的那一格」，
+    /// 拖到別的時間點就照那一格重量一次——挑一格煙最濃的停著，判出來的
+    /// 就是那一格該有的值，整支跟著它跑
+    auto: Option<dehaze::AutoParams>,
     /// 裁切要固定成哪個長寬比
     crop_aspect: CropAspect,
     /// 正在調整裁切範圍：預覽改顯示整格並畫出可拖曳的裁切框
@@ -5070,6 +5079,8 @@ impl Default for MovieTool {
             clip_tex: None,
             clip_base_tex: None,
             crop: Crop::default(),
+            auto_on: true,
+            auto: None,
             crop_aspect: CropAspect::Free,
             crop_editing: false,
             pro: false,
@@ -5121,6 +5132,8 @@ impl MovieTool {
         let fast = self.params.fast;
         self.params = SmokeParams::default();
         self.params.fast = fast;
+        self.auto_on = true;
+        self.auto = None;
         self.segments = vec![Segment::default()];
         self.grade = MovieGrade::default();
         self.crop = Crop::default();
@@ -5177,10 +5190,23 @@ impl MovieTool {
         self.batch_errs.clear();
     }
 
+    /// 去煙的滑桿現在停在哪：開著自動判參數就套上那一格量到的建議值。
+    ///
+    /// **只套去除煙霧與細節這兩條**——清雲與範圍在這個模組沒有介面可調，
+    /// 讓自動值把它們打開的話，畫面會多做一件使用者看不到開關的事
+    fn tuned_params(&self) -> SmokeParams {
+        let mut p = self.params.clone();
+        if let Some(a) = self.auto.as_ref().filter(|_| self.auto_on) {
+            p.strength = a.strength;
+            p.detail = a.detail;
+        }
+        p
+    }
+
     /// 某一段真的會拿去算的去煙參數：滑桿整支共用，遮色片是那一段自己的；
     /// 簡易模式不套遮色片（畫過的形狀仍留在段裡，切回專業就回來）
     fn effective_for(&self, seg: &Segment) -> SmokeParams {
-        let mut p = self.params.clone();
+        let mut p = self.tuned_params();
         p.shapes = if self.pro { seg.shapes.clone() } else { Vec::new() };
         p
     }
@@ -13595,7 +13621,13 @@ impl App {
         self.movie.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let r = movie::preview_frame(&src, at, max_long, crop.as_deref());
+            // 順手在同一條執行緒上量這一格的自動參數：與取格併在一起，
+            // 畫面不必為了量一次再等一輪
+            let r = movie::preview_frame(&src, at, max_long, crop.as_deref())
+                .map(|img| {
+                    let a = dehaze::auto_params(&img, ref_long);
+                    (img, a)
+                });
             let _ = tx.send(MovieMsg::Grabbed(want, r));
             ctx.request_repaint();
         });
@@ -14017,7 +14049,7 @@ impl App {
                         continue;
                     }
                     match res {
-                        Ok(img) => {
+                        Ok((img, auto)) => {
                             self.movie.base_tex =
                                 Some(load_rgb_texture(ctx, "movie_base", &img));
                             self.movie.base = Some(Arc::new(img));
@@ -14029,6 +14061,8 @@ impl App {
                             self.movie.mask_tex = None;
                             self.movie.mask_for = None;
                             self.movie.error = None;
+                            // 自動判參數照這一格量的（見 [`MovieTool::auto`]）
+                            self.movie.auto = Some(auto);
                         }
                         Err(e) => self.movie.error = Some(e),
                     }
@@ -14602,9 +14636,42 @@ impl App {
         );
         ui.add_space(4.0);
         ui.add_enabled_ui(!exporting, |ui| {
-            let mut p = self.movie.params.clone();
+            // 自動判參數：照時間軸現在停的那一格量，**整支共用同一組**
+            // （逐格各判會讓畫面一格一格跳，見 MovieTool::auto）
+            ui.horizontal_wrapped(|ui| {
+                let mut on = self.movie.auto_on;
+                if ui
+                    .checkbox(&mut on, "自動判參數")
+                    .on_hover_text(
+                        "照時間軸現在停的那一格，量出去除煙霧與細節該有的值，\n\
+                         整支影片共用這一組（逐格各判會讓扣掉的量一格一格跳，畫面像在閃）。\n\
+                         拖到別的時間點就照那一格重量一次；\n\
+                         挑一格煙最濃的停著判，整支跟著它跑最保險。\n\
+                         自己動過那兩條滑桿就會自動關掉，不再被蓋回去",
+                    )
+                    .changed()
+                {
+                    self.movie.auto_on = on;
+                }
+                if self.movie.auto_on {
+                    ui.label(
+                        egui::RichText::new(if self.movie.auto.is_some() {
+                            "已照這一格的煙量調好"
+                        } else {
+                            "等這一格讀進來就量"
+                        })
+                        .size(11.0)
+                        .color(theme::TEXT_WEAK),
+                    );
+                }
+            });
+            let eff = self.movie.tuned_params();
+            let mut p = eff.clone();
             slider_row(ui, &mut p.strength, 0, 100, "去除煙霧");
             slider_row(ui, &mut p.detail, 0, 100, "細節");
+            // 這兩條是自動值管的：自己動過就把自動判參數關掉，
+            // 否則下次換一格又被蓋回去（那兩個勾選不屬於自動值，不算數）
+            let tuned_moved = p.strength != eff.strength || p.detail != eff.detail;
             ui.label(
                 egui::RichText::new("去除煙霧＝煙霧扣掉多少 · 細節＝煙火線條的保留程度")
                     .size(11.0)
@@ -14624,7 +14691,11 @@ impl App {
                          估起來也像一層煙，扣下去整片會被壓暗",
                     );
             });
-            if p != self.movie.params {
+            if p != eff {
+                if tuned_moved {
+                    // 自己調過那兩條就不再被自動值蓋回去；滑桿從現在看到的值接著調
+                    self.movie.auto_on = false;
+                }
                 self.movie.params = p;
                 // 遮罩檢視開著的話那片紅蓋著，滑桿拖了也看不出差別（見 leave_mask_view）
                 self.movie.leave_mask_view();
@@ -30676,6 +30747,39 @@ mod tests {
         assert!(m.params.fast, "品質／速度是輸出區的偏好，不隨換批重設");
         assert!(m.size == MovieSize::Short(1080), "輸出尺寸要留著");
         assert!(m.pro, "簡易／專業是介面偏好，不隨換批重設");
+    }
+
+    /// 自動判參數：量到的值蓋掉去除煙霧與細節，其餘（清雲、範圍那些沒有介面的）
+    /// 一概不動；關掉就照滑桿走。整支共用一組，所以量的是預覽停著的那一格
+    #[test]
+    fn auto_params_only_drive_the_two_sliders_the_movie_module_shows() {
+        let mut m = MovieTool::default();
+        let d = SmokeParams::default();
+        // 還沒量到：就是滑桿上那組
+        assert_eq!(m.tuned_params().strength, d.strength);
+        m.auto = Some(dehaze::AutoParams {
+            strength: 60,
+            detail: 80,
+            sky_clean: 70,
+            sky_range: 55,
+        });
+        let t = m.tuned_params();
+        assert_eq!((t.strength, t.detail), (60, 80), "自動值要蓋掉這兩條");
+        assert_eq!(
+            (t.sky_clean, t.sky_range),
+            (d.sky_clean, d.sky_range),
+            "清雲與範圍在這個模組沒有介面，不該被自動值打開"
+        );
+        assert_eq!(t.sky_clean, 0, "自動值不該讓畫面多做一件看不到開關的事（清雲）");
+        // 關掉：回到滑桿上那組
+        m.auto_on = false;
+        assert_eq!(m.tuned_params().strength, d.strength);
+        // 去煙的參數走 tuned_params，所以段裡拿到的也是自動值
+        m.auto_on = true;
+        assert_eq!(m.effective().strength, 60);
+        // 換一批要連自動值一起歸零（下一支影片自己重量）
+        m.reset_batch(None, None);
+        assert!(m.auto_on && m.auto.is_none(), "換一批要回到「開著、還沒量」");
     }
 
     /// 拖去煙或調色的滑桿時要把遮罩檢視收起來：那片紅蓋著就看不出滑桿有沒有作用

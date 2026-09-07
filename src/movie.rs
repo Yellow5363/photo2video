@@ -62,7 +62,9 @@ impl VideoInfo {
 /// 背景執行緒回報給畫面的事
 pub enum MovieMsg {
     /// 預覽底圖取好了；附上當時的時間點，來回拖時間軸時用來丟棄過期的結果
-    Grabbed(f64, Result<RgbImage, String>),
+    /// 附上那一格量到的自動參數（見 [`dehaze::auto_params`]）：影片是逐格跑的，
+    /// 每格各判會讓扣掉的量一格一格跳，所以量一次、整支共用
+    Grabbed(f64, Result<(RgbImage, dehaze::AutoParams), String>),
     /// 預覽算完；附上當時的參數與時間點，用來判斷是不是已經過期
     Preview(SmokeParams, f64, RgbImage),
     /// 遮罩檢視算完（專業模式：紅色蓋住的地方不會被去煙／調色）；
