@@ -53,16 +53,16 @@ const GITHUB_REPO: &str = "Yellow5363/photo2video";
 mod theme {
     use eframe::egui::Color32;
 
-    pub const BG: Color32 = Color32::from_rgb(0x13, 0x14, 0x17); // 中央工作區
-    pub const PANEL: Color32 = Color32::from_rgb(0x1B, 0x1C, 0x21); // 側欄與上下欄
-    pub const CARD: Color32 = Color32::from_rgb(0x25, 0x27, 0x2D); // 卡片、按鈕
-    pub const CARD_HOVER: Color32 = Color32::from_rgb(0x2E, 0x30, 0x38);
-    pub const BORDER: Color32 = Color32::from_rgb(0x32, 0x34, 0x3C);
+    pub const BG: Color32 = Color32::from_rgb(0x1F, 0x20, 0x24); // 中央工作區
+    pub const PANEL: Color32 = Color32::from_rgb(0x27, 0x28, 0x2E); // 側欄與上下欄
+    pub const CARD: Color32 = Color32::from_rgb(0x31, 0x33, 0x3A); // 卡片、按鈕
+    pub const CARD_HOVER: Color32 = Color32::from_rgb(0x3A, 0x3C, 0x45);
+    pub const BORDER: Color32 = Color32::from_rgb(0x3E, 0x40, 0x49);
     /// 兩欄之間那種「獨立畫在大片深色背景上」的分隔線。
     /// BORDER 是貼著元件的邊框，靠元件本身的底色襯著才看得出來；
     /// 長線孤零零畫在背景上用 BORDER 幾乎看不見，要亮一階
     /// （這個值本來就在配色裡：滑鼠指到元件時的邊框色）
-    pub const DIVIDER: Color32 = Color32::from_rgb(0x45, 0x48, 0x52);
+    pub const DIVIDER: Color32 = Color32::from_rgb(0x51, 0x54, 0x5F);
     pub const TEXT: Color32 = Color32::from_rgb(0xE9, 0xEA, 0xEE);
     pub const TEXT_WEAK: Color32 = Color32::from_rgb(0x9A, 0x9C, 0xA8);
     pub const ACCENT: Color32 = Color32::from_rgb(0x5B, 0x8C, 0xFF);
@@ -74,7 +74,7 @@ mod theme {
     /// 主體追蹤的框。裁切框是白的、文字選取框是藍的，追蹤用橘色才不會混淆
     pub const TRACK: Color32 = Color32::from_rgb(0xFF, 0x8A, 0x3D);
     pub const ERROR: Color32 = Color32::from_rgb(0xE5, 0x60, 0x5A);
-    pub const PREVIEW_BG: Color32 = Color32::from_rgb(0x0D, 0x0E, 0x10);
+    pub const PREVIEW_BG: Color32 = Color32::from_rgb(0x19, 0x1A, 0x1D);
 }
 
 /// 主畫面右上角的功能模組（比照 Lightroom 的「圖庫｜編輯相片｜地圖…」）。
@@ -10061,9 +10061,9 @@ impl App {
         let rect = ui.available_rect_before_wrap();
         let r = rect.shrink(4.0);
         ui.painter()
-            .rect_filled(r, 14, egui::Color32::from_rgb(0x17, 0x18, 0x1C));
+            .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
         // 虛線外框
-        let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x3A, 0x3D, 0x46));
+        let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
         let rr = r.shrink(1.5);
         for (a, b) in [
             (rr.left_top(), rr.right_top()),
@@ -23898,7 +23898,7 @@ fn apply_theme(ctx: &egui::Context) {
     v.override_text_color = Some(theme::TEXT);
     v.panel_fill = theme::PANEL;
     v.window_fill = theme::PANEL;
-    v.extreme_bg_color = Color32::from_rgb(0x0F, 0x10, 0x13);
+    v.extreme_bg_color = Color32::from_rgb(0x1B, 0x1C, 0x20);
     v.faint_bg_color = theme::CARD;
     v.window_corner_radius = CornerRadius::same(10);
     v.menu_corner_radius = CornerRadius::same(8);
@@ -23933,7 +23933,7 @@ fn apply_theme(ctx: &egui::Context) {
 
     v.widgets.hovered.bg_fill = theme::CARD_HOVER;
     v.widgets.hovered.weak_bg_fill = theme::CARD_HOVER;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x45, 0x48, 0x52));
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x51, 0x54, 0x5F));
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
     v.widgets.hovered.corner_radius = CornerRadius::same(6);
 
@@ -25002,8 +25002,8 @@ fn stack_empty_state(ui: &mut egui::Ui, need_more: bool) -> bool {
     let mut pick = false;
     let r = ui.available_rect_before_wrap().shrink(4.0);
     ui.painter()
-        .rect_filled(r, 14, egui::Color32::from_rgb(0x17, 0x18, 0x1C));
-    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x3A, 0x3D, 0x46));
+        .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
+    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
     let rr = r.shrink(1.5);
     for (a, b) in [
         (rr.left_top(), rr.right_top()),
@@ -25057,8 +25057,8 @@ fn smoke_empty_state(ui: &mut egui::Ui, loading: bool) -> bool {
     let mut pick = false;
     let r = ui.available_rect_before_wrap().shrink(4.0);
     ui.painter()
-        .rect_filled(r, 14, egui::Color32::from_rgb(0x17, 0x18, 0x1C));
-    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x3A, 0x3D, 0x46));
+        .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
+    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
     let rr = r.shrink(1.5);
     for (a, b) in [
         (rr.left_top(), rr.right_top()),
@@ -25106,8 +25106,8 @@ fn movie_empty_state(ui: &mut egui::Ui) -> bool {
     let mut pick = false;
     let r = ui.available_rect_before_wrap().shrink(4.0);
     ui.painter()
-        .rect_filled(r, 14, egui::Color32::from_rgb(0x17, 0x18, 0x1C));
-    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x3A, 0x3D, 0x46));
+        .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
+    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
     let rr = r.shrink(1.5);
     for (a, b) in [
         (rr.left_top(), rr.right_top()),
@@ -25153,8 +25153,8 @@ fn enhance_empty_state(ui: &mut egui::Ui, loading: bool) -> Option<bool> {
     let mut act = None;
     let r = ui.available_rect_before_wrap().shrink(4.0);
     ui.painter()
-        .rect_filled(r, 14, egui::Color32::from_rgb(0x17, 0x18, 0x1C));
-    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x3A, 0x3D, 0x46));
+        .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
+    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
     let rr = r.shrink(1.5);
     for (a, b) in [
         (rr.left_top(), rr.right_top()),
