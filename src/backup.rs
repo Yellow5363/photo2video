@@ -16,6 +16,10 @@
 //! **只往目的資料夾寫**：目的那份比較新時就原封不動留著，不會反過來動到
 //! 來源。來源資料夾在整個過程中都是唯讀的。
 //!
+//! 「目的比較新就留著」是預設，可以由使用者關掉（`keep_newer`，見 [`plan`]）：
+//! 目的那邊被別的程式改過、要拿來源蓋回去時用得上。關掉之前畫面上會先警告
+//! 一次——覆蓋不像刪除會進資源回收筒，蓋掉就真的沒了。
+//!
 //! 這裡只負責「算出要做哪些事」與「做一件事」；進度、取消與畫面在 main.rs，
 //! 與其他模組同一套作法。
 
@@ -41,6 +45,13 @@ pub enum Kind {
     Copy,
     /// 兩邊都有、來源比較新：覆蓋掉目的那一份
     Update,
+    /// 兩邊都有、**目的那份比較新**：只有取消「不覆蓋目的比較新的檔案」
+    /// 才會出現，用來源把它蓋回去。
+    ///
+    /// 和 [`Kind::Update`] 做的事一樣（拷過去蓋掉），但清單上要分得出來：
+    /// 這是整個備份裡唯一會讓「比較新的內容」消失的一種，而且救不回來
+    /// （覆蓋不像刪除會進資源回收筒）
+    Overwrite,
     /// 只有目的有：勾了「保留」就不動，沒勾就刪掉
     Extra,
 }
@@ -51,6 +62,7 @@ impl Kind {
         match self {
             Kind::Copy => "新增",
             Kind::Update => "更新",
+            Kind::Overwrite => "覆蓋較新",
             Kind::Extra => "目的地多餘檔案",
         }
     }
@@ -61,7 +73,8 @@ impl Kind {
         match self {
             Kind::Copy => 0,
             Kind::Update => 1,
-            Kind::Extra => 2,
+            Kind::Overwrite => 2,
+            Kind::Extra => 3,
         }
     }
 }
@@ -88,7 +101,10 @@ pub struct Plan {
     /// 目的那份比較新、因此原封不動留著的檔案數。
     ///
     /// 只往目的寫，所以這幾個不是「要做的事」——但也不是「相同」，
-    /// 不另外算一份的話，畫面上的數字會兜不起來
+    /// 不另外算一份的話，畫面上的數字會兜不起來。
+    ///
+    /// 取消「不覆蓋目的比較新的檔案」時這裡會是 0，那幾個檔案改成排進
+    /// [`Kind::Overwrite`]
     pub newer_dst: usize,
     /// 掃描時讀不到、只好跳過的資料夾（權限不足、被別的程式鎖住之類）
     pub skipped: Vec<String>,
@@ -421,8 +437,18 @@ fn newer(a: SystemTime, b: SystemTime) -> Option<bool> {
     }
 }
 
-/// 比對兩個資料夾，算出要做哪些事（這一步不動到任何檔案）
-pub fn plan(src: &Path, dst: &Path, recursive: bool, cancel: &AtomicBool) -> Result<Plan, String> {
+/// 比對兩個資料夾，算出要做哪些事（這一步不動到任何檔案）。
+///
+/// `keep_newer`＝目的那份比較新時原封不動留著（正常情況）。取消它就把那幾個
+/// 也排成 [`Kind::Overwrite`]，用來源蓋回去——來源才是「對的那一份」、目的
+/// 被別的程式動過時要的就是這個
+pub fn plan(
+    src: &Path,
+    dst: &Path,
+    recursive: bool,
+    keep_newer: bool,
+    cancel: &AtomicBool,
+) -> Result<Plan, String> {
     validate(src, dst)?;
     let (a, mut skipped, mut ignored) = scan(src, recursive, cancel)?;
     // 目的資料夾還沒建起來：當成空的，整批都是「新增」
@@ -451,8 +477,14 @@ pub fn plan(src: &Path, dst: &Path, recursive: bool, cancel: &AtomicBool) -> Res
                     kind: Kind::Update,
                     bytes: s.len,
                 }),
-                // 目的那份比較新：只往目的寫，所以原封不動留著
-                Some(false) => newer_dst += 1,
+                // 目的那份比較新：只往目的寫，所以原封不動留著。
+                // 除非使用者自己取消了「不覆蓋目的比較新的檔案」
+                Some(false) if keep_newer => newer_dst += 1,
+                Some(false) => actions.push(Action {
+                    rel: s.rel.clone(),
+                    kind: Kind::Overwrite,
+                    bytes: s.len,
+                }),
                 // 一樣新、也一樣大：同一份，不必動
                 None if s.len == d.len => same += 1,
                 // 一樣新卻不一樣大：其中一份是上次拷到一半留下的。
@@ -501,7 +533,7 @@ pub fn apply(
     let in_src = src_root.join(&act.rel);
     let in_dst = dst_root.join(&act.rel);
     match act.kind {
-        Kind::Copy | Kind::Update => {
+        Kind::Copy | Kind::Update | Kind::Overwrite => {
             create_dirs_for(src_root, dst_root, &act.rel)?;
             copy_file(&in_src, &in_dst, &act.rel)
         }
@@ -776,7 +808,7 @@ mod tests {
         write_at(&src.join("兩邊一樣.txt"), "same", 300);
         write_at(&dst.join("兩邊一樣.txt"), "same", 300);
 
-        let p = plan(&src, &dst, true, &AtomicBool::new(false)).unwrap();
+        let p = plan(&src, &dst, true, true, &AtomicBool::new(false)).unwrap();
         let got = kinds(&p);
         assert_eq!(got.get("來源比較新.txt"), Some(&Kind::Update));
         assert_eq!(got.get("只有來源有.txt"), Some(&Kind::Copy));
@@ -800,6 +832,42 @@ mod tests {
     }
 
     #[test]
+    fn turning_off_keep_newer_overwrites_the_newer_destination_copy() {
+        // 取消「不覆蓋目的比較新的檔案」時，目的那份比較新的要改成排進待辦
+        // （Kind::Overwrite），做完內容以來源為準。清單上要分得出來是哪幾個
+        // ——這是唯一會讓比較新的內容消失、又進不了資源回收筒的一種
+        let root = tmp("keep_newer");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        write_at(&src.join("目的比較新.txt"), "來源這份才是對的", 600);
+        write_at(&dst.join("目的比較新.txt"), "被別的程式改過", 0);
+        // 一般的更新（來源比較新）不受這個開關影響，還是算 Update
+        write_at(&src.join("來源比較新.txt"), "new", 0);
+        write_at(&dst.join("來源比較新.txt"), "old", 600);
+
+        let keep = plan(&src, &dst, true, true, &AtomicBool::new(false)).unwrap();
+        assert_eq!(keep.newer_dst, 1, "預設要原封不動留著");
+        assert_eq!(keep.count(Kind::Overwrite), 0);
+
+        let p = plan(&src, &dst, true, false, &AtomicBool::new(false)).unwrap();
+        let got = kinds(&p);
+        assert_eq!(got.get("目的比較新.txt"), Some(&Kind::Overwrite));
+        assert_eq!(got.get("來源比較新.txt"), Some(&Kind::Update), "一般更新不受影響");
+        assert_eq!(p.newer_dst, 0, "已經排進待辦了就不能再算一份，數字會兜不起來");
+
+        for a in &p.actions {
+            apply(a, &src, &dst, true).unwrap();
+        }
+        assert_eq!(
+            fs::read_to_string(dst.join("目的比較新.txt")).unwrap(),
+            "來源這份才是對的",
+            "確認過就是要用來源蓋回去"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn copy_keeps_mtime_so_the_next_run_has_nothing_to_do() {
         // 拷過去的那份若帶著「現在」的時間，下一輪比對它永遠比來源新，
         // 於是每一批都被算成「目的比較新」而整批跳過，備份看起來沒在做事。
@@ -811,7 +879,7 @@ mod tests {
         fs::create_dir_all(&dst).unwrap();
 
         let cancel = AtomicBool::new(false);
-        let p = plan(&src, &dst, true, &cancel).unwrap();
+        let p = plan(&src, &dst, true, true, &cancel).unwrap();
         assert_eq!(p.actions.len(), 1);
         apply(&p.actions[0], &src, &dst, true).unwrap();
         assert_eq!(
@@ -820,7 +888,7 @@ mod tests {
             "子資料夾要跟著建起來"
         );
 
-        let p2 = plan(&src, &dst, true, &cancel).unwrap();
+        let p2 = plan(&src, &dst, true, true, &cancel).unwrap();
         assert!(p2.actions.is_empty(), "第二次應該一件都不用做");
         assert_eq!(p2.same, 1);
 
@@ -891,7 +959,7 @@ mod tests {
             "挑的目的資料夾自己就叫這個名字，不該變成 …\\2025_鳥_精選\\2025_鳥_精選"
         );
 
-        let p = plan(&src, &dst, true, &AtomicBool::new(false)).unwrap();
+        let p = plan(&src, &dst, true, true, &AtomicBool::new(false)).unwrap();
         assert_eq!(kinds(&p).get("IMG_001.jpg"), Some(&Kind::Copy));
         apply(&p.actions[0], &src, &dst, true).unwrap();
         assert_eq!(
@@ -932,7 +1000,7 @@ mod tests {
             assert!(out.is_ok(), "設定隱藏屬性失敗");
         }
 
-        let p = plan(&src, &dst, true, &AtomicBool::new(false)).unwrap();
+        let p = plan(&src, &dst, true, true, &AtomicBool::new(false)).unwrap();
         let got = kinds(&p);
         assert_eq!(got.get("A1208228.jpg"), Some(&Kind::Extra), "看得到的照片照列");
         assert_eq!(
@@ -970,7 +1038,7 @@ mod tests {
         }
 
         let cancel = AtomicBool::new(false);
-        let p = plan(&src, &dst, true, &cancel).unwrap();
+        let p = plan(&src, &dst, true, true, &cancel).unwrap();
         assert_eq!(p.actions.len(), 3, "目錄庫的三個檔案都要備份");
         for a in &p.actions {
             apply(a, &src, &dst, true).unwrap();
@@ -1006,7 +1074,7 @@ mod tests {
             .output();
         assert!(out.is_ok(), "設定系統屬性失敗");
 
-        let p = plan(&src, &dst, true, &AtomicBool::new(false)).unwrap();
+        let p = plan(&src, &dst, true, true, &AtomicBool::new(false)).unwrap();
         assert_eq!(
             kinds(&p).get("spring.lrcat-data/db.bin"),
             Some(&Kind::Copy),
@@ -1028,7 +1096,7 @@ mod tests {
         write_at(&dst.join("兩邊都有.txt"), "x", 300);
         write_at(&dst.join("只有目的有.txt"), "y", 0);
 
-        let p = plan(&src, &dst, true, &AtomicBool::new(false)).unwrap();
+        let p = plan(&src, &dst, true, true, &AtomicBool::new(false)).unwrap();
         assert_eq!(p.count(Kind::Extra), 1);
         assert_eq!(p.same, 1);
         assert_eq!(p.todo(true), 0, "勾了保留就一件事都不用做");
@@ -1069,7 +1137,7 @@ mod tests {
         write_at(&src.join("裡面/深的.txt"), "b", 0);
         write_at(&dst.join("裡面/深的.txt"), "b", 0);
 
-        let p = plan(&src, &dst, false, &AtomicBool::new(false)).unwrap();
+        let p = plan(&src, &dst, false, true, &AtomicBool::new(false)).unwrap();
         let got = kinds(&p);
         assert_eq!(got.get("這一層.txt"), Some(&Kind::Copy));
         assert_eq!(got.len(), 1, "只該看這一層");

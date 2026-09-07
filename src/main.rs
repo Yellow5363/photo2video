@@ -6106,6 +6106,9 @@ struct BackupClicks {
     restore: bool,
     /// 「✔ 完成備份」：這一批做完了，把每一組清掉重新挑
     finish: bool,
+    /// 「不覆蓋目的資料夾較新的檔案」被切成什麼。取消勾選要先跳一次警告，
+    /// 而對話框會擋住 UI 執行緒，所以和其他動作一樣畫完再處理
+    keep_newer: Option<bool>,
 }
 
 /// 清單最多列幾筆。備份一次好幾萬個檔案是常事，全部畫出來只是把畫面
@@ -6164,6 +6167,13 @@ struct BackupTool {
     /// 保留目的資料夾多出來的檔案。**預設勾著**：沒勾就是會刪東西，
     /// 這種事不能是「沒注意到」就發生的
     keep_extra: bool,
+    /// 目的那份比較新就原封不動留著。**預設勾著**（也是備份本來的規矩：
+    /// 只往目的寫、不會把比較新的內容換成舊的）。
+    ///
+    /// 取消它才會把那幾個排進待辦（[`backup::Kind::Overwrite`]），取消的當下
+    /// 先跳一次警告——多餘檔案是丟資源回收筒、還救得回來，覆蓋掉的內容
+    /// 沒有這條退路
+    keep_newer: bool,
     /// 連子資料夾一起備份
     recursive: bool,
     /// 按了「開始備份」，正在等比對結果：比對完接著把確認框叫出來、往下做
@@ -6209,6 +6219,7 @@ impl BackupTool {
             // （選資料夾的對話框仍會從上次的位置開始，見 [`LastDir`]）
             pairs: vec![BackupPair::default()],
             keep_extra: true,
+            keep_newer: true,
             recursive: true,
             ..Default::default()
         }
@@ -6276,7 +6287,10 @@ impl BackupTool {
         let (mut copying, mut deleting) = (false, false);
         for plan in self.pairs.iter().filter_map(|p| p.plan.as_ref()) {
             deleting |= !self.keep_extra && plan.count(backup::Kind::Extra) > 0;
-            copying |= plan.count(backup::Kind::Copy) + plan.count(backup::Kind::Update) > 0;
+            copying |= plan.count(backup::Kind::Copy)
+                + plan.count(backup::Kind::Update)
+                + plan.count(backup::Kind::Overwrite)
+                > 0;
         }
         match (copying, deleting) {
             (_, false) => "開始備份",
@@ -22856,6 +22870,41 @@ impl App {
         if clicks.finish {
             self.backup_finish();
         }
+        if let Some(keep) = clicks.keep_newer {
+            self.backup_set_keep_newer(keep);
+        }
+    }
+
+    /// 切換「不覆蓋目的資料夾較新的檔案」。
+    ///
+    /// **取消勾選要先問過**：那幾個檔案是目的那邊後來被改過的內容，蓋掉就
+    /// 沒了——多餘檔案的刪除還會先丟進資源回收筒（按一下就放得回來），
+    /// 覆蓋沒有這條退路，所以不能讓它是「順手點到」就生效的。
+    ///
+    /// 按了取消就什麼都不做（畫面下一幀自己回到勾著的樣子，狀態根本沒動過）
+    fn backup_set_keep_newer(&mut self, keep: bool) {
+        if keep == self.backup.keep_newer {
+            return;
+        }
+        if !keep
+            && !ask2(
+                rfd::MessageLevel::Warning,
+                "要覆蓋目的資料夾裡比較新的檔案嗎？",
+                "目的資料夾裡「比來源還新」的檔案，備份時會被來源那一份蓋掉。\n\n\
+                 這些通常是目的那邊後來被改過的內容。覆蓋掉就沒了——\n\
+                 刪除多餘檔案還會先丟進資源回收筒、按一下就放得回來，\n\
+                 覆蓋沒有這條退路。\n\n\
+                 目的那邊被別的程式動過、要整個以來源為準時才需要這樣做。\n\
+                 實際會蓋掉哪幾個，按「🔍 比對」就會用紅字「覆蓋較新」列出來。",
+                "覆蓋較新的檔案",
+                "取消",
+            )
+        {
+            return;
+        }
+        self.backup.keep_newer = keep;
+        // 換了規矩，哪些檔案要動就跟著變，剛才那份比對結果不算數
+        self.backup.invalidate();
     }
 
     /// 「✔ 完成備份」：把每一組的資料夾與比對結果清掉，回到剛進來的樣子，
@@ -22992,6 +23041,26 @@ impl App {
                 "勾著：來源沒有的檔案原封不動留在目的資料夾。\n\
                  取消勾選：目的資料夾會被整理成和來源一樣，多出來的檔案**會被刪掉**。",
             );
+            ui.add_space(18.0);
+            // 取消這一顆會蓋掉比較新的內容，而且覆蓋進不了資源回收筒。
+            // 改的是「要不要排進待辦」，所以動到就得重新比對——但真正寫回
+            // 狀態的是 backup_set_keep_newer（要先跳警告，見 BackupClicks）
+            let mut keep_newer = self.backup.keep_newer;
+            if ui
+                .add_enabled(
+                    idle,
+                    egui::Checkbox::new(&mut keep_newer, "不覆蓋目的資料夾較新的檔案"),
+                )
+                .on_hover_text(
+                    "勾著：目的那份比來源新就原封不動留著（備份本來的規矩，\n\
+                     只往目的寫、不會把新的內容換成舊的）。\n\
+                     取消勾選：連那幾個也**用來源蓋回去**——目的那邊被別的程式\n\
+                     改過、要以來源為準時才這樣做。覆蓋掉的內容不會進資源回收筒。",
+                )
+                .changed()
+            {
+                clicks.keep_newer = Some(keep_newer);
+            }
         });
         ui.add_space(10.0);
 
@@ -23350,6 +23419,7 @@ impl App {
             return;
         }
         let recursive = self.backup.recursive;
+        let keep_newer = self.backup.keep_newer;
         let cancel = Arc::new(AtomicBool::new(false));
         self.backup.cancel = cancel.clone();
         self.backup.busy = BackupBusy::Scanning;
@@ -23363,7 +23433,7 @@ impl App {
             for (i, src, dst) in jobs {
                 let _ = tx.send(BackupMsg::ScanAt(i));
                 ctx.request_repaint();
-                let res = backup::plan(&src, &dst, recursive, &cancel);
+                let res = backup::plan(&src, &dst, recursive, keep_newer, &cancel);
                 let stop = matches!(&res, Err(e) if e == backup::CANCELLED);
                 let _ = tx.send(BackupMsg::Planned(i, res));
                 if stop {
@@ -23406,8 +23476,10 @@ impl App {
         let mut jobs: Vec<Job> = Vec::new();
         // 確認框的內容：一組一段。只有一組時不標「第 n 組」，跟以前一樣
         let mut lines: Vec<String> = Vec::new();
-        // 全部組加起來有幾個多餘檔案（決定確認框是不是警告那種）
+        // 全部組加起來有幾個多餘檔案、幾個要蓋掉比較新的
+        // （決定確認框是不是警告那種）
         let mut extra_total = 0;
+        let mut over_total = 0;
         for i in usable {
             let p = &self.backup.pairs[i];
             let (Some(src), Some(dst), Some(plan)) = (p.src.clone(), p.target(), p.plan.as_ref())
@@ -23421,9 +23493,10 @@ impl App {
                 .filter(|a| !(keep_extra && a.kind == backup::Kind::Extra))
                 .cloned()
                 .collect();
-            let (copy, update, extra) = (
+            let (copy, update, over, extra) = (
                 plan.count(backup::Kind::Copy),
                 plan.count(backup::Kind::Update),
+                plan.count(backup::Kind::Overwrite),
                 plan.count(backup::Kind::Extra),
             );
             if multi {
@@ -23443,6 +23516,12 @@ impl App {
             if update > 0 {
                 lines.push(format!("· 用來源覆蓋目的比較舊的 {update} 個檔案"));
             }
+            // 唯一救不回來的一種，字要比別的重（覆蓋不進資源回收筒）
+            if over > 0 {
+                lines.push(format!(
+                    "· ⚠ 用來源蓋掉目的**比較新**的 {over} 個檔案（蓋掉就沒了，無法還原）"
+                ));
+            }
             if extra > 0 {
                 lines.push(match (keep_extra, recursive) {
                     (true, _) => format!("· 目的地多餘檔案 {extra} 個保留不動"),
@@ -23455,6 +23534,7 @@ impl App {
             }
             lines.push(String::new());
             extra_total += extra;
+            over_total += over;
             jobs.push(Job {
                 group: i,
                 src,
@@ -23479,7 +23559,7 @@ impl App {
         let deleting = !keep_extra && extra_total > 0;
         let verb = self.backup.verb();
         if !ask2(
-            if deleting {
+            if deleting || over_total > 0 {
                 rfd::MessageLevel::Warning
             } else {
                 rfd::MessageLevel::Info
@@ -25807,6 +25887,8 @@ fn ui_backup_stats(
         for (kind, color) in [
             (Kind::Copy, theme::SUCCESS),
             (Kind::Update, theme::ACCENT),
+            // 覆蓋比較新的那幾個用紅字：整批裡唯一救不回來的一種
+            (Kind::Overwrite, theme::ERROR),
             (Kind::Extra, if keep_extra { theme::TEXT_WEAK } else { theme::ERROR }),
         ] {
             let n = plan.count(kind);
@@ -25908,6 +25990,7 @@ fn ui_backup_list(
                     let color = match a.kind {
                         Kind::Copy => theme::SUCCESS,
                         Kind::Update => theme::ACCENT,
+                        Kind::Overwrite => theme::ERROR,
                         Kind::Extra => {
                             if keep_extra {
                                 theme::TEXT_WEAK
