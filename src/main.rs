@@ -2911,6 +2911,19 @@ enum MaskTool {
     Sky,
 }
 
+/// 按在已經畫好的遮色片形狀上時，抓到的是它的哪個部位（見 [`shape_at`]）
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Grab {
+    /// 抓到形狀本身：整個搬走，大小與方向都不變
+    Whole,
+    /// 線性漸層的端點（true＝實心的起點）：端點想拉去哪就拉去哪，
+    /// 方向與長度一起變——要轉角度就是拉這裡
+    Point(bool),
+    /// 線性漸層一端的界線（true＝起點那條）：只沿著漸層方向推，
+    /// 方向不變、只改過渡帶的寬度
+    Edge(bool),
+}
+
 /// 正在照片上拖曳、還沒放開的形狀（座標都是影像的相對座標 0~1）
 enum Draft {
     /// 起點與目前拖到的位置
@@ -3129,10 +3142,10 @@ struct SmokeTool {
     saved_path: Option<PathBuf>,
     /// 正在拖曳、還沒放開的形狀；放開滑鼠才寫進參數觸發重算
     draft: Option<Draft>,
-    /// 正在用拖的搬移的遮色片形狀：(第幾個, 目前累積的位移)。
+    /// 正在用拖的搬移的遮色片形狀：(第幾個, 抓到哪個部位, 目前累積的位移)。
     /// 與 draft 同一個道理——搬的過程只畫在暫時的位置，放開才寫回參數，
     /// 免得每動一個 pixel 就重跑一次去煙
-    moving: Option<(usize, egui::Vec2)>,
+    moving: Option<(usize, Grab, egui::Vec2)>,
     /// 目前選用的遮色片工具；None＝沒選（預設），左鍵改成拖曳平移預覽
     mask_tool: Option<MaskTool>,
     /// 筆刷粗細：筆跡直徑佔影像長邊的百分比
@@ -3962,8 +3975,8 @@ struct StackTool {
     object_edge: i32,
     /// 正在拖曳、還沒放開的形狀
     draft: Option<Draft>,
-    /// 正在用拖的搬移的遮色片形狀：(第幾個, 目前累積的位移)
-    moving: Option<(usize, egui::Vec2)>,
+    /// 正在用拖的搬移的遮色片形狀：(第幾個, 抓到哪個部位, 目前累積的位移)
+    moving: Option<(usize, Grab, egui::Vec2)>,
     /// 在單層檢視上把遮色片輪廓畫出來
     show_mask: bool,
     /// 預覽的顯示比例；None＝縮到剛好塞滿畫面
@@ -4995,8 +5008,8 @@ struct MovieTool {
     mask_tool: Option<MaskTool>,
     /// 正在畫面上拖曳、還沒放開的形狀；放開才寫進參數觸發重算
     draft: Option<Draft>,
-    /// 正在用拖的搬移的遮色片形狀：(第幾個, 目前累積的位移)
-    moving: Option<(usize, egui::Vec2)>,
+    /// 正在用拖的搬移的遮色片形狀：(第幾個, 抓到哪個部位, 目前累積的位移)
+    moving: Option<(usize, Grab, egui::Vec2)>,
     /// 筆刷粗細：筆跡直徑佔畫面長邊的百分比（與去煙霧同一個尺規）
     brush_size: i32,
     /// 新畫的放射性漸層要不要反轉（改成橢圓外才去煙）
@@ -13339,7 +13352,7 @@ impl App {
             let eff = self.smoke.effective();
             // 搬移中的那一個畫在暫時的位置，放開才真的寫回去
             let shifted = |i: usize, s: &dehaze::Shape| match self.smoke.moving {
-                Some((mi, d)) if mi == i => shape_moved(s, d),
+                Some((mi, g, d)) if mi == i => shape_dragged(s, g, d, img),
                 _ => s.clone(),
             };
             match eff.shapes.as_slice() {
@@ -13425,7 +13438,7 @@ impl App {
             {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             }
-            // 按在已經畫好的形狀上＝把它整個搬走，不是再畫一個。
+            // 按在已經畫好的形狀上＝抓住它（整個搬走，或拉漸層的一端），不是再畫一個。
             // 想在既有形狀裡面再畫一個，就從它外面開始拖
             if resp.drag_started() && outlines {
                 let eff = self.smoke.effective();
@@ -13433,31 +13446,32 @@ impl App {
                     .interact_pointer_pos()
                     .filter(|p| hit.contains(*p))
                     .and_then(|p| shape_at(&eff.shapes, p, img))
-                    .filter(|&i| shape_movable(&eff.shapes[i]))
-                    .map(|i| (i, egui::Vec2::ZERO));
+                    .map(|(i, g)| (i, g, egui::Vec2::ZERO));
             }
             // 拖到一半視窗失焦之類的情況不會送 drag_stopped，
             // 沒有這道保險就會永遠卡在搬移狀態
             if self.smoke.moving.is_some() && !resp.dragged() && !resp.drag_stopped() {
                 self.smoke.moving = None;
             }
-            if self.smoke.moving.is_some() {
+            if let Some((i, g, _)) = self.smoke.moving {
                 let d = resp.drag_delta();
-                if let Some((_, acc)) = self.smoke.moving.as_mut() {
+                if let Some((_, _, acc)) = self.smoke.moving.as_mut() {
                     *acc += egui::vec2(d.x / img.width(), d.y / img.height());
                 }
+                if let Some(s) = self.smoke.effective().shapes.get(i) {
+                    ui.ctx().set_cursor_icon(grab_cursor(s, g, img, true));
+                }
                 if resp.drag_stopped() {
-                    if let Some((i, acc)) = self.smoke.moving.take() {
+                    if let Some((i, g, acc)) = self.smoke.moving.take() {
                         let mut v = self.smoke.effective();
                         if let Some(s) = v.shapes.get(i) {
-                            v.shapes[i] = shape_moved(s, acc);
+                            v.shapes[i] = shape_dragged(s, g, acc, img);
                             self.smoke.set_params(v);
                         }
                     }
                 }
                 // 搬移中不再開新的 draft，也不處理下面那一整段
                 self.smoke.draft = None;
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 return;
             }
             if resp.drag_started() {
@@ -13480,10 +13494,9 @@ impl App {
             if self.smoke.draft.is_none() && outlines {
                 if let Some(p) = resp.hover_pos().filter(|p| hit.contains(*p)) {
                     let eff = self.smoke.effective();
-                    if shape_at(&eff.shapes, p, img)
-                        .is_some_and(|i| shape_movable(&eff.shapes[i]))
-                    {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    if let Some((i, g)) = shape_at(&eff.shapes, p, img) {
+                        ui.ctx()
+                            .set_cursor_icon(grab_cursor(&eff.shapes[i], g, img, false));
                     }
                 }
             }
@@ -15302,7 +15315,7 @@ impl App {
             };
             ui.label(
                 egui::RichText::new(if tool.is_some() {
-                    format!("直接在畫面上拖曳；不畫就是{whole}。畫好的框、漸層可以直接拖著搬")
+                    format!("直接在畫面上拖曳；不畫就是{whole}。畫好的框、漸層可以直接拖著搬；拖漸層兩端的圓點能轉方向、改長度，拖界線只改寬度")
                 } else {
                     match target {
                         MaskTarget::Dehaze => {
@@ -15435,7 +15448,7 @@ impl App {
                 .enumerate()
                 .map(|(i, s)| match self.movie.moving {
                     // 搬移中的那一個畫在暫時的位置，放開才真的寫回去
-                    Some((mi, d)) if mi == i => shape_moved(s, d),
+                    Some((mi, g, d)) if mi == i => shape_dragged(s, g, d, img),
                     _ => s.clone(),
                 })
                 .collect();
@@ -15461,36 +15474,37 @@ impl App {
         if tool == Some(MaskTool::Object) && resp.hover_pos().is_some_and(inside) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
-        // 按在已經畫好的形狀上＝把它整個搬走，不是再畫一個
+        // 按在已經畫好的形狀上＝抓住它（整個搬走，或拉漸層的一端），不是再畫一個
         if resp.drag_started() && outlines {
             let shapes = self.movie.mask_of(target).0;
             self.movie.moving = resp
                 .interact_pointer_pos()
                 .filter(|p| hit.contains(*p))
                 .and_then(|p| shape_at(shapes, p, img))
-                .filter(|&i| shape_movable(&shapes[i]))
-                .map(|i| (i, egui::Vec2::ZERO));
+                .map(|(i, g)| (i, g, egui::Vec2::ZERO));
         }
         // 拖到一半視窗失焦之類的情況不會送 drag_stopped，沒有這道保險就會永遠卡在搬移狀態
         if self.movie.moving.is_some() && !resp.dragged() && !resp.drag_stopped() {
             self.movie.moving = None;
         }
-        if self.movie.moving.is_some() {
+        if let Some((i, g, _)) = self.movie.moving {
             let d = resp.drag_delta();
-            if let Some((_, acc)) = self.movie.moving.as_mut() {
+            if let Some((_, _, acc)) = self.movie.moving.as_mut() {
                 *acc += egui::vec2(d.x / img.width(), d.y / img.height());
             }
+            if let Some(s) = self.movie.mask_of(target).0.get(i) {
+                ui.ctx().set_cursor_icon(grab_cursor(s, g, img, true));
+            }
             if resp.drag_stopped() {
-                if let Some((i, acc)) = self.movie.moving.take() {
+                if let Some((i, g, acc)) = self.movie.moving.take() {
                     let shapes = self.movie.mask_mut(target).0;
                     if let Some(s) = shapes.get(i).cloned() {
-                        shapes[i] = shape_moved(&s, acc);
+                        shapes[i] = shape_dragged(&s, g, acc, img);
                     }
                 }
             }
             // 搬移中不再開新的 draft，也不處理下面那一整段
             self.movie.draft = None;
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             return;
         }
         if resp.drag_started() {
@@ -15513,8 +15527,8 @@ impl App {
         if self.movie.draft.is_none() && outlines {
             if let Some(p) = resp.hover_pos().filter(|p| hit.contains(*p)) {
                 let shapes = self.movie.mask_of(target).0;
-                if shape_at(shapes, p, img).is_some_and(|i| shape_movable(&shapes[i])) {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                if let Some((i, g)) = shape_at(shapes, p, img) {
+                    ui.ctx().set_cursor_icon(grab_cursor(&shapes[i], g, img, false));
                 }
             }
         }
@@ -15998,9 +16012,9 @@ impl App {
             ),
             MovieBusy::Idle if mask_canvas && self.movie.mask_tool.is_some() => Some(
                 if compare {
-                    "在右邊的畫面上拖曳畫遮色片；畫好的框、漸層可以拖著搬"
+                    "在右邊的畫面上拖曳畫遮色片；畫好的框、漸層可以拖著搬；拖漸層兩端的圓點能轉方向、改長度"
                 } else {
-                    "直接在畫面上拖曳畫遮色片；畫好的框、漸層可以拖著搬"
+                    "直接在畫面上拖曳畫遮色片；畫好的框、漸層可以拖著搬；拖漸層兩端的圓點能轉方向、改長度"
                 }
                 .into(),
             ),
@@ -17880,10 +17894,10 @@ impl App {
                 ui.label(
                     egui::RichText::new(match (self.stack.tool.is_some(), inverted) {
                         (true, false) => {
-                            "直接在照片上拖曳；不畫就是這一層整張都照疊。畫好的框、漸層可以直接拖著搬"
+                            "直接在照片上拖曳；不畫就是這一層整張都照疊。畫好的框、漸層可以直接拖著搬；拖漸層兩端的圓點能轉方向、改長度，拖界線只改寬度"
                         }
                         (true, true) => {
-                            "圈出要疊進來的那一塊；還沒畫之前整張都照疊。畫好的框、漸層可以直接拖著搬"
+                            "圈出要疊進來的那一塊；還沒畫之前整張都照疊。畫好的框、漸層可以直接拖著搬；拖漸層兩端的圓點能轉方向、改長度，拖界線只改寬度"
                         }
                         (false, false) => "這一層還沒畫遮色片（整張都照疊）；要擋掉什麼再選一種工具",
                         (false, true) => "這一層還沒畫遮色片（整張都照疊）；要只疊哪一塊再選一種工具圈起來",
@@ -18071,7 +18085,7 @@ impl App {
             let shapes = self.stack.cur_mask().to_vec();
             // 搬移中的那一個畫在暫時的位置，放開才真的寫回去
             let shifted = |i: usize, s: &dehaze::Shape| match self.stack.moving {
-                Some((mi, d)) if mi == i => shape_moved(s, d),
+                Some((mi, g, d)) if mi == i => shape_dragged(s, g, d, img),
                 _ => s.clone(),
             };
             match shapes.as_slice() {
@@ -18106,7 +18120,7 @@ impl App {
         {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
-        // 按在已經畫好的形狀上＝把它整個搬走，不是再畫一個。
+        // 按在已經畫好的形狀上＝抓住它（整個搬走，或拉漸層的一端），不是再畫一個。
         // 想在既有形狀裡面再畫一個，就從它外面開始拖
         if resp.drag_started() && outlines {
             let shapes = self.stack.cur_mask().to_vec();
@@ -18114,30 +18128,31 @@ impl App {
                 .interact_pointer_pos()
                 .filter(|p| hit.contains(*p))
                 .and_then(|p| shape_at(&shapes, p, img))
-                .filter(|&i| shape_movable(&shapes[i]))
-                .map(|i| (i, egui::Vec2::ZERO));
+                .map(|(i, g)| (i, g, egui::Vec2::ZERO));
         }
         // 拖到一半視窗失焦之類的情況不會送 drag_stopped，
         // 沒有這道保險就會永遠卡在搬移狀態
         if self.stack.moving.is_some() && !resp.dragged() && !resp.drag_stopped() {
             self.stack.moving = None;
         }
-        if self.stack.moving.is_some() {
+        if let Some((i, g, _)) = self.stack.moving {
             let d = resp.drag_delta();
-            if let Some((_, acc)) = self.stack.moving.as_mut() {
+            if let Some((_, _, acc)) = self.stack.moving.as_mut() {
                 *acc += egui::vec2(d.x / img.width(), d.y / img.height());
             }
+            if let Some(s) = self.stack.cur_mask().get(i) {
+                ui.ctx().set_cursor_icon(grab_cursor(s, g, img, true));
+            }
             if resp.drag_stopped() {
-                if let Some((i, acc)) = self.stack.moving.take() {
+                if let Some((i, g, acc)) = self.stack.moving.take() {
                     let mut v = self.stack.cur_mask().to_vec();
                     if let Some(s) = v.get(i) {
-                        v[i] = shape_moved(s, acc);
+                        v[i] = shape_dragged(s, g, acc, img);
                         self.stack.set_cur_mask(v);
                     }
                 }
             }
             self.stack.draft = None;
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             return;
         }
         if resp.drag_started() {
@@ -18160,8 +18175,8 @@ impl App {
         if self.stack.draft.is_none() && outlines {
             if let Some(p) = resp.hover_pos().filter(|p| hit.contains(*p)) {
                 let shapes = self.stack.cur_mask();
-                if shape_at(shapes, p, img).is_some_and(|i| shape_movable(&shapes[i])) {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                if let Some((i, g)) = shape_at(shapes, p, img) {
+                    ui.ctx().set_cursor_icon(grab_cursor(&shapes[i], g, img, false));
                 }
             }
         }
@@ -20739,7 +20754,7 @@ impl App {
                         if eff.shapes.is_empty() {
                             ui.label(
                                 egui::RichText::new(if self.smoke.mask_tool.is_some() {
-                                    "直接在照片上拖曳；不畫就是整片天空都去煙。畫好的框、漸層可以直接拖著搬"
+                                    "直接在照片上拖曳；不畫就是整片天空都去煙。畫好的框、漸層可以直接拖著搬；拖漸層兩端的圓點能轉方向、改長度，拖界線只改寬度"
                                 } else {
                                     "預設不用遮色片（整片天空都去煙，地景與水面不動）；要再縮小範圍才選一種工具"
                                 })
@@ -25511,18 +25526,6 @@ fn paint_rotated_image(
     p.add(egui::Shape::mesh(mesh));
 }
 
-/// 已經畫好的遮色片形狀能不能用拖的整個搬走。
-///
-/// 只有幾何式的三種可以（框選、線性漸層、放射性漸層）——它們就是幾個數字，
-/// 搬過去還是同一個形狀。筆刷的筆跡與「物件」的點陣遮罩是跟著照片內容畫的，
-/// 搬到別的地方就對不上那團東西了，所以不給搬
-fn shape_movable(s: &dehaze::Shape) -> bool {
-    matches!(
-        s,
-        dehaze::Shape::Rect(_) | dehaze::Shape::Linear(_) | dehaze::Shape::Radial(_)
-    )
-}
-
 /// 點到螢幕上某一段線的距離（拿來判斷有沒有壓在線性漸層的軸線上）
 fn dist_to_seg(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     let ab = b - a;
@@ -25534,40 +25537,83 @@ fn dist_to_seg(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     (p - (a + ab * t)).length()
 }
 
-/// 找出壓在螢幕座標 `p` 上的遮色片形狀（**後畫的在上面**，所以從後面找起）。
-/// `img` 是整張照片畫出來的矩形
-fn shape_at(shapes: &[dehaze::Shape], p: egui::Pos2, img: egui::Rect) -> Option<usize> {
+/// 找出壓在螢幕座標 `p` 上的遮色片形狀，以及抓到它的哪個部位
+/// （**後畫的在上面**，所以從後面找起）。`img` 是整張照片畫出來的矩形。
+///
+/// 只有幾何式的三種抓得到（框選、線性漸層、放射性漸層）——它們就是幾個數字，
+/// 搬過去還是同一個形狀。筆刷的筆跡與「物件」的點陣遮罩是跟著照片內容畫的，
+/// 搬到別的地方就對不上那團東西了，所以不給抓。
+///
+/// 線性漸層分三個部位：兩端的圓點（[`Grab::Point`]）、中間的軸線
+/// （[`Grab::Whole`]）與兩端那兩條橫貫畫面的界線（[`Grab::Edge`]）。
+/// 圓點先判——它本來就壓在軸線與界線的交會處，不先判永遠抓不到
+fn shape_at(shapes: &[dehaze::Shape], p: egui::Pos2, img: egui::Rect) -> Option<(usize, Grab)> {
     /// 線性漸層抓軸線的容許距離（螢幕點）
     const GRAB: f32 = 12.0;
+    /// 抓端點圓點的容許距離：畫出來的點只有幾個像素，抓的範圍要比它大
+    const KNOB: f32 = 9.0;
+    /// 抓界線的容許距離：兩條線橫貫整張照片，抓的帶子太寬會擋到畫新形狀
+    const EDGE: f32 = 7.0;
     let to_screen =
         |x: f32, y: f32| egui::pos2(img.left() + x * img.width(), img.top() + y * img.height());
     shapes.iter().enumerate().rev().find_map(|(i, s)| {
-        let hit = match s {
+        let grab = match s {
             dehaze::Shape::Rect(r) => {
-                egui::Rect::from_two_pos(to_screen(r.x0, r.y0), to_screen(r.x1, r.y1)).contains(p)
+                egui::Rect::from_two_pos(to_screen(r.x0, r.y0), to_screen(r.x1, r.y1))
+                    .contains(p)
+                    .then_some(Grab::Whole)
             }
             dehaze::Shape::Linear(l) => {
-                dist_to_seg(p, to_screen(l.x0, l.y0), to_screen(l.x1, l.y1)) <= GRAB
+                let (a, b) = (to_screen(l.x0, l.y0), to_screen(l.x1, l.y1));
+                let d = b - a;
+                let len = d.length();
+                if (p - a).length() <= KNOB {
+                    Some(Grab::Point(true))
+                } else if (p - b).length() <= KNOB {
+                    Some(Grab::Point(false))
+                } else if dist_to_seg(p, a, b) <= GRAB {
+                    Some(Grab::Whole)
+                } else if len < 1e-3 || !img.contains(p) {
+                    // 界線只畫在照片範圍內，照片外面沒東西可抓
+                    None
+                } else {
+                    // 界線與軸線垂直：點到界線的距離，就是它沿軸線方向離那一端多遠
+                    let u = d / len;
+                    if (p - a).dot(u).abs() <= EDGE {
+                        Some(Grab::Edge(true))
+                    } else if (p - b).dot(u).abs() <= EDGE {
+                        Some(Grab::Edge(false))
+                    } else {
+                        None
+                    }
+                }
             }
             dehaze::Shape::Radial(r) => {
                 let c = to_screen(r.cx, r.cy);
                 let (rx, ry) = (r.rx * img.width(), r.ry * img.height());
                 if rx <= 0.5 || ry <= 0.5 {
-                    false
+                    None
                 } else {
                     let (dx, dy) = ((p.x - c.x) / rx, (p.y - c.y) / ry);
-                    dx * dx + dy * dy <= 1.0
+                    (dx * dx + dy * dy <= 1.0).then_some(Grab::Whole)
                 }
             }
-            _ => false,
+            _ => None,
         };
-        hit.then_some(i)
+        grab.map(|g| (i, g))
     })
 }
 
-/// 把形狀整個平移 `d`（相對座標）。框與橢圓會被夾住不讓它整個跑出畫面；
-/// 線性漸層本來就是無限延伸的帶子，只把兩端夾在畫面外一點點的範圍內
-fn shape_moved(s: &dehaze::Shape, d: egui::Vec2) -> dehaze::Shape {
+/// 抓住的部位拖了 `d`（相對座標）之後，形狀變成什麼樣子。
+///
+/// [`Grab::Whole`] 是整個平移：框與橢圓會被夾住不讓它整個跑出畫面；
+/// 線性漸層本來就是無限延伸的帶子，只把兩端夾在畫面外一點點的範圍內。
+/// 另外兩種部位只有線性漸層有，交給 [`linear_end_dragged`]
+fn shape_dragged(s: &dehaze::Shape, g: Grab, d: egui::Vec2, img: egui::Rect) -> dehaze::Shape {
+    if let (dehaze::Shape::Linear(l), Grab::Point(start) | Grab::Edge(start)) = (s, g) {
+        let along = matches!(g, Grab::Edge(_));
+        return dehaze::Shape::Linear(linear_end_dragged(l, start, along, d, img));
+    }
     // 平移量先夾好，形狀本身的大小才不會被夾變形
     let clamp_delta = |lo_x: f32, hi_x: f32, lo_y: f32, hi_y: f32, min: f32, max: f32| {
         egui::vec2(
@@ -25609,6 +25655,96 @@ fn shape_moved(s: &dehaze::Shape, d: egui::Vec2) -> dehaze::Shape {
             })
         }
         other => other.clone(),
+    }
+}
+
+/// 線性漸層的其中一端拖了 `d` 之後的樣子；另一端留在原地。
+/// `start`＝動的是起點（實心那端）。`along`＝只准沿著漸層方向推（抓界線時）：
+/// 方向不變、只改長度；否則端點跟著游標走，方向與長度一起變。
+///
+/// 沿軸投影要在**螢幕座標**上做：相對座標的 x、y 尺度不同（照片不是正方形），
+/// 直接在相對座標上投影，推出來的方向會歪掉
+fn linear_end_dragged(
+    l: &dehaze::Linear,
+    start: bool,
+    along: bool,
+    d: egui::Vec2,
+    img: egui::Rect,
+) -> dehaze::Linear {
+    /// 兩端最少要隔這麼遠（相對座標）：疊在一起就沒有方向，既畫不出來也抓不到
+    const MIN_LEN: f32 = 0.02;
+    let (fixed, end) = if start {
+        (egui::pos2(l.x1, l.y1), egui::pos2(l.x0, l.y0))
+    } else {
+        (egui::pos2(l.x0, l.y0), egui::pos2(l.x1, l.y1))
+    };
+    let scale = egui::vec2(img.width().max(1.0), img.height().max(1.0));
+    let to_px = |p: egui::Pos2| egui::pos2(p.x * scale.x, p.y * scale.y);
+    let (fs, es) = (to_px(fixed), to_px(end));
+    let axis = es - fs;
+    let ds = egui::vec2(d.x * scale.x, d.y * scale.y);
+    let moved = if along && axis.length() > 1e-3 {
+        // 推到另一端那一側就停住：抓界線是在調寬度，不是要把漸層翻面
+        let u = axis / axis.length();
+        fs + u * (axis.length() + ds.dot(u)).max(1.0)
+    } else {
+        es + ds
+    };
+    let mut p = egui::pos2(
+        (moved.x / scale.x).clamp(-0.25, 1.25),
+        (moved.y / scale.y).clamp(-0.25, 1.25),
+    );
+    let v = p - fixed;
+    if v.length() < MIN_LEN {
+        // 拉到快疊在一起：照原本的方向撐開到最短距離
+        let dir = [v, end - fixed, egui::vec2(0.0, 1.0)]
+            .into_iter()
+            .find(|v| v.length() > 1e-6)
+            .map(|v| v / v.length())
+            .unwrap_or(egui::vec2(0.0, 1.0));
+        p = fixed + dir * MIN_LEN;
+    }
+    if start {
+        dehaze::Linear {
+            x0: p.x,
+            y0: p.y,
+            x1: fixed.x,
+            y1: fixed.y,
+        }
+    } else {
+        dehaze::Linear {
+            x0: fixed.x,
+            y0: fixed.y,
+            x1: p.x,
+            y1: p.y,
+        }
+    }
+}
+
+/// 游標停在（或正抓著）形狀的某個部位時該長什麼樣：整個搬是手掌、端點是指頭
+/// （那是個把手）、界線是順著漸層方向的雙箭頭（推的是寬度）。`active`＝正按著拖
+fn grab_cursor(s: &dehaze::Shape, g: Grab, img: egui::Rect, active: bool) -> egui::CursorIcon {
+    match (g, s) {
+        (Grab::Whole, _) if active => egui::CursorIcon::Grabbing,
+        (Grab::Whole, _) => egui::CursorIcon::Grab,
+        (Grab::Point(_), _) => egui::CursorIcon::PointingHand,
+        (Grab::Edge(_), dehaze::Shape::Linear(l)) => {
+            // 漸層方向在螢幕上的角度（0°＝水平、90°＝垂直），挑最接近的一種雙箭頭；
+            // 反過來是同一條線，所以只看 0°～180°
+            let (dx, dy) = ((l.x1 - l.x0) * img.width(), (l.y1 - l.y0) * img.height());
+            let a = dy.atan2(dx).to_degrees().rem_euclid(180.0);
+            if !(22.5..157.5).contains(&a) {
+                egui::CursorIcon::ResizeHorizontal
+            } else if a < 67.5 {
+                // 螢幕的 y 朝下：往右下的線是左上—右下那一種
+                egui::CursorIcon::ResizeNwSe
+            } else if a < 112.5 {
+                egui::CursorIcon::ResizeVertical
+            } else {
+                egui::CursorIcon::ResizeNeSw
+            }
+        }
+        (Grab::Edge(_), _) => egui::CursorIcon::Grab,
     }
 }
 
@@ -27292,9 +27428,9 @@ fn paint_linear(p: &egui::Painter, img: egui::Rect, a: egui::Pos2, b: egui::Pos2
         );
     }
     p.line_segment([a, b], egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.7)));
-    // 實心的那端是全效果，空心的那端歸零
-    p.circle_filled(a, 4.0, theme::ACCENT);
-    p.circle_stroke(b, 4.0, egui::Stroke::new(1.4, theme::ACCENT));
+    // 實心的那端是全效果，空心的那端歸零。這兩顆也是把手：拖它就轉方向、改長度
+    p.circle_filled(a, 5.0, theme::ACCENT);
+    p.circle_stroke(b, 5.0, egui::Stroke::new(1.6, theme::ACCENT));
 }
 
 /// 放射性漸層：外圈是作用範圍的邊界，內圈是羽化帶的起點（以內為全效果）。
@@ -31698,5 +31834,104 @@ mod tests {
             n as f64 / secs
         );
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// 線性漸層的端點抓起來可以拉去任何地方：方向與長度一起變，另一端留在原地；
+    /// 拉到與另一端疊在一起時會被撐開，不會變成沒有方向的一個點
+    #[test]
+    fn 線性漸層拖端點會轉方向另一端不動() {
+        let img = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 900.0));
+        let l = dehaze::Linear {
+            x0: 0.5,
+            y0: 0.2,
+            x1: 0.5,
+            y1: 0.8,
+        };
+        let s = dehaze::Shape::Linear(l);
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        // 把終點往右拉：起點原地不動，終點跟著游標走
+        let dehaze::Shape::Linear(m) =
+            shape_dragged(&s, Grab::Point(false), egui::vec2(0.3, 0.0), img)
+        else {
+            panic!()
+        };
+        assert_eq!((m.x0, m.y0), (0.5, 0.2));
+        assert!(near(m.x1, 0.8) && near(m.y1, 0.8), "{m:?}");
+        // 拉起點也一樣，換終點不動
+        let dehaze::Shape::Linear(m) =
+            shape_dragged(&s, Grab::Point(true), egui::vec2(-0.2, 0.1), img)
+        else {
+            panic!()
+        };
+        assert_eq!((m.x1, m.y1), (0.5, 0.8));
+        assert!(near(m.x0, 0.3) && near(m.y0, 0.3), "{m:?}");
+        // 終點剛好拉到起點上：照原本的方向撐開到最短距離
+        let dehaze::Shape::Linear(m) =
+            shape_dragged(&s, Grab::Point(false), egui::vec2(0.0, -0.6), img)
+        else {
+            panic!()
+        };
+        assert_eq!((m.x0, m.y0), (0.5, 0.2));
+        assert!(near(m.x1, 0.5) && near(m.y1, 0.22), "{m:?}");
+    }
+
+    /// 抓界線只會沿著漸層方向推：方向不變、只改長度，而且推不過另一端。
+    /// 照片不是正方形、漸層又是斜的，方向要在螢幕座標上量才算數
+    #[test]
+    fn 線性漸層拖界線只改寬度不轉方向() {
+        let img = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 900.0));
+        let l = dehaze::Linear {
+            x0: 0.2,
+            y0: 0.2,
+            x1: 0.6,
+            y1: 0.7,
+        };
+        let s = dehaze::Shape::Linear(l);
+        let dir = |m: &dehaze::Linear| {
+            let v = egui::vec2((m.x1 - m.x0) * img.width(), (m.y1 - m.y0) * img.height());
+            v / v.length()
+        };
+        let same_dir = |a: egui::Vec2, b: egui::Vec2| (a.x - b.x).abs() < 1e-4 && (a.y - b.y).abs() < 1e-4;
+        let d0 = dir(&l);
+        // 往完全不相干的方向推，出來的方向還是原本那一個，起點不動
+        let dehaze::Shape::Linear(m) =
+            shape_dragged(&s, Grab::Edge(false), egui::vec2(0.3, -0.1), img)
+        else {
+            panic!()
+        };
+        assert!(same_dir(d0, dir(&m)), "{d0:?} vs {:?}", dir(&m));
+        assert_eq!((m.x0, m.y0), (0.2, 0.2));
+        assert!(m.x1 > 0.6 && m.y1 > 0.7, "應該變長：{m:?}");
+        // 往反方向推過頭：停在起點旁邊，方向照舊、不會翻面，也不會縮成一點
+        let dehaze::Shape::Linear(m) =
+            shape_dragged(&s, Grab::Edge(false), egui::vec2(-2.0, -2.0), img)
+        else {
+            panic!()
+        };
+        assert!(same_dir(d0, dir(&m)), "{d0:?} vs {:?}", dir(&m));
+        let len = ((m.x1 - m.x0).powi(2) + (m.y1 - m.y0).powi(2)).sqrt();
+        assert!(len >= 0.02 - 1e-5 && len < 0.05, "{m:?}");
+    }
+
+    /// 線性漸層按在哪就抓到哪：圓點優先於軸線、軸線優先於界線；
+    /// 兩條界線橫貫畫面，離軸線很遠也抓得到，但照片外面沒有界線可抓
+    #[test]
+    fn 線性漸層依按的位置分出端點軸線與界線() {
+        let img = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(1000.0, 500.0));
+        // 垂直的漸層：起點在螢幕 (600, 150)、終點在 (600, 450)
+        let shapes = vec![dehaze::Shape::Linear(dehaze::Linear {
+            x0: 0.5,
+            y0: 0.2,
+            x1: 0.5,
+            y1: 0.8,
+        })];
+        let at = |x: f32, y: f32| shape_at(&shapes, egui::pos2(x, y), img).map(|(_, g)| g);
+        assert_eq!(at(603.0, 152.0), Some(Grab::Point(true)));
+        assert_eq!(at(597.0, 447.0), Some(Grab::Point(false)));
+        assert_eq!(at(605.0, 300.0), Some(Grab::Whole));
+        assert_eq!(at(200.0, 152.0), Some(Grab::Edge(true)));
+        assert_eq!(at(1050.0, 448.0), Some(Grab::Edge(false)));
+        assert_eq!(at(200.0, 300.0), None);
+        assert_eq!(at(50.0, 150.0), None);
     }
 }
