@@ -6100,6 +6100,8 @@ struct BackupClicks {
     remove: Option<usize>,
     /// 攤開（或收起）哪一組的檔案清單
     toggle: Option<usize>,
+    /// 攤開（或收起）哪一組的略過清單
+    toggle_ignored: Option<usize>,
     scan: bool,
     run: bool,
     stop: bool,
@@ -6111,9 +6113,26 @@ struct BackupClicks {
     keep_newer: Option<bool>,
 }
 
-/// 清單最多列幾筆。備份一次好幾萬個檔案是常事，全部畫出來只是把畫面
-/// 拖垮——看幾筆確認「挑對資料夾了」就夠，總數在上面的統計列
-const BACKUP_LIST_MAX: usize = 500;
+/// 統計列尾巴那兩顆展開鈕，被按的是哪一顆（見 [`ui_backup_stats`]）
+#[derive(Clone, Copy)]
+enum BackupToggle {
+    /// 「看清單」：要動到的檔案
+    List,
+    /// 「看略過的」：被當作不存在的那幾個
+    Ignored,
+}
+
+/// 清單最多列幾筆（要動的檔案與略過的檔案各自算）。備份一次好幾萬個檔案
+/// 是常事，總數在上面的統計列；本來只列 500，使用者要看略過了哪些檔案時
+/// 不夠用，提到 3000。清單只畫看得見的那幾列（show_rows），列多不會拖慢
+const BACKUP_LIST_MAX: usize = 3000;
+
+/// 比對結果那一欄最窄能拖到多少（再窄路徑就整條看不到了）
+const BACKUP_RESULT_MIN: f32 = 320.0;
+
+/// 拖比對結果那一欄時，左邊至少要留這麼寬：
+/// 「來源資料夾 ［📂 選擇］ G:\20250124日本四國遊_精選_last」那一列的長度
+const BACKUP_LEFT_MIN: f32 = 470.0;
 
 /// 每做幾件回報一次進度。一件一報的話，一批幾萬個小檔會讓 UI 執行緒
 /// 光是收訊息就忙不完（畫面也不需要一件一件跳）
@@ -6161,9 +6180,13 @@ struct BackupTool {
     /// 兩列「尚未選擇」，見 [`BackupTool::ensure_one`]）
     pairs: Vec<BackupPair>,
     /// 比對結果的檔案清單攤開在畫面上的是第幾組。清單動輒幾百列，
-    /// 好幾組時一次只攤一組（每一組的統計那一列則一直看得到）；
-    /// 只有一組時不看這個，一律攤開
+    /// **比完預設收著**、一次只攤一組（每一組的統計那一列則一直看得到），
+    /// 要看再按「看清單」。一度做成只有一組就自動攤開，使用者反映內容
+    /// 太多、要的是先看數字再決定要不要看清單
     expanded: Option<usize>,
+    /// 略過的檔案（`._` 附屬檔那些，見 [`backup::Plan::ignored`]）列出來的
+    /// 是第幾組。和 `expanded` 各管各的，兩份可以同時開
+    show_ignored: Option<usize>,
     /// 保留目的資料夾多出來的檔案。**預設勾著**：沒勾就是會刪東西，
     /// 這種事不能是「沒注意到」就發生的
     keep_extra: bool,
@@ -6200,6 +6223,11 @@ struct BackupTool {
     total: usize,
     /// 正在比對／搬第幾組（畫面上那行字用）
     at: usize,
+    /// 比對結果那一欄佔視窗寬的幾成。使用者拖過就記他拖的比例，
+    /// 視窗之後被拉大／最大化時照這個比例跟上（見 [`App::ui_files_module`]）
+    result_frac: f32,
+    /// 上一輪畫的時候視窗有多寬，用來認出「視窗大小變了」
+    last_width: f32,
     /// 這一批備份**真的做完了**（搬檔那一趟跑完，不是只挑好資料夾或比對過）。
     /// 「✔ 完成備份」只在這個時候出現——剛挑好資料夾就冒出一顆「完成」，
     /// 看起來像「這樣就好了嗎？」，而且很容易誤按把剛排好的幾組清光。
@@ -6221,6 +6249,8 @@ impl BackupTool {
             keep_extra: true,
             keep_newer: true,
             recursive: true,
+            // 比對結果與左邊的設定各佔一半
+            result_frac: 0.5,
             ..Default::default()
         }
     }
@@ -6233,6 +6263,9 @@ impl BackupTool {
         }
         if self.expanded.is_some_and(|i| i >= self.pairs.len()) {
             self.expanded = None;
+        }
+        if self.show_ignored.is_some_and(|i| i >= self.pairs.len()) {
+            self.show_ignored = None;
         }
     }
 
@@ -22820,6 +22853,49 @@ impl App {
         self.backup.ensure_one();
         let mut clicks = BackupClicks::default();
 
+        // 比對結果自己一欄放右邊：檔案清單一列就是一整條完整路徑，擠在挑
+        // 資料夾那一欄底下又長又難讀，而右半邊本來就是空的。
+        //
+        // 預設佔**視窗的一半**，只受「左邊那一欄要放得下」這一條限制。
+        // 一度給它加了 1200 的上限，結果在寬螢幕上反而變窄（3600 寬的視窗
+        // 只分到三分之一），路徑照樣被切掉——上限本來就沒有道理，
+        // 螢幕愈寬、能看完的路徑就該愈長。
+        //
+        // **視窗大小變了就照比例重算一次**：egui 只在第一次建面板時吃
+        // default_width，之後記著自己那一份，視窗最大化它也不跟。程式開起來
+        // 是 1440 寬、面板 720，最大化到 3600 還是 720 就太窄了。變的那一幀
+        // 改用 exact_width 把記住的值蓋過去（width_range 縮成一個點），下一幀
+        // 恢復成可拖曳。
+        //
+        // 面板會不會自己縮水是另一件事，在 ui_backup_result 裡處理
+        // （內容要撐滿，不然 egui 會把面板縮到內容那麼寬）
+        let avail = ctx.available_rect().width();
+        let max_w = (avail - BACKUP_LEFT_MIN).max(BACKUP_RESULT_MIN);
+        let resized = (avail - self.backup.last_width).abs() > 0.5;
+        self.backup.last_width = avail;
+        let want = (avail * self.backup.result_frac).clamp(BACKUP_RESULT_MIN, max_w);
+        let panel_id = egui::Id::new("backup_result");
+        let mut panel = egui::SidePanel::right(panel_id)
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(14, 12)),
+            )
+            .resizable(true)
+            .default_width(want)
+            .width_range(BACKUP_RESULT_MIN..=max_w);
+        if resized {
+            panel = panel.exact_width(want);
+        }
+        panel.show(ctx, |ui| self.ui_backup_result(ui, &mut clicks));
+        // 使用者自己拖過就記他要的比例，下次視窗變大照這個比例跟上
+        // （視窗剛變過大小的那一幀是我們自己設的，不能拿來當他的意思）
+        if !resized && avail > 1.0 {
+            if let Some(st) = egui::containers::panel::PanelState::load(ctx, panel_id) {
+                self.backup.result_frac = (st.rect.width() / avail).clamp(0.15, 0.85);
+            }
+        }
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -22850,6 +22926,13 @@ impl App {
         }
         if let Some(i) = clicks.toggle {
             self.backup.expanded = if self.backup.expanded == Some(i) {
+                None
+            } else {
+                Some(i)
+            };
+        }
+        if let Some(i) = clicks.toggle_ignored {
+            self.backup.show_ignored = if self.backup.show_ignored == Some(i) {
                 None
             } else {
                 Some(i)
@@ -22915,12 +22998,14 @@ impl App {
     fn backup_finish(&mut self) {
         self.backup.pairs = vec![BackupPair::default()];
         self.backup.expanded = None;
+        self.backup.show_ignored = None;
         self.backup.error = None;
         self.backup.result = None;
         self.backup.invalidate();
     }
 
-    /// 資料備份的畫面本體：每一組資料夾、開關、按鈕、進度、比對結果。
+    /// 資料備份的左半邊：每一組資料夾、開關、按鈕、訊息與進度。
+    /// 比對結果在右邊自己一欄（見 [`App::ui_backup_result`]）。
     /// 按了什麼記在 `clicks` 裡，畫完再做（畫的時候不能動狀態）
     fn ui_backup_body(&mut self, ui: &mut egui::Ui, clicks: &mut BackupClicks) {
         let busy = self.backup.busy;
@@ -23213,12 +23298,51 @@ impl App {
             BackupBusy::Idle => {}
         }
 
-        if !idle {
+    }
+
+    /// 比對結果那一區（畫在右邊的獨立面板，見 [`App::ui_files_module`]）。
+    ///
+    /// 和左邊分開的理由：檔案清單一列就是一整條完整路徑（`J:\2025mac_桌布\
+    /// A9302272.jpg`），擠在挑資料夾那一欄底下又長又難讀，而右半邊本來是
+    /// 空的。分開之後兩邊各自捲動，清單捲到哪裡都不會把上面的按鈕推走
+    fn ui_backup_result(&mut self, ui: &mut egui::Ui, clicks: &mut BackupClicks) {
+        let keep_extra = self.backup.keep_extra;
+        let multi = self.backup.pairs.len() > 1;
+        let ready = self.backup.ready();
+        // **內容一律撐滿面板寬**。可拖曳的 SidePanel 記的是「內容實際畫到
+        // 多寬」，不是面板本身：比對進行中這裡只有兩行短字，內容就剩最小
+        // 寬度 320，下一幀面板跟著縮成 320；之後清單出現，ScrollArea 也只會
+        // 填滿現有的寬度，撐不回去——實際回報過「一按比對就變窄」就是這個
+        ui.set_min_width(ui.available_width());
+        ui.label(
+            egui::RichText::new("比對結果")
+                .size(13.0)
+                .strong()
+                .color(theme::TEXT),
+        );
+        ui.add_space(6.0);
+        // 比對／搬檔中：進度在左邊那欄，這裡不重複講。舊的那份結果已經
+        // 不算數了（invalidate 清掉了），留著只會讓人看錯
+        if self.backup.busy != BackupBusy::Idle {
+            ui.label(
+                egui::RichText::new("處理中…")
+                    .size(12.5)
+                    .color(theme::TEXT_WEAK),
+            );
             return;
         }
         if self.backup.planned() {
-            // 每一組的比對結果各一段：統計一列一直看得到；檔案清單好幾組時
-            // 一次只攤一組（按「看清單」換），只有一組就直接攤開
+            // 清單的高度照面板算：一份清單最多佔八成，「看清單」與「看略過的」
+            // 同時開就對半分。不能讓它「吃掉剩下全部」——後面幾組的統計列
+            // 會被推到面板外面、連捲都捲不到（好幾組時實際發生過）。
+            // 整段包在捲動區裡，超出去的部分捲得到
+            let panel_h = ui.available_height();
+            egui::ScrollArea::vertical()
+                .id_salt("backup_result_page")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+            // 每一組的比對結果各一段：統計一列一直看得到；檔案清單一次只攤
+            // 一組（按「看清單」換）
             for (i, pair) in self.backup.pairs.iter().enumerate() {
                 let Some(plan) = &pair.plan else { continue };
                 if multi {
@@ -23234,16 +23358,37 @@ impl App {
                         .color(theme::TEXT),
                     );
                 }
-                let open = !multi || self.backup.expanded == Some(i);
-                let can_open = multi && !plan.actions.is_empty();
-                if ui_backup_stats(ui, plan, keep_extra, can_open.then_some(open)) {
-                    clicks.toggle = Some(i);
+                // 清單預設收著，按了才攤開（只有一組也一樣，見 expanded 的說明）
+                let open = self.backup.expanded == Some(i);
+                let can_open = !plan.actions.is_empty();
+                let ignored_open = self.backup.show_ignored == Some(i);
+                let can_ignored = !plan.ignored.is_empty();
+                match ui_backup_stats(
+                    ui,
+                    plan,
+                    keep_extra,
+                    can_open.then_some(open),
+                    can_ignored.then_some(ignored_open),
+                ) {
+                    Some(BackupToggle::List) => clicks.toggle = Some(i),
+                    Some(BackupToggle::Ignored) => clicks.toggle_ignored = Some(i),
+                    None => {}
+                }
+                let list_h = if open && ignored_open {
+                    panel_h * 0.42
+                } else {
+                    panel_h * 0.8
+                }
+                .max(220.0);
+                if ignored_open {
+                    ui_backup_ignored(ui, plan, i, list_h);
                 }
                 if open {
                     let write_to = pair.target().unwrap_or_default();
-                    ui_backup_list(ui, plan, keep_extra, &write_to, i);
+                    ui_backup_list(ui, plan, keep_extra, &write_to, i, list_h);
                 }
             }
+                });
         } else if ready {
             ui.label(
                 egui::RichText::new(
@@ -23723,12 +23868,10 @@ impl App {
                     } else {
                         run_now = waiting;
                     }
-                    // 檔案清單先攤開第一個有東西要做的組
-                    self.backup.expanded = self
-                        .backup
-                        .pairs
-                        .iter()
-                        .position(|p| p.plan.as_ref().is_some_and(|q| !q.actions.is_empty()));
+                    // 清單一律先收著：比完先看數字，要看哪一組再自己按
+                    // （曾經自動攤開第一組，內容太多反而礙事）
+                    self.backup.expanded = None;
+                    self.backup.show_ignored = None;
                 }
                 // 搬檔中：只更新進度，通道要留著繼續收
                 Ok(BackupMsg::Progress { done, group }) => {
@@ -25873,16 +26016,17 @@ fn backup_dir_row(
 /// （檔案清單在 [`ui_backup_list`]）。
 ///
 /// 「相同」的那幾個不列（也沒進清單，見 [`backup::Plan`]），要看的是
-/// 「這次會動到什麼」。`list_toggle`＝Some(清單現在攤開著沒) 時列尾多一顆
-/// 「看清單」鈕（好幾組時一次只攤一組用），回傳 true＝按了它
+/// 「這次會動到什麼」。`list_toggle`／`ignored_toggle`＝Some(現在攤開著沒)
+/// 時列尾多一顆「看清單」／「看略過的」鈕，回傳按了哪一顆
 fn ui_backup_stats(
     ui: &mut egui::Ui,
     plan: &backup::Plan,
     keep_extra: bool,
     list_toggle: Option<bool>,
-) -> bool {
+    ignored_toggle: Option<bool>,
+) -> Option<BackupToggle> {
     use backup::Kind;
-    let mut clicked = false;
+    let mut clicked = None;
     ui.horizontal_wrapped(|ui| {
         for (kind, color) in [
             (Kind::Copy, theme::SUCCESS),
@@ -25921,10 +26065,10 @@ fn ui_backup_stats(
             .on_hover_text("這幾個檔案目的資料夾裡的比較新，備份只往目的寫，所以原封不動留著");
         }
         // 隱藏檔沒被算進去，數字會跟檔案總管對不上，講一聲
-        if plan.ignored > 0 {
+        if !plan.ignored.is_empty() {
             ui.add_space(10.0);
             ui.label(
-                egui::RichText::new(format!("略過 {}", plan.ignored))
+                egui::RichText::new(format!("略過 {}", plan.ignored.len()))
                     .size(12.5)
                     .color(theme::TEXT_WEAK),
             )
@@ -25939,7 +26083,17 @@ fn ui_backup_stats(
                 .selectable_label(open, if open { "▾ 收起清單" } else { "▸ 看清單" })
                 .clicked()
             {
-                clicked = true;
+                clicked = Some(BackupToggle::List);
+            }
+        }
+        if let Some(open) = ignored_toggle {
+            ui.add_space(6.0);
+            if ui
+                .selectable_label(open, if open { "▾ 收起略過的" } else { "▸ 看略過的" })
+                .on_hover_text("列出被當作不存在的那幾個檔案在哪裡（來源與目的兩邊都算）")
+                .clicked()
+            {
+                clicked = Some(BackupToggle::Ignored);
             }
         }
     });
@@ -25958,6 +26112,49 @@ fn ui_backup_stats(
     clicked
 }
 
+/// 略過的檔案：被當作不存在的那幾個（`._` 附屬檔、.DS_Store…）的完整路徑
+/// 一列一個，最高 `max_h`（由 [`App::ui_backup_result`] 照面板高度算）。
+/// `salt` 是第幾組，各組的捲動位置才不會混在一起。
+///
+/// 只畫看得見的那幾列（show_rows）：上限提到 3000 列之後，每一幀把
+/// 三千個標籤都排一遍會拖慢畫面
+fn ui_backup_ignored(ui: &mut egui::Ui, plan: &backup::Plan, salt: usize, max_h: f32) {
+    if plan.ignored.is_empty() {
+        return;
+    }
+    let shown = plan.ignored.len().min(BACKUP_LIST_MAX);
+    let row_h = ui.fonts(|f| f.row_height(&egui::FontId::proportional(12.0)));
+    ui.add_space(4.0);
+    egui::ScrollArea::both()
+        .id_salt(("backup_ignored", salt))
+        .max_height(max_h)
+        .auto_shrink([false, true])
+        .show_rows(ui, row_h, shown, |ui, range| {
+            for p in &plan.ignored[range] {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(p.to_string_lossy().into_owned())
+                            .size(12.0)
+                            .color(theme::TEXT_WEAK),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            }
+        });
+    // 放在捲動區外面：捲到哪裡都看得到「還有沒列出來的」
+    if plan.ignored.len() > BACKUP_LIST_MAX {
+        ui.label(
+            egui::RichText::new(format!(
+                "…另外還有 {} 個（只列前 {BACKUP_LIST_MAX} 個）",
+                plan.ignored.len() - BACKUP_LIST_MAX
+            ))
+            .size(11.5)
+            .color(theme::TEXT_WEAK),
+        );
+    }
+    ui.add_space(4.0);
+}
+
 /// 比對結果的檔案清單：要動到的每一個檔案一列（統計在 [`ui_backup_stats`]）。
 /// `salt` 是第幾組，各組的捲動位置才不會混在一起
 fn ui_backup_list(
@@ -25966,6 +26163,7 @@ fn ui_backup_list(
     keep_extra: bool,
     write_to: &Path,
     salt: usize,
+    max_h: f32,
 ) {
     use backup::Kind;
     if plan.actions.is_empty() {
@@ -25974,18 +26172,21 @@ fn ui_backup_list(
     ui.add_space(6.0);
     ui.separator();
     ui.add_space(4.0);
-    // 清單佔到視窗底（只有一組時就是整個下半部）。整頁在捲動區裡，
-    // 可用高度是無限大、看不出視窗還剩多少，得拿可見範圍的底邊來算；
-    // 上面的東西已經把它推到很下面時，至少留一個看得清楚的高度
-    let h = (ui.clip_rect().bottom() - ui.cursor().top() - 8.0).max(220.0);
+    let shown = plan.actions.len().min(BACKUP_LIST_MAX);
+    // 每一列的高度要固定，show_rows 才算得出捲軸該多長：動作那一欄至少
+    // 16，路徑那格是 12 號字，取較高的那個，列裡的每樣東西都不超過它
+    let row_h = ui
+        .fonts(|f| f.row_height(&egui::FontId::proportional(12.0)))
+        .max(16.0);
     // 路徑寫的是完整位置（含磁碟機代號），橫向也要能捲——不然長路徑會被
-    // 折成兩行，一整排看下來反而分不清哪一段是哪一個檔案
+    // 折成兩行，一整排看下來反而分不清哪一段是哪一個檔案。
+    // 只畫看得見的那幾列（show_rows），三千列也不會拖慢畫面
     egui::ScrollArea::both()
         .id_salt(("backup_list", salt))
-        .max_height(h)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for a in plan.actions.iter().take(BACKUP_LIST_MAX) {
+        .max_height(max_h)
+        .auto_shrink([false, true])
+        .show_rows(ui, row_h, shown, |ui, range| {
+            for a in &plan.actions[range] {
                 ui.horizontal(|ui| {
                     let color = match a.kind {
                         Kind::Copy => theme::SUCCESS,
@@ -26000,9 +26201,9 @@ fn ui_backup_list(
                         }
                     };
                     // 動作那一欄對齊：路徑才不會參差不齊。寬度照最長的那個
-                    // 字串（「目的地多餘檔案」七個字）留
+                    // 字串（「目的地多餘檔案」七個字）留；高度就是一列的高度
                     let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(104.0, 16.0), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(104.0, row_h), egui::Sense::hover());
                     ui.painter().text(
                         egui::pos2(rect.left(), rect.center().y),
                         egui::Align2::LEFT_CENTER,
@@ -26030,18 +26231,19 @@ fn ui_backup_list(
                     );
                 });
             }
-            if plan.actions.len() > BACKUP_LIST_MAX {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "…另外還有 {} 個（清單只列前 {BACKUP_LIST_MAX} 個，備份時全部都會做）",
-                        plan.actions.len() - BACKUP_LIST_MAX
-                    ))
-                    .size(11.5)
-                    .color(theme::TEXT_WEAK),
-                );
-            }
         });
+    // 放在捲動區外面：捲到哪裡都看得到「還有沒列出來的」
+    if plan.actions.len() > BACKUP_LIST_MAX {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "…另外還有 {} 個（清單只列前 {BACKUP_LIST_MAX} 個，備份時全部都會做）",
+                plan.actions.len() - BACKUP_LIST_MAX
+            ))
+            .size(11.5)
+            .color(theme::TEXT_WEAK),
+        );
+    }
 }
 
 /// 前後對照時貼在每半邊上緣的標籤（「編輯前」／「編輯後」）。

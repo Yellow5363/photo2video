@@ -108,10 +108,10 @@ pub struct Plan {
     pub newer_dst: usize,
     /// 掃描時讀不到、只好跳過的資料夾（權限不足、被別的程式鎖住之類）
     pub skipped: Vec<String>,
-    /// 當作不存在的隱藏／系統檔與 macOS 雜檔（兩邊加總，見 [`is_junk`]）。
-    /// 只是給畫面上講一聲用：檔案總管看到 3 個、程式說相同 3 個，
-    /// 中間少掉的那幾個去哪了要有個交代
-    pub ignored: usize,
+    /// 當作不存在的隱藏／系統檔與 macOS 雜檔（兩邊加總，見 [`is_junk`]），
+    /// 完整路徑。給畫面上交代用：檔案總管看到 3 個、程式說相同 3 個，
+    /// 中間少掉的那幾個去哪了要說得出來，使用者想看也列得出來
+    pub ignored: Vec<PathBuf>,
 }
 
 impl Plan {
@@ -369,10 +369,10 @@ fn scan(
     root: &Path,
     recursive: bool,
     cancel: &AtomicBool,
-) -> Result<(HashMap<String, Found>, Vec<String>, usize), String> {
+) -> Result<(HashMap<String, Found>, Vec<String>, Vec<PathBuf>), String> {
     let mut out: HashMap<String, Found> = HashMap::new();
     let mut skipped: Vec<String> = Vec::new();
-    let mut ignored = 0usize;
+    let mut ignored: Vec<PathBuf> = Vec::new();
     // 待掃的子資料夾（相對路徑；空的那個＝根本身）
     let mut dirs: Vec<PathBuf> = vec![PathBuf::new()];
     let mut is_root = true;
@@ -402,7 +402,7 @@ fn scan(
             // 檔案總管看不到的就當作不存在（macOS 的 ._ 附屬檔、回收筒…）
             if is_junk(&e) {
                 if ft.is_file() {
-                    ignored += 1;
+                    ignored.push(e.path());
                 }
                 continue;
             }
@@ -455,10 +455,10 @@ pub fn plan(
     let (b, skipped_dst, ignored_dst) = if dst.is_dir() {
         scan(dst, recursive, cancel)?
     } else {
-        (HashMap::new(), Vec::new(), 0)
+        (HashMap::new(), Vec::new(), Vec::new())
     };
     skipped.extend(skipped_dst);
-    ignored += ignored_dst;
+    ignored.extend(ignored_dst);
 
     let mut actions: Vec<Action> = Vec::new();
     let mut same = 0usize;
@@ -1010,7 +1010,7 @@ mod tests {
         );
         assert_eq!(got.get("desktop.ini"), Some(&Kind::Extra), "自訂圖示的另一半");
         assert_eq!(got.len(), 3, "._ 附屬檔與 .DS_Store 不該出現在清單上");
-        assert_eq!(p.ignored, 2, "略過幾個要算出來給畫面交代");
+        assert_eq!(p.ignored.len(), 2, "略過幾個要算出來給畫面交代");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1080,7 +1080,7 @@ mod tests {
             Some(&Kind::Copy),
             "看得見的系統資料夾要照樣備份"
         );
-        assert_eq!(p.ignored, 0);
+        assert!(p.ignored.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
