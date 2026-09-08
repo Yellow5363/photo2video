@@ -22990,8 +22990,15 @@ impl App {
         self.backup.invalidate();
     }
 
-    /// 「✔ 完成備份」：把每一組的資料夾與比對結果清掉，回到剛進來的樣子，
-    /// 接著挑下一批。
+    /// 「✔ 完成備份」／「↺ 重新選擇」：把每一組的資料夾與比對結果清掉，
+    /// 回到剛進來的樣子，接著挑下一批。
+    ///
+    /// **兩顆會動到檔案的開關一起回到預設（都勾著）**：「保留目的資料夾多餘
+    /// 的檔案」與「不覆蓋目的資料夾較新的檔案」。取消它們才會刪檔或蓋掉比較
+    /// 新的內容，而這種決定只該對「當時那一批」有效——換一批資料夾還默默
+    /// 留著上一批的設定，等於下一批一開始就處在會刪、會蓋的狀態。
+    ///
+    /// 「含子資料夾」不重設：它只是比對範圍，不會多動到任何檔案。
     ///
     /// 「↩ 還原剛才刪除的…」那一批**留著**：東西還在回收筒裡，按了「完成」
     /// 就撿不回來的話，這顆鈕會變成誤觸就沒得救的陷阱
@@ -22999,6 +23006,8 @@ impl App {
         self.backup.pairs = vec![BackupPair::default()];
         self.backup.expanded = None;
         self.backup.show_ignored = None;
+        self.backup.keep_extra = true;
+        self.backup.keep_newer = true;
         self.backup.error = None;
         self.backup.result = None;
         self.backup.invalidate();
