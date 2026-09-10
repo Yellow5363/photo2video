@@ -23643,6 +23643,34 @@ impl App {
         });
     }
 
+    /// 比對中按了關閉視窗：問一聲。回傳 true＝使用者要關。
+    ///
+    /// 比對本身不動到任何檔案，所以不像搬檔那樣硬擋——掃一個好幾萬張的
+    /// 資料夾要好幾分鐘，硬擋等於關不掉。但**按了「開始備份」也要先比對
+    /// 一輪才開始搬**（見 [`App::backup_start`]），這一段關掉的話備份根本
+    /// 沒做：實際遇過備份到一半關掉、沒有任何提示，回來以為已經備份好了
+    fn ask_quit_while_scanning(&self) -> bool {
+        if self.backup.pending_run {
+            ask2(
+                rfd::MessageLevel::Warning,
+                "備份還沒開始",
+                "按了「開始備份」之後，要先比對兩個資料夾才會開始搬檔案。\
+                 現在還在比對，檔案一個都還沒搬過去——這時候關掉的話，這次備份等於沒做。",
+                "不備份，直接關閉",
+                "回去看",
+            )
+        } else {
+            ask2(
+                rfd::MessageLevel::Info,
+                "正在比對",
+                "資料備份還在比對兩個資料夾（還沒動到任何檔案）。\
+                 現在關掉的話這次比對就白跑了，下次得重比一遍。",
+                "放棄比對，直接關閉",
+                "回去看",
+            )
+        }
+    }
+
     /// 按下「開始備份」：**一定先重新比對一次**，比完才接著往下做
     /// （見 [`App::poll_backup`]）。
     ///
@@ -24279,6 +24307,12 @@ impl eframe::App for App {
                     .set_title("正在備份")
                     .set_description("資料備份還在搬檔案，請等它跑完，或按「✖ 中止」再關閉。")
                     .show();
+            } else if self.backup.busy == BackupBusy::Scanning
+                && !self.ask_quit_while_scanning()
+            {
+                // 選了「回去看」：留下來，順手把畫面帶回資料備份那一頁
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.module = Module::Files;
             } else {
                 // 專案與去煙霧各自可能有沒存的東西，一次講完再問一次就好
                 let mut pending: Vec<&str> = Vec::new();
