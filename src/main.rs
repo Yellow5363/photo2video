@@ -4900,9 +4900,22 @@ struct MovieClip {
     frames: movie::ClipFrames,
 }
 
+/// 影片去煙的滑桿起始值：去除煙霧 60、細節 80。
+///
+/// 與照片模組的預設（80／60）刻意不同，是拿實拍的煙火影片比出來的：影片整支
+/// 共用一組、又不逐格重判，起手就該站在「少扣一點、多留一點線條」那一側——
+/// 扣過頭的煙火在動起來時特別顯眼，而煙沒扣乾淨還可以再把滑桿拉上去
+fn movie_default_params() -> SmokeParams {
+    SmokeParams {
+        strength: 60,
+        detail: 80,
+        ..SmokeParams::default()
+    }
+}
+
 /// 「影片去煙霧」模組的狀態：一支影片、一組參數，輸出成另一支影片。
 ///
-/// 刻意不做「每一格自動判參數」——照片模組是一張一張各自量的，搬到影片上
+/// 刻意不做「每一格自動判斷參數」——照片模組是一張一張各自量的，搬到影片上
 /// 每格量到的值都會差一點，扣掉的量跟著一格一格跳，看起來就是整片畫面在
 /// 忽明忽暗。整支共用一組反而穩
 struct MovieTool {
@@ -4983,7 +4996,8 @@ struct MovieTool {
     /// 裁切範圍（相對座標；只裁不轉）。整支影片（含同一批的其他支）共用一個框，
     /// 在去煙**之前**裁：與縮小同一個道理，裁掉的地方不必花力氣去煙
     crop: Crop,
-    /// 自動判參數的開關（預設開著）。關掉就照滑桿上調好的那組跑
+    /// 自動判斷參數的開關。**預設關著**：起始值（見 [`movie_default_params`]）
+    /// 實拍比下來比自動判的穩，要用再自己勾
     auto_on: bool,
     /// 預覽那一格量到的建議值（見 [`dehaze::auto_params`]）。
     ///
@@ -5064,7 +5078,7 @@ impl Default for MovieTool {
             after: None,
             base_tex: None,
             after_tex: None,
-            params: SmokeParams::default(),
+            params: movie_default_params(),
             grade: MovieGrade::default(),
             segments: vec![Segment::default()],
             grade_open: false,
@@ -5092,7 +5106,7 @@ impl Default for MovieTool {
             clip_tex: None,
             clip_base_tex: None,
             crop: Crop::default(),
-            auto_on: true,
+            auto_on: false,
             auto: None,
             crop_aspect: CropAspect::Free,
             crop_editing: false,
@@ -5143,9 +5157,9 @@ impl MovieTool {
     /// 跟這一批的畫面沒有關係
     fn reset_batch(&mut self, src: Option<PathBuf>, info: Option<VideoInfo>) {
         let fast = self.params.fast;
-        self.params = SmokeParams::default();
+        self.params = movie_default_params();
         self.params.fast = fast;
-        self.auto_on = true;
+        self.auto_on = false;
         self.auto = None;
         self.segments = vec![Segment::default()];
         self.grade = MovieGrade::default();
@@ -14869,18 +14883,20 @@ impl App {
         );
         ui.add_space(4.0);
         ui.add_enabled_ui(!exporting, |ui| {
-            // 自動判參數：照時間軸現在停的那一格量，**整支共用同一組**
+            // 自動判斷參數：照時間軸現在停的那一格量，**整支共用同一組**
             // （逐格各判會讓畫面一格一格跳，見 MovieTool::auto）
             ui.horizontal_wrapped(|ui| {
                 let mut on = self.movie.auto_on;
                 if ui
-                    .checkbox(&mut on, "自動判參數")
+                    .checkbox(&mut on, "自動判斷參數")
                     .on_hover_text(
                         "照時間軸現在停的那一格，量出去除煙霧與細節該有的值，\n\
                          整支影片共用這一組（逐格各判會讓扣掉的量一格一格跳，畫面像在閃）。\n\
                          拖到別的時間點就照那一格重量一次；\n\
                          挑一格煙最濃的停著判，整支跟著它跑最保險。\n\
-                         自己動過那兩條滑桿就會自動關掉，不再被蓋回去",
+                         自己動過那兩條滑桿就會自動關掉，不再被蓋回去。\n\
+                         預設是關著的：不勾就用起始值（去除煙霧 60、細節 80），\
+                         實拍比下來比自動判的穩",
                     )
                     .changed()
                 {
@@ -19828,7 +19844,7 @@ impl App {
                             .on_hover_text(
                                 "把照片**加到現在這批後面**，已經調好的參數、\n\
                                  筆跡與正在看的那一張都留著；\n\
-                                 新加的那幾張照樣會自動判參數",
+                                 新加的那幾張照樣會自動判斷參數",
                             )
                             .clicked()
                     {
@@ -20450,7 +20466,7 @@ impl App {
                         ui.horizontal_wrapped(|ui| {
                             let mut on = self.smoke.auto_on;
                             if ui
-                                .checkbox(&mut on, "自動判參數")
+                                .checkbox(&mut on, "自動判斷參數")
                                 .on_hover_text(
                                     "每張照片各自量出去除煙霧、細節、去除雲朵、範圍該有的值；\
                                      動過滑桿的照片會保留你調的，不再被蓋回去",
@@ -31738,10 +31754,10 @@ mod tests {
         assert!(m.crop.is_full() && m.crop_aspect == CropAspect::Free, "裁切沒清掉");
         assert_eq!(m.mask_target, MaskTarget::Dehaze);
         assert!(m.mask_tool.is_none() && !m.show_mask, "工具與遮罩檢視要一起收掉");
-        // 去煙的四條滑桿也要回到預設（上一批調到一半的值留著只會莫名其妙）
-        let d = SmokeParams::default();
-        assert_eq!(m.params.strength, d.strength, "去除煙霧沒回到預設");
-        assert_eq!(m.params.detail, d.detail, "細節沒回到預設");
+        // 去煙的四條滑桿也要回到起始值（上一批調到一半的值留著只會莫名其妙）
+        let d = movie_default_params();
+        assert_eq!(m.params.strength, d.strength, "去除煙霧沒回到起始值");
+        assert_eq!(m.params.detail, d.detail, "細節沒回到起始值");
         assert!(m.params.restore_trails, "「補回煙裡的軌跡」沒回到預設");
         assert!(m.params.sky_only, "「只處理天空」沒回到預設");
         // 輸出區那兩項留著：那是「要輸出成什麼」，跟這一批的畫面無關
@@ -31755,32 +31771,36 @@ mod tests {
     #[test]
     fn auto_params_only_drive_the_two_sliders_the_movie_module_shows() {
         let mut m = MovieTool::default();
-        let d = SmokeParams::default();
-        // 還沒量到：就是滑桿上那組
-        assert_eq!(m.tuned_params().strength, d.strength);
+        let d = movie_default_params();
+        // 影片模組的起始值與照片模組刻意不同（見 movie_default_params）
+        assert_eq!((d.strength, d.detail), (60, 80));
+        assert!(!m.auto_on, "自動判斷參數預設關著，起始值比自動判的穩");
+        assert_eq!(m.tuned_params().strength, d.strength, "沒勾就是滑桿上那組");
+
         m.auto = Some(dehaze::AutoParams {
-            strength: 60,
-            detail: 80,
+            strength: 35,
+            detail: 45,
             sky_clean: 70,
             sky_range: 55,
         });
+        // 沒勾：量到了也不算數
+        assert_eq!(m.tuned_params().strength, d.strength);
+        m.auto_on = true;
         let t = m.tuned_params();
-        assert_eq!((t.strength, t.detail), (60, 80), "自動值要蓋掉這兩條");
+        assert_eq!((t.strength, t.detail), (35, 45), "勾了就由自動值蓋掉這兩條");
         assert_eq!(
             (t.sky_clean, t.sky_range),
             (d.sky_clean, d.sky_range),
             "清雲與範圍在這個模組沒有介面，不該被自動值打開"
         );
         assert_eq!(t.sky_clean, 0, "自動值不該讓畫面多做一件看不到開關的事（清雲）");
-        // 關掉：回到滑桿上那組
-        m.auto_on = false;
-        assert_eq!(m.tuned_params().strength, d.strength);
         // 去煙的參數走 tuned_params，所以段裡拿到的也是自動值
-        m.auto_on = true;
-        assert_eq!(m.effective().strength, 60);
-        // 換一批要連自動值一起歸零（下一支影片自己重量）
+        assert_eq!(m.effective().strength, 35);
+        // 換一批：回到「關著、還沒量」，滑桿也回到起始值
+        m.params.strength = 90;
         m.reset_batch(None, None);
-        assert!(m.auto_on && m.auto.is_none(), "換一批要回到「開著、還沒量」");
+        assert!(!m.auto_on && m.auto.is_none(), "換一批要回到「關著、還沒量」");
+        assert_eq!(m.params.strength, d.strength, "換一批滑桿要回到起始值");
     }
 
     /// 拖去煙或調色的滑桿時要把遮罩檢視收起來：那片紅蓋著就看不出滑桿有沒有作用
