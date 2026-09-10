@@ -6322,14 +6322,9 @@ impl BackupTool {
         )
     }
 
-    /// 按鈕與確認框上寫的字：**按下去實際上要做的事**（每一組加起來看）。
-    ///
-    /// 一批全是刪除時還寫「開始備份」，會讓人以為是在拷東西，按了才發現
-    /// 是在刪。還沒比對過（不知道要做什麼）就照舊寫「開始備份」
-    fn verb(&self) -> &'static str {
-        if !self.planned() {
-            return "開始備份";
-        }
+    /// 這一批實際上要做的事（每一組加起來看）：會不會拷貝、會不會刪除。
+    /// 勾了「保留目的資料夾多餘的檔案」就不算刪
+    fn work(&self) -> (bool, bool) {
         let (mut copying, mut deleting) = (false, false);
         for plan in self.pairs.iter().filter_map(|p| p.plan.as_ref()) {
             deleting |= !self.keep_extra && plan.count(backup::Kind::Extra) > 0;
@@ -6338,10 +6333,40 @@ impl BackupTool {
                 + plan.count(backup::Kind::Overwrite)
                 > 0;
         }
-        match (copying, deleting) {
+        (copying, deleting)
+    }
+
+    /// 按鈕與確認框上寫的字：**按下去實際上要做的事**（每一組加起來看）。
+    ///
+    /// 一批全是刪除時還寫「開始備份」，會讓人以為是在拷東西，按了才發現
+    /// 是在刪。還沒比對過（不知道要做什麼）就照舊寫「開始備份」
+    fn verb(&self) -> &'static str {
+        if !self.planned() {
+            return "開始備份";
+        }
+        match self.work() {
             (_, false) => "開始備份",
             (true, true) => "備份並刪除",
             (false, true) => "刪除檔案",
+        }
+    }
+
+    /// 背景正在做的那件事叫什麼（沒在做事就是 None）。
+    ///
+    /// 給比對結果那一欄用：做事時清單是空的，只剩這一行字。以前一律寫
+    /// 「處理中…」，備份到一半接在「比對結果」底下看起來就成了「比對
+    /// 處理中」——實際回報過看不出到底在比對還是在備份，所以照真的在做
+    /// 的事寫（與按鈕上那個字同一套判斷，見 [`BackupTool::verb`]）
+    fn busy_text(&self) -> Option<&'static str> {
+        match self.busy {
+            BackupBusy::Idle => None,
+            BackupBusy::Scanning => Some("比對中…"),
+            BackupBusy::Running => Some(match self.work() {
+                (_, false) => "備份中…",
+                (true, true) => "備份並刪除中…",
+                (false, true) => "刪除中…",
+            }),
+            BackupBusy::Restoring => Some("還原中…"),
         }
     }
 
@@ -23338,6 +23363,20 @@ impl App {
         // 寬度 320，下一幀面板跟著縮成 320；之後清單出現，ScrollArea 也只會
         // 填滿現有的寬度，撐不回去——實際回報過「一按比對就變窄」就是這個
         ui.set_min_width(ui.available_width());
+        // 做事中：這一欄沒有結果可看（舊的那份 invalidate 清掉了，留著只會
+        // 讓人看錯），抬頭就直接寫在做哪一件事。以前是「比對結果」底下再
+        // 寫一行「處理中…」，備份到一半兩行連起來看成「比對處理中」——
+        // 實際回報過看不出到底在比對還是在備份。進度（第幾組、幾 % ）在
+        // 左邊那欄，這裡不重複講
+        if let Some(busy) = self.backup.busy_text() {
+            ui.label(
+                egui::RichText::new(busy)
+                    .size(13.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            return;
+        }
         ui.label(
             egui::RichText::new("比對結果")
                 .size(13.0)
@@ -23345,16 +23384,6 @@ impl App {
                 .color(theme::TEXT),
         );
         ui.add_space(6.0);
-        // 比對／搬檔中：進度在左邊那欄，這裡不重複講。舊的那份結果已經
-        // 不算數了（invalidate 清掉了），留著只會讓人看錯
-        if self.backup.busy != BackupBusy::Idle {
-            ui.label(
-                egui::RichText::new("處理中…")
-                    .size(12.5)
-                    .color(theme::TEXT_WEAK),
-            );
-            return;
-        }
         if self.backup.planned() {
             // 清單的高度照面板算：一份清單最多佔八成，「看清單」與「看略過的」
             // 同時開就對半分。不能讓它「吃掉剩下全部」——後面幾組的統計列
