@@ -2109,6 +2109,12 @@ fn pick_folder_remembering(
     fallback: Option<&Path>,
 ) -> Option<PathBuf> {
     let start = load_last_dir(which).or_else(|| fallback.map(|p| p.to_path_buf()));
+    // 對話框開著時 UI 執行緒就停在這一行，畫面不會更新。看門狗要知道這是
+    // 「在等對話框」而不是當掉，否則 15 秒就寫下一筆假的停止回應紀錄，
+    // 而且不會被撤銷（撤銷只給對話框狀態，見 [`hang_action`]）——下次開程式
+    // 就跳「上次畫面停止回應」。rfd 那條路是 [`file_dialog`] 自己設的，
+    // 自己叫 COM 的這條要在這裡設（實際回報過的狀況）
+    ui_phase(PHASE_FILE_DIALOG);
     #[cfg(windows)]
     if let Ok(r) = win_folder::pick(title, start.as_deref()) {
         if let Some(d) = &r {
@@ -30397,6 +30403,13 @@ mod tests {
             near.contains("fn pick_folder_remembering"),
             "第 {} 行的 pick_folder() 不在 pick_folder_remembering 裡：\n{near}",
             raw[0]
+        );
+        // 自己叫 COM 的那條路不會經過 file_dialog，狀態得自己設：漏了的話
+        // 使用者在對話框裡翻十五秒就被記一筆假的停止回應（見該函式的註解）
+        let body = &near[near.find("fn pick_folder_remembering").unwrap()..];
+        assert!(
+            body.contains("ui_phase(PHASE_FILE_DIALOG)"),
+            "pick_folder_remembering 沒把狀態設成「等對話框」，看門狗會誤判成當掉"
         );
     }
 
