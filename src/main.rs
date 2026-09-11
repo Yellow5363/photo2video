@@ -999,8 +999,8 @@ fn install_panic_hook() {
             .unwrap_or_else(|| "未知位置".into());
         let bt = std::backtrace::Backtrace::force_capture();
         let report = format!(
-            "Photo2Video v{}\npanic：{msg}\n位置：{loc}\n\nbacktrace：\n{bt}",
-            env!("CARGO_PKG_VERSION")
+            "{}\npanic：{msg}\n位置：{loc}\n\nbacktrace：\n{bt}",
+            version_line()
         );
         let path = crash_log_path();
         if let Some(dir) = path.parent() {
@@ -1101,25 +1101,113 @@ fn take_hang_report() -> Option<String> {
 /// 就沉到後面看不見了。而叫出對話框的是 UI 執行緒，它正停在這裡等回應，
 /// 視窗不會重畫、按 ✕ 也沒反應——看起來就是整個程式當掉又關不掉。
 /// 指定擁有者後對話框永遠在該視窗之上，點到被停用的視窗還會閃動提示
-fn file_dialog() -> rfd::FileDialog {
+fn file_dialog() -> FileDialog {
     ui_phase(PHASE_FILE_DIALOG);
+    note_dialog("檔案對話框（rfd）");
     let d = rfd::FileDialog::new();
     #[cfg(windows)]
     if let Some(owner) = dialog_owner() {
-        return d.set_parent(&owner);
+        return FileDialog(d.set_parent(&owner));
     }
-    d
+    FileDialog(d)
+}
+
+/// 系統檔案對話框的建構器（包著 rfd 的）。包一層是為了抓住**對話框關掉的
+/// 那一刻**（見 [`dialog_done`]）：rfd 的建構器被最後那個 pick_*／save_file
+/// 吃掉，呼叫端散在五個模組裡，沒有一個共同的「回來了」可以掛。
+/// 用法與 rfd 一樣，只轉發用得到的方法
+struct FileDialog(rfd::FileDialog);
+
+impl FileDialog {
+    fn set_title(self, title: impl Into<String>) -> Self {
+        let title = title.into();
+        note_dialog_more(&format!("「{title}」"));
+        Self(self.0.set_title(title))
+    }
+
+    fn set_directory(self, dir: impl AsRef<Path>) -> Self {
+        note_dialog_more(&format!("從 {} 開始", dir.as_ref().display()));
+        Self(self.0.set_directory(dir))
+    }
+
+    fn set_file_name(self, name: impl Into<String>) -> Self {
+        Self(self.0.set_file_name(name))
+    }
+
+    fn add_filter(self, name: impl Into<String>, exts: &[impl ToString]) -> Self {
+        Self(self.0.add_filter(name, exts))
+    }
+
+    fn pick_file(self) -> Option<PathBuf> {
+        let r = self.0.pick_file();
+        dialog_done();
+        r
+    }
+
+    fn pick_files(self) -> Option<Vec<PathBuf>> {
+        let r = self.0.pick_files();
+        dialog_done();
+        r
+    }
+
+    fn pick_folder(self) -> Option<PathBuf> {
+        let r = self.0.pick_folder();
+        dialog_done();
+        r
+    }
+
+    fn pick_folders(self) -> Option<Vec<PathBuf>> {
+        let r = self.0.pick_folders();
+        dialog_done();
+        r
+    }
+
+    fn save_file(self) -> Option<PathBuf> {
+        let r = self.0.save_file();
+        dialog_done();
+        r
+    }
 }
 
 /// 建立系統訊息對話框（擁有者處理同 [`file_dialog`]）
-fn message_dialog() -> rfd::MessageDialog {
+fn message_dialog() -> MessageDialog {
     ui_phase(PHASE_MSG_DIALOG);
+    note_dialog("訊息對話框");
     let d = rfd::MessageDialog::new();
     #[cfg(windows)]
     if let Some(owner) = dialog_owner() {
-        return d.set_parent(&owner);
+        return MessageDialog(d.set_parent(&owner));
     }
-    d
+    MessageDialog(d)
+}
+
+/// 系統訊息對話框的建構器（包著 rfd 的），理由同 [`FileDialog`]
+struct MessageDialog(rfd::MessageDialog);
+
+impl MessageDialog {
+    fn set_level(self, level: rfd::MessageLevel) -> Self {
+        Self(self.0.set_level(level))
+    }
+
+    fn set_title(self, title: impl Into<String>) -> Self {
+        let title = title.into();
+        note_dialog_more(&format!("「{title}」"));
+        Self(self.0.set_title(title))
+    }
+
+    fn set_description(self, text: impl Into<String>) -> Self {
+        Self(self.0.set_description(text))
+    }
+
+    fn set_buttons(self, buttons: rfd::MessageButtons) -> Self {
+        Self(self.0.set_buttons(buttons))
+    }
+
+    fn show(self) -> rfd::MessageDialogResult {
+        let r = self.0.show();
+        dialog_done();
+        r
+    }
 }
 
 /// 三選一確認框的答案（見 [`ask3`]）
@@ -1174,18 +1262,45 @@ fn ask3(level: rfd::MessageLevel, title: &str, body: &str, a: &str, b: &str, c: 
     }
 }
 
-/// 本執行緒目前作用中的視窗，包成 rfd 要的 handle；程式沒有視窗在前景時回傳 None
+/// 對話框要綁的視窗，包成 rfd 要的 handle；連主視窗都還沒有時回傳 None
 #[cfg(windows)]
 fn dialog_owner() -> Option<DialogOwner> {
-    // 只是要一個 HWND，不值得為此多拉一個 windows-sys 相依。
-    // GetActiveWindow 取的是「本執行緒」作用中的視窗，正好是使用者剛才
-    // 操作的那個，對話框就會綁在它上面
+    std::num::NonZeroIsize::new(owner_hwnd()).map(DialogOwner)
+}
+
+/// 對話框要綁在哪個視窗上（HWND）：主視窗；還沒抓到主視窗時退回本執行緒
+/// 目前作用中的那個。
+///
+/// 以前只用 GetActiveWindow。它取的是「本執行緒作用中的視窗」，使用者剛點過
+/// 程式視窗時沒問題，但關閉要求從工作列來（右鍵→關閉視窗）、或別的視窗
+/// 正好在前景時它回 0——對話框就沒有擁有者，Windows 不把它壓在程式視窗
+/// 之上，一沉到後面整個程式看起來就是當掉了（見 [`file_dialog`] 的說明）。
+/// 主視窗的 HWND 第一次 update 就記下來（[`MAIN_HWND`]），之後一律用它
+#[cfg(windows)]
+fn owner_hwnd() -> isize {
+    // 只是要一個 HWND，不值得為此多拉一個 windows-sys 相依
     #[link(name = "user32")]
     extern "system" {
         fn GetActiveWindow() -> isize;
     }
-    let hwnd = unsafe { GetActiveWindow() };
-    std::num::NonZeroIsize::new(hwnd).map(DialogOwner)
+    match MAIN_HWND.load(Ordering::Relaxed) {
+        0 => unsafe { GetActiveWindow() },
+        main => main,
+    }
+}
+
+/// 記下主視窗的 HWND（見 [`MAIN_HWND`]）；拿到一次就不再問
+#[cfg(windows)]
+fn remember_main_window(frame: &eframe::Frame) {
+    if MAIN_HWND.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    if let Ok(h) = frame.window_handle() {
+        if let RawWindowHandle::Win32(w) = h.as_raw() {
+            MAIN_HWND.store(w.hwnd.get(), Ordering::Relaxed);
+        }
+    }
 }
 
 /// 包一層讓 rfd 取得 HWND（rfd 的 set_parent 收 raw-window-handle 的型別）
@@ -1200,8 +1315,8 @@ impl raw_window_handle::HasWindowHandle for DialogOwner {
         let raw = raw_window_handle::RawWindowHandle::Win32(
             raw_window_handle::Win32WindowHandle::new(self.0),
         );
-        // SAFETY: HWND 取自本執行緒的作用中視窗；對話框顯示期間 UI 執行緒
-        // 就停在這個呼叫裡，視窗不可能在這段期間被銷毀
+        // SAFETY: HWND 是主視窗（或本執行緒的作用中視窗，見 owner_hwnd）；
+        // 對話框顯示期間 UI 執行緒就停在這個呼叫裡，視窗不可能在這段期間被銷毀
         Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) })
     }
 }
@@ -1232,6 +1347,17 @@ static WAKE_TICK: AtomicU64 = AtomicU64::new(0);
 /// 目前停在哪個功能模組（[`Module::ALL`] 的索引）：只在某個模組才發生的
 /// 問題，回報時看得出來
 static ACTIVE_MODULE: AtomicU8 = AtomicU8::new(0);
+/// 主視窗的 HWND（第一次 update 從 eframe 拿到就記著；0＝還沒拿到）。
+/// 對話框一律綁在它上面，見 [`owner_hwnd`]
+#[cfg(windows)]
+static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// 看門狗目前留著的那筆停止回應紀錄，是不是「對話框開著」時記的。
+/// 對話框一關（[`dialog_done`]）UI 執行緒就自己把它撤掉，不等看門狗下一輪：
+/// 使用者在對話框裡待超過兩分鐘、關掉後三秒內就把程式關了，那筆會留下來，
+/// 下次開程式跳一個根本沒發生的「停止回應」（實際發生過）
+static DIALOG_REPORTED: AtomicBool = AtomicBool::new(false);
+/// 目前開著（或最後開過）的對話框是哪一個、從哪裡開始：寫進停止回應的紀錄
+static DIALOG_NOTE: Mutex<String> = Mutex::new(String::new());
 
 /// 看門狗檢查間隔（同時也是心跳喚醒間隔）
 const WATCHDOG_POLL: Duration = Duration::from_secs(3);
@@ -1252,6 +1378,47 @@ fn now_ms() -> u64 {
 
 fn ui_phase(phase: u8) {
     UI_PHASE.store(phase, Ordering::Relaxed);
+}
+
+/// 對話框關掉、UI 執行緒回來了：心跳補到現在、階段切回一般狀態、
+/// 看門狗在對話框開著時記的那筆立刻撤銷。
+///
+/// 階段一定要在這裡切，不能等下一次 update：選完資料夾之後同一個 update
+/// 裡接著做的事（查成品檔存不存在、問要不要覆蓋…）要是卡住了，紀錄上
+/// 才不會寫成「在等對話框」，門檻也才是一般的十五秒而不是兩分鐘
+fn dialog_done() {
+    UI_TICK.store(now_ms(), Ordering::Relaxed);
+    ui_phase(PHASE_UPDATE);
+    withdraw_dialog_report();
+}
+
+/// 看門狗在對話框開著時記的那筆停止回應，對話框既然關了就撤（見 [`DIALOG_REPORTED`]）
+fn withdraw_dialog_report() {
+    withdraw_dialog_report_at(&hang_log_path());
+}
+
+fn withdraw_dialog_report_at(path: &Path) {
+    if DIALOG_REPORTED.swap(false, Ordering::Relaxed) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// 記下「現在開的是哪一個對話框」（見 [`DIALOG_NOTE`]）
+fn note_dialog(what: &str) {
+    *DIALOG_NOTE.lock().unwrap_or_else(|e| e.into_inner()) = what.to_string();
+}
+
+/// 補一段到目前對話框的描述後面（標題、起始位置…）
+fn note_dialog_more(extra: &str) {
+    let mut n = DIALOG_NOTE.lock().unwrap_or_else(|e| e.into_inner());
+    if !n.is_empty() {
+        n.push('，');
+    }
+    n.push_str(extra);
+}
+
+fn dialog_note() -> String {
+    DIALOG_NOTE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// 監看 UI 執行緒：太久沒更新就把「卡在哪」寫進 hang.log，
@@ -1292,16 +1459,20 @@ fn spawn_ui_watchdog(ctx: &egui::Context) {
                 HangAction::Fine => {
                     reported = false;
                     reported_dialog = false;
+                    DIALOG_REPORTED.store(false, Ordering::Relaxed);
                 }
                 HangAction::Withdraw => {
                     let _ = std::fs::remove_file(hang_log_path());
                     reported = false;
                     reported_dialog = false;
+                    DIALOG_REPORTED.store(false, Ordering::Relaxed);
                 }
                 HangAction::Report => {
                     reported = true;
                     reported_dialog = is_dialog_phase(phase);
                     write_hang_log(stalled, phase);
+                    // UI 執行緒一從對話框回來就會自己撤（見 dialog_done）
+                    DIALOG_REPORTED.store(reported_dialog, Ordering::Relaxed);
                 }
                 HangAction::AlreadyReported => {}
             }
@@ -1361,7 +1532,12 @@ fn hang_action(phase: u8, stalled_ms: u64, reported: bool, reported_dialog: bool
     }
 }
 
-/// 寫下停止回應的紀錄（覆蓋舊的：最新一次最接近使用者遇到的狀況）
+/// 寫下停止回應的紀錄（覆蓋舊的：最新一次最接近使用者遇到的狀況）。
+///
+/// 除了卡在哪個階段，還記：是哪一次建置的執行檔（同一個版號建過很多次）、
+/// 是哪個對話框從哪裡開的、以及當下本程式的視窗清單與前景視窗——
+/// 「對話框沒開起來」「開了被蓋住」「開著而且在前景」是三種完全不同的問題，
+/// 以前的紀錄分不出來，只能猜
 fn write_hang_log(stalled_ms: u64, phase: u8) {
     let doing = match phase {
         PHASE_FILE_DIALOG => "系統檔案對話框（程式在等它關閉；它可能被其他視窗蓋住）",
@@ -1376,21 +1552,232 @@ fn write_hang_log(stalled_ms: u64, phase: u8) {
     } else {
         "看門狗的重畫請求仍正常送出"
     };
-    let report = format!(
-        "Photo2Video v{}\n畫面停止回應：{} 秒沒有更新\n當時狀態：{doing}\n{wake}\n目前模組：{}\n",
-        env!("CARGO_PKG_VERSION"),
+    let mut report = format!(
+        "{}\n記錄時間：{}\n畫面停止回應：{} 秒沒有更新\n當時狀態：{doing}\n",
+        version_line(),
+        local_time(unix_now()),
         stalled_ms / 1000,
+    );
+    if is_dialog_phase(phase) {
+        let note = dialog_note();
+        if !note.is_empty() {
+            report.push_str(&format!("對話框：{note}\n"));
+        }
+    }
+    report.push_str(&format!(
+        "{wake}\n目前模組：{}\n",
         Module::ALL
             .get(ACTIVE_MODULE.load(Ordering::Relaxed) as usize)
             .copied()
             .unwrap_or(Module::Video)
             .label(),
-    );
+    ));
+    #[cfg(windows)]
+    {
+        let (ours, fg) = win_probe::snapshot(MAIN_HWND.load(Ordering::Relaxed));
+        report.push_str(&windows_report(&ours, fg.as_ref(), is_dialog_phase(phase)));
+    }
     let path = hang_log_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(&path, report);
+}
+
+/// 現在的 unix 秒數
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 「Photo2Video v0.14.0（建置 2026-09-11 11:22:25）」。同一個版號會建很多次，
+/// 拷到別臺電腦的檔案時間又不可靠，紀錄裡要看得出是哪一次建的
+fn version_line() -> String {
+    let built = exe_link_time()
+        .map(local_time)
+        .unwrap_or_else(|| "不明".into());
+    format!("Photo2Video v{}（建置 {built}）", env!("CARGO_PKG_VERSION"))
+}
+
+/// 這支執行檔連結時的時間戳（PE 檔頭的 TimeDateStamp，unix 秒）。
+/// 讀的是自己在記憶體裡的映像檔頭，不用開檔
+#[cfg(windows)]
+fn exe_link_time() -> Option<u64> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *const u8;
+    }
+    unsafe {
+        let base = GetModuleHandleW(std::ptr::null());
+        if base.is_null() || base.cast::<u16>().read_unaligned() != 0x5A4D {
+            return None; // 不是 'MZ'
+        }
+        let e_lfanew = base.add(0x3C).cast::<i32>().read_unaligned();
+        if !(0x40..=0x1000).contains(&e_lfanew) {
+            return None;
+        }
+        let nt = base.add(e_lfanew as usize);
+        if nt.cast::<u32>().read_unaligned() != 0x0000_4550 {
+            return None; // 不是 'PE\0\0'
+        }
+        // IMAGE_NT_HEADERS：Signature(4) 後面是 IMAGE_FILE_HEADER，
+        // 其中 Machine(2)、NumberOfSections(2) 之後就是 TimeDateStamp
+        Some(u64::from(nt.add(8).cast::<u32>().read_unaligned()))
+    }
+}
+
+#[cfg(not(windows))]
+fn exe_link_time() -> Option<u64> {
+    None
+}
+
+/// unix 秒數寫成本機時間「2026-09-11 11:22:25」
+#[cfg(windows)]
+fn local_time(unix: u64) -> String {
+    #[repr(C)]
+    struct FileTime {
+        lo: u32,
+        hi: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    #[allow(dead_code)]
+    struct SysTime {
+        year: u16,
+        month: u16,
+        weekday: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        ms: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn FileTimeToLocalFileTime(utc: *const FileTime, local: *mut FileTime) -> i32;
+        fn FileTimeToSystemTime(ft: *const FileTime, st: *mut SysTime) -> i32;
+    }
+    // FILETIME 是從 1601-01-01 起算的百奈秒
+    let ticks = (unix + 11_644_473_600) * 10_000_000;
+    let utc = FileTime {
+        lo: ticks as u32,
+        hi: (ticks >> 32) as u32,
+    };
+    let mut local = FileTime { lo: 0, hi: 0 };
+    let mut st = SysTime::default();
+    let ok = unsafe {
+        FileTimeToLocalFileTime(&utc, &mut local) != 0
+            && FileTimeToSystemTime(&local, &mut st) != 0
+    };
+    if !ok {
+        return format!("unix {unix}");
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        st.year, st.month, st.day, st.hour, st.minute, st.second
+    )
+}
+
+#[cfg(not(windows))]
+fn local_time(unix: u64) -> String {
+    format!("unix {unix}")
+}
+
+/// 一個最上層視窗的樣子（[`win_probe::snapshot`] 抓的；抽成純資料是為了
+/// 判讀那段測得到）
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct WinInfo {
+    title: String,
+    class: String,
+    visible: bool,
+    /// 縮到工作列了
+    iconic: bool,
+    /// 被停用（有對話框綁在它上面時，主視窗就是這樣）
+    enabled: bool,
+    /// 有擁有者視窗＝它是綁在別的視窗上的對話框
+    owned: bool,
+    /// 就是本程式的主視窗
+    main: bool,
+    /// 屬於本程式（前景視窗不一定是）
+    ours: bool,
+    /// 螢幕座標（左, 上, 右, 下）
+    rect: (i32, i32, i32, i32),
+}
+
+/// 把視窗清單寫成人看得懂的幾行，卡在對話框時最後給一句判讀：
+/// 「對話框根本沒開起來」「開了但被蓋住」「開著而且在前景」是三種完全不同的問題
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_report(ours: &[WinInfo], fg: Option<&WinInfo>, dialog_phase: bool) -> String {
+    let mut s = String::from("本程式的視窗：\n");
+    let mut hidden = 0;
+    for w in ours {
+        if !w.visible {
+            hidden += 1;
+            continue;
+        }
+        let (l, t, r, b) = w.rect;
+        let mut tags = Vec::new();
+        if w.main {
+            tags.push("主視窗");
+        }
+        if w.owned {
+            tags.push("綁在別的視窗上（對話框）");
+        } else if !w.main {
+            tags.push("沒綁在任何視窗上");
+        }
+        if w.iconic {
+            tags.push("已縮到工作列");
+        }
+        if !w.enabled {
+            tags.push("已停用");
+        }
+        s.push_str(&format!(
+            "  「{}」 類別 {}  {}  ({l},{t})-({r},{b})\n",
+            w.title,
+            w.class,
+            tags.join("、")
+        ));
+    }
+    if hidden > 0 {
+        s.push_str(&format!("  （另有 {hidden} 個看不見的輔助視窗）\n"));
+    }
+    match fg {
+        Some(f) => s.push_str(&format!(
+            "前景視窗：「{}」（{}）\n",
+            f.title,
+            if f.ours { "本程式" } else { "別的程式" }
+        )),
+        None => s.push_str("前景視窗：沒有\n"),
+    }
+    if dialog_phase {
+        let dialog = ours.iter().find(|w| w.visible && !w.main);
+        let verdict = match (dialog, fg) {
+            (None, _) => "沒看到對話框視窗——對話框還沒建立起來就卡住了（系統殼層或 COM 那邊），\
+                          或者已經關掉、程式接著卡在別處"
+                .to_string(),
+            (Some(d), _) if d.iconic => {
+                format!("對話框「{}」被縮到工作列了，點工作列上的程式圖示就回來", d.title)
+            }
+            (Some(d), Some(f)) if f.ours => format!(
+                "對話框「{}」開著、而且就在前景：程式沒有當，多半只是在裡面找了很久",
+                d.title
+            ),
+            (Some(d), _) => format!(
+                "對話框「{}」開著，但前景是別的程式：它被蓋住了（按 Alt+Tab 找得到）{}",
+                d.title,
+                if d.owned {
+                    ""
+                } else {
+                    "；而且它沒綁在主視窗上，點到程式視窗就會沉下去"
+                }
+            ),
+        };
+        s.push_str(&format!("判讀：{verdict}\n"));
+    }
+    s
 }
 
 /// 讀取上次儲存的每秒張數；沒有設定檔或值不合法時回傳 None
@@ -1831,7 +2218,7 @@ fn remember_dir(which: LastDir, picked: &Path) {
 
 /// 從「這個用途上次停的資料夾」開始的**選檔**對話框。沒有記錄時不指定
 /// 起始位置，交給作業系統決定（通常是最近用過的地方）
-fn dir_dialog(which: LastDir) -> rfd::FileDialog {
+fn dir_dialog(which: LastDir) -> FileDialog {
     let d = file_dialog();
     match load_last_dir(which) {
         Some(dir) => d.set_directory(dir),
@@ -1899,6 +2286,10 @@ mod win_folder {
     /// 那種拿不到可以寫檔的路徑）
     const FOS_PICKFOLDERS: u32 = 0x20;
     const FOS_FORCEFILESYSTEM: u32 = 0x40;
+    /// 預設就有的兩個，GetOptions 失敗時自己補：在對話框裡逛到哪都不改程式的
+    /// 工作目錄；欄位裡打一個不存在的名字會被擋下
+    const FOS_NOCHANGEDIR: u32 = 0x8;
+    const FOS_PATHMUSTEXIST: u32 = 0x800;
     /// 取「可以拿去開檔的完整路徑」
     const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
     /// 使用者按了取消（HRESULT_FROM_WIN32(ERROR_CANCELLED)）
@@ -1922,7 +2313,7 @@ mod win_folder {
         advise: usize,
         unadvise: usize,
         set_options: unsafe extern "system" fn(this: *mut c_void, fos: u32) -> HRESULT,
-        get_options: usize,
+        get_options: unsafe extern "system" fn(this: *mut c_void, fos: *mut u32) -> HRESULT,
         set_default_folder: usize,
         set_folder: unsafe extern "system" fn(this: *mut c_void, psi: *mut c_void) -> HRESULT,
         get_folder: usize,
@@ -1971,11 +2362,6 @@ mod win_folder {
         ) -> HRESULT;
     }
 
-    #[link(name = "user32")]
-    extern "system" {
-        fn GetActiveWindow() -> isize;
-    }
-
     /// COM 物件的小包裝：離開範圍就 Release，早退時不必記得自己收
     struct Com(*mut c_void);
 
@@ -2020,9 +2406,11 @@ mod win_folder {
     /// 「資料夾:」欄——同一批的姊妹資料夾都看得到，要選同一個直接按確定。
     /// 上一層不存在（磁碟機根目錄之類）就退回開在它自己裡面。
     ///
+    /// `owner` 是對話框要綁的視窗（主視窗，見 `owner_hwnd`；0＝不綁）。
+    ///
     /// 回傳 `Err(())` 代表「這條路走不通」（COM 起不來、系統太舊），
     /// 呼叫端要退回 rfd；`Ok(None)` 才是使用者按了取消
-    pub fn pick(title: &str, start: Option<&Path>) -> Result<Option<PathBuf>, ()> {
+    pub fn pick(title: &str, start: Option<&Path>, owner: isize) -> Result<Option<PathBuf>, ()> {
         unsafe {
             let init = CoInitializeEx(
                 std::ptr::null_mut(),
@@ -2032,13 +2420,17 @@ mod win_folder {
             if init < 0 {
                 return Err(());
             }
-            let r = pick_inner(title, start);
+            let r = pick_inner(title, start, owner);
             CoUninitialize();
             r
         }
     }
 
-    unsafe fn pick_inner(title: &str, start: Option<&Path>) -> Result<Option<PathBuf>, ()> {
+    unsafe fn pick_inner(
+        title: &str,
+        start: Option<&Path>,
+        owner: isize,
+    ) -> Result<Option<PathBuf>, ()> {
         let mut raw: *mut c_void = std::ptr::null_mut();
         let hr = CoCreateInstance(
             &CLSID_FILE_OPEN_DIALOG,
@@ -2053,7 +2445,12 @@ mod win_folder {
         let dlg = Com(raw);
         let vt = &**(dlg.0 as *mut *mut IFileDialogV);
 
-        if (vt.set_options)(dlg.0, FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM) < 0 {
+        // 在預設選項上加，不要整組換掉（預設有 NOCHANGEDIR 與 PATHMUSTEXIST）
+        let mut fos = 0u32;
+        if (vt.get_options)(dlg.0, &mut fos) < 0 {
+            fos = FOS_NOCHANGEDIR | FOS_PATHMUSTEXIST;
+        }
+        if (vt.set_options)(dlg.0, fos | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM) < 0 {
             return Err(());
         }
         let t = wide(title);
@@ -2077,8 +2474,8 @@ mod win_folder {
             }
         }
 
-        // 綁在使用者剛才操作的那個視窗上（與 dialog_owner 同一個作法）
-        match (vt.show)(dlg.0, GetActiveWindow()) {
+        // 綁在主視窗上（見 owner_hwnd）：沒綁的話一沉到程式視窗後面就找不到了
+        match (vt.show)(dlg.0, owner) {
             0 => {}
             CANCELLED => return Ok(None),
             _ => return Err(()),
@@ -2095,6 +2492,101 @@ mod win_folder {
             return Err(());
         }
         Ok(Some(PathBuf::from(take_wide(name))))
+    }
+}
+
+/// 看門狗寫紀錄時把本程式的視窗都列出來（見 [`windows_report`]）。
+/// 全在別的執行緒呼叫，所以只用不會送訊息給目標視窗的 API
+/// （InternalGetWindowText 而不是 GetWindowText）：UI 執行緒真的卡死時，
+/// 送訊息過去看門狗自己也會跟著卡住
+#[cfg(windows)]
+mod win_probe {
+    use super::WinInfo;
+
+    type HWND = isize;
+    type BOOL = i32;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(cb: unsafe extern "system" fn(HWND, isize) -> BOOL, lparam: isize) -> BOOL;
+        fn GetWindowThreadProcessId(hwnd: HWND, pid: *mut u32) -> u32;
+        fn IsWindowVisible(hwnd: HWND) -> BOOL;
+        fn IsIconic(hwnd: HWND) -> BOOL;
+        fn IsWindowEnabled(hwnd: HWND) -> BOOL;
+        fn GetWindowRect(hwnd: HWND, rect: *mut Rect) -> BOOL;
+        fn InternalGetWindowText(hwnd: HWND, buf: *mut u16, n: i32) -> i32;
+        fn GetClassNameW(hwnd: HWND, buf: *mut u16, n: i32) -> i32;
+        fn GetWindow(hwnd: HWND, cmd: u32) -> HWND;
+        fn GetForegroundWindow() -> HWND;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcessId() -> u32;
+    }
+
+    const GW_OWNER: u32 = 4;
+
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: isize) -> BOOL {
+        let out = &mut *(lparam as *mut Vec<HWND>);
+        if pid_of(hwnd) == GetCurrentProcessId() {
+            out.push(hwnd);
+        }
+        1
+    }
+
+    unsafe fn pid_of(hwnd: HWND) -> u32 {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        pid
+    }
+
+    unsafe fn text(
+        read: unsafe extern "system" fn(HWND, *mut u16, i32) -> i32,
+        hwnd: HWND,
+    ) -> String {
+        let mut buf = [0u16; 256];
+        let n = read(hwnd, buf.as_mut_ptr(), buf.len() as i32).clamp(0, buf.len() as i32);
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+
+    unsafe fn describe(hwnd: HWND, main: HWND) -> WinInfo {
+        let mut r = Rect::default();
+        GetWindowRect(hwnd, &mut r);
+        WinInfo {
+            title: text(InternalGetWindowText, hwnd),
+            class: text(GetClassNameW, hwnd),
+            visible: IsWindowVisible(hwnd) != 0,
+            iconic: IsIconic(hwnd) != 0,
+            enabled: IsWindowEnabled(hwnd) != 0,
+            owned: GetWindow(hwnd, GW_OWNER) != 0,
+            main: hwnd == main,
+            ours: pid_of(hwnd) == GetCurrentProcessId(),
+            rect: (r.left, r.top, r.right, r.bottom),
+        }
+    }
+
+    /// 本程式所有最上層視窗，加上目前的前景視窗（不一定是本程式的）
+    pub fn snapshot(main: isize) -> (Vec<WinInfo>, Option<WinInfo>) {
+        let mut handles: Vec<HWND> = Vec::new();
+        unsafe {
+            EnumWindows(collect, &mut handles as *mut Vec<HWND> as isize);
+        }
+        let ours = handles
+            .into_iter()
+            .map(|h| unsafe { describe(h, main) })
+            .collect();
+        let fg = unsafe { GetForegroundWindow() };
+        let fg = (fg != 0).then(|| unsafe { describe(fg, main) });
+        (ours, fg)
     }
 }
 
@@ -2115,12 +2607,20 @@ fn pick_folder_remembering(
     // 就跳「上次畫面停止回應」。rfd 那條路是 [`file_dialog`] 自己設的，
     // 自己叫 COM 的這條要在這裡設（實際回報過的狀況）
     ui_phase(PHASE_FILE_DIALOG);
+    note_dialog(&format!("選資料夾「{title}」"));
+    if let Some(s) = &start {
+        note_dialog_more(&format!("從 {} 開始", s.display()));
+    }
     #[cfg(windows)]
-    if let Ok(r) = win_folder::pick(title, start.as_deref()) {
-        if let Some(d) = &r {
-            remember_dir(which, d);
+    {
+        note_dialog_more("自己叫 COM");
+        if let Ok(r) = win_folder::pick(title, start.as_deref(), owner_hwnd()) {
+            dialog_done();
+            if let Some(d) = &r {
+                remember_dir(which, d);
+            }
+            return r;
         }
-        return r;
     }
     // 非 Windows，或自己那條路走不通時：退回 rfd（欄位會是空白的，
     // 但開在上次那個資料夾裡面，按確定拿到的仍是它）
@@ -24498,10 +24998,17 @@ fn clean_stale_temp_files() {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // 心跳：跑到這裡代表 UI 執行緒還活著（給看門狗判斷有沒有卡住）
         UI_TICK.store(now_ms(), Ordering::Relaxed);
         ui_phase(PHASE_UPDATE);
+        // 對話框開著時記下的停止回應，UI 既然回來了就撤（正常是 dialog_done
+        // 撤的，這裡是保險；見 DIALOG_REPORTED）
+        withdraw_dialog_report();
+        #[cfg(windows)]
+        remember_main_window(frame);
+        #[cfg(not(windows))]
+        let _ = &frame;
 
         ACTIVE_MODULE.store(
             Module::ALL.iter().position(|m| *m == self.module).unwrap_or(0) as u8,
@@ -29856,6 +30363,112 @@ mod tests {
         }
     }
 
+    /// 對話框一關，UI 執行緒自己就把「對話框開著時記的那筆」撤掉，
+    /// 不等看門狗下一輪（三秒）：關掉對話框後馬上關程式，那筆會留下來，
+    /// 下次開程式跳一個沒發生過的停止回應（實際發生過）。
+    /// 旗標沒立（不是對話框時記的）就不能碰：畫面真的凍住過是該追的問題
+    #[test]
+    fn 對話框一關就把它開著時記的那筆撤掉() {
+        let path = std::env::temp_dir().join(format!("p2v_hang_{}.log", std::process::id()));
+        std::fs::write(&path, "x").unwrap();
+        DIALOG_REPORTED.store(true, Ordering::Relaxed);
+        withdraw_dialog_report_at(&path);
+        assert!(!path.exists(), "對話框開著時記的那筆要撤掉");
+        assert!(!DIALOG_REPORTED.load(Ordering::Relaxed), "撤過旗標就要放下");
+        std::fs::write(&path, "x").unwrap();
+        withdraw_dialog_report_at(&path);
+        assert!(path.exists(), "不是對話框時記的不能撤");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 每個系統對話框都要經過 file_dialog／message_dialog 那兩層包裝：
+    /// 對話框關掉那一刻的收尾（dialog_done）掛在包裝的最後一個方法上，
+    /// 直接 new 一個 rfd 的就繞過去了
+    #[test]
+    fn every_system_dialog_goes_through_the_wrappers() {
+        let src = include_str!("main.rs");
+        // 字串拆兩半，免得這條測試自己也被算進去
+        let file = concat!("rfd::FileDialog", "::new()");
+        let msg = concat!("rfd::MessageDialog", "::new()");
+        assert_eq!(src.matches(file).count(), 1, "rfd 的檔案對話框只能在 file_dialog 裡 new");
+        assert_eq!(src.matches(msg).count(), 1, "rfd 的訊息對話框只能在 message_dialog 裡 new");
+    }
+
+    /// 停止回應的紀錄要分得出「對話框根本沒開起來」「開了但被蓋住」
+    /// 「開著而且在前景」——以前只寫「可能被其他視窗蓋住」，三種都長一樣
+    #[test]
+    fn 停止回應紀錄的判讀分得出對話框沒開起來與被蓋住() {
+        fn win(title: &str, main: bool, owned: bool) -> WinInfo {
+            WinInfo {
+                title: title.into(),
+                class: "#32770".into(),
+                visible: true,
+                iconic: false,
+                enabled: true,
+                owned,
+                main,
+                ours: true,
+                rect: (0, 0, 10, 10),
+            }
+        }
+        let main = win("Photo2Video", true, false);
+        let dlg = win("選擇資料夾", false, true);
+        let mut other = win("檔案總管", false, false);
+        other.ours = false;
+
+        let r = windows_report(&[main.clone()], Some(&main), true);
+        assert!(r.contains("沒看到對話框視窗"), "{r}");
+
+        let r = windows_report(&[main.clone(), dlg.clone()], Some(&dlg), true);
+        assert!(r.contains("就在前景"), "{r}");
+
+        let r = windows_report(&[main.clone(), dlg.clone()], Some(&other), true);
+        assert!(r.contains("被蓋住"), "{r}");
+        assert!(!r.contains("沒綁在主視窗上"), "有綁擁有者就不該多那句：{r}");
+
+        let loose = win("選擇資料夾", false, false);
+        let r = windows_report(&[main.clone(), loose], Some(&other), true);
+        assert!(r.contains("沒綁在主視窗上"), "{r}");
+
+        // 不在對話框階段就不下判讀
+        let r = windows_report(&[main], None, false);
+        assert!(!r.contains("判讀"), "{r}");
+    }
+
+    /// 紀錄開頭要寫得出「這是哪一次建的」：PE 檔頭的連結時間戳讀得到、
+    /// 而且是最近的（測試執行檔就是剛剛才連結的）；本機時間的格式固定
+    #[test]
+    fn 版本那一行帶著這次建置的時間() {
+        #[cfg(windows)]
+        {
+            let link = exe_link_time().expect("讀不到自己的 PE 檔頭時間戳");
+            let now = unix_now();
+            assert!(
+                link <= now + 60 && now - link < 30 * 24 * 3600,
+                "連結時間戳 {link} 離現在 {now} 太遠"
+            );
+            assert!(version_line().contains("（建置 20"), "{}", version_line());
+        }
+        let t = local_time(0);
+        assert!(t.starts_with("19") || t.starts_with("unix"), "{t}");
+        assert!(t.starts_with("unix") || t.len() == 19, "{t}");
+    }
+
+    /// 真的去列一次視窗（測試程序自己沒有視窗，前景是別的程式）：
+    /// 確認 FFI 宣告沒寫錯、跨程序讀標題不會卡
+    #[cfg(windows)]
+    #[test]
+    fn 視窗快照在真機上列得出來() {
+        let (ours, fg) = win_probe::snapshot(0);
+        assert!(ours.iter().all(|w| w.ours));
+        let r = windows_report(&ours, fg.as_ref(), true);
+        assert!(r.contains("前景視窗："), "{r}");
+        assert!(r.contains("判讀："), "{r}");
+        if std::env::var_os("P2V_PROBE_VERBOSE").is_some() {
+            eprintln!("{r}");
+        }
+    }
+
     /// 對話框的門檻要比一般狀態寬得多——UI 執行緒停在對話框裡是本來就會發生的事
     #[test]
     fn 對話框的門檻比一般狀態寬() {
@@ -30386,8 +30999,14 @@ mod tests {
         let mut raw = Vec::new();
         for (i, l) in lines.iter().enumerate() {
             // 本程式自己那個同名的方法（self.pick_folder()）只是轉手，
-            // 真正開對話框的是它裡面那一行
-            if l.contains(".pick_folder()") && !l.contains("self.pick_folder") {
+            // 真正開對話框的是它裡面那一行；包裝層 FileDialog 轉發給 rfd 的
+            // 那一行（self.0.pick_folder()）也不算
+            // （字串拆兩半，這條測試自己那一行才不會被算進去）
+            let needle = concat!(".pick_folder", "()");
+            if l.contains(needle)
+                && !l.contains("self.pick_folder")
+                && !l.contains("self.0.pick_folder")
+            {
                 raw.push(i + 1);
             }
         }
@@ -30398,7 +31017,7 @@ mod tests {
             "選一個資料夾要走 pick_folder_remembering，不要直接叫 rfd。多出來的在第 {raw:?} 行"
         );
         let i = raw[0] - 1;
-        let near = lines[i.saturating_sub(30)..=i].join("\n");
+        let near = lines[i.saturating_sub(50)..=i].join("\n");
         assert!(
             near.contains("fn pick_folder_remembering"),
             "第 {} 行的 pick_folder() 不在 pick_folder_remembering 裡：\n{near}",
@@ -30428,7 +31047,7 @@ mod tests {
         };
         #[cfg(windows)]
         {
-            let r = win_folder::pick("PROBE_FOLDER_DIALOG", Some(&dir));
+            let r = win_folder::pick("PROBE_FOLDER_DIALOG", Some(&dir), 0);
             eprintln!("RESULT={r:?}");
         }
     }
