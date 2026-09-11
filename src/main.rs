@@ -1839,35 +1839,292 @@ fn dir_dialog(which: LastDir) -> rfd::FileDialog {
     }
 }
 
-/// 從「這個用途上次停的資料夾」開始的**選資料夾**對話框。
+/// 自己叫 Windows 的「選資料夾」對話框，為的是**把上次那個資料夾的名字預填進
+/// 「資料夾:」欄**。
 ///
-/// 和選檔不同，資料夾對話框列的是「子資料夾」：直接開在上次選的那一個裡面，
-/// 而照片資料夾底下通常沒有子資料夾，畫面就只剩一句「沒有符合搜尋條件的
-/// 項目」，看起來像壞掉。改成開在它的**上一層**並把名字填進欄位——上次
-/// 選的那個就在清單裡，旁邊同一批的姊妹資料夾也一起看得到，
-/// 要選同一個也只要直接按「選擇資料夾」
-fn folder_dialog(which: LastDir) -> rfd::FileDialog {
-    let d = file_dialog();
-    let Some(dir) = load_last_dir(which) else {
-        return d;
+/// 為什麼不用 rfd：**它的 pick_folder 根本不送 SetFileName**（只有 pick_file
+/// 與 save_file 會送，見 rfd 0.15／0.17 的 `build_pick_folder`）。走 rfd 就只有
+/// 兩種都不對的選擇——開在上次那個資料夾的**上一層**，欄位空白、按下確定拿到的
+/// 是上一層（每次都存錯地方，而且畫面上看不出來，實際回報過）；或是開在它
+/// **裡面**，按確定雖然是對的，欄位卻還是空白，使用者看不出來它記住了沒有。
+///
+/// 自己叫 COM 才兩者兼得：開在上一層（姊妹資料夾看得到）＋名字預填好
+/// （直接按確定就是它）。這兩件事都用 [`folder_dialog_probe`] 實測過。
+///
+
+/// 只在 Windows 上、只做單選；其他平台與多選（資料備份的來源）仍走 rfd。
+/// 這裡手寫 COM 的介面表是照 rfd 自己的作法（它也是手寫的），
+/// **順序就是介面的定義順序，插錯一個位置會呼叫到別的方法**，不要重排
+#[cfg(windows)]
+mod win_folder {
+    use std::ffi::c_void;
+    use std::path::{Path, PathBuf};
+
+    type HRESULT = i32;
+
+    #[repr(C)]
+    struct Guid {
+        d1: u32,
+        d2: u16,
+        d3: u16,
+        d4: [u8; 8],
+    }
+
+    /// CLSID_FileOpenDialog {DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}
+    const CLSID_FILE_OPEN_DIALOG: Guid = Guid {
+        d1: 0xDC1C_5A9C,
+        d2: 0xE88A,
+        d3: 0x4DDE,
+        d4: [0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7],
     };
-    let (start, name) = folder_dialog_start(&dir);
-    let d = d.set_directory(start);
-    match name {
-        Some(n) => d.set_file_name(n),
-        None => d,
+    /// IID_IFileDialog {42F85136-DB7E-439C-85F1-E4075D135FC8}
+    const IID_FILE_DIALOG: Guid = Guid {
+        d1: 0x42F8_5136,
+        d2: 0xDB7E,
+        d3: 0x439C,
+        d4: [0x85, 0xF1, 0xE4, 0x07, 0x5D, 0x13, 0x5F, 0xC8],
+    };
+    /// IID_IShellItem {43826D1E-E718-42EE-BC55-A1E261C37BFE}
+    const IID_SHELL_ITEM: Guid = Guid {
+        d1: 0x4382_6D1E,
+        d2: 0xE718,
+        d3: 0x42EE,
+        d4: [0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE],
+    };
+
+    const CLSCTX_INPROC_SERVER: u32 = 0x1;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+    /// 選的是資料夾，而且一定要是真的檔案系統路徑（不收「媒體櫃」那種虛擬位置，
+    /// 那種拿不到可以寫檔的路徑）
+    const FOS_PICKFOLDERS: u32 = 0x20;
+    const FOS_FORCEFILESYSTEM: u32 = 0x40;
+    /// 取「可以拿去開檔的完整路徑」
+    const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
+    /// 使用者按了取消（HRESULT_FROM_WIN32(ERROR_CANCELLED)）
+    const CANCELLED: HRESULT = -2_147_023_673; // 0x800704C7
+
+    #[repr(C)]
+    struct IUnknownV {
+        query_interface: usize,
+        add_ref: usize,
+        release: unsafe extern "system" fn(this: *mut c_void) -> u32,
+    }
+
+    /// IModalWindow ＋ IFileDialog（攤平成一張表，順序就是兩個介面接起來的順序）
+    #[repr(C)]
+    struct IFileDialogV {
+        base: IUnknownV,
+        show: unsafe extern "system" fn(this: *mut c_void, owner: isize) -> HRESULT,
+        set_file_types: usize,
+        set_file_type_index: usize,
+        get_file_type_index: usize,
+        advise: usize,
+        unadvise: usize,
+        set_options: unsafe extern "system" fn(this: *mut c_void, fos: u32) -> HRESULT,
+        get_options: usize,
+        set_default_folder: usize,
+        set_folder: unsafe extern "system" fn(this: *mut c_void, psi: *mut c_void) -> HRESULT,
+        get_folder: usize,
+        get_current_selection: usize,
+        set_file_name: unsafe extern "system" fn(this: *mut c_void, name: *const u16) -> HRESULT,
+        get_file_name: usize,
+        set_title: unsafe extern "system" fn(this: *mut c_void, title: *const u16) -> HRESULT,
+        set_ok_button_label: usize,
+        set_file_name_label: usize,
+        get_result: unsafe extern "system" fn(this: *mut c_void, ppsi: *mut *mut c_void) -> HRESULT,
+        // 之後還有 AddPlace、SetDefaultExtension…，這裡用不到就不宣告
+    }
+
+    #[repr(C)]
+    struct IShellItemV {
+        base: IUnknownV,
+        bind_to_handler: usize,
+        get_parent: usize,
+        get_display_name:
+            unsafe extern "system" fn(this: *mut c_void, sigdn: u32, out: *mut *mut u16) -> HRESULT,
+        get_attributes: usize,
+        compare: usize,
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(reserved: *mut c_void, flags: u32) -> HRESULT;
+        fn CoUninitialize();
+        fn CoCreateInstance(
+            clsid: *const Guid,
+            outer: *mut c_void,
+            ctx: u32,
+            iid: *const Guid,
+            out: *mut *mut c_void,
+        ) -> HRESULT;
+        fn CoTaskMemFree(p: *mut c_void);
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHCreateItemFromParsingName(
+            path: *const u16,
+            bind: *mut c_void,
+            iid: *const Guid,
+            out: *mut *mut c_void,
+        ) -> HRESULT;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetActiveWindow() -> isize;
+    }
+
+    /// COM 物件的小包裝：離開範圍就 Release，早退時不必記得自己收
+    struct Com(*mut c_void);
+
+    impl Drop for Com {
+        fn drop(&mut self) {
+            unsafe {
+                let vt = *(self.0 as *mut *mut IUnknownV);
+                ((*vt).release)(self.0);
+            }
+        }
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// COM 配置的寬字串轉成 String，順手把它還給 COM
+    unsafe fn take_wide(p: *mut u16) -> String {
+        let mut n = 0;
+        while *p.add(n) != 0 {
+            n += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+        CoTaskMemFree(p.cast());
+        s
+    }
+
+    /// 把路徑做成 IShellItem（給 SetFolder 用）
+    unsafe fn shell_item(path: &Path) -> Option<Com> {
+        // Windows 自己的 API 不吃 \\?\ 這種長路徑前綴
+        let s = path.to_string_lossy();
+        let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+        let w = wide(s);
+        let mut out: *mut c_void = std::ptr::null_mut();
+        let hr = SHCreateItemFromParsingName(w.as_ptr(), std::ptr::null_mut(), &IID_SHELL_ITEM, &mut out);
+        (hr >= 0 && !out.is_null()).then(|| Com(out))
+    }
+
+    /// 開「選資料夾」對話框。
+    ///
+    /// `start` 是上次選的那個資料夾：對話框開在它的**上一層**、名字預填進
+    /// 「資料夾:」欄——同一批的姊妹資料夾都看得到，要選同一個直接按確定。
+    /// 上一層不存在（磁碟機根目錄之類）就退回開在它自己裡面。
+    ///
+    /// 回傳 `Err(())` 代表「這條路走不通」（COM 起不來、系統太舊），
+    /// 呼叫端要退回 rfd；`Ok(None)` 才是使用者按了取消
+    pub fn pick(title: &str, start: Option<&Path>) -> Result<Option<PathBuf>, ()> {
+        unsafe {
+            let init = CoInitializeEx(
+                std::ptr::null_mut(),
+                COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+            );
+            // 這條執行緒已經被別人初始化成別種模式時不能硬幹，也不該去收它
+            if init < 0 {
+                return Err(());
+            }
+            let r = pick_inner(title, start);
+            CoUninitialize();
+            r
+        }
+    }
+
+    unsafe fn pick_inner(title: &str, start: Option<&Path>) -> Result<Option<PathBuf>, ()> {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_FILE_OPEN_DIALOG,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_FILE_DIALOG,
+            &mut raw,
+        );
+        if hr < 0 || raw.is_null() {
+            return Err(());
+        }
+        let dlg = Com(raw);
+        let vt = &**(dlg.0 as *mut *mut IFileDialogV);
+
+        if (vt.set_options)(dlg.0, FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM) < 0 {
+            return Err(());
+        }
+        let t = wide(title);
+        (vt.set_title)(dlg.0, t.as_ptr());
+
+        // 開在上一層＋預填名字；沒有上一層就開在它自己裡面（那時欄位留空，
+        // 按確定拿到的就是它，見 folder_dialog 的實測）
+        if let Some(dir) = start {
+            let (at, name) = match (dir.parent(), dir.file_name()) {
+                (Some(p), Some(n)) if p.is_dir() => {
+                    (p.to_path_buf(), Some(n.to_string_lossy().into_owned()))
+                }
+                _ => (dir.to_path_buf(), None),
+            };
+            if let Some(item) = shell_item(&at) {
+                (vt.set_folder)(dlg.0, item.0);
+            }
+            if let Some(n) = name {
+                let n = wide(&n);
+                (vt.set_file_name)(dlg.0, n.as_ptr());
+            }
+        }
+
+        // 綁在使用者剛才操作的那個視窗上（與 dialog_owner 同一個作法）
+        match (vt.show)(dlg.0, GetActiveWindow()) {
+            0 => {}
+            CANCELLED => return Ok(None),
+            _ => return Err(()),
+        }
+
+        let mut item: *mut c_void = std::ptr::null_mut();
+        if (vt.get_result)(dlg.0, &mut item) < 0 || item.is_null() {
+            return Err(());
+        }
+        let item = Com(item);
+        let ivt = &**(item.0 as *mut *mut IShellItemV);
+        let mut name: *mut u16 = std::ptr::null_mut();
+        if (ivt.get_display_name)(item.0, SIGDN_FILESYSPATH, &mut name) < 0 || name.is_null() {
+            return Err(());
+        }
+        Ok(Some(PathBuf::from(take_wide(name))))
     }
 }
 
-/// [`folder_dialog`] 的位置計算：回傳（對話框要開在哪裡，要預填的名字）。
-/// 一般情況是「上次選的資料夾的上一層 + 它自己的名字」；上一層不存在
-/// （磁碟機根目錄，或路徑只剩一段）時就開在它自己裡面、不預填
-fn folder_dialog_start(dir: &Path) -> (PathBuf, Option<String>) {
-    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
-    match (dir.parent(), name) {
-        (Some(parent), Some(name)) if parent.is_dir() => (parent.to_path_buf(), Some(name)),
-        _ => (dir.to_path_buf(), None),
+/// 選一個資料夾，並且**真的記住上次選的那一個**：對話框開在它的上一層、
+/// 名字預填進「資料夾:」欄（見 [`win_folder`]）。`fallback` 是還沒記過時
+/// 要從哪裡開始（通常是照片或影片自己所在的資料夾）。
+///
+/// 選好就順手記下來，呼叫端不必自己再 [`remember_dir`] 一次
+fn pick_folder_remembering(
+    which: LastDir,
+    title: &str,
+    fallback: Option<&Path>,
+) -> Option<PathBuf> {
+    let start = load_last_dir(which).or_else(|| fallback.map(|p| p.to_path_buf()));
+    #[cfg(windows)]
+    if let Ok(r) = win_folder::pick(title, start.as_deref()) {
+        if let Some(d) = &r {
+            remember_dir(which, d);
+        }
+        return r;
     }
+    // 非 Windows，或自己那條路走不通時：退回 rfd（欄位會是空白的，
+    // 但開在上次那個資料夾裡面，按確定拿到的仍是它）
+    let dialog = match &start {
+        Some(d) => file_dialog().set_directory(d),
+        None => file_dialog(),
+    };
+    let picked = dialog.set_title(title).pick_folder()?;
+    remember_dir(which, &picked);
+    Some(picked)
 }
 
 /// 是否支援程式內一鍵更新。發佈頁目前只提供 Windows 執行檔
@@ -4900,19 +5157,6 @@ struct MovieClip {
     frames: movie::ClipFrames,
 }
 
-/// 影片去煙的滑桿起始值：去除煙霧 60、細節 80。
-///
-/// 與照片模組的預設（80／60）刻意不同，是拿實拍的煙火影片比出來的：影片整支
-/// 共用一組、又不逐格重判，起手就該站在「少扣一點、多留一點線條」那一側——
-/// 扣過頭的煙火在動起來時特別顯眼，而煙沒扣乾淨還可以再把滑桿拉上去
-fn movie_default_params() -> SmokeParams {
-    SmokeParams {
-        strength: 60,
-        detail: 80,
-        ..SmokeParams::default()
-    }
-}
-
 /// 「影片去煙霧」模組的狀態：一支影片、一組參數，輸出成另一支影片。
 ///
 /// 刻意不做「每一格自動判斷參數」——照片模組是一張一張各自量的，搬到影片上
@@ -4996,7 +5240,7 @@ struct MovieTool {
     /// 裁切範圍（相對座標；只裁不轉）。整支影片（含同一批的其他支）共用一個框，
     /// 在去煙**之前**裁：與縮小同一個道理，裁掉的地方不必花力氣去煙
     crop: Crop,
-    /// 自動判斷參數的開關。**預設關著**：起始值（見 [`movie_default_params`]）
+    /// 自動判斷參數的開關。**預設關著**：起始值（見 [`SmokeParams::default`]）
     /// 實拍比下來比自動判的穩，要用再自己勾
     auto_on: bool,
     /// 預覽那一格量到的建議值（見 [`dehaze::auto_params`]）。
@@ -5078,7 +5322,7 @@ impl Default for MovieTool {
             after: None,
             base_tex: None,
             after_tex: None,
-            params: movie_default_params(),
+            params: SmokeParams::default(),
             grade: MovieGrade::default(),
             segments: vec![Segment::default()],
             grade_open: false,
@@ -5157,7 +5401,7 @@ impl MovieTool {
     /// 跟這一批的畫面沒有關係
     fn reset_batch(&mut self, src: Option<PathBuf>, info: Option<VideoInfo>) {
         let fast = self.params.fast;
-        self.params = movie_default_params();
+        self.params = SmokeParams::default();
         self.params.fast = fast;
         self.auto_on = false;
         self.auto = None;
@@ -7656,11 +7900,9 @@ impl App {
     }
 
     fn pick_folder(&mut self) {
-        if let Some(dir) = folder_dialog(LastDir::VideoPhotos)
-            .set_title("選擇照片資料夾")
-            .pick_folder()
+        if let Some(dir) =
+            pick_folder_remembering(LastDir::VideoPhotos, "選擇照片資料夾", None)
         {
-            remember_dir(LastDir::VideoPhotos, &dir);
             let files = collect_images_in_dir(&dir);
             // 掃不到照片（空資料夾，或照片都在子資料夾）就標記，於空狀態提示
             self.import_found_nothing = files.is_empty();
@@ -11852,24 +12094,16 @@ impl App {
         let out_dir: Option<PathBuf> = if here {
             None
         } else {
-            // 上次另存到哪就從那裡開始（folder_dialog 會開在它的上一層並把
-            // 名字填好，要存回同一個資料夾直接按確定即可）；還沒存過才退回
-            // 照片自己所在的資料夾
-            let dialog = if load_last_dir(LastDir::DehazeOutput).is_some() {
-                folder_dialog(LastDir::DehazeOutput)
-            } else {
-                match self.smoke.current().and_then(|p| p.parent()) {
-                    Some(dir) => file_dialog().set_directory(dir),
-                    None => file_dialog(),
-                }
-            };
-            let Some(d) = dialog
-                .set_title("選擇要存放去煙照片的資料夾")
-                .pick_folder()
-            else {
+            // 上次另存到哪，名字就預填在「資料夾:」欄，要存回同一個直接按確定
+            // （見 pick_folder_remembering）；還沒存過才退回照片自己的資料夾
+            let here = self.smoke.current().and_then(|p| p.parent());
+            let Some(d) = pick_folder_remembering(
+                LastDir::DehazeOutput,
+                "選擇要存放去煙照片的資料夾",
+                here,
+            ) else {
                 return;
             };
-            remember_dir(LastDir::DehazeOutput, &d);
             Some(d)
         };
         // 輸出檔名先在這裡決定好，不留到背景執行緒——已經存在的要先問過
@@ -14054,23 +14288,15 @@ impl App {
         // 一支就照舊讓人自己命名；好幾支則改挑資料夾，每支各自取
         // 「原檔名_去煙.mp4」——一支一支問名字太煩，而且中途還要顧著回來按
         let outs: Vec<PathBuf> = if jobs.len() > 1 && !merging {
-            // 選資料夾要用 folder_dialog：直接開在上次那個資料夾裡面，
-            // 底下沒有子資料夾時畫面會只剩一句「沒有符合搜尋條件的項目」
-            // （見 folder_dialog 的說明）
-            let dialog = match load_last_dir(LastDir::MovieOutput) {
-                Some(_) => folder_dialog(LastDir::MovieOutput),
-                None => match src.parent() {
-                    Some(d) => file_dialog().set_directory(d),
-                    None => file_dialog(),
-                },
-            };
-            let Some(dir) = dialog
-                .set_title(format!("這 {} 支影片要存到哪個資料夾", jobs.len()))
-                .pick_folder()
-            else {
+            // 上次輸出到哪，名字就預填好（見 pick_folder_remembering）；
+            // 還沒輸出過才退回來源影片自己的資料夾
+            let Some(dir) = pick_folder_remembering(
+                LastDir::MovieOutput,
+                &format!("這 {} 支影片要存到哪個資料夾", jobs.len()),
+                src.parent(),
+            ) else {
                 return;
             };
-            remember_dir(LastDir::MovieOutput, &dir);
             jobs.iter()
                 .map(|p| next_free_path(&dir.join(format!("{}_去煙.mp4", stem(p)))))
                 .collect()
@@ -21253,13 +21479,11 @@ impl App {
         if !self.enhance_confirm_replace() {
             return;
         }
-        let Some(dir) = folder_dialog(LastDir::EnhancePhotos)
-            .set_title("選擇要優化的照片資料夾")
-            .pick_folder()
+        let Some(dir) =
+            pick_folder_remembering(LastDir::EnhancePhotos, "選擇要優化的照片資料夾", None)
         else {
             return;
         };
-        remember_dir(LastDir::EnhancePhotos, &dir);
         let mut files = collect_images_in_dir(&dir);
         if files.is_empty() {
             self.enhance.error =
@@ -21654,21 +21878,16 @@ impl App {
         let out_dir: Option<PathBuf> = if here {
             None
         } else {
-            let dialog = if load_last_dir(LastDir::EnhanceOutput).is_some() {
-                folder_dialog(LastDir::EnhanceOutput)
-            } else {
-                match self.enhance.current().and_then(|p| p.parent()) {
-                    Some(dir) => file_dialog().set_directory(dir),
-                    None => file_dialog(),
-                }
-            };
-            let Some(d) = dialog
-                .set_title("選擇要存放優化照片的資料夾")
-                .pick_folder()
-            else {
+            // 上次另存到哪，名字就預填在「資料夾:」欄（見 pick_folder_remembering）；
+            // 還沒存過才退回照片自己的資料夾
+            let here = self.enhance.current().and_then(|p| p.parent());
+            let Some(d) = pick_folder_remembering(
+                LastDir::EnhanceOutput,
+                "選擇要存放優化照片的資料夾",
+                here,
+            ) else {
                 return;
             };
-            remember_dir(LastDir::EnhanceOutput, &d);
             Some(d)
         };
         // 輸出檔名先在這裡決定好，不留到背景執行緒——已經存在的要先問過
@@ -23493,19 +23712,34 @@ impl App {
     /// 挑來源時跳出上次挑目的的位置，比各自記還糟
     fn backup_pick_dir(&mut self, i: usize, is_src: bool) {
         if is_src {
-            let dirs = folder_dialog(LastDir::BackupSource)
+            // 多選一定要在清單裡一個一個點，所以開在上次那個的**上一層**：
+            // 同一顆碟底下要備份的那幾個資料夾都在眼前。
+            // （單選不必這樣——名字預填好，直接按確定就是它，
+            // 見 pick_folder_remembering）
+            let last = load_last_dir(LastDir::BackupSource);
+            let start = last
+                .as_deref()
+                .and_then(|d| d.parent())
+                .filter(|p| p.is_dir())
+                .map(|p| p.to_path_buf())
+                .or(last);
+            let dialog = match &start {
+                Some(d) => file_dialog().set_directory(d),
+                None => file_dialog(),
+            };
+            let dirs = dialog
                 .set_title("選擇來源資料夾（要備份出去的，可一次選好幾個）")
                 .pick_folders();
             if let Some(dirs) = dirs {
+                // 記起始位置的事由 backup_set_dir 做（拖進來的也走它）
                 self.backup_set_sources(i, dirs);
             }
-        } else {
-            let d = folder_dialog(LastDir::BackupDest)
-                .set_title("選擇目的資料夾（備份要放進去的那一個）")
-                .pick_folder();
-            if let Some(d) = d {
-                self.backup_set_dir(i, false, d);
-            }
+        } else if let Some(d) = pick_folder_remembering(
+            LastDir::BackupDest,
+            "選擇目的資料夾（備份要放進去的那一個）",
+            None,
+        ) {
+            self.backup_set_dir(i, false, d);
         }
     }
 
@@ -30132,27 +30366,58 @@ mod tests {
         }
     }
 
+    /// 選一個資料夾一律要走 [`pick_folder_remembering`]：只有它會把上次那個
+    /// 資料夾的名字預填進「資料夾:」欄。直接用 rfd 的 `pick_folder()` 的話，
+    /// 欄位是空的，按下確定拿到的可能是上一層——每次都存錯地方，
+    /// 而且畫面上看不出來（實際回報過的狀況）。
+    ///
+    /// 對話框沒辦法在一般測試裡打開（要開請跑 [`folder_dialog_probe`]），
+    /// 這裡守的是「有沒有人繞過去自己叫 rfd」
     #[test]
-    fn folder_dialog_starts_one_level_up_so_the_list_is_not_empty() {
-        // 選資料夾的對話框列的是子資料夾。開在上次選的那個裡面，照片資料夾
-        // 底下通常沒有子資料夾，使用者只會看到「沒有符合搜尋條件的項目」。
-        // 正確行為是開在上一層、把名字預填好
-        let root = std::env::temp_dir().join(format!("p2v_dlg_{}", std::process::id()));
-        let child = root.join("連拍1");
-        std::fs::create_dir_all(&child).unwrap();
+    fn every_folder_picker_goes_through_the_remembering_one() {
+        let src = include_str!("main.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut raw = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            // 本程式自己那個同名的方法（self.pick_folder()）只是轉手，
+            // 真正開對話框的是它裡面那一行
+            if l.contains(".pick_folder()") && !l.contains("self.pick_folder") {
+                raw.push(i + 1);
+            }
+        }
+        // 唯一一個：pick_folder_remembering 裡面那條「自己那條路走不通」的退路
+        assert_eq!(
+            raw.len(),
+            1,
+            "選一個資料夾要走 pick_folder_remembering，不要直接叫 rfd。多出來的在第 {raw:?} 行"
+        );
+        let i = raw[0] - 1;
+        let near = lines[i.saturating_sub(30)..=i].join("\n");
+        assert!(
+            near.contains("fn pick_folder_remembering"),
+            "第 {} 行的 pick_folder() 不在 pick_folder_remembering 裡：\n{near}",
+            raw[0]
+        );
+    }
 
-        let (start, name) = folder_dialog_start(&child);
-        assert_eq!(start, root, "應該開在上一層，否則清單會是空的");
-        assert_eq!(name.as_deref(), Some("連拍1"), "上次選的資料夾名要預填");
-
-        // 上一層不存在（已被刪掉／磁碟機根目錄）時退回開在它自己裡面，
-        // 不能把對話框丟到一個不存在的路徑
-        let orphan = root.join("已刪掉的上層").join("裡面");
-        let (start, name) = folder_dialog_start(&orphan);
-        assert_eq!(start, orphan, "上一層不存在時就開在它自己");
-        assert_eq!(name, None, "沒有上一層就不預填名字");
-
-        let _ = std::fs::remove_dir_all(&root);
+    /// 手動探針（平常不跑）：把「選資料夾」對話框真的開起來，看「資料夾:」欄
+    /// 有沒有預填、按下確定拿到哪一個。rfd 的 pick_folder 不送檔名，所以那條路
+    /// 只能開在某個位置、欄位永遠空白——自己叫 COM 才填得上（見 [`win_folder`]）。
+    ///
+    /// `P2V_PROBE_DIR=<資料夾> cargo test --release --bin photo2video -- --ignored folder_dialog_probe --nocapture`
+    /// 跑起來之後用 PowerShell 找視窗、點「選擇資料夾」，就能自動驗證
+    #[test]
+    #[ignore]
+    fn folder_dialog_probe() {
+        let Some(dir) = std::env::var_os("P2V_PROBE_DIR").map(PathBuf::from) else {
+            eprintln!("沒設 P2V_PROBE_DIR，跳過");
+            return;
+        };
+        #[cfg(windows)]
+        {
+            let r = win_folder::pick("PROBE_FOLDER_DIALOG", Some(&dir));
+            eprintln!("RESULT={r:?}");
+        }
     }
 
     #[test]
@@ -31755,7 +32020,7 @@ mod tests {
         assert_eq!(m.mask_target, MaskTarget::Dehaze);
         assert!(m.mask_tool.is_none() && !m.show_mask, "工具與遮罩檢視要一起收掉");
         // 去煙的四條滑桿也要回到起始值（上一批調到一半的值留著只會莫名其妙）
-        let d = movie_default_params();
+        let d = SmokeParams::default();
         assert_eq!(m.params.strength, d.strength, "去除煙霧沒回到起始值");
         assert_eq!(m.params.detail, d.detail, "細節沒回到起始值");
         assert!(m.params.restore_trails, "「補回煙裡的軌跡」沒回到預設");
@@ -31771,8 +32036,8 @@ mod tests {
     #[test]
     fn auto_params_only_drive_the_two_sliders_the_movie_module_shows() {
         let mut m = MovieTool::default();
-        let d = movie_default_params();
-        // 影片模組的起始值與照片模組刻意不同（見 movie_default_params）
+        let d = SmokeParams::default();
+        // 兩個模組共用的起始值（見 SmokeParams::default 的說明）
         assert_eq!((d.strength, d.detail), (60, 80));
         assert!(!m.auto_on, "自動判斷參數預設關著，起始值比自動判的穩");
         assert_eq!(m.tuned_params().strength, d.strength, "沒勾就是滑桿上那組");

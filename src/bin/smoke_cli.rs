@@ -59,8 +59,8 @@ fn main() {
         }
     }
     let mut p = dehaze::SmokeParams {
-        strength: a.get(3).and_then(|s| s.parse().ok()).unwrap_or(80),
-        detail: a.get(4).and_then(|s| s.parse().ok()).unwrap_or(60),
+        strength: a.get(3).and_then(|s| s.parse().ok()).unwrap_or(60),
+        detail: a.get(4).and_then(|s| s.parse().ok()).unwrap_or(80),
         shapes,
         tolerance: std::env::var("SMOKE_TOL")
             .ok()

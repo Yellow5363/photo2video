@@ -973,8 +973,11 @@ pub const MAX_CLOUD: usize = 6;
 impl Default for SmokeParams {
     fn default() -> Self {
         Self {
-            strength: 80,
-            detail: 60,
+            // 去除煙霧 60、細節 80：拿實拍的煙火比出來的起手式。
+            // 站在「少扣一點、多留一點線條」那一側——扣過頭的煙火看得出來，
+            // 尤其影片動起來特別顯眼；煙沒扣乾淨還可以再把滑桿拉上去
+            strength: 60,
+            detail: 80,
             restore_trails: true,
             sky_only: true,
             shapes: Vec::new(),
@@ -3013,6 +3016,14 @@ const AUTO_SMOKE_COVER: f32 = 0.01;
 /// 下限之下等於沒去煙，上限之上會連煙火自己的光暈一起扣掉
 const AUTO_STRENGTH: (i32, i32) = (45, 95);
 
+/// 回推出來的強度最後再打幾折。
+///
+/// 反推的目標是「把煙壓到這張照片自己的乾淨夜空」，那是**剛好扣乾淨**的量；
+/// 可是煙霧層的估計難免有誤差，正好踩在線上就容易多扣一點，煙火的光暈跟著
+/// 被削掉一圈。留一成的餘裕站在「寧可少扣」那一側——煙沒扣乾淨還可以再把
+/// 滑桿拉上去，扣過頭的煙火卻救不回來（影片動起來時特別顯眼）
+const AUTO_STRENGTH_TRIM: f32 = 0.9;
+
 /// 細節的下限與可加上去的幅度：天空裡完全沒有線條就取下限，
 /// 線條密到頂（[`STREAK_MAX`]）則加滿
 const AUTO_DETAIL: (i32, i32) = (55, 40);
@@ -3256,8 +3267,11 @@ pub fn auto_params(img: &RgbImage, source_long: u32) -> AutoParams {
     // 強度要照濃煙那一頭定：薄霧處 k 幾乎為 0，讓它參與平均會把整張的強度拉垮
     let hi = quantile(&mut thick, AUTO_THICK_Q, 0.0);
     let pool = pool_gain(source_long);
-    let strength = if !enough {
-        AUTO_STRENGTH.0
+    // `strength` 是回報給滑桿的（打過折，見 [`AUTO_STRENGTH_TRIM`]）；
+    // `strength_full` 是「剛好扣乾淨」沒打折的那個，下面量殘留雲要用它——
+    // 折扣是留餘裕，不代表天上多了雲，清雲不該因此判得更重
+    let (strength, strength_full) = if !enough {
+        (AUTO_STRENGTH.0, AUTO_STRENGTH.0)
     } else {
         let mut ks: Vec<f32> = (0..n)
             .filter(|&i| smoky(i) && ys[i] >= hi)
@@ -3265,7 +3279,11 @@ pub fn auto_params(img: &RgbImage, source_long: u32) -> AutoParams {
             .collect();
         let default_k = SmokeParams::default().strength as f32 / 100.0 * DEHAZE_GAIN;
         let k = quantile(&mut ks, AUTO_K_Q, default_k) * pool;
-        ((k / DEHAZE_GAIN * 100.0).round() as i32).clamp(AUTO_STRENGTH.0, AUTO_STRENGTH.1)
+        // 打完折才夾上下限：折扣是「留點餘裕」，不是把下限也跟著往下拉
+        let to_strength = |k: f32| {
+            ((k / DEHAZE_GAIN * 100.0).round() as i32).clamp(AUTO_STRENGTH.0, AUTO_STRENGTH.1)
+        };
+        (to_strength(k * AUTO_STRENGTH_TRIM), to_strength(k))
     };
 
     // --- 4. 雲朵：把扣完之後仍然不平的天空壓到同一級 ---
@@ -3277,8 +3295,9 @@ pub fn auto_params(img: &RgbImage, source_long: u32) -> AutoParams {
     // 那是「沒有雲要清」時仍然開著的量，不是量出來有這麼多雲
     //
     // 量的是扣完之後的天空，所以要把 pool 補償先除回去：那個倍率補的是原尺寸
-    // 估不足的部分，直接套在縮圖量出來的煙霧層上會把殘留算得比實際少
-    let k = strength as f32 / 100.0 * DEHAZE_GAIN / pool;
+    // 估不足的部分，直接套在縮圖量出來的煙霧層上會把殘留算得比實際少。
+    // 用沒打折的強度（見上面 strength_full 的說明）
+    let k = strength_full as f32 / 100.0 * DEHAZE_GAIN / pool;
     let mut left: Vec<f32> = (0..n)
         .filter(|&i| sky.d[i] > 0.5 && streaks.d[i] < AUTO_STREAK_MAX)
         // 量的是「高出底色多少」：清雲壓的也是這一截
