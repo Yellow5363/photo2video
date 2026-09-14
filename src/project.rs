@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{dehaze, edit, enhance, stack};
 use crate::{Adjustments, Crop, CropAspect, EnhanceParams, GradeTarget};
-use crate::{MovieGrade, MovieSize, Segment};
+use crate::{MovieGrade, MovieSize, MovieText, Segment};
 
 /// 專案檔放在使用者那批照片（或影片）所在資料夾底下的這個子資料夾，
 /// 底下再照模組各分一層（見 [`project_dir`]）
@@ -248,6 +248,24 @@ pub struct MovieProject {
     pub object_edge: i32,
     /// 試播要抓幾秒
     pub clip_secs: f64,
+    /// 疊在畫面上的文字（整支共用，每段各有自己的秒數）
+    pub texts: Vec<MovieText>,
+    /// 字型名稱；開檔時依名稱找回索引，找不到就用第一個字型
+    /// （與去煙霧模組同一套，見 [`DehazeProject::text_font`]）
+    pub text_font: String,
+    pub text_color: [u8; 4],
+    pub text_outline_w: i32,
+    pub text_outline_color: [u8; 4],
+    pub text_boxed: bool,
+    /// 背景音樂：檔案，以及音樂與影片原聲各自的音量（百分比）
+    pub music_path: Option<PathBuf>,
+    pub music_volume: i32,
+    pub src_volume: i32,
+    pub music_fade: bool,
+    /// 三個可收合區塊當時是開是合
+    pub text_open: bool,
+    pub mask_open: bool,
+    pub music_open: bool,
 }
 
 impl Default for MovieProject {
@@ -274,6 +292,19 @@ impl Default for MovieProject {
             object_feather: dehaze::OBJECT_FEATHER,
             object_edge: 0,
             clip_secs: 5.0,
+            texts: Vec::new(),
+            text_font: String::new(),
+            text_color: [255, 255, 255, 255],
+            text_outline_w: 2,
+            text_outline_color: [0, 0, 0, 255],
+            text_boxed: false,
+            music_path: None,
+            music_volume: 100,
+            src_volume: 100,
+            music_fade: true,
+            text_open: false,
+            mask_open: true,
+            music_open: false,
         }
     }
 }

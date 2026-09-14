@@ -140,7 +140,7 @@ impl Module {
             Module::Video => "把一疊照片排成影片：調色、加文字、配背景音樂後輸出 MP4",
             Module::Dehaze => "去掉煙火照片裡的煙霧、保留煙火線條，處理後另存新檔",
             Module::Stack => "把多張煙火用加亮／濾色疊成一張，可調色後存檔",
-            Module::Movie => "把整支影片逐格去掉煙霧，輸出成一支新的 MP4（聲音原樣保留）",
+            Module::Movie => "把整支影片逐格去掉煙霧，可加文字與背景音樂，輸出成一支新的 MP4",
             Module::Enhance => {
                 "整批照片自動調色並強化主體：層次、光影、通透度一次調好，處理後另存新檔"
             }
@@ -2435,6 +2435,203 @@ mod win_folder {
         ) -> HRESULT;
     }
 
+    type Hwnd = isize;
+    type Bool = i32;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(cb: unsafe extern "system" fn(Hwnd, isize) -> Bool, lparam: isize) -> Bool;
+        fn EnumChildWindows(
+            parent: Hwnd,
+            cb: unsafe extern "system" fn(Hwnd, isize) -> Bool,
+            lparam: isize,
+        ) -> Bool;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn IsWindowVisible(hwnd: Hwnd) -> Bool;
+        fn GetClassNameW(hwnd: Hwnd, buf: *mut u16, n: i32) -> i32;
+        fn GetAncestor(hwnd: Hwnd, flags: u32) -> Hwnd;
+        fn PostMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> Bool;
+        fn SendMessageTimeoutW(
+            hwnd: Hwnd,
+            msg: u32,
+            w: usize,
+            l: isize,
+            flags: u32,
+            timeout: u32,
+            out: *mut usize,
+        ) -> isize;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcessId() -> u32;
+    }
+
+    const WM_GETTEXT: u32 = 0x000D;
+    const WM_CLOSE: u32 = 0x0010;
+    const GA_ROOT: u32 = 2;
+    const EM_SETSEL: u32 = 0x00B1;
+    const EM_SCROLLCARET: u32 = 0x00B7;
+    const EM_POSFROMCHAR: u32 = 0x00D6;
+    /// 對方沒在收訊息就直接放棄，不要跟著一起卡住
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+    const MSG_TIMEOUT_MS: u32 = 200;
+
+    /// 送一則訊息給**別條執行緒**的視窗。對話框跑在 UI 執行緒的強制回應迴圈裡，
+    /// 而這裡是另一條執行緒——一律走有逾時的版本，萬一 UI 真的卡住，
+    /// 卡的也只有它，不會多賠一條永遠醒不來的執行緒進去
+    unsafe fn send(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> Option<usize> {
+        let mut out = 0usize;
+        let ok = SendMessageTimeoutW(
+            hwnd,
+            msg,
+            w,
+            l,
+            SMTO_ABORTIFHUNG,
+            MSG_TIMEOUT_MS,
+            &mut out,
+        );
+        (ok != 0).then_some(out)
+    }
+
+    /// 找視窗時要比對的東西：類別名稱與內容，以及找到的那一個
+    struct Hunt {
+        want: Vec<u16>,
+        found: Hwnd,
+    }
+
+    unsafe fn class_of(hwnd: Hwnd) -> String {
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+
+    /// 讀一個控制項現在的內容。WM_GETTEXT 自己送（而不是用 GetWindowTextW），
+    /// 為的是走上面那條有逾時的路
+    unsafe fn text_of(hwnd: Hwnd) -> Vec<u16> {
+        let mut buf = [0u16; 520];
+        let n = send(
+            hwnd,
+            WM_GETTEXT,
+            buf.len(),
+            buf.as_mut_ptr() as isize,
+        )
+        .unwrap_or(0)
+        .min(buf.len() - 1);
+        buf[..n].to_vec()
+    }
+
+    /// 逐一看過每個子孫視窗，找出**內容正好是我們預填那串**的 Edit
+    unsafe extern "system" fn find_edit(hwnd: Hwnd, lparam: isize) -> Bool {
+        let h = &mut *(lparam as *mut Hunt);
+        if class_of(hwnd).eq_ignore_ascii_case("Edit") && text_of(hwnd) == h.want {
+            h.found = hwnd;
+            return 0; // 找到了就不必再看下去
+        }
+        1
+    }
+
+    /// 逐一看過本行程的每個最上層視窗，找出裡面有那個 Edit 的那一個
+    unsafe extern "system" fn find_dialog(hwnd: Hwnd, lparam: isize) -> Bool {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != GetCurrentProcessId() || IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        EnumChildWindows(hwnd, find_edit, lparam);
+        // 找到就停；對話框是本行程自己的（IFileDialog 跑在同一個行程裡）
+        if (*(lparam as *mut Hunt)).found != 0 {
+            return 0;
+        }
+        1
+    }
+
+    /// 第 0 個字現在看不看得見（看不見就是整串被捲到左邊去了）。
+    /// EM_POSFROMCHAR 回的是它在控制項座標裡的位置，低 16 位元是 x（有號）；
+    /// −1 代表那個字根本沒顯示出來
+    pub(super) fn head_visible(edit: isize) -> bool {
+        let r = match unsafe { send(edit, EM_POSFROMCHAR, 0, 0) } {
+            Some(v) => v as isize,
+            None => return true, // 問不到就別亂動它
+        };
+        // P2V_DLG_DEBUG=1 會把每次量到的位置印出來（查這一段時很省事）
+        if std::env::var_os("P2V_DLG_DEBUG").is_some() {
+            eprintln!("  [資料夾欄] x={}", (r & 0xFFFF) as u16 as i16);
+        }
+        r != -1 && ((r & 0xFFFF) as u16 as i16) >= 0
+    }
+
+    /// 實測用：把含著這個控制項的對話框關掉（等同按取消）。
+    /// PostMessage 不等回應，所以呼叫端不會跟著卡在對話框的迴圈裡
+    pub(super) fn close_dialog_of(edit: isize) {
+        unsafe {
+            let root = GetAncestor(edit, GA_ROOT);
+            if root != 0 {
+                PostMessageW(root, WM_CLOSE, 0, 0);
+            }
+        }
+    }
+
+    /// 找出「資料夾:」欄那個 Edit（內容正好是我們預填那串的那一個）；
+    /// 還沒出現就回 0。實測也用它（見 `folder_dialog_scrolls_the_name_to_the_start`）
+    pub(super) fn find_name_edit(name: &[u16]) -> isize {
+        let mut hunt = Hunt {
+            want: name.to_vec(),
+            found: 0,
+        };
+        unsafe { EnumWindows(find_dialog, &mut hunt as *mut Hunt as isize) };
+        hunt.found
+    }
+
+    /// 把「資料夾:」欄捲回開頭。
+    ///
+    /// 預填的名字比欄位寬時，Windows 把它捲到**尾端**——畫面上看到的是
+    /// 「…漁人碼頭煙火 - test」，開頭那幾個字被切掉，認不出是哪一批。
+    ///
+    /// 作法是等對話框出現之後重下一次選取。**分三步，順序是實測出來的**：
+    /// 直接送一次「反著選」（起點在字尾、游標在字首）選取範圍雖然對，
+    /// 畫面卻一動也不動（實測 x 一直停在 −309）；要先把選取**收成一個點**
+    /// 落在字首，控制項才會跟著捲過去，捲好之後再整串選起來就不會被拉回尾端。
+    /// 全選留著，想整個換掉照樣打字就取代。
+    ///
+    /// 對話框自己也會在初始化時全選一次，時間點不一定在我們前面或後面，
+    /// 所以盯著看一小段時間：被它捲回尾端就再修一次
+    pub(super) fn scroll_name_to_start(name: &str) {
+        let want: Vec<u16> = name.encode_utf16().collect();
+        if want.is_empty() {
+            return;
+        }
+        std::thread::spawn(move || {
+            let mut edit: isize = 0;
+            // 對話框要一點時間才畫出來（最多等四秒）；找到之後再盯半秒，
+            // 免得它初始化的全選晚我們一步、又把欄位捲回尾端
+            let mut left = 160;
+            let mut watch = 0;
+            while left > 0 {
+                if edit == 0 {
+                    edit = find_name_edit(&want);
+                } else if watch >= 20 {
+                    break; // 盯滿半秒都沒再被捲走，收工
+                } else {
+                    watch += 1;
+                }
+                if edit != 0 && !head_visible(edit) {
+                    unsafe {
+                        // 分三步，順序有講究（實測出來的，見函式說明）：
+                        // 先把選取收成一個點落在字首——**選取真的動了**，
+                        // 控制項才會跟著把畫面捲過去
+                        send(edit, EM_SETSEL, 0, 0);
+                        send(edit, EM_SCROLLCARET, 0, 0);
+                        // 已經捲在開頭了，這時再整串選起來不會把畫面拉回尾端
+                        send(edit, EM_SETSEL, 0, want.len() as isize);
+                    }
+                }
+                left -= 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        });
+    }
+
     /// COM 物件的小包裝：離開範圍就 Release，早退時不必記得自己收
     struct Com(*mut c_void);
 
@@ -2542,8 +2739,11 @@ mod win_folder {
                 (vt.set_folder)(dlg.0, item.0);
             }
             if let Some(n) = name {
-                let n = wide(&n);
-                (vt.set_file_name)(dlg.0, n.as_ptr());
+                let w = wide(&n);
+                (vt.set_file_name)(dlg.0, w.as_ptr());
+                // 名字比欄位寬時 Windows 會把它捲到尾端，開頭那幾個字就看不到了。
+                // 對話框一出現就把它捲回開頭（見 scroll_name_to_start）
+                scroll_name_to_start(&n);
             }
         }
 
@@ -5624,11 +5824,17 @@ impl GradeZone {
 
 impl MovieGrade {
     /// 真的會動到畫面的那幾區（照 1、2、3 的順序，**依序**疊上去：
-    /// 第二區看得到第一區的結果，重疊的地方兩區都會作用）
+    /// 第二區看得到第一區的結果，重疊的地方兩區都會作用）。
+    ///
+    /// **簡易模式只有第一區**：那個模式的介面就是一組滑桿、整張一起調，
+    /// 沒有分區也沒有遮色片。專業模式調過的第二、三區數字仍留在手上，
+    /// 只是不套用——切回專業就回來（與遮色片同一個規則，見 [`GradeZone::active`]）
     fn active(&self, pro: bool, seg: &Segment) -> Vec<ActiveGrade> {
+        let n = if pro { GRADE_ZONES } else { 1 };
         self.zones
             .iter()
             .enumerate()
+            .take(n)
             .filter_map(|(i, z)| z.active(pro, &seg.grade_shapes[i]))
             .collect()
     }
@@ -5690,6 +5896,50 @@ struct Segment {
     /// 三個調色遮色區各自的遮色片：畫到的地方才套那一區的調色
     /// （或反過來，見 [`GradeZone::invert`]）
     grade_shapes: [Vec<dehaze::Shape>; GRADE_ZONES],
+}
+
+/// 疊在影片上的一段文字：內容、位置、大小與旋轉和照片那邊同一套
+/// （[`edit::TextItem`]），另外記它在第幾秒到第幾秒之間出現。
+///
+/// 時間是**每一支影片各自從 0 秒起算**的——與遮色片的分段同一個規矩，
+/// 排了好幾支時每支都從自己的 0 秒開始套
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct MovieText {
+    #[serde(flatten)]
+    item: edit::TextItem,
+    start: f64,
+    end: f64,
+}
+
+impl Default for MovieText {
+    fn default() -> Self {
+        Self {
+            item: edit::TextItem::default(),
+            start: 0.0,
+            // 沒講幾秒就是「一路到片尾」；真正的片長在新增時填進去
+            end: f64::from(u32::MAX),
+        }
+    }
+}
+
+impl MovieText {
+    /// 新的一段：整支影片都顯示（片長不知道時給一個長到不會擋路的值）
+    fn new(secs: f64) -> Self {
+        Self {
+            end: if secs > 0.0 { secs } else { Self::default().end },
+            ..Default::default()
+        }
+    }
+
+    /// 交給輸出那一端的樣子（見 [`movie::TimedText`]）
+    fn timed(&self) -> movie::TimedText {
+        movie::TimedText {
+            item: self.item.clone(),
+            start: self.start,
+            end: self.end,
+        }
+    }
 }
 
 /// 影片去煙霧目前在背景做的事（同時間只會有一件）
@@ -5773,6 +6023,26 @@ struct MovieTool {
     segments: Vec<Segment>,
     /// 調色區塊展開著沒（十二條滑桿佔掉一大截，預設收起來）
     grade_open: bool,
+    /// 疊在畫面上的文字（整支共用，每段各有自己的時間，見 [`MovieText`]）
+    texts: Vec<MovieText>,
+    /// 文字樣式（字型、顏色、外框，全部文字共用）
+    text_style: SubtitleStyle,
+    /// 預覽上目前選取的那一段文字（`texts` 的索引），選著才畫縮放與旋轉把手
+    sel_text: Option<usize>,
+    /// 這一幀滑鼠正壓在（或懸在）某段文字上：左鍵讓給文字，不拿來平移預覽
+    text_busy: bool,
+    /// 「文字」「遮色片」「背景音樂」三個區塊展開著沒
+    text_open: bool,
+    mask_open: bool,
+    music_open: bool,
+    /// 背景音樂的檔案；None＝不配樂，聲音照原樣搬過去
+    music_path: Option<PathBuf>,
+    /// 音樂與影片原聲各自的音量（百分比，100＝原樣）。
+    /// 原聲拉到 0 就等於「只要音樂」
+    music_volume: i32,
+    src_volume: i32,
+    /// 音樂結尾自動淡出（最多 2 秒）
+    music_fade: bool,
     /// 畫面上那張預覽套的是哪幾區的調色；與現在相同就不必重算
     /// （None＝還沒套過任何東西，與「套過、但一區都不作用」不同）。
     /// 與去煙分開是刻意的——去煙要算上一秒，調色是零點幾秒的事，
@@ -5914,6 +6184,19 @@ impl Default for MovieTool {
             grade: MovieGrade::default(),
             segments: vec![Segment::default()],
             grade_open: false,
+            texts: Vec::new(),
+            text_style: SubtitleStyle::default(),
+            sel_text: None,
+            text_busy: false,
+            // 文字與音樂是可有可無的加工，預設收起來（與照片轉影片那兩塊一致）；
+            // 遮色片是這個模組的主力，預設攤開
+            text_open: false,
+            mask_open: true,
+            music_open: false,
+            music_path: None,
+            music_volume: 100,
+            src_volume: 100,
+            music_fade: true,
             graded: None,
             size: MovieSize::Source,
             rendered: None,
@@ -5999,6 +6282,10 @@ impl MovieTool {
         self.crop_aspect = CropAspect::Free;
         self.merge = false;
         self.mask_target = MaskTarget::Dehaze;
+        // 文字與配樂也是「這一批」的設定：上一批打的字留到下一批只會莫名其妙
+        self.texts.clear();
+        self.sel_text = None;
+        self.music_path = None;
         self.close_mask_tools();
         self.reset_for(src, info);
     }
@@ -6090,6 +6377,38 @@ impl MovieTool {
                 grades: self.grade.active(self.pro, s),
             })
             .collect()
+    }
+
+    /// 預覽現在代表影片的第幾秒：平常就是時間軸停的位置，試播中則是
+    /// 那一小段的起點加上播到哪。文字要照這個秒數決定畫不畫
+    fn preview_secs(&self) -> f64 {
+        match self.clip.as_ref().filter(|_| self.show_clip) {
+            Some(c) => c.key.at + self.play_pos,
+            None => self.at,
+        }
+    }
+
+    /// 這一刻預覽上要顯示的那幾段文字，回傳（第幾段, 內容）
+    /// ——索引留著，畫面上拖曳時要寫回 `texts` 那一段
+    fn texts_now(&self) -> Vec<usize> {
+        let t = self.preview_secs();
+        (0..self.texts.len())
+            .filter(|&k| {
+                let e = &self.texts[k];
+                e.item.visible() && t + 1e-6 >= e.start && t < e.end - 1e-6
+            })
+            .collect()
+    }
+
+    /// 輸出要配的背景音樂；沒選檔（或檔案不在了）就是不配
+    fn music_track(&self) -> Option<movie::MusicTrack> {
+        let path = self.music_path.clone().filter(|p| p.is_file())?;
+        Some(movie::MusicTrack {
+            path,
+            volume: self.music_volume.clamp(0, 200),
+            src_volume: self.src_volume.clamp(0, 200),
+            fade_out: self.music_fade,
+        })
     }
 
     /// 目前預覽的時間點落在第幾段（最後一段 `start` ≤ `at` 的；第一段從 0 起，
@@ -13495,7 +13814,14 @@ impl App {
     /// 讀不到字型檔也照樣建立這個家族（內容退回介面字型），
     /// 呼叫端才不必分兩種情況處理
     fn ensure_smoke_font(&mut self, ctx: &egui::Context) {
-        let idx = self.smoke.text_style.font_idx;
+        self.ensure_text_font(ctx, self.smoke.text_style.font_idx);
+    }
+
+    /// 把字型清單裡第 `idx` 個灌進 egui 的 [`SMOKE_FONT`] 家族，預覽的文字才是
+    /// 使用者挑的那一套。去煙霧與影片去煙霧共用這一份——同時間只看得到一個
+    /// 模組，兩邊挑了不同字型就換一次（`font_loaded` 記的正是「現在灌進去的
+    /// 是哪一個」）
+    fn ensure_text_font(&mut self, ctx: &egui::Context, idx: usize) {
         if self.smoke.font_loaded == Some(idx) {
             return;
         }
@@ -15055,6 +15381,23 @@ impl App {
             object_feather: m.object_feather,
             object_edge: m.object_edge,
             clip_secs: m.clip_secs,
+            texts: m.texts.clone(),
+            text_font: self
+                .fonts
+                .get(m.text_style.font_idx)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default(),
+            text_color: m.text_style.color.to_array(),
+            text_outline_w: m.text_style.outline_w,
+            text_outline_color: m.text_style.outline_color.to_array(),
+            text_boxed: m.text_style.boxed,
+            music_path: m.music_path.clone(),
+            music_volume: m.music_volume,
+            src_volume: m.src_volume,
+            music_fade: m.music_fade,
+            text_open: m.text_open,
+            mask_open: m.mask_open,
+            music_open: m.music_open,
         }
     }
 
@@ -15101,6 +15444,29 @@ impl App {
         m.object_feather = p.object_feather.clamp(0, 100);
         m.object_edge = p.object_edge.clamp(-100, 100);
         m.clip_secs = p.clip_secs;
+        m.texts = p.texts;
+        m.sel_text = None;
+        m.text_style = SubtitleStyle {
+            // 字型清單依系統而異，所以存的是名稱；這臺電腦沒有那個字型
+            // 就退回第一個（與另外兩個模組同一套）
+            font_idx: self
+                .fonts
+                .iter()
+                .position(|(n, _)| *n == p.text_font)
+                .unwrap_or(0),
+            color: color_from_rgba(p.text_color),
+            outline_w: p.text_outline_w.clamp(0, 8),
+            outline_color: color_from_rgba(p.text_outline_color),
+            boxed: p.text_boxed,
+        };
+        // 音樂檔可能已經被搬走或刪掉，不在就當作沒配樂
+        m.music_path = p.music_path.filter(|q| q.is_file());
+        m.music_volume = p.music_volume.clamp(0, 200);
+        m.src_volume = p.src_volume.clamp(0, 200);
+        m.music_fade = p.music_fade;
+        m.text_open = p.text_open;
+        m.mask_open = p.mask_open;
+        m.music_open = p.music_open;
         // 存檔時時間軸停在哪就回到哪（夾在片長內：換過來源檔的話會超出）
         let secs = m.info.as_ref().map(|i| i.secs).unwrap_or(0.0);
         m.at = p.at.clamp(0.0, secs.max(0.0));
@@ -15410,6 +15776,28 @@ impl App {
         // （見 MovieTool::export_segs）
         let segs = self.movie.export_segs();
         let graded = segs.iter().any(|s| !s.grades.is_empty());
+        // 文字：字型清單只有主執行緒查得到，先解析成路徑；真正讀檔留給背景
+        // 執行緒，而且只有真的有字要畫時才讀（中文字型動輒二十 MB）
+        let timed: Vec<movie::TimedText> = self
+            .movie
+            .texts
+            .iter()
+            .filter(|t| t.item.visible())
+            .map(MovieText::timed)
+            .collect();
+        let font_path = (!timed.is_empty())
+            .then(|| {
+                self.fonts
+                    .get(self.movie.text_style.font_idx)
+                    .or(self.fonts.first())
+                    .map(|(_, p)| p.clone())
+            })
+            .flatten();
+        let text_style = self.movie.text_style.clone();
+        // 背景音樂。合併輸出時各段先不配樂，接成一支之後整支再配一次——
+        // 否則音樂會每換一段就從頭放（見 [`movie::add_music`]）
+        let music = self.movie.music_track();
+        let part_music = music.clone().filter(|_| !merging);
         let size = self.movie.size;
         // 裁切整批共用同一個框（相對座標，套在每一支自己的尺寸上）
         let crop = self.movie.crop.clamped();
@@ -15449,6 +15837,22 @@ impl App {
             // 合併時：成功跑完的那幾段（等一下要照順序接起來）
             let mut done_parts: Vec<PathBuf> = Vec::new();
             let mut aborted = false;
+            // 合併之後那一支有多長、有沒有聲音（配樂那一步要用）
+            let mut merged_secs = 0.0f64;
+            let mut merged_audio = false;
+            // 整批共用同一個字型，讀一次就好（讀不到就不畫字，不能整批不跑）
+            let text = font_path
+                .as_deref()
+                .and_then(edit::load_font)
+                .map(|font| movie::TextJob {
+                    items: timed,
+                    style: text_style,
+                    font,
+                });
+            if text.is_none() && font_path.is_some() {
+                let _ = tx.send(MovieMsg::Failed("字型讀取失敗，這次輸出沒有畫上文字".into()));
+            }
+            let text = text.filter(movie::TextJob::has_text);
             for (i, (src, out)) in jobs.iter().zip(parts.iter()).enumerate() {
                 if cancel.load(Ordering::Relaxed) {
                     aborted = true;
@@ -15489,12 +15893,17 @@ impl App {
                     scale,
                     &codec,
                     workers,
+                    text.as_ref(),
+                    part_music.as_ref(),
                     &cancel,
                     &report,
                 ) {
                     Ok(()) => {
                         last_ok = Some(out.clone());
                         done_parts.push(out.clone());
+                        // 合併之後整支多長、有沒有聲音（配樂那一步要用）
+                        merged_secs += info.secs;
+                        merged_audio |= info.audio.is_some();
                     }
                     // 空訊息＝使用者按了中止，不是這一支的問題
                     Err(e) if e.is_empty() => {
@@ -15509,8 +15918,40 @@ impl App {
             // 合併：把跑好的那幾段接成一支。接不起來（各段規格不同）時
             // 不能把使用者剛才等的那幾十分鐘丟掉——改成把各段搬到成品旁邊
             if merging && !aborted && !done_parts.is_empty() {
-                match movie::concat(&done_parts, &final_out) {
-                    Ok(()) => last_ok = Some(final_out.clone()),
+                // 有配樂的話先接到暫存檔，整支再配一次（見 [`movie::add_music`]）；
+                // 沒配樂就直接接成成品
+                let tmp = music
+                    .as_ref()
+                    .and_then(|_| done_parts[0].parent())
+                    .map(|d| d.join("merged.mp4"));
+                let joined = tmp.clone().unwrap_or_else(|| final_out.clone());
+                match movie::concat(&done_parts, &joined) {
+                    Ok(()) => match (&music, &tmp) {
+                        (Some(m), Some(_)) => {
+                            match movie::add_music(
+                                &joined,
+                                &final_out,
+                                m,
+                                merged_secs,
+                                merged_audio,
+                            ) {
+                                Ok(()) => last_ok = Some(final_out.clone()),
+                                Err(e) => {
+                                    // 配樂失敗不能把剛才等的那幾十分鐘丟掉：
+                                    // 接好的那一支照樣給他，只是沒有背景音樂
+                                    let moved = std::fs::rename(&joined, &final_out).is_ok()
+                                        || std::fs::copy(&joined, &final_out).is_ok();
+                                    if moved {
+                                        last_ok = Some(final_out.clone());
+                                    }
+                                    let _ = tx.send(MovieMsg::Failed(format!(
+                                        "配樂失敗：{e}。已改成輸出沒有背景音樂的版本"
+                                    )));
+                                }
+                            }
+                        }
+                        _ => last_ok = Some(final_out.clone()),
+                    },
                     Err(e) => {
                         let dir = final_out.parent().unwrap_or(Path::new("."));
                         let mut moved = 0;
@@ -15529,7 +15970,13 @@ impl App {
                         }
                         let _ = tx.send(MovieMsg::Failed(format!(
                             "合併失敗（各段的尺寸或影格率不一致時接不起來）：{e}。\
-                             已改成分開輸出 {moved} 支到同一個資料夾"
+                             已改成分開輸出 {moved} 支到同一個資料夾{}",
+                            // 配樂是接好之後才做的，接不起來就等於沒配到
+                            if music.is_some() {
+                                "（背景音樂是接成一支之後才配的，這幾支沒有）"
+                            } else {
+                                ""
+                            }
                         )));
                     }
                 }
@@ -15760,6 +16207,10 @@ impl App {
         let center_frame = egui::Frame::default()
             .fill(theme::BG)
             .inner_margin(egui::Margin::same(12));
+        // 預覽上的文字要用使用者挑的那套字型，先灌進 egui（換字型才重載一次）
+        if self.movie.text_open || !self.movie.texts.is_empty() {
+            self.ensure_text_font(ctx, self.movie.text_style.font_idx);
+        }
 
         if self.movie.src.is_some() {
             egui::SidePanel::right("movie_side")
@@ -16013,7 +16464,14 @@ impl App {
     fn ui_movie_grade(&mut self, ui: &mut egui::Ui, exporting: bool) {
         // 按下去只記旗標，畫完這一列才跳確認框（見 ui_adjust_section 的說明）
         let mut ask_clear = false;
-        let tab = self.movie.grade.tab.min(GRADE_ZONES - 1);
+        let pro = self.movie.pro;
+        // 簡易模式一律是第一區：那個模式沒有分區的概念，介面上就是一組滑桿
+        // （第二、三區調過的數字留著不動，切到專業就回來）
+        let tab = if pro {
+            self.movie.grade.tab.min(GRADE_ZONES - 1)
+        } else {
+            0
+        };
         self.movie.grade.tab = tab;
         ui.horizontal(|ui| {
             section_toggle(ui, "調色", &mut self.movie.grade_open);
@@ -16022,10 +16480,16 @@ impl App {
                 // 輸出中一律鎖住，與這個模組其他設定一樣
                 if dirty
                     && ui
-                        .add_enabled(!exporting, egui::Button::new("↺ 清除這一區").small())
-                        .on_hover_text(
-                            "把這一區的十二條滑桿歸零（另外兩區、去煙的設定與遮色片都不受影響）",
+                        .add_enabled(
+                            !exporting,
+                            egui::Button::new(if pro { "↺ 清除這一區" } else { "↺ 清除調色" })
+                                .small(),
                         )
+                        .on_hover_text(if pro {
+                            "把這一區的十二條滑桿歸零（另外兩區、去煙的設定與遮色片都不受影響）"
+                        } else {
+                            "把十二條滑桿一次全部歸零（去煙的設定不受影響）"
+                        })
                         .clicked()
                 {
                     ask_clear = true;
@@ -16035,12 +16499,16 @@ impl App {
         if ask_clear
             && ask2(
                 rfd::MessageLevel::Warning,
-                "清除這一區的調色",
-                &format!(
-                    "將把「遮色區 {}」的十二條滑桿全部歸零。\n\
-                     另外兩區、去煙的設定與遮色片都不受影響。",
-                    tab + 1
-                ),
+                if pro { "清除這一區的調色" } else { "清除調色" },
+                &if pro {
+                    format!(
+                        "將把「遮色區 {}」的十二條滑桿全部歸零。\n\
+                         另外兩區、去煙的設定與遮色片都不受影響。",
+                        tab + 1
+                    )
+                } else {
+                    "將把十二條調色滑桿全部歸零。\n去煙的設定不受影響。".to_string()
+                },
                 "清除",
                 "取消",
             )
@@ -16051,42 +16519,47 @@ impl App {
             return;
         }
         ui.label(
-            egui::RichText::new(
+            egui::RichText::new(if pro {
                 "去煙之後才套用，整支影片共用同一組。三個遮色區各調各的，\
-                 照 1、2、3 的順序疊上去",
-            )
+                 照 1、2、3 的順序疊上去"
+            } else {
+                "去煙之後才套用，整張一起調，整支影片共用同一組"
+            })
             .size(11.0)
             .color(theme::TEXT_WEAK),
         );
         ui.add_space(4.0);
         ui.add_enabled_ui(!exporting, |ui| {
             // 三區各十二條一起排下來要捲上老半天，所以一次只顯示一區的設定。
-            // 沒顯示的那幾區照樣記著自己的數字，切回去就在
-            ui.horizontal_wrapped(|ui| {
-                for i in 0..GRADE_ZONES {
-                    // 調過的那幾區標一下，才不會以為別區的設定不見了
-                    let z = &self.movie.grade.zones[i];
-                    let touched = !z.grade.grade_is_neutral();
-                    let text = if touched {
-                        format!("遮色區 {}（已調）", i + 1)
-                    } else {
-                        format!("遮色區 {}", i + 1)
-                    };
-                    if check_label(ui, tab == i, text)
-                        .on_hover_text(
-                            "每一區各有自己的十二條滑桿與遮色片；\n\
-                             滑桿全歸零的區不作用（不必另外關掉）",
-                        )
-                        .clicked()
-                    {
-                        self.movie.grade.tab = i;
-                        // 工具正對著別區的遮色片時跟著換過來，接下來畫的才是這一區的
-                        if matches!(self.movie.mask_target, MaskTarget::Grade(_)) {
-                            self.movie.mask_target = MaskTarget::Grade(i);
+            // 沒顯示的那幾區照樣記著自己的數字，切回去就在。
+            // 簡易模式沒有這一排——那個模式只有第一區、也沒有遮色片
+            if pro {
+                ui.horizontal_wrapped(|ui| {
+                    for i in 0..GRADE_ZONES {
+                        // 調過的那幾區標一下，才不會以為別區的設定不見了
+                        let z = &self.movie.grade.zones[i];
+                        let touched = !z.grade.grade_is_neutral();
+                        let text = if touched {
+                            format!("遮色區 {}（已調）", i + 1)
+                        } else {
+                            format!("遮色區 {}", i + 1)
+                        };
+                        if check_label(ui, tab == i, text)
+                            .on_hover_text(
+                                "每一區各有自己的十二條滑桿與遮色片；\n\
+                                 滑桿全歸零的區不作用（不必另外關掉）",
+                            )
+                            .clicked()
+                        {
+                            self.movie.grade.tab = i;
+                            // 工具正對著別區的遮色片時跟著換過來，接下來畫的才是這一區的
+                            if matches!(self.movie.mask_target, MaskTarget::Grade(_)) {
+                                self.movie.mask_target = MaskTarget::Grade(i);
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
             let tab = self.movie.grade.tab;
             ui.add_space(2.0);
             // 套用遮色片是專業模式限定：簡易模式一律整張調
@@ -16146,6 +16619,25 @@ impl App {
                 self.movie.leave_mask_view();
             }
         });
+        // 專業模式調過第二、三區之後切回簡易：那些數字留著但不套用
+        // （與遮色片同一個規則）。不講一句的話，畫面會莫名其妙少掉一截調色
+        if !pro {
+            let kept: Vec<String> = (1..GRADE_ZONES)
+                .filter(|&i| !self.movie.grade.zones[i].grade.grade_is_neutral())
+                .map(|i| (i + 1).to_string())
+                .collect();
+            if !kept.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "專業模式的遮色區 {} 調過的數字留著，簡易模式不套用；切到專業就回來",
+                        kept.join("、")
+                    ))
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
+                );
+            }
+        }
     }
 
     /// 右邊那條面板：去煙的四項核心參數、分區調色與輸出。
@@ -16256,6 +16748,16 @@ impl App {
         ui.separator();
         ui.add_space(8.0);
         self.ui_movie_grade(ui, exporting);
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+        self.ui_movie_text(ui, exporting);
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+        self.ui_movie_music(ui, exporting);
 
         ui.add_space(14.0);
         ui.separator();
@@ -16470,10 +16972,12 @@ impl App {
             });
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new(if info.audio.is_some() {
-                    "聲音原樣搬過去，畫面重新編碼成 H.264 MP4"
-                } else {
-                    "這支影片沒有聲音；畫面重新編碼成 H.264 MP4"
+                egui::RichText::new(match (self.movie.music_path.is_some(), info.audio.is_some()) {
+                    // 配了樂就不能照搬聲音了：混完要重編一次（見 movie::Encoder）
+                    (true, true) => "原聲與背景音樂混成一軌重新編碼；畫面編成 H.264 MP4",
+                    (true, false) => "背景音樂編成一條音軌；畫面編成 H.264 MP4",
+                    (false, true) => "聲音原樣搬過去，畫面重新編碼成 H.264 MP4",
+                    (false, false) => "這支影片沒有聲音；畫面重新編碼成 H.264 MP4",
                 })
                 .size(11.0)
                 .color(theme::TEXT_WEAK),
@@ -16526,12 +17030,26 @@ impl App {
     /// 會去煙。控制項與去煙霧模組那一組相同（工具列、各工具的選項、
     /// 羽化與濃度、遮罩檢視），差別只在這裡畫的一份是**整支影片每一格共用**的
     fn ui_movie_mask(&mut self, ui: &mut egui::Ui, exporting: bool) {
-        ui.label(
-            egui::RichText::new("🎭 遮色片")
-                .size(SECTION_FONT)
-                .strong()
-                .color(theme::TEXT),
-        );
+        // 收合著也看得出畫過沒：整支影片哪一段畫了都算
+        let drawn = self.movie.segments.iter().any(|s| {
+            !s.shapes.is_empty() || s.grade_shapes.iter().any(|g| !g.is_empty())
+        });
+        ui.horizontal(|ui| {
+            section_toggle(ui, "🎭 遮色片", &mut self.movie.mask_open);
+            if drawn && !self.movie.mask_open {
+                ui.label(
+                    egui::RichText::new("已畫")
+                        .size(11.0)
+                        .color(theme::ACCENT),
+                );
+            }
+        });
+        if !self.movie.mask_open {
+            // 收起來時工具與遮罩檢視一起收掉：否則預覽還停在「左鍵是拿來畫的」
+            // 狀態，而能關掉它的那一排按鈕已經看不到了
+            self.movie.close_mask_tools();
+            return;
+        }
         ui.add_space(4.0);
         // 輸出中一律鎖住，與這個模組其他設定一樣
         ui.add_enabled_ui(!exporting, |ui| {
@@ -16547,6 +17065,568 @@ impl App {
             .size(11.0)
             .color(theme::TEXT_WEAK),
         );
+    }
+
+    /// 影片去煙霧的「文字」區塊。文字疊在去煙與調色**之後**，輸出時才真正
+    /// 一格一格燒進畫面；每一段各有自己出現的時間（秒），位置、大小與旋轉
+    /// 直接在預覽上拖曳最快（見 [`App::ui_movie_text_overlay`]）
+    fn ui_movie_text(&mut self, ui: &mut egui::Ui, exporting: bool) {
+        // 片長：新增的那一段預設「整支都顯示」，秒數也照它夾住
+        let secs = self.movie.info.as_ref().map(|i| i.secs).unwrap_or(0.0);
+        let now = self.movie.preview_secs();
+        let no_font = self.fonts.is_empty();
+        ui.horizontal(|ui| {
+            section_toggle(ui, "文字", &mut self.movie.text_open);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 沒有字型就畫不出字，讓它加一段只會加出一段永遠不會出現的文字
+                if ui
+                    .add_enabled(!no_font && !exporting, egui::Button::new("＋ 新增文字").small())
+                    .on_disabled_hover_text(if no_font {
+                        "找不到可用的系統字型"
+                    } else {
+                        "輸出中不能改設定"
+                    })
+                    .clicked()
+                {
+                    let mut e = MovieText::new(secs);
+                    // 同一批連續新增的幾段若都停在底部中央會完全疊住，
+                    // 依現有段數往上錯開（每段 8%、循環 5 段），與照片轉影片一致
+                    let off = (self.movie.texts.len() % 5) as f32 * 0.08;
+                    e.item.y = (0.85 - off).clamp(0.1, 0.85);
+                    self.movie.texts.push(e);
+                    self.movie.sel_text = Some(self.movie.texts.len() - 1);
+                    self.movie.text_open = true; // 收合時新增 → 自動展開
+                }
+            });
+        });
+        if !self.movie.text_open {
+            return;
+        }
+        ui.label(
+            egui::RichText::new(
+                "在中央預覽直接拖曳文字調整位置；點選文字可縮放與旋轉。\
+                 前後對照時文字畫在右邊那格（＝成品）上",
+            )
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(8.0);
+
+        let mut remove: Option<usize> = None;
+        let mut select: Option<usize> = None;
+        ui.add_enabled_ui(!exporting, |ui| {
+            for (k, e) in self.movie.texts.iter_mut().enumerate() {
+                let selected = self.movie.sel_text == Some(k);
+                egui::Frame::default()
+                    .fill(theme::CARD)
+                    .corner_radius(8)
+                    .stroke(if selected {
+                        egui::Stroke::new(1.5, theme::ACCENT)
+                    } else {
+                        egui::Stroke::NONE
+                    })
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("文字 {}", k + 1))
+                                            .strong()
+                                            .size(12.5)
+                                            .color(theme::ACCENT),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text("點擊可在預覽中選取這段文字")
+                                .clicked()
+                            {
+                                select = Some(k);
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("🗑")
+                                        .on_hover_text("刪除這段文字")
+                                        .clicked()
+                                    {
+                                        remove = Some(k);
+                                    }
+                                },
+                            );
+                        });
+                        // 出現的時間。上限放寬到片長之外，一批裡有比預覽這支更長的
+                        // 影片時也調得到（時間是每一支各自從 0 秒起算的）
+                        let top = (secs.max(1.0) * 4.0).max(60.0);
+                        fn sec_drag(v: &mut f64, top: f64) -> egui::DragValue<'_> {
+                            egui::DragValue::new(v)
+                                .speed(0.1)
+                                .range(0.0..=top)
+                                .max_decimals(1)
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("第").size(12.0).color(theme::TEXT_WEAK));
+                            let r1 = ui.add(sec_drag(&mut e.start, top));
+                            if ui
+                                .small_button("⏱")
+                                .on_hover_text("設成時間軸現在停的位置")
+                                .clicked()
+                            {
+                                e.start = now.max(0.0);
+                            }
+                            ui.label(egui::RichText::new("到").size(12.0).color(theme::TEXT_WEAK));
+                            let r2 = ui.add(sec_drag(&mut e.end, top));
+                            if ui
+                                .small_button("⏱")
+                                .on_hover_text("設成時間軸現在停的位置")
+                                .clicked()
+                            {
+                                e.end = now.max(0.0);
+                            }
+                            ui.label(egui::RichText::new("秒").size(12.0).color(theme::TEXT_WEAK));
+                            // 終點被拉到起點前面就把它推回來（照片那邊同一條規矩）
+                            if (r1.changed() || r2.changed()) && e.end < e.start {
+                                e.end = e.start;
+                            }
+                        });
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut e.item.text)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("這段時間要顯示的文字（可多行）"),
+                        );
+                        if resp.gained_focus() {
+                            select = Some(k);
+                        }
+                        slider_row(ui, &mut e.item.size, 8, 300, "大小");
+                        rot_slider_row(ui, &format!("movie_text_rot_{k}"), &mut e.item.rot);
+                        // 時間軸不在這一段的範圍裡就看不到它，講一句免得以為打的字不見了
+                        if e.item.visible() && (now + 1e-6 < e.start || now >= e.end - 1e-6) {
+                            ui.label(
+                                egui::RichText::new(
+                                    "時間軸現在不在這一段的範圍內，預覽上看不到",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                            );
+                        }
+                    });
+                ui.add_space(6.0);
+            }
+        });
+        if let Some(k) = select {
+            self.movie.sel_text = Some(k);
+        }
+        if let Some(k) = remove {
+            self.movie.texts.remove(k);
+            self.movie.sel_text = match self.movie.sel_text {
+                Some(s) if s == k => None,
+                Some(s) if s > k => Some(s - 1),
+                other => other,
+            };
+        }
+        if self.movie.texts.is_empty() {
+            ui.label(
+                egui::RichText::new("尚未加入文字，點右上「＋ 新增文字」開始")
+                    .size(11.5)
+                    .color(theme::TEXT_WEAK),
+            );
+        }
+        ui.add_space(10.0);
+
+        if no_font {
+            ui.colored_label(theme::ERROR, "找不到可用的系統字型，文字功能無法使用");
+            return;
+        }
+        group_label(ui, "文字樣式（全部共用）");
+        ui.add_space(2.0);
+        ui.add_enabled_ui(!exporting, |ui| {
+            egui::Frame::default()
+                .fill(theme::CARD)
+                .corner_radius(8)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("字型").color(theme::TEXT_WEAK));
+                        let cur = self
+                            .fonts
+                            .get(self.movie.text_style.font_idx)
+                            .map(|(n, _)| n.as_str())
+                            .unwrap_or("？");
+                        egui::ComboBox::from_id_salt("movie_text_font")
+                            .selected_text(cur)
+                            .width((ui.available_width() - 8.0).max(80.0))
+                            .show_ui(ui, |ui| {
+                                for (i, (name, _)) in self.fonts.iter().enumerate() {
+                                    check_value(ui, &mut self.movie.text_style.font_idx, i, name);
+                                }
+                            });
+                    });
+                    slider_row(ui, &mut self.movie.text_style.outline_w, 0, 8, "外框");
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("文字").color(theme::TEXT_WEAK));
+                        ui.color_edit_button_srgba(&mut self.movie.text_style.color);
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("外框").color(theme::TEXT_WEAK));
+                        ui.color_edit_button_srgba(&mut self.movie.text_style.outline_color);
+                        ui.add_space(10.0);
+                        ui.checkbox(&mut self.movie.text_style.boxed, "半透明底框");
+                    });
+                });
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "秒數是每一支影片各自從 0 秒起算的（與遮色片的分段同一個規矩）：\
+                 排了好幾支時，每一支都從自己的開頭套同一組文字",
+            )
+            .size(11.0)
+            .color(theme::TEXT_WEAK),
+        );
+    }
+
+    /// 影片去煙霧的「背景音樂」區塊。影片本來就有聲音，所以原聲與音樂
+    /// 各有一條音量滑桿——原聲拉到 0 就等於「只要音樂」
+    fn ui_movie_music(&mut self, ui: &mut egui::Ui, exporting: bool) {
+        let has_audio = self
+            .movie
+            .info
+            .as_ref()
+            .is_some_and(|i| i.audio.is_some());
+        ui.horizontal(|ui| {
+            section_toggle(ui, "背景音樂", &mut self.movie.music_open);
+            if !self.movie.music_open {
+                if let Some(p) = &self.movie.music_path {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                p.file_name().unwrap_or_default().to_string_lossy().as_ref(),
+                            )
+                            .size(11.0)
+                            .color(theme::TEXT_WEAK),
+                        )
+                        .truncate(),
+                    );
+                }
+            }
+        });
+        if !self.movie.music_open {
+            return;
+        }
+        ui.add_space(4.0);
+        let mut remove = false;
+        ui.add_enabled_ui(!exporting, |ui| {
+            egui::Frame::default()
+                .fill(theme::CARD)
+                .corner_radius(8)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| match &self.movie.music_path {
+                    None => {
+                        if ui.button("🎵  選擇音樂檔").clicked() {
+                            if let Some(f) = dir_dialog(LastDir::VideoMusic)
+                                .set_title("選擇背景音樂")
+                                .add_filter("音訊檔", AUDIO_EXTS)
+                                .pick_file()
+                            {
+                                remember_dir(LastDir::VideoMusic, &f);
+                                self.movie.music_path = Some(f);
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "支援 MP3、WAV、M4A、FLAC、OGG，也可以直接拖進視窗",
+                            )
+                            .size(11.0)
+                            .color(theme::TEXT_WEAK),
+                        );
+                    }
+                    Some(p) => {
+                        let name = p.file_name().unwrap_or_default().to_string_lossy();
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("🎵").size(13.0));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(name.as_ref())
+                                        .size(12.5)
+                                        .color(theme::TEXT),
+                                )
+                                .truncate(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("×").on_hover_text("移除音樂").clicked() {
+                                        remove = true;
+                                    }
+                                },
+                            );
+                        });
+                        slider_row(ui, &mut self.movie.music_volume, 0, 200, "音樂音量");
+                        if has_audio {
+                            slider_row(ui, &mut self.movie.src_volume, 0, 200, "原聲音量");
+                            ui.label(
+                                egui::RichText::new(
+                                    "兩軌混在一起。原聲音量拉到 0 就是只留音樂；\
+                                     兩邊都開大有可能破音，聽起來刺耳就各降一點",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("這支影片本身沒有聲音，成品只會有這段音樂")
+                                    .size(11.0)
+                                    .color(theme::TEXT_WEAK),
+                            );
+                        }
+                        ui.checkbox(&mut self.movie.music_fade, "結尾自動淡出（最多 2 秒）");
+                        ui.label(
+                            egui::RichText::new("音樂比影片短會自動循環，比影片長會自動裁切")
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                        );
+                    }
+                });
+        });
+        if remove {
+            self.movie.music_path = None;
+        }
+        if self.movie.music_path.is_some() {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(if self.movie.jobs().len() > 1 && self.movie.merge {
+                    "合併輸出時是接成一支之後再配一次樂，音樂不會每換一支就從頭放"
+                } else {
+                    "排了好幾支各存各的時，每一支都從音樂的開頭配起"
+                })
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+            );
+        }
+    }
+
+    /// 預覽上的文字：與去煙霧模組同一套操作（拖曳＝移動、角落把手＝縮放、
+    /// 頂部圓形把手＝旋轉），由 egui 直接畫、零延遲；輸出時才用同一套字型
+    /// 一格一格燒進畫面（見 [`movie::TextJob`]）。
+    ///
+    /// `view` 是「處理後」那一格的可視範圍、`img` 是畫面實際畫出來的矩形
+    /// （含縮放與平移）。畫的是**這一刻該出現的那幾段**（見
+    /// [`MovieTool::texts_now`]），與成品在同一秒看到的完全一樣
+    fn ui_movie_text_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: egui::Rect,
+        img: egui::Rect,
+        interactive: bool,
+    ) {
+        let shown = self.movie.texts_now();
+        // 選著的那一段被刪掉時把選取收起來。**只看索引在不在**：剛按下
+        // 「＋ 新增文字」那一段還是空白的、時間軸也可能不在它的範圍內，
+        // 這時仍要讓它保持選著（右邊那張卡片的選取框才不會立刻閃掉）；
+        // 把手本來就只畫在這一刻真的看得到的那幾段上
+        if self.movie.sel_text.is_some_and(|k| k >= self.movie.texts.len()) {
+            self.movie.sel_text = None;
+        }
+        if shown.is_empty() {
+            self.movie.text_busy = false;
+            return;
+        }
+        let style = self.movie.text_style.clone();
+        // 文字裁到畫面範圍（輸出也只畫在畫面上），選取框與把手裁到可視範圍，
+        // 文字靠邊時把手才不會跟著被切掉
+        let p = ui.painter().with_clip_rect(view.intersect(img));
+        let chrome = ui.painter().with_clip_rect(view);
+        // 字級與外框以 1080p 高度為基準縮放，與輸出時的算法一致
+        let scale = img.height() / 1080.0;
+        let ow_screen = style.outline_w as f32 * scale;
+        let mut busy = false;
+        let mut select: Option<usize> = None;
+
+        for k in shown {
+            let t = self.movie.texts[k].item.clone();
+            let font_px = (t.size as f32 * scale).max(2.0);
+            let galley = p.layout(
+                t.text.trim_end().to_string(),
+                self.smoke_text_font(font_px),
+                style.color,
+                f32::INFINITY,
+            );
+            let half = galley.size() / 2.0;
+            let center = img.min + egui::vec2(t.x * img.width(), t.y * img.height());
+            let angle = t.rot.to_radians();
+
+            // 半透明底框（近似輸出時畫的那一塊）
+            if style.boxed {
+                let pad = (font_px * 0.25).max(4.0 * scale);
+                let ext = half + egui::vec2(pad, pad);
+                let corners: Vec<egui::Pos2> = [
+                    egui::vec2(-ext.x, -ext.y),
+                    egui::vec2(ext.x, -ext.y),
+                    egui::vec2(ext.x, ext.y),
+                    egui::vec2(-ext.x, ext.y),
+                ]
+                .into_iter()
+                .map(|v| center + rot_vec(v, angle))
+                .collect();
+                p.add(egui::Shape::convex_polygon(
+                    corners,
+                    egui::Color32::from_black_alpha(102),
+                    egui::Stroke::NONE,
+                ));
+            }
+
+            // 外框（八個方向偏移重繪）＋本體，與輸出時的畫法相同
+            let mk = |off: egui::Vec2, override_color: Option<egui::Color32>| {
+                let pos = center + rot_vec(-half + off, angle);
+                let mut ts = egui::epaint::TextShape::new(pos.round(), galley.clone(), style.color);
+                ts.angle = angle;
+                ts.override_text_color = override_color;
+                egui::Shape::Text(ts)
+            };
+            if ow_screen > 0.05 {
+                for (dx, dy) in [
+                    (-1.0, 0.0),
+                    (1.0, 0.0),
+                    (0.0, -1.0),
+                    (0.0, 1.0),
+                    (-0.7, -0.7),
+                    (0.7, -0.7),
+                    (-0.7, 0.7),
+                    (0.7, 0.7),
+                ] {
+                    p.add(mk(
+                        egui::vec2(dx, dy) * ow_screen,
+                        Some(style.outline_color),
+                    ));
+                }
+            }
+            p.add(mk(egui::Vec2::ZERO, None));
+
+            if !interactive {
+                continue;
+            }
+
+            // 主體互動：以旋轉後的外接矩形當點擊/拖曳範圍
+            let bb = egui::vec2(
+                half.x * angle.cos().abs() + half.y * angle.sin().abs(),
+                half.x * angle.sin().abs() + half.y * angle.cos().abs(),
+            ) + egui::vec2(6.0, 6.0);
+            let id = ui.id().with(("movie_text", k));
+            let resp = ui.interact(
+                egui::Rect::from_center_size(center, bb * 2.0),
+                id,
+                egui::Sense::click_and_drag(),
+            );
+            // 滑鼠壓在文字上時左鍵歸文字用，不要同時把預覽也拖著跑
+            busy |= resp.hovered() || resp.dragged();
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            }
+            if resp.clicked() || resp.drag_started() {
+                select = Some(k);
+            }
+            if resp.dragged() {
+                let d = resp.drag_delta();
+                let e = &mut self.movie.texts[k].item;
+                e.x = (e.x + d.x / img.width()).clamp(0.0, 1.0);
+                e.y = (e.y + d.y / img.height()).clamp(0.0, 1.0);
+            }
+
+            if self.movie.sel_text != Some(k) {
+                continue;
+            }
+            // 選取框與把手
+            let ext = half + egui::vec2(8.0, 8.0);
+            let corners: Vec<egui::Pos2> = [
+                egui::vec2(-ext.x, -ext.y),
+                egui::vec2(ext.x, -ext.y),
+                egui::vec2(ext.x, ext.y),
+                egui::vec2(-ext.x, ext.y),
+            ]
+            .into_iter()
+            .map(|v| center + rot_vec(v, angle))
+            .collect();
+            for i in 0..4 {
+                chrome.line_segment(
+                    [corners[i], corners[(i + 1) % 4]],
+                    egui::Stroke::new(1.5, theme::ACCENT),
+                );
+            }
+            // 角落縮放把手
+            for (ci, c) in corners.iter().enumerate() {
+                let vis = egui::Rect::from_center_size(*c, egui::vec2(9.0, 9.0));
+                chrome.rect_filled(vis, 2, egui::Color32::WHITE);
+                chrome.rect_stroke(
+                    vis,
+                    2,
+                    egui::Stroke::new(1.5, theme::ACCENT),
+                    egui::StrokeKind::Inside,
+                );
+                let hr = ui.interact(
+                    egui::Rect::from_center_size(*c, egui::vec2(14.0, 14.0)),
+                    id.with(("corner", ci)),
+                    egui::Sense::drag(),
+                );
+                busy |= hr.hovered() || hr.dragged();
+                if hr.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                }
+                if hr.dragged() {
+                    if let Some(ptr) = hr.interact_pointer_pos() {
+                        let prev = ptr - hr.drag_delta();
+                        let d0 = (prev - center).length();
+                        let d1 = (ptr - center).length();
+                        if d0 > 4.0 {
+                            let e = &mut self.movie.texts[k].item;
+                            e.size = (e.size as f32 * d1 / d0).round().clamp(8.0, 300.0) as i32;
+                        }
+                    }
+                }
+            }
+            // 旋轉把手（頂邊中點向外延伸的圓形）
+            let top_mid = center + rot_vec(egui::vec2(0.0, -ext.y), angle);
+            let handle = center + rot_vec(egui::vec2(0.0, -ext.y - 22.0), angle);
+            chrome.line_segment([top_mid, handle], egui::Stroke::new(1.5, theme::ACCENT));
+            chrome.circle_filled(handle, 5.5, theme::ACCENT);
+            chrome.circle_stroke(handle, 5.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
+            let rr = ui.interact(
+                egui::Rect::from_center_size(handle, egui::vec2(16.0, 16.0)),
+                id.with("rotate"),
+                egui::Sense::drag(),
+            );
+            busy |= rr.hovered() || rr.dragged();
+            if rr.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            if rr.dragged() {
+                if let Some(ptr) = rr.interact_pointer_pos() {
+                    let v = ptr - center;
+                    if v.length() > 4.0 {
+                        let mut deg = v.y.atan2(v.x).to_degrees() + 90.0;
+                        if deg > 180.0 {
+                            deg -= 360.0;
+                        }
+                        if deg < -180.0 {
+                            deg += 360.0;
+                        }
+                        // 靠近 45° 倍數時吸附
+                        for s in [-180.0f32, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0] {
+                            if (deg - s).abs() < 4.0 {
+                                deg = s;
+                                break;
+                            }
+                        }
+                        self.movie.texts[k].item.rot = deg;
+                    }
+                }
+            }
+        }
+
+        self.movie.text_busy = busy;
+        if let Some(k) = select {
+            self.movie.sel_text = Some(k);
+        }
     }
 
     /// 某一份遮色片的工具列與選項：五種工具、還原／清除、各工具自己的選項、
@@ -17140,6 +18220,10 @@ impl App {
             && !mask_canvas
             && !clip_on
             && !cropping
+            // 滑鼠壓在文字上是要搬它，不是要看原圖（原圖沒有字，一按文字就
+            // 整個閃掉）。text_busy 是上一幀量的，而它在**懸著**時就已經
+            // 立起來了，所以按下去的那一幀就擋得住
+            && !self.movie.text_busy
             && resp.is_pointer_button_down_on();
         let mask_view = !clip_on && self.movie.mask_shown() && self.movie.mask_tex.is_some();
         let base_t = if clip_on {
@@ -17240,7 +18324,8 @@ impl App {
             Some(z) => {
                 let size = nominal * (z / ppp);
                 if ui.rect_contains_pointer(rect) {
-                    let left_pans = !mask_canvas && !cropping;
+                    // 左鍵優先讓給遮色片工具、裁切框與文字（見 MovieTool::text_busy）
+                    let left_pans = !mask_canvas && !cropping && !self.movie.text_busy;
                     if left_pans {
                         ui.ctx().set_cursor_icon(if ui.input(|i| i.pointer.primary_down()) {
                             egui::CursorIcon::Grabbing
@@ -17327,6 +18412,19 @@ impl App {
             if done {
                 self.movie.set_crop_editing(false);
             }
+        }
+        // 疊在畫面上的文字：畫在「處理後」那一格上（成品就是那一張）。
+        // 遮罩檢視那片紅、調整裁切範圍時的整格、按住看原圖，這三種畫面都不是
+        // 成品的樣子，文字讓開不畫；輸出中則只看、不給改
+        if let Some(img) = img.filter(|_| !mask_view && !cropping && !self.movie.show_before) {
+            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(view));
+            c.set_clip_rect(view);
+            let interactive = !mask_canvas
+                && self.movie.mask_tool.is_none()
+                && self.movie.busy != MovieBusy::Exporting;
+            self.ui_movie_text_overlay(&mut c, view, img, interactive);
+        } else {
+            self.movie.text_busy = false;
         }
         // 還在忙就講一句，不然畫面停著不動像當掉
         let note: Option<String> = match self.movie.busy {
@@ -17777,7 +18875,7 @@ impl App {
         ) {
             // 存檔要先挑檔名（可能被取消），真的開始存了才記著「存完接著換」
             Ask3::First => {
-                self.stack.pick_after_save = self.stack_save(ctx);
+                self.stack.pick_after_save = self.stack_save(ctx, false);
                 false
             }
             Ask3::Second => true,
@@ -18547,12 +19645,16 @@ impl App {
         });
     }
 
-    /// 用原尺寸重疊一次並存成一張照片。`here` 為真就存回地景那張的資料夾，
-    /// 否則跳資料夾對話框讓使用者自己挑
+    /// 用原尺寸重疊一次並存成一張照片。
+    ///
+    /// `here` 為真（「💾 存檔」）就存回**來源照片所在的資料夾**、檔名自動取，
+    /// 不跳對話框；為假（「📁 另存新檔…」）才跳存檔對話框讓使用者挑位置與檔名。
+    /// 與去煙霧、優化影像那兩個模組同一套規矩。
+    ///
     /// 回傳 true＝**真的開始存了**（背景執行緒已經跑起來）。
-    /// 挑檔名時按取消、或檔名不能用而擋下來的，都回 false——
+    /// 挑檔名時按取消、覆蓋問到一半取消、或檔名不能用而擋下來的，都回 false——
     /// 呼叫端要靠它決定「存完之後」還要不要接著做別的事
-    fn stack_save(&mut self, ctx: &egui::Context) -> bool {
+    fn stack_save(&mut self, ctx: &egui::Context, here: bool) -> bool {
         if self.stack.photos.len() < 2 {
             return false;
         }
@@ -18580,32 +19682,65 @@ impl App {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "photo".into());
-        // 檔名交給存檔對話框，使用者可以自己改；檔案已存在時
-        // 系統的存檔對話框會先問要不要覆蓋
-        // 先指到地景那張自己的資料夾（見 output_start_dir）
-        let start_dir = output_start_dir(LastDir::StackOutput, Some(ground.as_path()));
-        let dialog = match start_dir {
-            Some(d) => file_dialog().set_directory(d),
-            None => file_dialog(),
-        };
-        let Some(out) = dialog
-            .set_title("儲存疊圖成品")
-            .set_file_name(format!("{stem}_疊圖.jpg"))
-            .add_filter("JPEG 圖片", &["jpg", "jpeg"])
-            .save_file()
-        else {
-            return false;
-        };
-        // 對話框可能回一個沒有副檔名的路徑（使用者自己把它刪掉了）。
-        // 補上之後才成立的檔名，存檔對話框沒問過使用者，得自己補問一次
-        let out = if out.extension().is_none() {
-            let fixed = out.with_extension("jpg");
-            if !confirm_overwrite(&fixed) {
-                return false;
+        let out = if here {
+            // 「存檔」：存回來源照片自己的資料夾，不再問位置。
+            // 名字取自上面那張（不是地景），所以不會與任何來源檔同名
+            let dir = name_src
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default();
+            let out = dir.join(format!("{stem}_疊圖.jpg"));
+            // 自動命名沒有對話框可以問，已經存在就自己問一次
+            if out.exists() {
+                let name = out.file_name().unwrap_or_default().to_string_lossy();
+                match ask3(
+                    rfd::MessageLevel::Warning,
+                    "成品檔已存在",
+                    &format!(
+                        "「{name}」已經存在。\n\n\
+                         「覆蓋」：舊檔直接被蓋掉\n\
+                         「另取新檔名」：保留舊檔，這次自動改成不重複的檔名\n\
+                         「取消」：不存檔"
+                    ),
+                    "覆蓋",
+                    "另取新檔名",
+                    "取消",
+                ) {
+                    Ask3::First => out,
+                    Ask3::Second => next_free_path(&out),
+                    Ask3::Cancel => return false,
+                }
+            } else {
+                out
             }
-            fixed
         } else {
-            out
+            // 「另存新檔…」：檔名交給存檔對話框，使用者可以自己改；
+            // 檔案已存在時系統的存檔對話框會先問要不要覆蓋。
+            // 先指到地景那張自己的資料夾（見 output_start_dir）
+            let start_dir = output_start_dir(LastDir::StackOutput, Some(ground.as_path()));
+            let dialog = match start_dir {
+                Some(d) => file_dialog().set_directory(d),
+                None => file_dialog(),
+            };
+            let Some(out) = dialog
+                .set_title("儲存疊圖成品")
+                .set_file_name(format!("{stem}_疊圖.jpg"))
+                .add_filter("JPEG 圖片", &["jpg", "jpeg"])
+                .save_file()
+            else {
+                return false;
+            };
+            // 對話框可能回一個沒有副檔名的路徑（使用者自己把它刪掉了）。
+            // 補上之後才成立的檔名，存檔對話框沒問過使用者，得自己補問一次
+            if out.extension().is_none() {
+                let fixed = out.with_extension("jpg");
+                if !confirm_overwrite(&fixed) {
+                    return false;
+                }
+                fixed
+            } else {
+                out
+            }
         };
         // 存成來源照片本身會把原檔毀掉，這個不能讓它過
         if self.stack.photos.iter().any(|p| same_path_ci(&out, p)) {
@@ -18613,7 +19748,10 @@ impl App {
                 Some("這個檔名就是來源照片之一，會把原檔蓋掉；請換一個名字".into());
             return false;
         }
-        remember_dir(LastDir::StackOutput, &out);
+        // 「上次另存到哪」只記使用者自己挑的那次；存回來源資料夾不算
+        if !here {
+            remember_dir(LastDir::StackOutput, &out);
+        }
         let key = self.stack.key();
         let grade = self.stack.grade;
         // 存檔尺寸在按下去的當下定案（與去煙霧一致）
@@ -19769,8 +20907,9 @@ impl App {
         let mut paste = false;
         // 要移除的那一張（右鍵選單或 Delete 鍵）
         let mut remove_idx: Option<usize> = None;
-        // 按了存檔（會跳存檔對話框讓使用者自己挑位置與檔名）
-        let mut save = false;
+        // 按了哪一顆存成品：Some(true)＝「存檔」（存回來源資料夾、不問位置）、
+        // Some(false)＝「另存新檔…」（跳存檔對話框自己挑位置與檔名）
+        let mut save: Option<bool> = None;
         // 存檔列的「💾 專案儲存」與工具列的「📂 開啟專案」
         let mut save_project = false;
         let mut open_project = false;
@@ -20981,18 +22120,27 @@ impl App {
                             );
                         } else {
                             let ready = busy == StackBusy::Idle && self.stack.bases_ready();
-                            if primary_button(ui, "💾  存檔…", ready)
+                            if primary_button(ui, "💾  存檔", ready)
                                 .on_hover_text(
-                                    "用原尺寸重疊一次存成一張。\n\
-                                     會先跳存檔視窗讓你挑位置、改檔名；\n\
-                                     檔名預設取自目前選著的那一層（不是地景），\n\
-                                     同名檔案已存在時會先問要不要覆蓋",
+                                    "用原尺寸重疊一次存成一張，\n\
+                                     存回來源照片所在的資料夾、不用再選位置。\n\
+                                     檔名取自目前選著的那一層（不是地景）加上 _疊圖；\n\
+                                     同名檔案已存在時會先問要覆蓋還是另取新檔名",
                                 )
                                 .clicked()
                             {
-                                save = true;
+                                save = Some(true);
                             }
-                            // 專案儲存擺在存檔鈕左邊：它存的是設定，不是成品
+                            // 要放到別的地方、或想自己取名才點這顆
+                            ui.add_space(6.0);
+                            if ui
+                                .add_enabled(ready, egui::Button::new("📁 另存新檔…").small())
+                                .on_hover_text("自己挑位置與檔名存放成品")
+                                .clicked()
+                            {
+                                save = Some(false);
+                            }
+                            // 專案儲存擺在兩顆「存成品」的左邊：它存的是設定，不是成品
                             ui.add_space(6.0);
                             if project_save_button(ui, Module::Stack, total > 0) {
                                 save_project = true;
@@ -21158,8 +22306,8 @@ impl App {
                 self.stack.dirty = true;
             }
         }
-        if save {
-            self.stack_save(ctx);
+        if let Some(here) = save {
+            self.stack_save(ctx, here);
         }
         // 清除確認擺在最後：這一幀的操作都處理完，dirty 才是最新的狀態
         if clear {
@@ -25606,7 +26754,7 @@ impl App {
             Module::Movie if self.movie.busy == MovieBusy::Exporting => {
                 (theme::TEXT_WEAK, "⏳", "輸出中，暫時無法換影片")
             }
-            Module::Movie => (theme::ACCENT, "⬇", "放開滑鼠載入要去煙霧的影片"),
+            Module::Movie => (theme::ACCENT, "⬇", "放開滑鼠載入要去煙霧的影片（音訊檔＝背景音樂）"),
             Module::Enhance if self.enhance.busy == EnhanceBusy::Saving => {
                 (theme::TEXT_WEAK, "⏳", "存檔中，暫時無法加入照片")
             }
@@ -26025,11 +27173,22 @@ impl eframe::App for App {
             // 影片去煙霧模組：拖一疊進來就整批排隊（第一支拿來預覽、
             // 其餘排在後面，全部套同一組設定）
             let vids: Vec<PathBuf> = dropped.iter().filter(|p| is_video(p)).cloned().collect();
+            // 夾帶的音訊檔＝設定為背景音樂，並展開「背景音樂」區塊（收合時
+            // 拖入否則毫無回饋，使用者會以為沒設定成功）
+            let music = dropped.iter().find(|p| is_audio(p)).cloned();
+            let got_music = music.is_some();
+            if let Some(a) = music {
+                remember_dir(LastDir::VideoMusic, &a);
+                self.movie.music_path = Some(a);
+                self.movie.music_open = true;
+            }
             match vids.first() {
                 Some(v) => {
                     remember_dir(LastDir::MovieSource, v);
                     self.movie_append(vids.clone(), ctx);
                 }
+                // 只拖音樂進來是合理的（片子已經在了），那就不算錯
+                None if got_music => {}
                 None => {
                     self.movie.error = Some(format!(
                         "拖進來的檔案裡沒有影片（支援 {}）",
@@ -26139,7 +27298,7 @@ impl eframe::App for App {
                             && self.stack.busy == StackBusy::Idle
                             && self.stack.bases_ready() =>
                     {
-                        self.stack_save(ctx);
+                        self.stack_save(ctx, true);
                     }
                     Module::Enhance
                         if !self.enhance.photos.is_empty()
@@ -32103,6 +33262,96 @@ mod tests {
         assert_eq!(*back.mask, *before, "重算出來的權重圖與存檔前不同");
     }
 
+    /// 影片去煙霧的專案檔：文字與配樂存得回來，而且**這幾個欄位還不存在時**
+    /// 存的舊專案照樣開得起來（少的那幾項退回預設，見 `#[serde(default)]`）
+    #[test]
+    fn movie_project_keeps_the_texts_and_the_music() {
+        let mut p = project::MovieProject::default();
+        p.texts = vec![MovieText {
+            item: edit::TextItem {
+                text: "將軍吼".into(),
+                x: 0.4,
+                y: 0.2,
+                size: 72,
+                rot: -15.0,
+            },
+            start: 3.5,
+            end: 12.0,
+        }];
+        p.music_path = Some(PathBuf::from(r"C:\music\bg.mp3"));
+        p.music_volume = 60;
+        p.src_volume = 0;
+        p.music_fade = false;
+        p.mask_open = false;
+        let j = serde_json::to_string(&p).unwrap();
+        let back: project::MovieProject = serde_json::from_str(&j).unwrap();
+        assert!(back.texts == p.texts, "文字沒有原樣存回來：{j}");
+        assert_eq!(back.music_path, p.music_path);
+        assert_eq!(
+            (back.music_volume, back.src_volume, back.music_fade),
+            (60, 0, false)
+        );
+        assert!(!back.mask_open);
+
+        // 舊專案（連 texts／music 這幾個欄位都還沒有）照樣開得起來
+        let old = r#"{"module":"movie","at":4.0,"pro":true}"#;
+        let back: project::MovieProject = serde_json::from_str(old).unwrap();
+        assert_eq!(back.at, 4.0);
+        assert!(back.pro && back.texts.is_empty() && back.music_path.is_none());
+        assert!(back.mask_open, "舊專案沒存過就照預設：遮色片區塊是攤開的");
+    }
+
+    /// 「選資料夾」對話框的「資料夾:」欄：預填的名字比欄位寬時，Windows 會把它
+    /// 捲到尾端，開頭那幾個字看不到。這裡實測它被捲回開頭了沒有。
+    ///
+    /// 會**真的開一個對話框**（所以平常不跑，要手動點名）：
+    /// `cargo test --bin photo2video -- --ignored folder_dialog_scrolls --nocapture`
+    /// 不必碰滑鼠——另一條執行緒去找那個欄位、問它第 0 個字看不看得見，
+    /// 問完就 PostMessage WM_CLOSE 把對話框關掉
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn folder_dialog_scrolls_the_name_to_the_start() {
+        // 名字要長到塞不進欄位，才試得出「捲到尾端」這件事
+        let long = "20260830漁人碼頭煙火測試用的資料夾名字刻意取得很長很長很長 - test";
+        let dir = std::env::temp_dir().join("p2v_dlg").join(long);
+        std::fs::create_dir_all(&dir).expect("建不了測試資料夾");
+        let want: Vec<u16> = long.encode_utf16().collect();
+
+        let seen = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (s, d) = (seen.clone(), done.clone());
+        let probe = thread::spawn(move || {
+            let mut edit = 0isize;
+            for _ in 0..200 {
+                if edit == 0 {
+                    edit = win_folder::find_name_edit(&want);
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                // 找到之後再等一下：對話框自己的全選可能晚一步，
+                // 修正要撐得過那一下才算數
+                thread::sleep(Duration::from_millis(600));
+                s.store(win_folder::head_visible(edit), Ordering::Relaxed);
+                d.store(true, Ordering::Relaxed);
+                win_folder::close_dialog_of(edit);
+                return;
+            }
+            d.store(true, Ordering::Relaxed);
+        });
+
+        let r = win_folder::pick("實測：資料夾欄要捲到開頭", Some(&dir), 0);
+        let _ = probe.join();
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("p2v_dlg"));
+
+        assert!(r.is_ok(), "對話框開不起來（COM 起不來？），這個實測沒有意義");
+        assert!(done.load(Ordering::Relaxed), "沒找到「資料夾:」那個欄位");
+        assert!(
+            seen.load(Ordering::Relaxed),
+            "「資料夾:」欄還是捲在尾端，開頭那幾個字看不到"
+        );
+    }
+
     /// 專案檔靠 `module` 欄位認模組；沒有那個欄位的是這個欄位還不存在時
     /// 存的 .p2v，全都是影片專案
     #[test]
@@ -33844,6 +35093,81 @@ mod tests {
         assert_eq!(m.effective().shapes.len(), 1, "併回去之後這段時間用前一段的遮色片");
     }
 
+    /// 文字：預覽畫的是「這一秒該出現的那幾段」，時間軸走到哪就跟到哪；
+    /// 試播中改看播放頭的位置。空白的段落不算，輸出也不會為它跑一趟
+    #[test]
+    fn movie_text_follows_the_timeline_and_the_clip_playhead() {
+        let mut m = MovieTool::default();
+        m.info = Some(VideoInfo {
+            w: 1920,
+            h: 1080,
+            fps: 30.0,
+            secs: 100.0,
+            audio: Some("aac".into()),
+        });
+        // 新增的一段預設整支都顯示
+        let mut first = MovieText::new(100.0);
+        first.item.text = "開場".into();
+        assert_eq!((first.start, first.end), (0.0, 100.0));
+        let mut second = MovieText::new(100.0);
+        second.item.text = "後半".into();
+        second.start = 50.0;
+        let blank = MovieText::new(100.0); // 只有位置、沒有字
+        m.texts = vec![first, second, blank];
+
+        m.at = 10.0;
+        assert_eq!(m.texts_now(), [0], "只有第一段的時間範圍蓋到 10 秒");
+        m.at = 60.0;
+        assert_eq!(m.texts_now(), [0, 1], "兩段都蓋到 60 秒；空白那段永遠不算");
+
+        // 試播中看的是播放頭，不是時間軸停的位置
+        m.show_clip = true;
+        m.clip = Some(MovieClip {
+            key: ClipKey {
+                src: PathBuf::from("a.mp4"),
+                at: 80.0,
+                secs: 5.0,
+                size: MovieSize::Source,
+                crop: Crop::default(),
+                segs: Vec::new(),
+            },
+            frames: movie::ClipFrames {
+                fps: 20.0,
+                base: Vec::new(),
+                after: Vec::new(),
+            },
+        });
+        m.play_pos = 2.0;
+        assert_eq!(m.preview_secs(), 82.0);
+        assert_eq!(m.texts_now(), [0, 1]);
+        m.show_clip = false;
+        m.at = 20.0;
+        assert_eq!(m.preview_secs(), 20.0, "沒在試播就是時間軸停的位置");
+        assert_eq!(m.texts_now(), [0]);
+
+        // 換一批就整組收掉：上一批打的字留到下一批只會莫名其妙
+        m.music_path = Some(PathBuf::from("bg.mp3"));
+        m.reset_batch(None, None);
+        assert!(m.texts.is_empty() && m.music_path.is_none());
+    }
+
+    /// 背景音樂：選了檔才算數（檔案不在就當作沒配樂），音量照介面的範圍夾住
+    #[test]
+    fn movie_music_needs_a_file_that_is_still_there() {
+        let mut m = MovieTool::default();
+        assert!(m.music_track().is_none(), "沒選檔就是不配樂");
+        m.music_path = Some(PathBuf::from("這個檔不存在.mp3"));
+        assert!(m.music_track().is_none(), "檔案不在了也當作沒配樂");
+        // 拿本專案自己的檔案當「確實存在」的音樂檔（測試不依賴外部素材）
+        let here = PathBuf::from(file!());
+        assert!(here.is_file(), "測試前提：找得到自己的原始碼檔");
+        m.music_path = Some(here);
+        m.music_volume = 250;
+        m.src_volume = -10;
+        let t = m.music_track().expect("檔案在就要配得起來");
+        assert_eq!((t.volume, t.src_volume), (200, 0), "音量夾在 0~200");
+    }
+
     /// 裁切：先裁再縮決定成品尺寸；調整裁切範圍時畫布是整格（成品尺度），
     /// 進出調整都要重取底圖，遮色片工具與試播要讓開
     #[test]
@@ -33957,7 +35281,17 @@ mod tests {
         let g = m.active_grade();
         assert_eq!(g.len(), 1, "簡易模式照樣調色");
         assert!(g[0].shapes.is_empty(), "簡易模式不套調色的遮色片");
+        // 簡易模式的介面只有一組滑桿（＝第一區），所以第二、三區調過的
+        // 也不該偷偷套上去；數字留著，切回專業就回來
+        m.grade.zones[1].grade.exposure = -40;
+        m.grade.zones[2].grade.saturation = 50;
+        let g = m.active_grade();
+        assert_eq!(g.len(), 1, "簡易模式只套第一區");
+        assert_eq!(g[0].grade.exposure, 30, "套的是第一區那一組");
         m.pro = true;
+        assert_eq!(m.active_grade().len(), 3, "切回專業，三區都回來");
+        m.grade.zones[1].grade = Adjustments::default();
+        m.grade.zones[2].grade = Adjustments::default();
         // 對著調色那份的工具：沒勾套用就沒東西可看，勾了才有
         m.mask_target = MaskTarget::Grade(0);
         assert!(m.target_can_show());
@@ -34228,6 +35562,9 @@ mod tests {
             None,
             &codec,
             workers,
+            // 基準量的是去煙本身，文字與配樂不進來攪和
+            None,
+            None,
             &cancel,
             &|n| *done.lock().unwrap() = n,
         )

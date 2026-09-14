@@ -23,13 +23,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use ab_glyph::FontVec;
 use ffmpeg_sidecar::command::FfmpegCommand;
 use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel};
 use image::RgbImage;
 
 use crate::dehaze::{self, SmokeParams};
-use crate::edit;
-use crate::{ActiveGrade, MaskKey};
+use crate::edit::{self, TextItem};
+use crate::{ActiveGrade, MaskKey, SubtitleStyle};
 
 /// 一支影片的基本資料（開檔時量一次，之後預覽與輸出都照它走）
 #[derive(Clone, Debug)]
@@ -246,7 +247,11 @@ struct Encoder {
 }
 
 impl Encoder {
-    /// 開一個從 stdin 吃 rawvideo、把聲音從原始檔搬過來的編碼行程
+    /// 開一個從 stdin 吃 rawvideo、把聲音從原始檔搬過來的編碼行程。
+    ///
+    /// 加了背景音樂（`music`）時聲音就不能照搬了：原聲與音樂各自套音量、
+    /// 再混成一條（見 [`audio_mix_filter`]），`secs` 是算音樂淡出起點用的片長
+    #[allow(clippy::too_many_arguments)]
     fn start(
         src: &Path,
         dst: &Path,
@@ -255,6 +260,8 @@ impl Encoder {
         fps: f32,
         audio: Option<&str>,
         codec: &[&str],
+        music: Option<&MusicTrack>,
+        secs: f64,
     ) -> Result<Self, String> {
         let mut cmd = FfmpegCommand::new();
         cmd.arg("-y")
@@ -272,11 +279,24 @@ impl Encoder {
                 "pipe:0",
             ])
             // 第 1 個輸入：原始檔，只為了把聲音搬過來
-            .input(src.to_string_lossy())
-            .args(["-map", "0:v:0"]);
-        if audio.is_some() {
+            .input(src.to_string_lossy());
+        // 第 2 個輸入：背景音樂。無限循環讀進來，比影片短就自己接下去、
+        // 長的部分由 -shortest 在影片結束時收掉
+        if let Some(m) = music {
+            cmd.args(["-stream_loop", "-1"]);
+            cmd.input(m.path.to_string_lossy());
+        }
+        cmd.args(["-map", "0:v:0"]);
+        match music {
+            Some(m) => {
+                cmd.args(["-filter_complex", &audio_mix_filter(m, 1, audio.is_some(), secs)])
+                    .args(["-map", "[aout]"]);
+            }
             // 加問號＝找不到就算了，不要整個失敗
-            cmd.args(["-map", "1:a:0?"]);
+            None if audio.is_some() => {
+                cmd.args(["-map", "1:a:0?"]);
+            }
+            None => {}
         }
         cmd.args([
             // yuv420p 只吃偶數邊長；來源是奇數（少見但存在）就切掉最後一列/行
@@ -285,10 +305,15 @@ impl Encoder {
             "-pix_fmt",
             "yuv420p",
         ])
-        .args(codec)
-        .args(audio_args(audio));
-        if audio.is_some() {
-            // 聲音比畫面長（或反過來）時以短的那個為準，結尾才不會拖一段黑畫面
+        .args(codec);
+        match music {
+            // 混過的聲音沒得照搬，一律重編
+            Some(_) => cmd.args(["-c:a", "aac", "-b:a", "192k"]),
+            None => cmd.args(audio_args(audio)),
+        };
+        if audio.is_some() || music.is_some() {
+            // 聲音比畫面長（或反過來）時以短的那個為準，結尾才不會拖一段黑畫面。
+            // 音樂是無限循環讀進來的，更是非有這一個不可
             cmd.arg("-shortest");
         }
         cmd.output(dst.to_string_lossy());
@@ -364,6 +389,78 @@ pub struct ExportSeg {
     pub params: SmokeParams,
     /// 這一段真的會作用的調色遮色區，照 1、2、3 的順序**依序**疊上去
     pub grades: Vec<ActiveGrade>,
+}
+
+/// 燒進畫面的一段文字：內容、位置與大小和照片那邊同一套（[`TextItem`]），
+/// 另外記它在第幾秒到第幾秒之間出現（**每一支影片各自從 0 秒起算**）
+#[derive(Clone)]
+pub struct TimedText {
+    pub item: TextItem,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// 整支影片的文字：樣式與字型全部共用，一段一段各有自己的時間
+/// （字型檔動輒二十 MB，讀一次就整支用到底）
+pub struct TextJob {
+    pub items: Vec<TimedText>,
+    pub style: SubtitleStyle,
+    pub font: FontVec,
+}
+
+/// 第 `t` 秒那一格要畫上去的幾段（含起點、不含終點：相鄰兩段接得起來、
+/// 不會有一格同時畫兩段）。預覽那邊也照這一條挑，看到的才與成品一致
+pub fn texts_at(items: &[TimedText], t: f64) -> Vec<TextItem> {
+    items
+        .iter()
+        .filter(|x| t + 1e-6 >= x.start && t < x.end - 1e-6)
+        .map(|x| x.item.clone())
+        .collect()
+}
+
+impl TextJob {
+    /// 這一份到底有沒有東西要畫（全是空白的段落不算）
+    pub fn has_text(&self) -> bool {
+        self.items.iter().any(|x| x.item.visible())
+    }
+}
+
+/// 疊在影片上的背景音樂。原聲與音樂各有自己的音量，原聲拉到 0
+/// 就等於「只要音樂」（見 [`audio_mix_filter`]）
+#[derive(Clone)]
+pub struct MusicTrack {
+    pub path: PathBuf,
+    /// 音樂的音量（百分比，100＝原樣）
+    pub volume: i32,
+    /// 影片原聲的音量（百分比，0＝不要原聲）
+    pub src_volume: i32,
+    /// 音樂結尾自動淡出（最多 2 秒）
+    pub fade_out: bool,
+}
+
+/// 背景音樂的 `-filter_complex`：原聲是第 `src_idx` 個輸入、音樂是第
+/// `music_idx` 個，混成 `[aout]`。`secs` 是影片長度（算淡出的起點用）。
+///
+/// 沒有原聲（或原聲音量調到 0）時就只有音樂那一條，不必走 amix。
+/// 混的時候用 `normalize=0`：amix 預設會把每一條都除以條數，那樣兩條滑桿
+/// 標 100 卻只剩一半，使用者調起來對不上
+fn audio_mix_filter(m: &MusicTrack, src_idx: usize, has_src: bool, secs: f64) -> String {
+    let vol = |v: i32| format!("volume={:.3}", v.max(0) as f64 / 100.0);
+    let music_idx = src_idx + 1;
+    // 音樂的結尾淡出：最多 2 秒，短片按總長一半縮短（與照片轉影片同一條規矩）
+    let mut music = vol(m.volume);
+    if m.fade_out && secs > 1.0 {
+        let d = (secs * 0.5).min(2.0);
+        music.push_str(&format!(",afade=t=out:st={:.3}:d={d:.3}", secs - d));
+    }
+    if !has_src || m.src_volume <= 0 {
+        return format!("[{music_idx}:a]{music}[aout]");
+    }
+    format!(
+        "[{src_idx}:a]{}[a0];[{music_idx}:a]{music}[a1];\
+         [a0][a1]amix=inputs=2:normalize=0:duration=longest[aout]",
+        vol(m.src_volume)
+    )
 }
 
 /// 試播用的一小段：原始與處理後各一份，逐格放在記憶體裡循環播
@@ -498,10 +595,13 @@ pub fn prepare_clip(
                     params: p,
                     grades: &segs[k].grades,
                     weights: wt,
+                    // 試播不燒文字：畫面上那幾段是 egui 直接畫在預覽上的
+                    // （見 `App::ui_movie_text_overlay`），燒進來會變成兩層
+                    texts: Vec::new(),
                 }
             })
             .collect();
-        for o in dehaze_frames(chunk, &jobs, interp_stride(fps)) {
+        for o in dehaze_frames(chunk, &jobs, interp_stride(fps), None) {
             after.push(o.ok_or_else(|| "影格處理失敗".to_string())?);
         }
         done += chunk.len();
@@ -510,11 +610,13 @@ pub fn prepare_clip(
     Ok(ClipFrames { fps, base, after })
 }
 
-/// 一格要怎麼處理：哪一組去煙參數、哪幾區調色（權重圖照區排，None＝那區整張調）
+/// 一格要怎麼處理：哪一組去煙參數、哪幾區調色（權重圖照區排，None＝那區整張調）、
+/// 這一格的時間點落在哪幾段文字裡（樣式與字型是整支共用的，見 [`TextJob`]）
 struct FrameJob<'a> {
     params: &'a SmokeParams,
     grades: &'a [ActiveGrade],
     weights: &'a [Option<Vec<f32>>],
+    texts: Vec<TextItem>,
 }
 
 /// 奇數格能不能用前後兩格內插的門檻：縮圖上「中間那格與前後平均的差」佔亮度的
@@ -596,7 +698,12 @@ fn batch_frames(workers: usize, w: u32, h: u32) -> usize {
 /// 畫面變動大的那一格（快速搖鏡、切換）不內插、照算——用縮圖比一比就知道
 /// （見 [`frame_diff`]）；批次尾端沒有下一個錨點可借的格也照算。
 /// `MOVIE_INTERP_DEBUG=1` 會把每一格的判定印到 stderr
-fn dehaze_frames(imgs: &[RgbImage], jobs: &[FrameJob], stride: usize) -> Vec<Option<RgbImage>> {
+fn dehaze_frames(
+    imgs: &[RgbImage],
+    jobs: &[FrameJob],
+    stride: usize,
+    text: Option<&TextJob>,
+) -> Vec<Option<RgbImage>> {
     let n = imgs.len().min(jobs.len());
     if n == 0 {
         return Vec::new();
@@ -668,6 +775,10 @@ fn dehaze_frames(imgs: &[RgbImage], jobs: &[FrameJob], stride: usize) -> Vec<Opt
                     for (z, g) in job.grades.iter().enumerate() {
                         apply_active_grade(&mut out, g, job.weights.get(z).and_then(|w| w.as_deref()));
                     }
+                    // 文字疊在最上面（調色不會動到它，與去煙霧模組同一個順序）
+                    if let Some(t) = text.filter(|_| !job.texts.is_empty()) {
+                        edit::draw_texts(&mut out, &job.texts, &t.style, &t.font);
+                    }
                     Some(out)
                 })
             })
@@ -692,7 +803,9 @@ fn seg_at(segs: &[ExportSeg], t: f64) -> usize {
 /// `first` 是這一批第一格的序號、`fps` 拿來把序號換算成秒，逐格挑它落在哪一段
 /// （一批可能跨兩段）；`weights` 是每一段、每一個調色遮色區的權重圖
 /// （見 [`grade_weights`]，外層照段排、內層照區排，None＝那一區整張調），
-/// 整支影片的每一格尺寸相同，所以呼叫端每段只鋪一次、每一批重複用
+/// 整支影片的每一格尺寸相同，所以呼叫端每段只鋪一次、每一批重複用。
+/// `text` 是要燒上去的文字，同樣照秒數逐格挑（見 [`texts_at`]）
+#[allow(clippy::too_many_arguments)]
 fn dehaze_batch(
     frames: Vec<Vec<u8>>,
     w: u32,
@@ -701,6 +814,7 @@ fn dehaze_batch(
     fps: f32,
     segs: &[ExportSeg],
     weights: &[Vec<Option<Vec<f32>>>],
+    text: Option<&TextJob>,
 ) -> Result<Vec<Vec<u8>>, String> {
     let stride = interp_stride(fps);
     let fps = fps.max(1e-3) as f64;
@@ -713,15 +827,17 @@ fn dehaze_batch(
     // （批次大小本來就是照核心數決定的，見 crate::movie_workers）
     let jobs: Vec<FrameJob> = (0..imgs.len())
         .map(|j| {
-            let k = seg_at(segs, (first + j as u64) as f64 / fps);
+            let t = (first + j as u64) as f64 / fps;
+            let k = seg_at(segs, t);
             FrameJob {
                 params: &segs[k].params,
                 grades: &segs[k].grades,
                 weights: weights.get(k).map(Vec::as_slice).unwrap_or(&[]),
+                texts: text.map(|x| texts_at(&x.items, t)).unwrap_or_default(),
             }
         })
         .collect();
-    dehaze_frames(&imgs, &jobs, stride)
+    dehaze_frames(&imgs, &jobs, stride, text)
         .into_iter()
         .map(|o| o.map(RgbImage::into_raw))
         .collect::<Option<Vec<_>>>()
@@ -734,6 +850,8 @@ fn dehaze_batch(
 /// 套那一段的去煙參數與調色（調色在去煙之後套，見 [`apply_active_grade`]）；
 /// `codec` 是編碼器參數（由 [`crate::detect_h264_encoder`] 決定，與照片轉影片
 /// 用的是同一組）；`workers` 是同時處理幾格；
+/// `text` 是要燒進畫面的文字（照秒數逐格挑，見 [`TextJob`]）；
+/// `music` 是要混進去的背景音樂（見 [`MusicTrack`]）；
 /// `cancel` 被設起就中止並把寫到一半的檔案清掉；
 /// `progress` 每處理完一批回報一次累計格數
 #[allow(clippy::too_many_arguments)]
@@ -746,6 +864,8 @@ pub fn export(
     scale: Option<(u32, u32)>,
     codec: &[&str],
     workers: usize,
+    text: Option<&TextJob>,
+    music: Option<&MusicTrack>,
     cancel: &AtomicBool,
     progress: &dyn Fn(u64),
 ) -> Result<(), String> {
@@ -807,6 +927,8 @@ pub fn export(
                             info.fps,
                             info.audio.as_deref(),
                             codec,
+                            music,
+                            info.secs,
                         ) {
                             Ok(e) => enc = Some(e),
                             Err(e) => {
@@ -847,7 +969,7 @@ pub fn export(
         for w in grade_w.iter_mut().take(k0) {
             w.clear();
         }
-        let outs = match dehaze_batch(batch, fw, fh, done, info.fps, segs, &grade_w) {
+        let outs = match dehaze_batch(batch, fw, fh, done, info.fps, segs, &grade_w, text) {
             Ok(o) => o,
             Err(e) => {
                 failed = Some(e);
@@ -955,6 +1077,54 @@ pub fn concat(parts: &[PathBuf], dst: &Path) -> Result<(), String> {
     }
 }
 
+/// 把背景音樂混進一支**已經做好**的影片，寫成另一支。
+///
+/// 合併輸出時走這一條：各段是分開跑的，音樂要是各段各配一次，接起來會變成
+/// 每換一段音樂就從頭放。所以各段先不配樂，接好之後整支再配一次。
+/// 畫面直接照搬（`-c:v copy`），只有聲音重編，所以這一步很快。
+///
+/// `secs` 是接好那一支的長度（算音樂淡出的起點用）、`has_audio` 是它本身
+/// 有沒有聲音
+pub fn add_music(
+    src: &Path,
+    dst: &Path,
+    m: &MusicTrack,
+    secs: f64,
+    has_audio: bool,
+) -> Result<(), String> {
+    let mut cmd = FfmpegCommand::new();
+    cmd.arg("-y")
+        .input(src.to_string_lossy())
+        .args(["-stream_loop", "-1"])
+        .input(m.path.to_string_lossy())
+        .args(["-map", "0:v:0"])
+        .args(["-filter_complex", &audio_mix_filter(m, 0, has_audio, secs)])
+        .args(["-map", "[aout]"])
+        .args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"])
+        .arg("-shortest")
+        .output(dst.to_string_lossy());
+    let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
+    let mut errs: Vec<String> = Vec::new();
+    if let Ok(iter) = child.iter() {
+        for ev in iter {
+            if let FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, m) = ev {
+                errs.push(m);
+            }
+        }
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    if ok && dst.exists() {
+        Ok(())
+    } else {
+        let _ = std::fs::remove_file(dst);
+        Err(if errs.is_empty() {
+            "配樂失敗".into()
+        } else {
+            errs.join("\n")
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,6 +1156,176 @@ mod tests {
         // 60p 每三格一份場、30p 每兩格
         assert_eq!(interp_stride(59.94), 3);
         assert_eq!(interp_stride(29.97), 2);
+    }
+
+    fn timed(start: f64, end: f64, s: &str) -> TimedText {
+        TimedText {
+            item: TextItem {
+                text: s.into(),
+                ..Default::default()
+            },
+            start,
+            end,
+        }
+    }
+
+    /// 文字照秒數挑：含起點、不含終點，所以相鄰兩段接得起來、
+    /// 不會有一格同時畫到兩段
+    #[test]
+    fn timed_text_picks_by_second_and_does_not_overlap_at_the_seam() {
+        let items = vec![timed(0.0, 3.0, "前"), timed(3.0, 6.0, "後")];
+        let names =
+            |t: f64| -> Vec<String> { texts_at(&items, t).into_iter().map(|x| x.text).collect() };
+        assert_eq!(names(0.0), ["前"], "第一段從 0 秒就要出現");
+        assert_eq!(names(2.99), ["前"]);
+        assert_eq!(names(3.0), ["後"], "接縫上只有後面那一段");
+        assert_eq!(names(5.99), ["後"]);
+        assert!(names(6.0).is_empty(), "過了終點就不畫");
+    }
+
+    /// 背景音樂的音軌：有原聲就兩條混起來（不讓 amix 自己除以二），
+    /// 原聲音量拉到 0（或影片本來就沒聲音）就只剩音樂那一條
+    #[test]
+    fn audio_mix_keeps_both_volumes_and_drops_the_source_at_zero() {
+        let m = MusicTrack {
+            path: PathBuf::from("bg.mp3"),
+            volume: 60,
+            src_volume: 120,
+            fade_out: false,
+        };
+        let both = audio_mix_filter(&m, 1, true, 30.0);
+        assert!(both.contains("[1:a]volume=1.200[a0]"), "原聲的音量：{both}");
+        assert!(both.contains("[2:a]volume=0.600[a1]"), "音樂的音量：{both}");
+        assert!(both.contains("normalize=0"), "混的時候不要再除以條數：{both}");
+        // 影片沒聲音、或原聲調到 0：只有音樂，不必走 amix
+        let only = audio_mix_filter(&m, 1, false, 30.0);
+        assert_eq!(only, "[2:a]volume=0.600[aout]");
+        let muted = MusicTrack { src_volume: 0, ..m.clone() };
+        assert_eq!(audio_mix_filter(&muted, 1, true, 30.0), "[2:a]volume=0.600[aout]");
+        // 淡出：最多兩秒，短片按總長一半縮
+        let fading = MusicTrack { fade_out: true, ..m.clone() };
+        assert!(audio_mix_filter(&fading, 1, false, 30.0).contains("afade=t=out:st=28.000:d=2.000"));
+        assert!(audio_mix_filter(&fading, 1, false, 3.0).contains("afade=t=out:st=1.500:d=1.500"));
+        assert!(!audio_mix_filter(&fading, 1, false, 0.5).contains("afade"), "太短就不淡出");
+        // 合併輸出那一條：原聲是第 0 個輸入、音樂是第 1 個
+        let merged = audio_mix_filter(&m, 0, true, 30.0);
+        assert!(merged.contains("[0:a]volume=1.200[a0]") && merged.contains("[1:a]volume=0.600[a1]"));
+    }
+
+    /// 文字真的燒進畫面、音樂真的混進音軌（平常不跑，要手動點名；ffmpeg 要在
+    /// PATH 上，字型用系統的微軟正黑體）：
+    /// `cargo test --release --bin photo2video -- --ignored movie_export_burns_text_and_music --nocapture`
+    ///
+    /// 自己用 ffmpeg 生一支五秒的測試片與一段兩秒的音樂（音樂比影片短，
+    /// 順便試到循環），跑兩次輸出——一次帶文字、一次不帶——再比同一個時間點的
+    /// 那一格：文字時間內要不一樣、時間外要一模一樣
+    #[test]
+    #[ignore]
+    fn movie_export_burns_text_and_music() {
+        let dir = std::env::temp_dir().join("p2v_text_music");
+        std::fs::create_dir_all(&dir).expect("建不了暫存資料夾");
+        let (src, music) = (dir.join("src.mp4"), dir.join("bg.mp3"));
+        let ff = |args: &[&str]| {
+            let ok = FfmpegCommand::new()
+                .args(args)
+                .spawn()
+                .expect("FFmpeg 啟動失敗")
+                .wait()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "ffmpeg 失敗：{args:?}");
+        };
+        ff(&[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=5",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=5",
+            "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            &src.to_string_lossy(),
+        ]);
+        ff(&[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "sine=frequency=880:duration=2",
+            &music.to_string_lossy(),
+        ]);
+
+        let info = probe(&src).expect("讀不到測試片");
+        assert!(info.audio.is_some(), "測試片要有聲音");
+        let segs = vec![ExportSeg {
+            start: 0.0,
+            params: SmokeParams::default(),
+            grades: Vec::new(),
+        }];
+        let codec = ["-c:v", "libx264", "-preset", "ultrafast"];
+        let cancel = AtomicBool::new(false);
+        let track = MusicTrack {
+            path: music.clone(),
+            volume: 60,
+            src_volume: 40,
+            fade_out: true,
+        };
+        // 文字只蓋前 2.5 秒，時間外那一格才驗得出「沒被畫到」
+        let font = ["msjh.ttc", "msyh.ttc", "arial.ttf"]
+            .iter()
+            .map(|f| PathBuf::from(r"C:\Windows\Fonts").join(f))
+            .find_map(|p| edit::load_font(&p))
+            .expect("找不到可用的系統字型");
+        let text = TextJob {
+            items: vec![TimedText {
+                item: TextItem {
+                    text: "測試文字".into(),
+                    x: 0.5,
+                    y: 0.5,
+                    size: 200,
+                    rot: 0.0,
+                },
+                start: 0.0,
+                end: 2.5,
+            }],
+            style: SubtitleStyle::default(),
+            font,
+        };
+        let run = |dst: &Path, text: Option<&TextJob>, music: Option<&MusicTrack>| {
+            export(
+                &src, dst, &info, &segs, None, None, &codec, 4, text, music, &cancel, &|_| {},
+            )
+            .expect("輸出失敗");
+        };
+        let plain = dir.join("plain.mp4");
+        let fancy = dir.join("fancy.mp4");
+        run(&plain, None, None);
+        run(&fancy, Some(&text), Some(&track));
+
+        // 文字：時間內的那一格要被畫上字、時間外的不該有字。
+        //
+        // 不能要求逐位元組相等——H.264 是失真的，前面幾格的內容不同就會讓
+        // 編碼器在後面幾格也做出不一樣的決定。改成數「差很多的像素有幾個」：
+        // 白字畫在測試圖上，差距是幾十到兩百多，編碼雜訊則落在個位數
+        let at = |p: &Path, t: f64| preview_frame(p, t, None, None).expect("讀不到那一格");
+        let loud = |t: f64| -> usize {
+            let (a, b) = (at(&plain, t).into_raw(), at(&fancy, t).into_raw());
+            a.iter().zip(&b).filter(|(x, y)| x.abs_diff(**y) > 60).count()
+        };
+        let (inside, outside) = (loud(1.0), loud(4.0));
+        assert!(
+            inside > 2000,
+            "第 1 秒在文字的時間內，畫面應該被畫上字（只有 {inside} 個像素差很多）"
+        );
+        assert!(
+            outside * 20 < inside,
+            "第 4 秒已經過了文字的終點，不該再有字（時間外 {outside}、時間內 {inside}）"
+        );
+
+        // 音樂：長度沒被無限循環的音樂拖長，而且確實有一條音軌
+        let out = probe(&fancy).expect("讀不到成品");
+        assert!(out.audio.is_some(), "配了樂，成品要有聲音");
+        assert!(
+            (out.secs - info.secs).abs() < 0.5,
+            "成品長度 {:.2} 秒與來源 {:.2} 秒差太多（音樂是無限循環讀進來的，\
+             -shortest 沒收住的話會一路寫下去）",
+            out.secs,
+            info.secs
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 內插到底差多少（平常不跑，要手動點名；ffmpeg 要在 PATH 上）：
