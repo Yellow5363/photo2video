@@ -31,6 +31,8 @@ mod enhance;
 mod movie;
 use movie::{MovieMsg, VideoInfo};
 
+mod project;
+
 mod stack;
 use stack::BlendMode;
 
@@ -83,7 +85,7 @@ mod theme {
 /// 1. 這裡加一個 variant，並補進 [`Module::ALL`]（順序＝模組列由左到右的順序）
 /// 2. [`Module::label`] / [`Module::icon`] / [`Module::hint`] 各補一條分支
 /// 3. [`App::ui_module_body`] 加一條分支，畫這個模組自己的面板
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Module {
     /// 照片轉影片（本程式最早、也是主要的功能）
     Video,
@@ -145,6 +147,32 @@ impl Module {
             Module::Files => "資料備份：把來源資料夾同步到目的，新的蓋掉舊的、缺的補齊",
         }
     }
+
+    /// 專案檔裡的模組識別字串；檔案管理沒有專案可存
+    fn project_kind(self) -> Option<&'static str> {
+        Some(match self {
+            Module::Video => project::KIND_VIDEO,
+            Module::Dehaze => project::KIND_DEHAZE,
+            Module::Stack => project::KIND_STACK,
+            Module::Movie => project::KIND_MOVIE,
+            Module::Enhance => project::KIND_ENHANCE,
+            Module::Files => return None,
+        })
+    }
+
+    /// 專案檔名開頭的起始值。使用者存過一次之後改用他自己取的名字
+    /// （見 [`project::saved_name`]）
+    fn project_prefix(self) -> &'static str {
+        match self {
+            Module::Video => "轉影片",
+            Module::Dehaze => "去煙霧",
+            Module::Stack => "疊圖",
+            Module::Movie => "影片去煙",
+            Module::Enhance => "優化",
+            Module::Files => "",
+        }
+    }
+
 }
 
 /// 功能表列點下去要做的事。選單的 closure 借著 `self`，開檔案／訊息對話框
@@ -465,9 +493,10 @@ impl Crop {
 }
 
 /// 裁切要固定成哪個長寬比
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 enum CropAspect {
     /// 自由：四角各拖各的
+    #[default]
     Free,
     /// 跟原圖同比例
     Original,
@@ -823,6 +852,9 @@ const RECENT_PROJECTS_MAX: usize = 8;
 struct ProjectFile {
     /// 專案檔格式版本，目前為 1
     version: u32,
+    /// 這份專案是哪個模組的（見 [`project::parse`]）。這個欄位還不存在時
+    /// 存出來的 .p2v 全都是影片專案，所以預設值就是它
+    module: String,
     /// 存檔當下的程式版本（僅供除錯參考）
     app_version: String,
     photos: Vec<PathBuf>,
@@ -869,6 +901,7 @@ impl Default for ProjectFile {
         let style = SubtitleStyle::default();
         Self {
             version: 1,
+            module: project::KIND_VIDEO.into(),
             app_version: String::new(),
             photos: Vec::new(),
             fps: 10,
@@ -1633,9 +1666,10 @@ fn exe_link_time() -> Option<u64> {
     None
 }
 
-/// unix 秒數寫成本機時間「2026-09-11 11:22:25」
+/// unix 秒數換成本機時間的年、月、日、時、分、秒；換不出來（非 Windows、
+/// 或系統呼叫失敗）就是 None
 #[cfg(windows)]
-fn local_time(unix: u64) -> String {
+fn local_parts(unix: u64) -> Option<(u16, u16, u16, u16, u16, u16)> {
     #[repr(C)]
     struct FileTime {
         lo: u32,
@@ -1671,18 +1705,29 @@ fn local_time(unix: u64) -> String {
         FileTimeToLocalFileTime(&utc, &mut local) != 0
             && FileTimeToSystemTime(&local, &mut st) != 0
     };
-    if !ok {
-        return format!("unix {unix}");
-    }
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        st.year, st.month, st.day, st.hour, st.minute, st.second
-    )
+    ok.then_some((st.year, st.month, st.day, st.hour, st.minute, st.second))
 }
 
 #[cfg(not(windows))]
+fn local_parts(_unix: u64) -> Option<(u16, u16, u16, u16, u16, u16)> {
+    None
+}
+
+/// unix 秒數寫成本機時間「2026-09-11 11:22:25」
 fn local_time(unix: u64) -> String {
-    format!("unix {unix}")
+    match local_parts(unix) {
+        Some((y, mo, d, h, mi, s)) => {
+            format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+        }
+        None => format!("unix {unix}"),
+    }
+}
+
+/// 現在的本機日期與時間，寫成專案檔名用的「20260914-1300」
+/// （1300＝下午一點）。取不到本機時間就是 None
+fn date_stamp() -> Option<String> {
+    let (y, mo, d, h, mi, _) = local_parts(unix_now())?;
+    Some(format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}"))
 }
 
 /// 一個最上層視窗的樣子（[`win_probe::snapshot`] 抓的；抽成純資料是為了
@@ -2131,18 +2176,26 @@ enum LastDir {
     DehazeOutput,
     /// 去煙霧模組：要疊上去的圖片（浮水印、簽名檔之類，通常不跟照片放一起）
     DehazeOverlay,
+    /// 去煙霧模組：專案檔（預設位置見 [`project::project_dir`]）
+    DehazeProject,
     /// 煙火疊圖模組：要疊的照片
     StackPhotos,
     /// 煙火疊圖模組：「另存新檔」的存放資料夾
     StackOutput,
+    /// 煙火疊圖模組：專案檔（預設位置見 [`project::project_dir`]）
+    StackProject,
     /// 影片去煙霧模組：要處理的影片
     MovieSource,
     /// 影片去煙霧模組：輸出的影片
     MovieOutput,
+    /// 影片去煙霧模組：專案檔（預設位置見 [`project::project_dir`]）
+    MovieProject,
     /// 優化影像模組：要處理的照片
     EnhancePhotos,
     /// 優化影像模組：「另存新檔」的存放資料夾
     EnhanceOutput,
+    /// 優化影像模組：專案檔（預設位置見 [`project::project_dir`]）
+    EnhanceProject,
     /// 檔案管理 ▸ 資料備份：來源資料夾
     BackupSource,
     /// 檔案管理 ▸ 資料備份：目的資料夾
@@ -2152,7 +2205,7 @@ enum LastDir {
 impl LastDir {
     /// 全部的用途。加新欄位時記得補進來——測試會拿它檢查沒有兩個用途
     /// 共用同一個 config 欄位
-    const ALL: [LastDir; 15] = [
+    const ALL: [LastDir; 19] = [
         LastDir::VideoPhotos,
         LastDir::VideoProject,
         LastDir::VideoMusic,
@@ -2160,12 +2213,16 @@ impl LastDir {
         LastDir::DehazePhotos,
         LastDir::DehazeOutput,
         LastDir::DehazeOverlay,
+        LastDir::DehazeProject,
         LastDir::StackPhotos,
         LastDir::StackOutput,
+        LastDir::StackProject,
         LastDir::MovieSource,
         LastDir::MovieOutput,
+        LastDir::MovieProject,
         LastDir::EnhancePhotos,
         LastDir::EnhanceOutput,
+        LastDir::EnhanceProject,
         LastDir::BackupSource,
         LastDir::BackupDest,
     ];
@@ -2180,15 +2237,31 @@ impl LastDir {
             LastDir::DehazePhotos => "dir_dehaze_photos",
             LastDir::DehazeOutput => "dir_dehaze_output",
             LastDir::DehazeOverlay => "dir_dehaze_overlay",
+            LastDir::DehazeProject => "dir_dehaze_project",
             LastDir::StackPhotos => "dir_stack_photos",
             LastDir::StackOutput => "dir_stack_output",
+            LastDir::StackProject => "dir_stack_project",
             LastDir::MovieSource => "dir_movie_source",
             LastDir::MovieOutput => "dir_movie_output",
+            LastDir::MovieProject => "dir_movie_project",
             LastDir::EnhancePhotos => "dir_enhance_photos",
             LastDir::EnhanceOutput => "dir_enhance_output",
+            LastDir::EnhanceProject => "dir_enhance_project",
             LastDir::BackupSource => "dir_backup_source",
             LastDir::BackupDest => "dir_backup_dest",
         }
+    }
+
+    /// 這個模組的專案檔上次停在哪個資料夾；檔案管理沒有專案
+    fn project_of(m: Module) -> Option<LastDir> {
+        Some(match m {
+            Module::Video => LastDir::VideoProject,
+            Module::Dehaze => LastDir::DehazeProject,
+            Module::Stack => LastDir::StackProject,
+            Module::Movie => LastDir::MovieProject,
+            Module::Enhance => LastDir::EnhanceProject,
+            Module::Files => return None,
+        })
     }
 }
 
@@ -2591,16 +2664,19 @@ mod win_probe {
 }
 
 /// 選一個資料夾，並且**真的記住上次選的那一個**：對話框開在它的上一層、
-/// 名字預填進「資料夾:」欄（見 [`win_folder`]）。`fallback` 是還沒記過時
-/// 要從哪裡開始（通常是照片或影片自己所在的資料夾）。
+/// 名字預填進「資料夾:」欄（見 [`win_folder`]）。
+///
+/// `start` 是「這一次應該從哪裡開始」，**給了就用它**——存成品時呼叫端會給
+/// 手上這批照片自己的資料夾（見 [`output_start_dir`]），那比「上次存到哪」
+/// 貼近正在做的事；挑「要處理哪一批」時則給 None，那時上次挑過的地方才是
+/// 最好的起點。
 ///
 /// 選好就順手記下來，呼叫端不必自己再 [`remember_dir`] 一次
-fn pick_folder_remembering(
-    which: LastDir,
-    title: &str,
-    fallback: Option<&Path>,
-) -> Option<PathBuf> {
-    let start = load_last_dir(which).or_else(|| fallback.map(|p| p.to_path_buf()));
+fn pick_folder_remembering(which: LastDir, title: &str, start: Option<&Path>) -> Option<PathBuf> {
+    let start = start
+        .filter(|d| d.is_dir())
+        .map(|p| p.to_path_buf())
+        .or_else(|| load_last_dir(which));
     // 對話框開著時 UI 執行緒就停在這一行，畫面不會更新。看門狗要知道這是
     // 「在等對話框」而不是當掉，否則 15 秒就寫下一筆假的停止回應紀錄，
     // 而且不會被撤銷（撤銷只給對話框狀態，見 [`hang_action`]）——下次開程式
@@ -4555,11 +4631,13 @@ enum StackMsg {
 
 /// 疊圖的調色面板現在調的是哪一份。兩者用的是同一組滑桿，
 /// 但套用的時機完全不同（見 [`App::ui_stack_grade`]）
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 enum GradeTarget {
     /// 縮圖列選著的那一層，**疊進去之前**先套在它身上
     Layer,
     /// 疊好的成品，**疊完之後**才套用（裁切也算在這一邊）
+    /// 預設調的是這一邊（與 [`StackTool::default`] 一致）
+    #[default]
     Output,
 }
 
@@ -5392,9 +5470,10 @@ impl TrackTool {
 /// 以**短邊**為準（1080p＝短邊 1080），直拍的影片才會照它該有的方向縮——
 /// 用寬度或長邊當基準的話，同一個「1080p」在橫拍與直拍上會是兩種東西。
 /// 一律不放大：來源比選的還小就原樣輸出，放大只是讓檔案變大而已
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 enum MovieSize {
     /// 與來源相同（完全不縮）
+    #[default]
     Source,
     /// 短邊縮到這麼多
     Short(u32),
@@ -5444,7 +5523,8 @@ impl MovieSize {
 /// 專業模式可以再勾「套用遮色片」，用與去煙同一套工具圈出**只要調色的地方**
 /// （例如只壓暗地景、只把某一朵煙火的顏色拉鮮豔）；這份遮色片與去煙的那份
 /// 是分開的兩份——去煙的範圍與想調色的範圍本來就不一定是同一塊
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct MovieGrade {
     /// 三個遮色區，各有各的滑桿與遮色片；照順序疊上去
     zones: [GradeZone; GRADE_ZONES],
@@ -5470,7 +5550,8 @@ const GRADE_ZONES: usize = 3;
 ///
 /// 滑桿全歸零＝這一區不作用（不必另外一個開關）；沒勾「套用遮色片」或
 /// 一個形狀都沒畫＝整格都調
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct GradeZone {
     /// 十二條滑桿
     grade: Adjustments,
@@ -5599,7 +5680,8 @@ struct MaskKey {
 /// 鏡頭會動的影片，一份遮色片撐不完整支——在鏡頭移動的地方切一刀、
 /// 每一段各畫各的。其餘設定（去煙滑桿、調色滑桿、羽化與濃度）仍是整支共用：
 /// 那些跟鏡頭在哪沒關係，一段一組反而讓人搞不清楚現在改的是哪一段
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct Segment {
     /// 這一段從第幾秒開始（第一段永遠是 0）
     start: f64,
@@ -6057,6 +6139,23 @@ impl MovieTool {
         true
     }
 
+    /// 把分段收成該有的樣子：至少一段、照 `start` 由小到大排好、第一段從 0 起。
+    ///
+    /// 專案檔可能被手改、或是別的版本寫的，而 [`MovieTool::seg`] 是直接拿
+    /// 索引取值的——一段都沒有會當場 panic
+    fn normalize_segments(&mut self) {
+        if self.segments.is_empty() {
+            self.segments.push(Segment::default());
+        }
+        // NaN 的 start（手改壞的檔）比不出大小，那時維持原順序就好
+        self.segments.sort_by(|a, b| {
+            a.start
+                .partial_cmp(&b.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.segments[0].start = 0.0;
+    }
+
     /// 預覽現在要看的是不是遮罩檢視（專業模式限定）
     fn mask_shown(&self) -> bool {
         self.pro && self.show_mask
@@ -6334,6 +6433,27 @@ impl MovieTool {
         Some(self.size.apply(w, h))
     }
 
+    /// 輸出一支影片（或合併成一支）時，存檔對話框要預帶的檔名（不含副檔名）：
+    /// 「影片去煙_<來源資料夾名>_<解析度>」。
+    ///
+    /// 解析度照 [`MovieTool::out_dims`]——**先裁再縮**，與真正寫出去的那一組
+    /// 相同，也是尺寸下拉右邊顯示的那個數字。換一個尺寸就是換一個檔名，
+    /// 因為這是按下輸出的當下才算的
+    fn out_stem(&self) -> String {
+        let (w, h) = self
+            .out_dims()
+            .or_else(|| self.info.as_ref().map(|i| (i.w, i.h)))
+            .unwrap_or((0, 0));
+        // 用**來源影片的檔名**：一支對一支，認得出是哪一支跑出來的
+        let name = self
+            .src
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        video_file_stem(&name, "去煙", w, h)
+    }
+
     /// 預覽需不需要重算（參數或時間點與畫面上那張不同）
     fn needs_render(&self) -> bool {
         match &self.rendered {
@@ -6428,7 +6548,8 @@ struct EnhanceKey {
 ///
 /// - `grade` 是**逐張量出來的**，每張的值本來就不一樣，動它只可能是在改這一張。
 /// - `local` 是「你想要多少」，量不出來，預設就該整批一起走。
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct EnhanceParams {
     /// 十二條調色滑桿 ＋ 裁切
     grade: Adjustments,
@@ -7270,6 +7391,9 @@ struct App {
     import_found_nothing: bool,
     /// 最近開啟/儲存的專案檔（新的在前），顯示在空狀態畫面供一鍵開啟
     recent_projects: Vec<PathBuf>,
+    /// 最近一次「專案儲存／開啟」的提示與時間，在按鈕旁短暫顯示。
+    /// 五個模組共用一份：同一時間只會有一個模組在畫面上
+    project_note: Option<(String, Instant)>,
     /// 轉檔中的輸出檔路徑；轉檔中關窗或 worker 異常中斷時據此清掉
     /// 半成品檔案（與 run_conversion 失敗時的清理一致），完成後清為 None
     convert_output: Option<PathBuf>,
@@ -7394,6 +7518,7 @@ impl App {
             crash_report: take_last_run_report(),
             import_found_nothing: false,
             recent_projects: load_recent_projects(),
+            project_note: None,
             convert_output: None,
             current_project: None,
             project_saved_at: None,
@@ -7437,7 +7562,7 @@ impl App {
             // 夾帶的照片語意不明，加上去只會弄髒剛開的專案。
             // 專案檔也不能丟給 add_photos——會被 is_image 過濾而靜默沒反應
             if let Some(proj) = initial_files.iter().find(|p| is_project_file(p)) {
-                app.load_project(proj);
+                app.open_project_path(proj, &cc.egui_ctx);
             } else {
                 app.add_photos(initial_files);
             }
@@ -8444,6 +8569,7 @@ impl App {
             .collect();
         ProjectFile {
             version: 1,
+            module: project::KIND_VIDEO.into(),
             app_version: env!("CARGO_PKG_VERSION").into(),
             photos: self.photos.clone(),
             fps: self.fps,
@@ -8510,45 +8636,11 @@ impl App {
         }
     }
 
+    /// 「另存新檔」：跳存檔對話框挑位置與檔名。與另外四個模組共用同一套
+    /// 規則（預設放在照片資料夾底下的「專案」、檔名帶日期時間），
+    /// 已經開著某個 .p2v 時則預帶它自己的名字與資料夾
     fn save_project_dialog(&mut self) {
-        // 預帶目前專案的檔名，另存時不用重打
-        let default_name = self
-            .current_project
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("我的專案.{PROJECT_EXT}"));
-        // 已經有專案檔就從它自己的資料夾開始（比「上次存專案的地方」更貼近
-        // 使用者正在做的事），沒有才用記下來的位置
-        let mut dialog = match self.current_project.as_ref().and_then(|p| p.parent()) {
-            Some(dir) if dir.is_dir() => file_dialog().set_directory(dir),
-            _ => dir_dialog(LastDir::VideoProject),
-        };
-        dialog = dialog
-            .set_title("儲存專案")
-            .add_filter("Photo2Video 專案", &[PROJECT_EXT])
-            .set_file_name(default_name);
-        let Some(mut path) = dialog.save_file() else {
-            return;
-        };
-        remember_dir(LastDir::VideoProject, &path);
-        // 使用者改掉或拿掉副檔名時補回來，之後開啟對話框的過濾器才找得到
-        if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_none_or(|e| !e.eq_ignore_ascii_case(PROJECT_EXT))
-        {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            path.set_file_name(format!("{name}.{PROJECT_EXT}"));
-            // 補完副檔名之後才成立的檔名，存檔對話框沒問過使用者
-            if !confirm_overwrite(&path) {
-                return;
-            }
-        }
-        self.save_project_to(&path);
+        self.save_module_project(Module::Video);
     }
 
     /// 寫入專案檔到指定路徑；成功時更新最近清單與「目前專案」
@@ -8564,15 +8656,7 @@ impl App {
                 return;
             }
         };
-        // 原子寫入：先寫臨時檔再 rename 覆蓋。直接覆寫既有專案檔時若寫到
-        // 一半崩潰/斷電，會損壞使用者辛苦設定的整個專案（照片、調色、文字、
-        // 音樂全丟）。先寫 .tmp 成功才置換，既有專案檔在意外時仍完好。
-        // 臨時檔名帶行程 ID（比照 update_config、temp_path）：兩個視窗同時把
-        // 同一個專案存檔時，才不會共用同一個 .tmp——共用會讓其中一個視窗跳出
-        // 假的「儲存失敗」，甚至讓 rename 搬到另一個視窗覆寫到一半的內容
-        let tmp = path.with_extension(format!("{PROJECT_EXT}.{}.tmp", std::process::id()));
-        let result = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path));
-        match result {
+        match write_project_atomic(path, &json) {
             Ok(()) => {
                 self.remember_recent_project(path);
                 self.current_project = Some(path.to_path_buf());
@@ -8580,7 +8664,6 @@ impl App {
                 self.mark_project_clean(); // 存檔成功＝目前內容即乾淨狀態
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp); // 失敗時不留臨時檔
                 message_dialog()
                     .set_level(rfd::MessageLevel::Error)
                     .set_title("儲存專案失敗")
@@ -8631,23 +8714,12 @@ impl App {
         save_recent_projects(&self.recent_projects);
     }
 
-    fn open_project_dialog(&mut self) {
-        if let Some(path) = dir_dialog(LastDir::VideoProject)
-            .set_title("開啟專案")
-            .add_filter("Photo2Video 專案", &[PROJECT_EXT])
-            .pick_file()
-        {
-            remember_dir(LastDir::VideoProject, &path);
-            self.load_project(&path);
-        }
-    }
-
-    /// 讀入專案檔並還原所有編輯狀態。照片檔已不在原路徑時略過該張並提醒；
-    /// 文字段落的照片編號跟著平移，維持綁在同一張照片上
-    fn load_project(&mut self, path: &Path) {
-        // 與照片清單同因（見 add_photos）：以相對路徑開啟（CLI 參數、
-        // 「開啟方式」）時，字面路徑存進最近清單會隨工作目錄失效
-        let path = &std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    /// 還原一份影片模組的專案。照片檔已不在原路徑時略過該張並提醒；
+    /// 文字段落的照片編號跟著平移，維持綁在同一張照片上。
+    ///
+    /// 檔案的讀取與解析在 [`App::open_project_path`]——要先看過內容才分得出
+    /// 這是哪個模組的專案，解析好的東西沒必要再讀一次檔案
+    fn load_project(&mut self, pf: ProjectFile, path: &Path) {
         // 與「新專案」的確認一致：目前已有照片（可能有未存檔的編輯）時
         // 先確認再取代，否則開啟/拖入其他專案會默默清掉現有工作。
         // 啟動參數與空狀態的最近清單此時照片為空，維持一鍵直開不多問
@@ -8662,23 +8734,6 @@ impl App {
                 return;
             }
         }
-        let pf: ProjectFile = match std::fs::read_to_string(path)
-            .map_err(|e| e.to_string())
-            .and_then(|txt| serde_json::from_str(&txt).map_err(|e| e.to_string()))
-        {
-            Ok(p) => p,
-            Err(e) => {
-                // 開不起來的檔案從最近清單移除，之後不再顯示
-                self.recent_projects.retain(|p| !same_path_ci(p, path));
-                save_recent_projects(&self.recent_projects);
-                message_dialog()
-                    .set_level(rfd::MessageLevel::Error)
-                    .set_title("開啟專案失敗")
-                    .set_description(format!("無法讀取專案檔：\n{e}"))
-                    .show();
-                return;
-            }
-        };
         self.remember_recent_project(path);
         // 之後 Ctrl+S 直接覆寫回這個檔案
         self.current_project = Some(path.to_path_buf());
@@ -8829,29 +8884,275 @@ impl App {
         self.mark_project_clean();
     }
 
+    // ---------- 各模組的專案檔（影片模組那一份在上面） ----------
+
+    /// 切換模組。「專案已儲存／已開啟」的提示是五個模組共用一份的，
+    /// 換模組就收掉——留著會在沒做過那件事的模組裡冒出來
+    fn set_module(&mut self, m: Module) {
+        if self.module != m {
+            self.project_note = None;
+        }
+        self.module = m;
+    }
+
+    /// 目前模組手上那批東西的第一個檔案：專案檔預設就存在它旁邊的
+    /// 「專案」資料夾（見 [`project::project_dir`]）
+    fn project_src(&self, m: Module) -> Option<&Path> {
+        let p = match m {
+            Module::Video => self.photos.first()?,
+            Module::Dehaze => self.smoke.photos.first()?,
+            Module::Stack => self.stack.photos.first()?,
+            Module::Movie => self.movie.src.as_ref()?,
+            Module::Enhance => self.enhance.photos.first()?,
+            Module::Files => return None,
+        };
+        Some(p.as_path())
+    }
+
+    /// 這個模組現在有沒有東西可以存成專案
+    fn project_ready(&self, m: Module) -> bool {
+        match m {
+            Module::Video => !self.photos.is_empty(),
+            Module::Dehaze => !self.smoke.photos.is_empty(),
+            Module::Stack => !self.stack.photos.is_empty(),
+            Module::Movie => self.movie.src.is_some(),
+            Module::Enhance => !self.enhance.photos.is_empty(),
+            Module::Files => false,
+        }
+    }
+
+    /// 把目前模組的編輯狀態打包成專案檔的 JSON
+    fn project_json(&self, m: Module) -> Result<String, serde_json::Error> {
+        match m {
+            Module::Video => serde_json::to_string_pretty(&self.project_data()),
+            Module::Dehaze => serde_json::to_string_pretty(&self.smoke_project_data()),
+            Module::Stack => serde_json::to_string_pretty(&self.stack_project_data()),
+            Module::Movie => serde_json::to_string_pretty(&self.movie_project_data()),
+            Module::Enhance => serde_json::to_string_pretty(&self.enhance_project_data()),
+            Module::Files => Ok(String::new()),
+        }
+    }
+
+    /// 「專案儲存」：把這一次編輯的每一項設定寫成一個 .p2v，下次開回來接著做。
+    ///
+    /// 預設存在那批照片（或影片）資料夾底下的「專案」裡，檔名是
+    /// 「名字－日期－時間」（如 去煙霧-20260914-1300）。使用者在對話框裡把
+    /// 名字改成自己的就記著，下次預帶他那一個，時間的部分照樣換成新的
+    fn save_module_project(&mut self, m: Module) {
+        let (Some(kind), Some(which)) = (m.project_kind(), LastDir::project_of(m)) else {
+            return;
+        };
+        let json = match self.project_json(m) {
+            Ok(j) => j,
+            Err(e) => {
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("專案儲存失敗")
+                    .set_description(format!("無法產生專案內容：\n{e}"))
+                    .show();
+                return;
+            }
+        };
+        // 預設檔名**每次都帶現在的時間**，即使已經開著某個 .p2v 也一樣：
+        // 規則就是「名字＋當天日期＋時間」，預帶舊檔名等於預設要蓋掉上一份
+        // （想蓋掉的人用 Ctrl+S，那條路本來就直接覆寫、不開對話框）
+        let stem = project::file_stem(&project::saved_name(kind, m.project_prefix()));
+        let default_name = format!("{stem}.{PROJECT_EXT}");
+        // 有照片就存到它旁邊的「專案／<模組>」資料夾（沒有就建一個）；
+        // 還沒選照片就退回目前這個專案檔自己的資料夾，再不行才用上次的位置
+        let start = project::project_dir(self.project_src(m), m.project_prefix(), true)
+            .or_else(|| {
+                (m == Module::Video)
+                    .then(|| self.current_project.as_ref())
+                    .flatten()
+                    .and_then(|p| p.parent())
+                    .filter(|d| d.is_dir())
+                    .map(Path::to_path_buf)
+            })
+            .or_else(|| load_last_dir(which));
+        let mut dialog = file_dialog();
+        if let Some(dir) = start {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(mut path) = dialog
+            .set_title("專案儲存")
+            .add_filter("Photo2Video 專案", &[PROJECT_EXT])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+        // 使用者改掉或拿掉副檔名時補回來，之後開啟對話框的過濾器才找得到
+        // （與影片模組同一套，見 [`App::save_project_dialog`]）
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_none_or(|e| !e.eq_ignore_ascii_case(PROJECT_EXT))
+        {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            path.set_file_name(format!("{name}.{PROJECT_EXT}"));
+            // 補完副檔名之後才成立的檔名，存檔對話框沒問過使用者
+            if !confirm_overwrite(&path) {
+                return;
+            }
+        }
+        remember_dir(which, &path);
+        // 記下使用者這次取的名字（把程式加的日期時間拆掉），下次預帶它
+        if let Some(s) = path.file_stem().and_then(|s| s.to_str()) {
+            project::remember_name(kind, project::strip_stamp(s));
+        }
+        match write_project_atomic(&path, &json) {
+            Ok(()) => {
+                self.remember_recent_project(&path);
+                // 影片模組的 Ctrl+S 與「未儲存變更」比對都認「目前專案」，
+                // 從這裡存的也要算數
+                if m == Module::Video {
+                    self.current_project = Some(path.clone());
+                    self.project_saved_at = Some(Instant::now());
+                    self.mark_project_clean();
+                }
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.project_note = Some((format!("專案已儲存：{name}"), Instant::now()));
+            }
+            Err(e) => {
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("專案儲存失敗")
+                    .set_description(format!("無法寫入檔案：\n{e}"))
+                    .show();
+            }
+        }
+    }
+
+    /// 「開啟專案」：挑一個 .p2v。從哪個模組按的只決定對話框從哪個資料夾
+    /// 開始找——檔案裡記著它自己是哪個模組的，開起來會切過去
+    fn open_module_project(&mut self, m: Module, ctx: &egui::Context) {
+        let which = LastDir::project_of(m).unwrap_or(LastDir::VideoProject);
+        // 手上有照片就先看它旁邊的「專案／<模組>」資料夾（多半就存在那裡），
+        // 那裡沒有才用上次開／存專案的位置
+        let start = project::project_dir(self.project_src(m), m.project_prefix(), false)
+            .or_else(|| load_last_dir(which));
+        let mut dialog = file_dialog();
+        if let Some(dir) = start {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog
+            .set_title("開啟專案")
+            .add_filter("Photo2Video 專案", &[PROJECT_EXT])
+            .pick_file()
+        {
+            remember_dir(which, &path);
+            self.open_project_path(&path, ctx);
+        }
+    }
+
+    /// 開啟一份專案檔：先認出它是哪個模組的，切過去再載入。
+    ///
+    /// 專案檔不分模組共用 .p2v，使用者不必先切到對的模組才開得起來；
+    /// 從功能表、最近清單、拖曳進來、「開啟方式」的都走這裡
+    fn open_project_path(&mut self, path: &Path, ctx: &egui::Context) {
+        // 與照片清單同因（見 add_photos）：以相對路徑開啟（CLI 參數、
+        // 「開啟方式」）時，字面路徑存進最近清單會隨工作目錄失效
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|e| format!("無法讀取專案檔：\n{e}"))
+            .and_then(|txt| project::parse(&txt));
+        let any = match parsed {
+            Ok(a) => a,
+            Err(e) => {
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("開啟專案失敗")
+                    .set_description(e)
+                    .show();
+                // 開不起來的就別再留在最近清單裡礙事（與影片模組一致）
+                self.recent_projects.retain(|p| !same_path_ci(p, &path));
+                save_recent_projects(&self.recent_projects);
+                return;
+            }
+        };
+        let target = any.module();
+        // 下次要開專案時就從這裡開始找（拖曳進來的也算——那多半就是專案放的地方）
+        if let Some(which) = LastDir::project_of(target) {
+            remember_dir(which, &path);
+        }
+        // 影片模組的載入自己會問「要取代目前的照片與設定嗎」、自己報遺失檔，
+        // 沿用原本那一條路（它還要管音樂、字幕段落的照片編號平移）
+        if let project::AnyProject::Video(pf) = any {
+            self.set_module(Module::Video);
+            self.load_project(*pf, &path);
+            return;
+        }
+        // 換掉整個工作狀態之前先確認，否則開錯一個檔就把手上的東西清掉
+        if self.project_ready(target)
+            && !ask2(
+                rfd::MessageLevel::Warning,
+                "開啟專案",
+                &format!(
+                    "將以開啟的專案取代「{}」目前的內容，尚未儲存的變更會遺失。",
+                    target.label()
+                ),
+                "開啟專案",
+                "取消",
+            )
+        {
+            return;
+        }
+        self.set_module(target);
+        let missing = match any {
+            project::AnyProject::Dehaze(p) => self.smoke_load_project(*p, ctx),
+            project::AnyProject::Stack(p) => self.stack_load_project(*p, ctx),
+            project::AnyProject::Movie(p) => self.movie_load_project(*p, ctx),
+            project::AnyProject::Enhance(p) => self.enhance_load_project(*p, ctx),
+            project::AnyProject::Video(_) => unreachable!("影片專案在上面就處理掉了"),
+        };
+        self.remember_recent_project(&path);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.project_note = Some((format!("專案已開啟：{name}"), Instant::now()));
+        if missing > 0 {
+            message_dialog()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("專案已開啟，但部分檔案遺失")
+                .set_description(format!(
+                    "有 {missing} 個檔案已不在原路徑（或不是支援的格式），已從清單移除。"
+                ))
+                .show();
+        }
+    }
+
     fn start_convert(&mut self, ctx: &egui::Context) {
         let ext = self.format.ext();
-        // 有開啟專案就用專案名當輸出預設檔名（如「日本旅遊.p2v」→
-        // 「日本旅遊.mp4」），比固定的 output 更貼合使用者、不用每次改名
-        let stem = self
-            .current_project
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "output".into());
-        // 還沒輸出過就先指到第一張照片所在的資料夾——其他三個模組都是這樣，
-        // 不指定的話對話框會開在作業系統自己挑的地方
-        let dialog = match load_last_dir(LastDir::VideoOutput) {
-            Some(_) => dir_dialog(LastDir::VideoOutput),
-            None => match self.photos.first().and_then(|p| p.parent()) {
-                Some(d) => file_dialog().set_directory(d),
-                None => file_dialog(),
-            },
+        // 預設檔名「連拍影片_<照片資料夾名>_<解析度>」（見 video_file_stem）。
+        // 解析度要用**實際會輸出的**那一組：選「原始像素」時得先解析成
+        // 具體尺寸，否則檔名上會寫成 0x0
+        let res = self.resolved_resolution();
+        // 用**照片資料夾的名字**：一支影片是整批照片合出來的，
+        // 沒有哪一張的檔名代表得了它
+        let folder = self
+            .photos
+            .first()
+            .and_then(|p| folder_name(p))
+            .unwrap_or_default();
+        let default_name = format!("{}.{ext}", video_file_stem(&folder, "", res.w, res.h));
+        // 先指到這批照片自己的資料夾，沒有才用上次存到哪（見 output_start_dir）
+        let start = output_start_dir(LastDir::VideoOutput, self.photos.first().map(|p| p.as_path()));
+        let dialog = match start {
+            Some(d) => file_dialog().set_directory(d),
+            None => file_dialog(),
         };
         let Some(output) = dialog
             .set_title("選擇影片儲存位置")
             .add_filter(format!("{} 影片", ext.to_uppercase()), &[ext])
-            .set_file_name(format!("{stem}.{ext}"))
+            .set_file_name(default_name)
             .save_file()
         else {
             return;
@@ -9424,11 +9725,11 @@ impl App {
     fn run_menu_action(&mut self, act: MenuAction, ctx: &egui::Context) {
         // 「檔案」裡的動作都是影片專案的事；從別的模組按下去就順便切過去，
         // 否則畫面毫無變化，使用者會以為沒反應
+        // （「開啟專案」與「最近的專案」除外：專案檔自己記著是哪個模組的，
+        // 由 [`App::open_project_path`] 決定要切到哪裡）
         if matches!(
             act,
             MenuAction::NewProject
-                | MenuAction::OpenProject
-                | MenuAction::OpenRecent(_)
                 | MenuAction::SaveProject
                 | MenuAction::SaveProjectAs
                 | MenuAction::AddFolder
@@ -9449,8 +9750,14 @@ impl App {
                     self.new_project();
                 }
             }
-            MenuAction::OpenProject => self.open_project_dialog(),
-            MenuAction::OpenRecent(p) => self.load_project(&p),
+            MenuAction::OpenProject => {
+                let m = match self.module {
+                    Module::Files => Module::Video,
+                    other => other,
+                };
+                self.open_module_project(m, ctx);
+            }
+            MenuAction::OpenRecent(p) => self.open_project_path(&p, ctx),
             MenuAction::SaveProject => self.quick_save_project(),
             MenuAction::SaveProjectAs => self.save_project_dialog(),
             MenuAction::AddFolder => self.pick_folder(),
@@ -9468,7 +9775,7 @@ impl App {
             MenuAction::ClearEnhance => self.enhance_clear_confirmed(),
             // 畫面上那顆「✔ 完成備份」做的是同一件事
             MenuAction::ClearBackup => self.backup_finish(),
-            MenuAction::Switch(m) => self.module = m,
+            MenuAction::Switch(m) => self.set_module(m),
             MenuAction::CheckUpdate => {
                 // 手動重新檢查時，讓新版通知條可以再次出現
                 self.update_banner_dismissed = false;
@@ -9571,7 +9878,7 @@ impl App {
                 ui.add_space(4.0);
             });
         if let Some(m) = switch_to {
-            self.module = m;
+            self.set_module(m);
         }
     }
 
@@ -11116,7 +11423,8 @@ impl App {
             ))
             .clicked()
         {
-            self.open_project_dialog();
+            let ctx = child.ctx().clone();
+            self.open_module_project(Module::Video, &ctx);
         }
         // 最近的專案：點檔名直接開啟，不用再走檔案對話框。
         // 不在這裡檢查檔案是否存在（每幀摸磁碟太浪費），
@@ -11147,7 +11455,8 @@ impl App {
                     .on_hover_text(p.to_string_lossy())
                     .clicked()
                 {
-                    self.load_project(&p);
+                    let ctx = child.ctx().clone();
+                    self.open_project_path(&p, &ctx);
                 }
             }
         }
@@ -11195,6 +11504,32 @@ impl App {
                     self.save_project_dialog();
                 }
             });
+            // 與煙火影片去煙霧同一套：來源名稱放大一點，完整路徑用滑鼠停著看。
+            //
+            // 一批照片沒有「那一個檔名」可顯示，所以顯示**它們所在資料夾**的
+            // 名字——那也正是輸出影片預設檔名的前半段（見 [`video_file_stem`]），
+            // 兩邊對得起來，存檔時一眼就知道現在轉的是哪一批
+            if let Some(first) = self.photos.first() {
+                ui.separator();
+                let name = folder_name(first).unwrap_or_default();
+                let dir = first
+                    .parent()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                ui.label(egui::RichText::new(name).size(15.0).color(theme::TEXT))
+                    .on_hover_text(dir);
+                // 這批照片是從好幾個資料夾加進來的：只寫一個名字會讓人以為
+                // 全部都在那裡，輸出檔名也只取得到第一張那個
+                let here = first.parent();
+                if self.photos.iter().any(|p| p.parent() != here) {
+                    ui.label(
+                        egui::RichText::new("· 還有別的資料夾")
+                            .size(11.5)
+                            .color(theme::TEXT_WEAK),
+                    )
+                    .on_hover_text("這批照片不是全都從同一個資料夾加進來的");
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 與實際輸出時長一致（Ken Burns 的對齊見 estimated_video_secs）
                 let secs = self.estimated_video_secs();
@@ -12229,6 +12564,127 @@ impl App {
         self.smoke_load_current(ctx);
         self.spawn_smoke_auto(ctx);
         self.request_smoke_thumbs();
+    }
+
+    /// 把「去煙霧」這一次的編輯打包成專案檔內容
+    fn smoke_project_data(&self) -> project::DehazeProject {
+        let order = &self.smoke.photos;
+        // 存進專案的後製要把筆跡拿掉：那是 finish_for 每次逐張補上去的，
+        // 真正的來源在 wipes 裡（見 [`SmokeTool::wipes`]），一起存會存兩份
+        let strip = |mut f: Finish| {
+            f.wipes.clear();
+            f
+        };
+        let s = &self.smoke;
+        project::DehazeProject {
+            version: project::VERSION,
+            module: project::KIND_DEHAZE.into(),
+            app_version: project::app_version(),
+            photos: order.clone(),
+            cur: s.cur,
+            params: s.params.clone(),
+            overrides: dump_map(&s.overrides, order),
+            finish: strip(s.finish.clone()),
+            finish_overrides: dump_map(&s.finish_overrides, order)
+                .into_iter()
+                .map(|(p, f)| (p, strip(f)))
+                .collect(),
+            wipes: dump_map(&s.wipes, order),
+            auto: dump_map(&s.auto, order),
+            auto_on: s.auto_on,
+            per_photo: s.per_photo,
+            text_font: self
+                .fonts
+                .get(s.text_style.font_idx)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default(),
+            text_color: s.text_style.color.to_array(),
+            text_outline_w: s.text_style.outline_w,
+            text_outline_color: s.text_style.outline_color.to_array(),
+            text_boxed: s.text_style.boxed,
+            brush_size: s.brush_size,
+            radial_invert: s.radial_invert,
+            object_feather: s.object_feather,
+            object_edge: s.object_edge,
+            wipe_size: s.wipe_size,
+            wipe_feather: s.wipe_feather,
+            wipe_flow: s.wipe_flow,
+            wipe_density: s.wipe_density,
+            wipe_keep: s.wipe_keep,
+            crop_aspect: s.crop_aspect,
+            // 挑起來的那幾張也照照片順序輸出，同一份專案每次存的內容才穩定
+            multi_sel: order
+                .iter()
+                .filter(|p| s.multi_sel.contains(*p))
+                .cloned()
+                .collect(),
+            sky_open: s.sky_open,
+            grade_open: s.grade_open,
+            text_open: s.text_open,
+            image_open: s.image_open,
+            wipe_open: s.wipe_open,
+        }
+    }
+
+    /// 還原一份「去煙霧」專案；回傳已經不在原路徑的照片張數。
+    ///
+    /// 先清乾淨再照專案重建：逐張的設定都以檔案路徑為鍵，上一批留著的話
+    /// 只要有同名檔案就會悄悄套上去（與 [`App::smoke_clear_photos`] 同一個顧慮）
+    fn smoke_load_project(&mut self, p: project::DehazeProject, ctx: &egui::Context) -> usize {
+        let (photos, missing) = existing_photos(&p.photos);
+        self.smoke_clear_photos();
+        let keep: HashSet<PathBuf> = photos.iter().cloned().collect();
+        // 量好的自動值要趕在 smoke_set_photos 之前放進去：它會照手上缺哪幾張
+        // 排背景量測，這裡先補齊就一張都不必再量（一批幾十張要等上一陣子）
+        self.smoke.auto = restore_map(p.auto, &keep);
+        if !photos.is_empty() {
+            self.smoke_set_photos(photos, ctx);
+        }
+        let s = &mut self.smoke;
+        s.params = p.params;
+        s.overrides = restore_map(p.overrides, &keep);
+        s.finish = p.finish;
+        s.finish_overrides = restore_map(p.finish_overrides, &keep);
+        s.wipes = restore_map(p.wipes, &keep);
+        s.auto_on = p.auto_on;
+        s.per_photo = p.per_photo;
+        s.text_style = SubtitleStyle {
+            // 字型清單依系統而異，所以存的是名稱；這臺電腦沒有那個字型
+            // 就退回第一個（與影片模組同一套，見 [`App::load_project`]）
+            font_idx: self
+                .fonts
+                .iter()
+                .position(|(n, _)| *n == p.text_font)
+                .unwrap_or(0),
+            color: color_from_rgba(p.text_color),
+            outline_w: p.text_outline_w.clamp(0, 8),
+            outline_color: color_from_rgba(p.text_outline_color),
+            boxed: p.text_boxed,
+        };
+        s.brush_size = p.brush_size.clamp(1, 100);
+        s.radial_invert = p.radial_invert;
+        s.object_feather = p.object_feather.clamp(0, 100);
+        s.object_edge = p.object_edge.clamp(-100, 100);
+        s.wipe_size = p.wipe_size.clamp(1, 100);
+        s.wipe_feather = p.wipe_feather.clamp(0, 100);
+        s.wipe_flow = p.wipe_flow.clamp(0, 100);
+        s.wipe_density = p.wipe_density.clamp(0, 100);
+        s.wipe_keep = p.wipe_keep;
+        s.crop_aspect = p.crop_aspect;
+        s.multi_sel = p.multi_sel.into_iter().filter(|q| keep.contains(q)).collect();
+        s.sky_open = p.sky_open;
+        s.grade_open = p.grade_open;
+        s.text_open = p.text_open;
+        s.image_open = p.image_open;
+        s.wipe_open = p.wipe_open;
+        // 存檔時停在哪一張就回到那一張；那張已經不見了就回到第一張
+        s.cur = p.cur.min(s.photos.len().saturating_sub(1));
+        s.scroll_to_cur = true;
+        // 參數是在 smoke_set_photos 之後才寫進去的，預覽要重算一次才是
+        // 專案存下來的樣子（load_current 順便把算圖的快取全部收掉）
+        self.smoke_load_current(ctx);
+        self.request_smoke_thumbs();
+        missing
     }
 
     /// 使用者主動清掉這批照片（模組操作列的「🗑 清除照片」與功能表列）。
@@ -14573,6 +15029,89 @@ impl App {
         }
     }
 
+    /// 把「煙火影片去煙霧」這一次的編輯打包成專案檔內容。
+    /// 這個模組整批影片共用同一組設定，所以沒有「逐支」的東西
+    fn movie_project_data(&self) -> project::MovieProject {
+        let m = &self.movie;
+        project::MovieProject {
+            version: project::VERSION,
+            module: project::KIND_MOVIE.into(),
+            app_version: project::app_version(),
+            src: m.src.clone(),
+            queue: m.queue.clone(),
+            merge: m.merge,
+            at: m.at,
+            params: m.params.clone(),
+            grade: m.grade.clone(),
+            segments: m.segments.clone(),
+            size: m.size,
+            crop: m.crop,
+            crop_aspect: m.crop_aspect,
+            auto_on: m.auto_on,
+            pro: m.pro,
+            grade_open: m.grade_open,
+            brush_size: m.brush_size,
+            radial_invert: m.radial_invert,
+            object_feather: m.object_feather,
+            object_edge: m.object_edge,
+            clip_secs: m.clip_secs,
+        }
+    }
+
+    /// 還原一份「煙火影片去煙霧」專案；回傳已經不在原路徑的影片支數。
+    ///
+    /// 預覽的那一支不見時就把排隊的第一支遞補上來——整批共用同一組設定，
+    /// 少了第一支其餘照樣跑得動，沒必要整份開不起來
+    fn movie_load_project(&mut self, p: project::MovieProject, ctx: &egui::Context) -> usize {
+        let listed: Vec<PathBuf> = p.src.iter().chain(p.queue.iter()).cloned().collect();
+        let mut alive = listed.iter().filter(|q| q.is_file()).cloned();
+        let missing = listed.len() - listed.iter().filter(|q| q.is_file()).count();
+        let Some(first) = alive.next() else {
+            // 一支都不在了：回到空畫面，設定不必還原（沒有東西可以套）
+            self.movie.reset_batch(None, None);
+            self.movie.error = Some("專案裡的影片都已不在原路徑".into());
+            return missing;
+        };
+        let queue: Vec<PathBuf> = alive.collect();
+        // reset_batch 會把去煙參數、遮色片、分段、調色與裁切全部歸零，
+        // 所以要先開片、再把專案的設定寫回去
+        self.movie_set_src(first, true, ctx);
+        if self.movie.src.is_none() {
+            return missing; // 開片失敗（讀不到／沒有 ffmpeg），錯誤訊息已經設好
+        }
+        let m = &mut self.movie;
+        m.queue = queue;
+        m.merge = p.merge;
+        m.params = p.params;
+        m.grade = p.grade;
+        // 至少一段、照 start 排好、第一段從 0 起（見 [`Segment`]）；
+        // 手改過的專案檔也要照這個規矩收進來
+        m.segments = p.segments;
+        m.normalize_segments();
+        m.size = p.size;
+        m.crop = p.crop.clamped();
+        m.crop_aspect = p.crop_aspect;
+        m.auto_on = p.auto_on;
+        // 走 set_pro 而不是直接指定：切回簡易模式時遮色片工具與遮罩檢視
+        // 要一起收起來，否則畫面會停在簡易模式看不到也改不動的狀態
+        m.set_pro(p.pro);
+        m.grade_open = p.grade_open;
+        m.brush_size = p.brush_size.clamp(1, 100);
+        m.radial_invert = p.radial_invert;
+        m.object_feather = p.object_feather.clamp(0, 100);
+        m.object_edge = p.object_edge.clamp(-100, 100);
+        m.clip_secs = p.clip_secs;
+        // 存檔時時間軸停在哪就回到哪（夾在片長內：換過來源檔的話會超出）
+        let secs = m.info.as_ref().map(|i| i.secs).unwrap_or(0.0);
+        m.at = p.at.clamp(0.0, secs.max(0.0));
+        // 參數是開片之後才寫進去的，預覽那一格要重抓、重算
+        m.grabbed_at = None;
+        m.rendered = None;
+        m.graded = None;
+        m.auto = None;
+        missing
+    }
+
     /// 從影片取 `at` 那一格當預覽底圖
     fn spawn_movie_grab(&mut self, ctx: &egui::Context) {
         let (Some(src), Some(info)) = (self.movie.src.clone(), self.movie.info.clone()) else {
@@ -14791,8 +15330,11 @@ impl App {
         };
         // 合併：好幾支接成一支，所以照「一支」那條路問一個檔名
         let merging = jobs.len() > 1 && self.movie.merge;
-        // 一支就照舊讓人自己命名；好幾支則改挑資料夾，每支各自取
-        // 「原檔名_去煙.mp4」——一支一支問名字太煩，而且中途還要顧著回來按
+        // 輸出一支影片時的預設檔名（見 [`MovieTool::out_stem`]）
+        let out_stem = self.movie.out_stem();
+        // 一支（或合併成一支）就問一個檔名；好幾支各存各的則改挑資料夾，
+        // 每支各自取「原檔名_去煙.mp4」——那時同一個資料夾、同一個解析度，
+        // 照公式取會變成每支都同名
         let outs: Vec<PathBuf> = if jobs.len() > 1 && !merging {
             // 上次輸出到哪，名字就預填好（見 pick_folder_remembering）；
             // 還沒輸出過才退回來源影片自己的資料夾
@@ -14807,21 +15349,16 @@ impl App {
                 .map(|p| next_free_path(&dir.join(format!("{}_去煙.mp4", stem(p)))))
                 .collect()
         } else {
-            let dialog = match load_last_dir(LastDir::MovieOutput) {
-                Some(_) => dir_dialog(LastDir::MovieOutput),
-                // 還沒輸出過就先指到來源影片自己的資料夾
-                None => match src.parent() {
-                    Some(d) => file_dialog().set_directory(d),
-                    None => file_dialog(),
-                },
+            // 先指到來源影片自己的資料夾（見 output_start_dir）
+            let dialog = match output_start_dir(LastDir::MovieOutput, Some(src.as_path())) {
+                Some(d) => file_dialog().set_directory(d),
+                None => file_dialog(),
             };
             let Some(mut out) = dialog
                 .add_filter("MP4 影片", &["mp4"])
-                .set_file_name(if merging {
-                    format!("{}_去煙_合併.mp4", stem(&src))
-                } else {
-                    format!("{}_去煙.mp4", stem(&src))
-                })
+                // 合併與單支都是輸出一支影片，用同一套檔名；是不是合併
+                // 看對話框標題就知道，不必再塞進檔名
+                .set_file_name(format!("{out_stem}.mp4"))
                 .set_title(if merging {
                     "合併後的影片要存成"
                 } else {
@@ -15211,6 +15748,9 @@ impl App {
         let mut clear = false;
         let mut export = false;
         let mut stop = false;
+        // 側欄輸出鈕旁的「💾 專案儲存」與工具列的「📂 開啟專案」
+        let mut save_project = false;
+        let mut open_project = false;
         let busy = self.movie.busy;
         let exporting = busy == MovieBusy::Exporting;
         let side_frame = egui::Frame::default()
@@ -15232,9 +15772,10 @@ impl App {
                         .id_salt("movie_side_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            let (e, s) = self.ui_movie_side(ui);
+                            let (e, s, sp) = self.ui_movie_side(ui);
                             export |= e;
                             stop |= s;
+                            save_project |= sp;
                         });
                 });
         }
@@ -15272,6 +15813,10 @@ impl App {
                             .clicked()
                     {
                         clear = true;
+                    }
+                    // 開啟專案跟在選影片那幾顆旁邊（與另外三個模組同一個位置）
+                    if project_open_button(ui, !exporting) {
+                        open_project = true;
                     }
                     if self.movie.src.is_some() {
                         ui.separator();
@@ -15417,6 +15962,12 @@ impl App {
         }
         if add {
             self.movie_add(ctx);
+        }
+        if save_project {
+            self.save_module_project(Module::Movie);
+        }
+        if open_project {
+            self.open_module_project(Module::Movie, ctx);
         }
         if let Some((from, to)) = move_to {
             self.movie_reorder(from, to, ctx);
@@ -15598,9 +16149,9 @@ impl App {
     }
 
     /// 右邊那條面板：去煙的四項核心參數、分區調色與輸出。
-    /// 回傳（按了輸出, 按了中止）
-    fn ui_movie_side(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
-        let (mut export, mut stop) = (false, false);
+    /// 回傳（按了輸出, 按了中止, 按了專案儲存）
+    fn ui_movie_side(&mut self, ui: &mut egui::Ui) -> (bool, bool, bool) {
+        let (mut export, mut stop, mut save_project) = (false, false, false);
         let exporting = self.movie.busy == MovieBusy::Exporting;
         // 清掉最後一個形狀時遮罩檢視自己關掉、畫出第一個形狀時又自己亮起來
         // （對著哪一份遮色片就看哪一份，見 [`MovieTool::sync_mask_view`]）
@@ -15792,7 +16343,7 @@ impl App {
         ui.add_space(6.0);
 
         let Some(info) = self.movie.info.clone() else {
-            return (export, stop);
+            return (export, stop, save_project);
         };
         let total = info.frames();
         let (ow, oh) = self.movie.size.apply(info.w, info.h);
@@ -15904,9 +16455,19 @@ impl App {
             } else {
                 "🎬  輸出影片".to_string()
             };
-            if primary_button(ui, &label, self.movie.base.is_some()).clicked() {
-                export = true;
-            }
+            // 側欄只有三百多寬，而輸出鈕的字會隨支數變長（「合併輸出（3 支
+            // 接成一支）」）。用會換行的那種排法：擺得下就並排，擺不下就自己
+            // 掉到下一列，不會被面板邊界裁掉
+            ui.horizontal_wrapped(|ui| {
+                if primary_button(ui, &label, self.movie.base.is_some()).clicked() {
+                    export = true;
+                }
+                // 專案儲存就擺在輸出鈕旁邊：存的是這一支調好的設定，不是影片
+                ui.add_space(6.0);
+                if project_save_button(ui, Module::Movie, self.movie.src.is_some()) {
+                    save_project = true;
+                }
+            });
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(if info.audio.is_some() {
@@ -15954,7 +16515,11 @@ impl App {
                 }
             });
         }
-        (export, stop)
+        // 「專案已儲存／已開啟」的提示：與另外三個模組一樣留幾秒就消失
+        if project_note_label(ui, &self.project_note) {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        }
+        (export, stop, save_project)
     }
 
     /// 專業模式的「遮色片」區塊：選一種工具直接在預覽上畫，只有畫到的地方
@@ -17435,6 +18000,95 @@ impl App {
         self.request_stack_thumbs();
     }
 
+    /// 把「煙火疊圖」這一次的編輯打包成專案檔內容
+    fn stack_project_data(&self) -> project::StackProject {
+        let order = &self.stack.photos;
+        let s = &self.stack;
+        project::StackProject {
+            version: project::VERSION,
+            module: project::KIND_STACK.into(),
+            app_version: project::app_version(),
+            photos: order.clone(),
+            ground: s.ground,
+            cur: s.cur,
+            pro: s.pro,
+            mode: s.mode,
+            blend_noted: s.blend_noted,
+            masks: dump_map(&s.masks, order),
+            mask_polarity: dump_map(&s.mask_polarity, order),
+            feather: s.feather,
+            mask_density: s.mask_density,
+            xforms: dump_map(&s.xforms, order),
+            grades: dump_map(&s.grades, order),
+            auto_offsets: dump_map(&s.auto_offsets, order),
+            auto_align: s.auto_align,
+            protect_land: s.protect_land,
+            grade: s.grade,
+            grade_target: s.grade_target,
+            grade_open: s.grade_open,
+            crop_aspect: s.crop_aspect,
+            brush_size: s.brush_size,
+            radial_invert: s.radial_invert,
+            object_feather: s.object_feather,
+            object_edge: s.object_edge,
+            move_ghost: s.move_ghost,
+            move_mode: s.move_mode,
+            show_mask: s.show_mask,
+        }
+    }
+
+    /// 還原一份「煙火疊圖」專案；回傳已經不在原路徑的照片張數
+    fn stack_load_project(&mut self, p: project::StackProject, ctx: &egui::Context) -> usize {
+        let (photos, missing) = existing_photos(&p.photos);
+        self.stack_clear_photos();
+        let keep: HashSet<PathBuf> = photos.iter().cloned().collect();
+        if !photos.is_empty() {
+            self.stack_set_photos(photos, ctx);
+        }
+        let s = &mut self.stack;
+        // 對齊結果要在 set_photos **之後**才放回去：它會把上一批的整批清掉
+        // （對齊是相對於地景的）。放回去之後 spawn_stack_align 就只算還缺的那幾張
+        s.auto_offsets = restore_map(p.auto_offsets, &keep);
+        s.masks = restore_map(p.masks, &keep);
+        s.mask_polarity = restore_map(p.mask_polarity, &keep);
+        s.xforms = restore_map(p.xforms, &keep);
+        s.grades = restore_map(p.grades, &keep);
+        // 張數可能因遺失（或超過上限被截掉）而變少，兩個索引都要夾回範圍內
+        let last = s.photos.len().saturating_sub(1);
+        s.ground = p.ground.min(last);
+        s.cur = p.cur.min(last);
+        s.pro = p.pro;
+        s.mode = p.mode;
+        s.blend_noted = p.blend_noted;
+        s.feather = p.feather.clamp(0, 100);
+        s.mask_density = p.mask_density.clamp(0, 100);
+        s.auto_align = p.auto_align;
+        s.protect_land = p.protect_land;
+        s.grade = p.grade.clamped();
+        s.grade_target = p.grade_target;
+        s.grade_open = p.grade_open;
+        s.crop_aspect = p.crop_aspect;
+        s.brush_size = p.brush_size.clamp(1, 100);
+        s.radial_invert = p.radial_invert;
+        s.object_feather = p.object_feather.clamp(0, 100);
+        s.object_edge = p.object_edge.clamp(-100, 100);
+        s.move_ghost = p.move_ghost;
+        // 「調整圖層」與遮罩檢視是專業模式專屬的，簡易模式不能留著開著
+        s.move_mode = p.move_mode && p.pro;
+        s.show_mask = p.show_mask && p.pro;
+        s.scroll_to_cur = true;
+        // 設定是在 set_photos 之後才寫進去的，要重疊一次才是專案存下來的樣子
+        s.applied = None;
+        s.stacked = None;
+        s.graded = None;
+        s.tex_out = None;
+        s.tex_raw = None;
+        s.tex_raw_of = None;
+        s.layer_previews.clear();
+        self.request_stack_thumbs();
+        missing
+    }
+
     /// 使用者主動清掉這批照片。還沒存檔就先問一次
     fn stack_clear_confirmed(&mut self) {
         if self.stack.busy == StackBusy::Saving {
@@ -17928,8 +18582,8 @@ impl App {
             .unwrap_or_else(|| "photo".into());
         // 檔名交給存檔對話框，使用者可以自己改；檔案已存在時
         // 系統的存檔對話框會先問要不要覆蓋
-        let start_dir = load_last_dir(LastDir::StackOutput)
-            .or_else(|| ground.parent().map(|p| p.to_path_buf()));
+        // 先指到地景那張自己的資料夾（見 output_start_dir）
+        let start_dir = output_start_dir(LastDir::StackOutput, Some(ground.as_path()));
         let dialog = match start_dir {
             Some(d) => file_dialog().set_directory(d),
             None => file_dialog(),
@@ -19117,6 +19771,9 @@ impl App {
         let mut remove_idx: Option<usize> = None;
         // 按了存檔（會跳存檔對話框讓使用者自己挑位置與檔名）
         let mut save = false;
+        // 存檔列的「💾 專案儲存」與工具列的「📂 開啟專案」
+        let mut save_project = false;
+        let mut open_project = false;
         let mut clear = false;
         let mut goto: Option<usize> = None;
         let mut set_ground: Option<usize> = None;
@@ -19211,6 +19868,10 @@ impl App {
                             .clicked()
                     {
                         clear = true;
+                    }
+                    // 開啟專案跟在選照片那幾顆旁邊（與去煙霧同一個位置）
+                    if project_open_button(ui, busy != StackBusy::Saving) {
+                        open_project = true;
                     }
                     if total > 0 {
                         ui.separator();
@@ -20331,6 +20992,11 @@ impl App {
                             {
                                 save = true;
                             }
+                            // 專案儲存擺在存檔鈕左邊：它存的是設定，不是成品
+                            ui.add_space(6.0);
+                            if project_save_button(ui, Module::Stack, total > 0) {
+                                save_project = true;
+                            }
                         }
                         // 存檔尺寸緊鄰存檔鈕（與去煙霧同一組設定、同一個位置）
                         ui.add_space(10.0);
@@ -20375,6 +21041,9 @@ impl App {
                                 );
                                 ctx.request_repaint_after(Duration::from_secs(1));
                             }
+                        }
+                        if project_note_label(ui, &self.project_note) {
+                            ctx.request_repaint_after(Duration::from_secs(1));
                         }
                     });
                 });
@@ -20448,6 +21117,12 @@ impl App {
         if add {
             self.stack_add_photos(ctx);
         }
+        if save_project {
+            self.save_module_project(Module::Stack);
+        }
+        if open_project {
+            self.open_module_project(Module::Stack, ctx);
+        }
         // Ctrl+V：焦點在輸入框裡時讓給輸入框（那時貼的是文字）
         let hotkey = self.stack.busy != StackBusy::Saving
             && self.stack.photos.len() < MAX_STACK_PHOTOS
@@ -20507,6 +21182,9 @@ impl App {
         let mut save: Option<bool> = None;
         let mut reset = false;
         let mut clear = false;
+        // 存檔列的「💾 專案儲存」與工具列的「📂 開啟專案」
+        let mut save_project = false;
+        let mut open_project = false;
         // 工具列的「🖼 疊圖片」與「📋 貼上圖片」（畫完這一幀才處理，
         // 檔案對話框不能開在版面中間）
         let mut add_overlay = false;
@@ -20590,6 +21268,10 @@ impl App {
                             .clicked()
                     {
                         clear = true;
+                    }
+                    // 開啟專案跟在選照片那幾顆旁邊：它就是另一種「把東西叫進來」
+                    if project_open_button(ui, busy == SmokeBusy::Idle) {
+                        open_project = true;
                     }
                     // 疊圖片就跟在選照片那兩顆旁邊：右側面板窄，這兩顆擠在
                     // 「圖片」標題旁會把區塊名稱推掉
@@ -21739,14 +22421,17 @@ impl App {
                             if primary_button(ui, &label, busy == SmokeBusy::Idle)
                                 .on_hover_text(if picked > 0 {
                                     "只存縮圖列上挑起來的那幾張；\
-                                     每張都存回它自己的原始資料夾，檔名加上 _去煙。\n\
+                                     每張都存回它自己的原始資料夾，\n\
+                                     檔名加上 _去煙。\n\
                                      在縮圖上直接點一下就取消挑選，改成整批都存"
                                 } else if total > 1 {
-                                    "每張都存回它自己的原始資料夾，檔名加上 _去煙，不用再選位置。\n\
+                                    "每張都存回它自己的原始資料夾，\
+                                     檔名加上 _去煙，不用再選位置。\n\
                                      只想存其中幾張：在縮圖列上按住 Ctrl 逐張點、\
                                      或按住 Shift 選一整段"
                                 } else {
-                                    "存回原始照片所在的資料夾，檔名加上 _去煙，不用再選位置"
+                                    "存回原始照片所在的資料夾，\
+                                     檔名加上 _去煙，不用再選位置"
                                 })
                                 .clicked()
                             {
@@ -21762,6 +22447,12 @@ impl App {
                                 .clicked()
                             {
                                 save = Some(false);
+                            }
+                            // 專案儲存擺在兩顆「存成品」的左邊：它存的是設定，
+                            // 不是第三種存照片的方式
+                            ui.add_space(6.0);
+                            if project_save_button(ui, Module::Dehaze, total > 0) {
+                                save_project = true;
                             }
                         }
                         // 存檔尺寸緊鄰存檔鈕：要縮多大是按下去之前才決定的事
@@ -21822,6 +22513,9 @@ impl App {
                                 ctx.request_repaint_after(Duration::from_secs(1));
                             }
                         }
+                        if project_note_label(ui, &self.project_note) {
+                            ctx.request_repaint_after(Duration::from_secs(1));
+                        }
                     });
                 });
                 // 存檔列不捲動，量它的高度下一幀留位用（見上面算 img_h 的地方）
@@ -21874,6 +22568,12 @@ impl App {
         }
         if add {
             self.smoke_add_photos(ctx);
+        }
+        if save_project {
+            self.save_module_project(Module::Dehaze);
+        }
+        if open_project {
+            self.open_module_project(Module::Dehaze, ctx);
         }
         if add_overlay {
             if let Some(p) = dir_dialog(LastDir::DehazeOverlay)
@@ -22121,6 +22821,72 @@ impl App {
         self.enhance_load_current(ctx);
         self.spawn_enhance_auto(ctx);
         self.request_enhance_thumbs();
+    }
+
+    /// 把「優化影像」這一次的編輯打包成專案檔內容
+    fn enhance_project_data(&self) -> project::EnhanceProject {
+        let order = &self.enhance.photos;
+        let e = &self.enhance;
+        project::EnhanceProject {
+            version: project::VERSION,
+            module: project::KIND_ENHANCE.into(),
+            app_version: project::app_version(),
+            photos: order.clone(),
+            cur: e.cur,
+            preset: e.preset,
+            preset_overrides: dump_map(&e.preset_overrides, order),
+            // 量出來的自動建議連同「是用哪個類型量的」一起存
+            auto: dump_map(&e.auto, order)
+                .into_iter()
+                .map(|(p, (preset, a))| (p, preset, a))
+                .collect(),
+            auto_on: e.auto_on,
+            auto_amount: e.auto_amount,
+            params: e.params,
+            grade_overrides: dump_map(&e.grade_overrides, order),
+            local_overrides: dump_map(&e.local_overrides, order),
+            per_photo: e.per_photo,
+            crop_aspect: e.crop_aspect,
+            grade_open: e.grade_open,
+            show_mask: e.show_mask,
+        }
+    }
+
+    /// 還原一份「優化影像」專案；回傳已經不在原路徑的照片張數
+    fn enhance_load_project(&mut self, p: project::EnhanceProject, ctx: &egui::Context) -> usize {
+        let (photos, missing) = existing_photos(&p.photos);
+        self.enhance_clear_photos();
+        let keep: HashSet<PathBuf> = photos.iter().cloned().collect();
+        // 量好的自動建議趕在 set_photos 之前放回去，才不會整批再量一次
+        // （與去煙霧同一個作法，見 [`App::smoke_load_project`]）
+        self.enhance.auto = p
+            .auto
+            .into_iter()
+            .filter(|(q, _, _)| keep.contains(q))
+            .map(|(q, preset, a)| (q, (preset, a)))
+            .collect();
+        // 類型也要先設好：量測是照類型跑的，晚一步就會用舊類型量一輪
+        self.enhance.preset = p.preset;
+        self.enhance.preset_overrides = restore_map(p.preset_overrides, &keep);
+        if !photos.is_empty() {
+            self.enhance_set_photos(photos, ctx);
+        }
+        let e = &mut self.enhance;
+        e.auto_on = p.auto_on;
+        e.auto_amount = p.auto_amount.clamp(0, 200);
+        e.params = p.params;
+        e.grade_overrides = restore_map(p.grade_overrides, &keep);
+        e.local_overrides = restore_map(p.local_overrides, &keep);
+        e.per_photo = p.per_photo;
+        e.crop_aspect = p.crop_aspect;
+        e.grade_open = p.grade_open;
+        e.show_mask = p.show_mask;
+        e.cur = p.cur.min(e.photos.len().saturating_sub(1));
+        e.scroll_to_cur = true;
+        // 設定是在 set_photos 之後才寫進去的，預覽要照它重算一次
+        self.enhance_load_current(ctx);
+        self.request_enhance_thumbs();
+        missing
     }
 
     /// 使用者主動清掉這批照片。還沒存檔就先問一次
@@ -22775,6 +23541,9 @@ impl App {
         let mut clear = false;
         // Some(true)＝直接存回原始資料夾，Some(false)＝另存到自己挑的資料夾
         let mut save: Option<bool> = None;
+        // 存檔列的「💾 專案儲存」與工具列的「📂 開啟專案」
+        let mut save_project = false;
+        let mut open_project = false;
         let mut reset = false;
         let mut goto: Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
@@ -22847,6 +23616,10 @@ impl App {
                             .clicked()
                     {
                         clear = true;
+                    }
+                    // 開啟專案跟在選照片那幾顆旁邊（與去煙霧、疊圖同一個位置）
+                    if project_open_button(ui, idle) {
+                        open_project = true;
                     }
                     if total > 1 {
                         ui.separator();
@@ -23266,9 +24039,11 @@ impl App {
                             };
                             if primary_button(ui, &label, busy == EnhanceBusy::Idle)
                                 .on_hover_text(if total > 1 {
-                                    "每張都存回它自己的原始資料夾，檔名加上 _優化，不用再選位置"
+                                    "每張都存回它自己的原始資料夾，\
+                                     檔名加上 _優化，不用再選位置"
                                 } else {
-                                    "存回原始照片所在的資料夾，檔名加上 _優化，不用再選位置"
+                                    "存回原始照片所在的資料夾，\
+                                     檔名加上 _優化，不用再選位置"
                                 })
                                 .clicked()
                             {
@@ -23283,6 +24058,11 @@ impl App {
                                 .clicked()
                             {
                                 save = Some(false);
+                            }
+                            // 專案儲存擺在兩顆「存成品」的左邊（與去煙霧同一個位置）
+                            ui.add_space(6.0);
+                            if project_save_button(ui, Module::Enhance, total > 0) {
+                                save_project = true;
                             }
                         }
                         // 存檔尺寸緊鄰存檔鈕：要縮多大是按下去之前才決定的事
@@ -23341,6 +24121,9 @@ impl App {
                                 ctx.request_repaint_after(Duration::from_secs(1));
                             }
                         }
+                        if project_note_label(ui, &self.project_note) {
+                            ctx.request_repaint_after(Duration::from_secs(1));
+                        }
                     });
                 });
                 // 存檔列不捲動，量它的高度下一幀留位用
@@ -23392,6 +24175,12 @@ impl App {
         }
         if add {
             self.enhance_add_photos(ctx);
+        }
+        if save_project {
+            self.save_module_project(Module::Enhance);
+        }
+        if open_project {
+            self.open_module_project(Module::Enhance, ctx);
         }
         if let Some(i) = goto {
             self.enhance_select(i, ctx);
@@ -25298,8 +26087,7 @@ impl eframe::App for App {
             // 專案；且 load_project 的取代確認被按「取消」時，照片仍會被加入。
             // 多個專案檔也只取第一個，不連續跳出多個確認框
             if let Some(proj) = dropped.iter().find(|p| is_project_file(p)) {
-                remember_dir(LastDir::VideoProject, proj);
-                self.load_project(proj);
+                self.open_project_path(proj, ctx);
             } else {
                 let mut files = Vec::new();
                 let mut any_dir = false;
@@ -25362,11 +26150,15 @@ impl eframe::App for App {
                     _ => {}
                 }
             }
-            // 專案是影片模組的東西，從別的模組開啟就順便切過去，
-            // 否則按了好像沒反應
+            // Ctrl+O 開專案。五個模組都有自己的專案檔，從哪個模組按只決定
+            // 對話框從哪個資料夾開始找——開起來會照檔案自己記的模組切過去
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
-                self.module = Module::Video;
-                self.open_project_dialog();
+                // 檔案管理沒有專案可開，比照原本的行為切到影片模組
+                let m = match self.module {
+                    Module::Files => Module::Video,
+                    other => other,
+                };
+                self.open_module_project(m, ctx);
             }
         }
 
@@ -27532,6 +28324,53 @@ fn group_label(ui: &mut egui::Ui, text: &str) {
     );
 }
 
+/// 存檔列上的「專案儲存」。按下去只回傳 true，呼叫端等這一幀畫完才開對話框
+/// ——檔案對話框會擋住 UI 執行緒，在版面的 closure 裡直接開等於邊借用 self
+/// 邊開窗（與功能表列的 [`MenuAction`] 同一個顧慮）
+fn project_save_button(ui: &mut egui::Ui, m: Module, enabled: bool) -> bool {
+    ui.add_enabled(enabled, egui::Button::new("💾 專案儲存").small())
+        .on_hover_text(format!(
+            "把這一次調的每一項設定存成專案檔，下次開回來接著做\
+             （存的是設定，不是成品照片）。\n\
+             預設存在照片所在資料夾底下的「{}」裡，\n\
+             檔名預設是「{}-日期-時間」，可以改成自己的名字",
+            project::PROJECT_DIR,
+            m.project_prefix()
+        ))
+        .clicked()
+}
+
+/// 「專案已儲存／已開啟」的提示留幾秒，與各模組的存檔提示同一個長度
+const PROJECT_NOTE_SECS: Duration = Duration::from_secs(8);
+
+/// 存檔列上的「專案已儲存／已開啟」提示。回傳 true 表示還在顯示，
+/// 呼叫端要排下一幀重畫，時間到了它才會自己消失
+fn project_note_label(ui: &mut egui::Ui, note: &Option<(String, Instant)>) -> bool {
+    let Some((msg, at)) = note else {
+        return false;
+    };
+    if at.elapsed() >= PROJECT_NOTE_SECS {
+        return false;
+    }
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(format!("✔ {msg}"))
+            .size(11.5)
+            .color(theme::SUCCESS),
+    );
+    true
+}
+
+/// 模組工具列上的「開啟專案」。回傳 true 的處理時機同 [`project_save_button`]
+fn project_open_button(ui: &mut egui::Ui, enabled: bool) -> bool {
+    ui.add_enabled(enabled, egui::Button::new("📂  開啟專案"))
+        .on_hover_text(
+            "開啟之前用「專案儲存」存下來的專案檔，\n\
+             把那一次的照片與所有設定原樣叫回來",
+        )
+        .clicked()
+}
+
 /// 主要動作按鈕（強調色）
 fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
     ui.scope(|ui| {
@@ -28687,6 +29526,119 @@ fn is_audio(p: &Path) -> bool {
 
 fn is_project_file(p: &Path) -> bool {
     ext_in(p, &[PROJECT_EXT])
+}
+
+/// 原子寫入專案檔：先寫臨時檔再 rename 覆蓋。直接覆寫既有專案檔時若寫到
+/// 一半崩潰/斷電，會損壞使用者辛苦設定的整個專案（照片、調色、文字、
+/// 音樂全丟）。先寫 .tmp 成功才置換，既有專案檔在意外時仍完好。
+/// 臨時檔名帶行程 ID（比照 update_config、temp_path）：兩個視窗同時把
+/// 同一個專案存檔時，才不會共用同一個 .tmp——共用會讓其中一個視窗跳出
+/// 假的「儲存失敗」，甚至讓 rename 搬到另一個視窗覆寫到一半的內容
+fn write_project_atomic(path: &Path, json: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("{PROJECT_EXT}.{}.tmp", std::process::id()));
+    let r = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp); // 失敗時不留臨時檔
+    }
+    r
+}
+
+/// 存成品時，存檔對話框要從哪個資料夾開始：**手上這批東西自己的資料夾**優先，
+/// 沒有（還沒選照片、或那個資料夾不在了）才退回上次存到哪。
+///
+/// 反過來（先看上次存到哪）會讓人存錯地方：這一輪換了一批照片，對話框卻還停在
+/// 上一輪的輸出資料夾，檔名又是照新這批取的，一按存檔就散到別的資料夾去。
+/// `src` 給的是那批的第一個檔案
+fn output_start_dir(which: LastDir, src: Option<&Path>) -> Option<PathBuf> {
+    src.and_then(|p| p.parent())
+        .filter(|d| !d.as_os_str().is_empty() && d.is_dir())
+        .map(|d| d.to_path_buf())
+        .or_else(|| load_last_dir(which))
+}
+
+/// 輸出尺寸寫進檔名的短標籤：`4k`、`1440p`、`1080p`、`720p`、`480p`。
+///
+/// 照**短邊**認（影片模組的尺寸設定本來就是調短邊，直拍的影片也才認得出來）；
+/// 不是這幾個常用尺寸的（原始像素、來源本來就是奇怪的尺寸）就寫實際的寬x高
+fn size_tag(w: u32, h: u32) -> String {
+    match w.min(h) {
+        2160 => "4k".into(),
+        1440 => "1440p".into(),
+        1080 => "1080p".into(),
+        720 => "720p".into(),
+        480 => "480p".into(),
+        _ => format!("{w}x{h}"),
+    }
+}
+
+/// 影片成品的檔名：`<來源名稱>[_<標記>]_<解析度>`。
+///
+/// `source` 由呼叫端給，因為兩個模組的「一支影片是從哪來的」不一樣：
+///
+/// - **照片轉影片**給**照片資料夾的名字**，不加標記
+///   （`20260718連拍1_4k`）——一支影片是整批照片合出來的，沒有哪一個
+///   檔名代表得了它，資料夾名字才講得出這是哪一場拍的。
+/// - **煙火影片去煙霧**給**來源影片自己的檔名**、標記「去煙」
+///   （`20260802將軍吼_4k_1分33_去煙_1080p`）——一支對一支，那才認得出
+///   是哪一支處理出來的，標記則分得出這是處理過的還是原始檔。
+///
+/// `source` 是空的（照片放在磁碟根目錄下，沒有資料夾名可用）時退回「影片」，
+/// 免得檔名變成只有一個解析度
+fn video_file_stem(source: &str, mark: &str, w: u32, h: u32) -> String {
+    let tag = size_tag(w, h);
+    let head = match source.trim() {
+        "" => "影片",
+        s => s,
+    };
+    match mark.trim() {
+        "" => format!("{head}_{tag}"),
+        m => format!("{head}_{m}_{tag}"),
+    }
+}
+
+/// 這個檔案所在**資料夾的名字**（只有最後那一段，不是整條路徑）
+fn folder_name(p: &Path) -> Option<String> {
+    p.parent()
+        .and_then(|d| d.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
+/// 專案檔裡的 [r, g, b, a] 還原成 egui 的顏色
+fn color_from_rgba(c: [u8; 4]) -> egui::Color32 {
+    egui::Color32::from_rgba_premultiplied(c[0], c[1], c[2], c[3])
+}
+
+/// 專案檔裡的照片清單挑出還在的那幾張，回傳 (還在的, 不見了幾張)。
+/// 除了檔案存在，也要求是支援的圖片格式：專案檔可能被手改塞入別的東西，
+/// 或照片被改存成程式讀不了的格式
+fn existing_photos(list: &[PathBuf]) -> (Vec<PathBuf>, usize) {
+    let kept: Vec<PathBuf> = list
+        .iter()
+        // 0 位元組的照片視同遺失（見 is_nonempty_file）：留著只會在存檔時
+        // 逐張報錯，不如現在就當作缺檔略過並提示
+        .filter(|p| p.is_file() && is_image(p) && is_nonempty_file(p))
+        .cloned()
+        .collect();
+    let missing = list.len() - kept.len();
+    (kept, missing)
+}
+
+/// 把 `Vec<(路徑, 值)>`（專案檔裡的存法）收回 HashMap，並丟掉不在這一批
+/// 裡的項目——照片清單可能因檔案遺失而少了幾張
+fn restore_map<T>(pairs: Vec<(PathBuf, T)>, keep: &HashSet<PathBuf>) -> HashMap<PathBuf, T> {
+    pairs
+        .into_iter()
+        .filter(|(k, _)| keep.contains(k))
+        .collect()
+}
+
+/// 反過來：HashMap 依照片順序攤成陣列。JSON 物件的鍵順序不保證穩定，
+/// 同一份專案每次存出來的內容才會一樣（與影片模組的 adj_overrides 同一個理由）
+fn dump_map<T: Clone>(map: &HashMap<PathBuf, T>, order: &[PathBuf]) -> Vec<(PathBuf, T)> {
+    order
+        .iter()
+        .filter_map(|p| map.get(p).map(|v| (p.clone(), v.clone())))
+        .collect()
 }
 
 /// Windows 路徑不分大小寫的比較（最近專案清單去重用）
@@ -30963,6 +31915,481 @@ mod tests {
         // 任一欄位改動都要反映在序列化，否則 has_unsaved_changes 會漏判未儲存變更
         back.ken_burns = !back.ken_burns;
         assert_ne!(serde_json::to_string(&back).unwrap(), json1, "欄位改動未反映在序列化");
+    }
+
+    /// 另外四個模組的專案檔一樣是核心功能：各自往返一次，確認沒有欄位在
+    /// 往返中遺失（HashMap 都轉成陣列存了，順序也不會亂跳）
+    #[test]
+    fn 四個模組的專案檔往返不掉欄位() {
+        let a = PathBuf::from(r"C:\煙火\1.jpg");
+        let b = PathBuf::from(r"C:\煙火\2.jpg");
+        let rect = dehaze::Shape::Rect(dehaze::Region {
+            x0: 0.1,
+            y0: 0.2,
+            x1: 0.8,
+            y1: 0.9,
+        });
+
+        let mut dh = project::DehazeProject {
+            app_version: "9.9.9".into(),
+            photos: vec![a.clone(), b.clone()],
+            cur: 1,
+            auto_on: false,
+            per_photo: false,
+            text_font: "微軟正黑體".into(),
+            wipe_keep: false,
+            crop_aspect: CropAspect::Ratio(16, 9),
+            multi_sel: vec![b.clone()],
+            ..Default::default()
+        };
+        dh.params.strength = 73;
+        dh.params.shapes = vec![rect.clone()];
+        dh.overrides = vec![(
+            b.clone(),
+            dehaze::SmokeParams {
+                detail: 12,
+                ..Default::default()
+            },
+        )];
+        dh.wipes = vec![(
+            a.clone(),
+            vec![edit::Wipe {
+                radius: 0.05,
+                ..Default::default()
+            }],
+        )];
+        dh.auto = vec![(
+            a.clone(),
+            dehaze::AutoParams {
+                strength: 55,
+                detail: 66,
+                sky_clean: 7,
+                sky_range: 8,
+            },
+        )];
+        dh.finish.texts = vec![edit::TextItem {
+            text: "落款".into(),
+            rot: 12.0,
+            ..Default::default()
+        }];
+        let j = serde_json::to_string(&dh).unwrap();
+        let back: project::DehazeProject = serde_json::from_str(&j).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), j, "去煙霧專案往返有欄位遺失");
+
+        let st = project::StackProject {
+            app_version: "9.9.9".into(),
+            photos: vec![a.clone(), b.clone()],
+            ground: 1,
+            pro: true,
+            mode: stack::BlendMode::Screen,
+            masks: vec![(b.clone(), vec![rect.clone()])],
+            mask_polarity: vec![(b.clone(), true)],
+            xforms: vec![(
+                b.clone(),
+                stack::Xform {
+                    dx: 0.01,
+                    dy: -0.02,
+                    scale: 1.1,
+                    rot: 3.0,
+                },
+            )],
+            grades: vec![(
+                a.clone(),
+                Adjustments {
+                    contrast: 20,
+                    ..Default::default()
+                },
+            )],
+            auto_offsets: vec![(b.clone(), None), (a.clone(), Some(stack::Xform::default()))],
+            grade_target: GradeTarget::Output,
+            crop_aspect: CropAspect::Original,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&st).unwrap();
+        let back: project::StackProject = serde_json::from_str(&j).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), j, "疊圖專案往返有欄位遺失");
+
+        let mut mv = project::MovieProject {
+            app_version: "9.9.9".into(),
+            src: Some(PathBuf::from(r"C:\煙火\a.mp4")),
+            queue: vec![PathBuf::from(r"C:\煙火\b.mp4")],
+            merge: true,
+            at: 12.5,
+            size: MovieSize::Short(1080),
+            crop: Crop {
+                x0: 0.1,
+                x1: 0.9,
+                quarter: 1,
+                ..Default::default()
+            },
+            pro: true,
+            clip_secs: 10.0,
+            ..Default::default()
+        };
+        mv.segments = vec![
+            Segment {
+                start: 0.0,
+                shapes: vec![rect.clone()],
+                ..Default::default()
+            },
+            Segment {
+                start: 4.0,
+                ..Default::default()
+            },
+        ];
+        mv.grade.zones[1].grade.exposure = 15;
+        mv.grade.zones[1].mask_on = true;
+        let j = serde_json::to_string(&mv).unwrap();
+        let back: project::MovieProject = serde_json::from_str(&j).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), j, "影片去煙專案往返有欄位遺失");
+
+        let en = project::EnhanceProject {
+            app_version: "9.9.9".into(),
+            photos: vec![a.clone(), b.clone()],
+            cur: 1,
+            preset: enhance::Preset::Portrait,
+            preset_overrides: vec![(b.clone(), enhance::Preset::Landscape)],
+            auto: vec![(a.clone(), enhance::Preset::Bird, enhance::Auto::default())],
+            auto_amount: 60,
+            grade_overrides: vec![(
+                a.clone(),
+                Adjustments {
+                    vibrance: 25,
+                    ..Default::default()
+                },
+            )],
+            local_overrides: vec![(b.clone(), enhance::Local { subject: 40, skin: 20 })],
+            per_photo: true,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&en).unwrap();
+        let back: project::EnhanceProject = serde_json::from_str(&j).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), j, "優化專案往返有欄位遺失");
+    }
+
+    /// 「物件」遮色片存的是一張點陣權重圖，寫成 base64 才不會讓專案檔爆炸大。
+    /// 開檔後的 mask 是從 raw 重算的，要比得出「選到的是同一塊」
+    #[test]
+    fn 物件遮色片的權重圖存成base64且往返後選到同一塊() {
+        // 中間一整塊 255、四周 0 的小圖
+        let (w, h) = (16usize, 12usize);
+        let raw: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                if (4..12).contains(&x) && (3..9).contains(&y) {
+                    255
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let area = dehaze::Region {
+            x0: 0.2,
+            y0: 0.1,
+            x1: 0.7,
+            y1: 0.6,
+        };
+        let obj = dehaze::Object::from_raw(raw, w, h, area, 20, -10);
+        let before = obj.mask.clone();
+        let j = serde_json::to_string(&dehaze::Shape::Object(obj)).unwrap();
+        // 存成 JSON 數字陣列的話，一張 384×384 的權重圖要五十幾萬個字元
+        assert!(!j.contains(",255,"), "權重圖不該存成數字陣列：{j}");
+        let dehaze::Shape::Object(back) = serde_json::from_str(&j).unwrap() else {
+            panic!("往返後不是物件形狀");
+        };
+        assert_eq!((back.w, back.h), (w, h));
+        assert_eq!((back.feather, back.edge), (20, -10));
+        assert_eq!(back.area, area);
+        assert_eq!(*back.mask, *before, "重算出來的權重圖與存檔前不同");
+    }
+
+    /// 專案檔靠 `module` 欄位認模組；沒有那個欄位的是這個欄位還不存在時
+    /// 存的 .p2v，全都是影片專案
+    #[test]
+    fn 專案檔照module欄位認出是哪個模組的() {
+        for (kind, m) in [
+            (project::KIND_DEHAZE, Module::Dehaze),
+            (project::KIND_STACK, Module::Stack),
+            (project::KIND_MOVIE, Module::Movie),
+            (project::KIND_ENHANCE, Module::Enhance),
+        ] {
+            let txt = format!(r#"{{"module":"{kind}"}}"#);
+            assert_eq!(project::parse(&txt).unwrap().module(), m, "{kind} 認錯模組");
+        }
+        // 舊的 .p2v（還沒有 module 欄位時存的）＝影片專案
+        let old = r#"{"version":1,"fps":7,"photos":[]}"#;
+        assert_eq!(project::parse(old).unwrap().module(), Module::Video);
+        // 五個模組各自存出來的檔案，都要被認回自己那一種
+        for m in [
+            Module::Video,
+            Module::Dehaze,
+            Module::Stack,
+            Module::Movie,
+            Module::Enhance,
+        ] {
+            let txt = match m {
+                Module::Video => serde_json::to_string(&ProjectFile::default()).unwrap(),
+                Module::Dehaze => {
+                    serde_json::to_string(&project::DehazeProject::default()).unwrap()
+                }
+                Module::Stack => serde_json::to_string(&project::StackProject::default()).unwrap(),
+                Module::Movie => serde_json::to_string(&project::MovieProject::default()).unwrap(),
+                _ => serde_json::to_string(&project::EnhanceProject::default()).unwrap(),
+            };
+            assert_eq!(
+                project::parse(&txt).unwrap().module(),
+                m,
+                "{} 的專案檔認錯模組",
+                m.label()
+            );
+        }
+        // 壞掉的內容要回錯誤，不是 panic
+        assert!(project::parse("{ 這不是 JSON").is_err());
+        // 用記事本開來改過再存回去會多一個 UTF-8 BOM，那不該讓整份開不起來
+        let bom = format!("\u{feff}{{\"module\":\"{}\"}}", project::KIND_STACK);
+        assert_eq!(project::parse(&bom).unwrap().module(), Module::Stack);
+    }
+
+    /// 檔名是「名字-日期-時間」。下次存檔要換上新的時間，所以得拆得回
+    /// 使用者自己取的那一段
+    #[test]
+    fn 專案檔名帶日期時間且拆得回使用者取的名字() {
+        assert_eq!(project::strip_stamp("去煙霧-20260914-1300"), "去煙霧");
+        assert_eq!(
+            project::strip_stamp("漁人碼頭 煙火-20260914-1300"),
+            "漁人碼頭 煙火"
+        );
+        // 整個改掉的（尾巴沒有那一段）原樣留著，不要砍掉人家的名字
+        assert_eq!(project::strip_stamp("我的專案"), "我的專案");
+        assert_eq!(project::strip_stamp("2026-09-14 的煙火"), "2026-09-14 的煙火");
+        // 少了名字或少了時間都不該拼出多餘的「-」
+        assert!(!project::file_stem("疊圖").ends_with('-'));
+        assert!(!project::file_stem("").starts_with('-'));
+        // 取得到本機時間（Windows）時才驗得到完整格式
+        if let Some(stamp) = date_stamp() {
+            assert_eq!(stamp.len(), 13, "時間戳應長得像 20260914-1300：{stamp}");
+            let stem = project::file_stem("優化");
+            assert_eq!(stem, format!("優化-{stamp}"));
+            assert_eq!(project::strip_stamp(&stem), "優化");
+        }
+    }
+
+    /// 影片成品的檔名是**算出來的**：開頭 ＋ 中間 ＋ 解析度。中間那一段
+    /// 兩個模組不一樣——照片轉影片是照片資料夾的名字（一支影片是整批合出來的），
+    /// 影片去煙是來源影片自己的檔名（一支對一支）。
+    /// 照片的成品則不帶這些，維持「原檔名_後綴」（那部分在各自的存檔那裡）
+    #[test]
+    fn 影片檔名帶來源名稱與解析度() {
+        let photo = PathBuf::from(r"F:\20260718連拍1\A9300174.jpg");
+        let folder = folder_name(&photo).unwrap_or_default();
+        assert_eq!(folder, "20260718連拍1");
+        // 照片轉影片：資料夾名 ＋ 常用尺寸的短標籤，沒有額外的標記
+        assert_eq!(
+            video_file_stem(&folder, "", 3840, 2160),
+            "20260718連拍1_4k"
+        );
+        assert_eq!(
+            video_file_stem(&folder, "", 1920, 1080),
+            "20260718連拍1_1080p"
+        );
+        // 「原始像素」那種不是常用尺寸的，寫實際的寬x高
+        assert_eq!(
+            video_file_stem(&folder, "", 8640, 5760),
+            "20260718連拍1_8640x5760"
+        );
+        // 影片去煙：換成**來源影片的檔名**（不是資料夾），並標「去煙」
+        let movie = PathBuf::from(r"F:\20260830漁人碼頭煙火_video_去煙\20260802將軍吼_4k_1分33.mp4");
+        let name = movie
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert_eq!(
+            video_file_stem(&name, "去煙", 1920, 1080),
+            "20260802將軍吼_4k_1分33_去煙_1080p"
+        );
+        // 短邊認尺寸：直拍的影片也要認得出是 1080p
+        assert_eq!(size_tag(1080, 1920), "1080p");
+        assert_eq!(size_tag(2160, 3840), "4k");
+        assert_eq!(size_tag(854, 480), "480p");
+        // 來源名稱取不到時退回「影片」，檔名不會變成只有一個解析度
+        assert_eq!(video_file_stem("", "", 1280, 720), "影片_720p");
+        assert_eq!(video_file_stem("  ", "去煙", 1280, 720), "影片_去煙_720p");
+        // 根目錄下的照片沒有資料夾名可用（就是上面那條退路）
+        assert_eq!(folder_name(Path::new(r"F:\a.jpg")), None);
+    }
+
+    /// 存成品的對話框要開在**手上這批東西自己的資料夾**，不是上次存到哪。
+    /// 反過來的話換一批照片之後對話框還停在上一輪的位置，一按存檔就散出去
+    #[test]
+    fn 存檔對話框從這批東西自己的資料夾開始() {
+        let base = std::env::temp_dir().join(format!("p2v_outdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let here = base.join("20260714連拍1");
+        std::fs::create_dir_all(&here).unwrap();
+        let photo = here.join("A9309791.jpg");
+        std::fs::write(&photo, b"x").unwrap();
+        // 「上次存到哪」不在這裡設——那會寫進使用者真正的設定檔。
+        // 拿它現在記著的值當對照就夠了
+        let last = load_last_dir(LastDir::VideoOutput);
+        // 手上有照片：照片自己的資料夾贏過上次那個
+        assert_eq!(
+            output_start_dir(LastDir::VideoOutput, Some(&photo)),
+            Some(here.clone()),
+            "應該開在這批照片所在的資料夾"
+        );
+        // 還沒選照片：才退回上次存到哪
+        assert_eq!(output_start_dir(LastDir::VideoOutput, None), last);
+        // 照片所在的資料夾已經不在了（拔掉的隨身碟）：一樣退回上次那個
+        let gone = base.join("不存在的資料夾").join("a.jpg");
+        assert_eq!(output_start_dir(LastDir::VideoOutput, Some(&gone)), last);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 換一個輸出尺寸，預設檔名要跟著換。檔名是按下輸出時才照
+    /// [`MovieTool::out_dims`] 算的，所以走一遍下拉裡的每一個選項對一次
+    #[test]
+    fn 影片檔名跟著輸出尺寸換() {
+        let src = PathBuf::from(r"F:\20260830漁人碼頭煙火\20260802將軍吼_4k.mp4");
+        let mut m = MovieTool::default();
+        m.src = Some(src.clone());
+        m.info = Some(VideoInfo {
+            w: 3840,
+            h: 2160,
+            fps: 60.0,
+            secs: 94.0,
+            audio: None,
+        });
+        // 尺寸下拉由上到下：與來源相同 / 4K / 2K / Full HD / 720p / 480p。
+        // 來源就是 4K，所以前兩個算出來一樣（實際輸出本來就同一組尺寸）
+        let expect = [
+            (MovieSize::Source, "20260802將軍吼_4k_去煙_4k"),
+            (MovieSize::Short(2160), "20260802將軍吼_4k_去煙_4k"),
+            (MovieSize::Short(1440), "20260802將軍吼_4k_去煙_1440p"),
+            (MovieSize::Short(1080), "20260802將軍吼_4k_去煙_1080p"),
+            (MovieSize::Short(720), "20260802將軍吼_4k_去煙_720p"),
+            (MovieSize::Short(480), "20260802將軍吼_4k_去煙_480p"),
+        ];
+        assert_eq!(expect.len(), MovieSize::ALL.len(), "尺寸選項有增減，這裡要跟著補");
+        for (size, want) in expect {
+            m.size = size;
+            // 直接叫 movie_export 取檔名時用的那個方法
+            assert_eq!(
+                m.out_stem(),
+                want,
+                "{} 算出來的檔名不對",
+                size.label()
+            );
+        }
+        // 裁切過的影片：檔名要照**裁完再縮**的實際輸出尺寸，
+        // 不是沒裁之前那一組（下拉右邊顯示的數字也是這個）
+        m.size = MovieSize::Source;
+        m.crop = Crop {
+            x0: 0.25,
+            x1: 0.75,
+            ..Default::default()
+        };
+        assert_eq!(m.out_dims(), Some((1920, 2160)));
+        assert_eq!(
+            m.out_stem(),
+            "20260802將軍吼_4k_去煙_1920x2160",
+            "裁切過就不是標準尺寸了，要寫實際的寬x高"
+        );
+
+        // 照片轉影片的解析度下拉也走一遍（那邊是固定的畫布尺寸，不像影片
+        // 要先套到來源上；「原始像素」是算出來的，不在這份清單裡對）
+        let photo = PathBuf::from(r"F:\20260718連拍1\A9300174.jpg");
+        let folder = folder_name(&photo).unwrap_or_default();
+        for (res, want) in [
+            (Resolution { w: 1280, h: 720 }, "20260718連拍1_720p"),
+            (Resolution { w: 1920, h: 1080 }, "20260718連拍1_1080p"),
+            (Resolution { w: 2560, h: 1440 }, "20260718連拍1_1440p"),
+            (Resolution { w: 3840, h: 2160 }, "20260718連拍1_4k"),
+        ] {
+            assert!(
+                Resolution::ALL.contains(&res),
+                "{} 已經不在下拉清單裡了",
+                res.label()
+            );
+            assert_eq!(
+                video_file_stem(&folder, "", res.w, res.h),
+                want,
+                "{} 算出來的檔名不對",
+                res.label()
+            );
+        }
+    }
+
+    /// 專案檔存在照片資料夾底下的「專案／<模組>」裡：存檔時不存在就建起來，
+    /// 開檔時不存在就別建——按個「開啟」不該在人家的資料夾裡長出東西。
+    /// 分模組是為了讓存檔視窗只看得到自己那一種（五個模組共用同一個副檔名）
+    #[test]
+    fn 專案檔預設放在照片資料夾底下的模組子資料夾() {
+        let base = std::env::temp_dir().join(format!("p2v_proj_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let photo = base.join("A1.jpg");
+        std::fs::write(&photo, b"x").unwrap();
+        let root = base.join(project::PROJECT_DIR);
+        let stack = root.join("疊圖");
+        // 開檔：連「專案」都還沒有就回 None，也不會順手建出來
+        assert_eq!(project::project_dir(Some(&photo), "疊圖", false), None);
+        assert!(!root.is_dir());
+        // 存檔：連模組那一層一起建起來
+        assert_eq!(
+            project::project_dir(Some(&photo), "疊圖", true),
+            Some(stack.clone())
+        );
+        assert!(stack.is_dir());
+        // 建好之後開檔也找得到
+        assert_eq!(
+            project::project_dir(Some(&photo), "疊圖", false),
+            Some(stack.clone())
+        );
+        // 別的模組是另一層，彼此看不到對方的檔
+        let dehaze = project::project_dir(Some(&photo), "去煙霧", true).unwrap();
+        assert_eq!(dehaze, root.join("去煙霧"));
+        assert_ne!(dehaze, stack);
+        // 開檔時自己那一層還沒有，就退回「專案」本身——還沒分層之前存的
+        // 舊檔都在那裡，不然會變得找不到
+        assert_eq!(
+            project::project_dir(Some(&photo), "影片去煙", false),
+            Some(root.clone())
+        );
+        // 沒有照片就沒有「旁邊」可言
+        assert_eq!(project::project_dir(None, "疊圖", true), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 分段是直接拿索引取值的（[`MovieTool::seg`]），一段都沒有會當場 panic。
+    /// 手改過、或別的版本寫的專案檔都要能收成該有的樣子
+    #[test]
+    fn 專案檔的分段收成至少一段且照時間排好() {
+        let mut m = MovieTool::default();
+        m.segments.clear();
+        m.normalize_segments();
+        assert_eq!(m.segments.len(), 1, "一段都沒有時要補一段");
+        assert_eq!(m.segments[0].start, 0.0);
+        // 順序亂的、第一段不從 0 起的，都要收好
+        m.segments = vec![
+            Segment {
+                start: 9.0,
+                ..Default::default()
+            },
+            Segment {
+                start: 3.0,
+                ..Default::default()
+            },
+            Segment {
+                start: 6.0,
+                ..Default::default()
+            },
+        ];
+        m.normalize_segments();
+        let starts: Vec<f64> = m.segments.iter().map(|s| s.start).collect();
+        assert_eq!(starts, vec![0.0, 6.0, 9.0]);
+        // 收好之後 seg() 才拿得到東西（at 停在最後一段裡）
+        m.at = 7.0;
+        assert_eq!(m.seg().start, 6.0);
     }
 
     #[test]

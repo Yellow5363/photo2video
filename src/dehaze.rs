@@ -260,7 +260,8 @@ fn sky_range_for(y: f32) -> i32 {
 
 /// 只在畫面某個區塊去煙時的作用範圍。
 /// 用相對座標（0~1）而非像素，預覽縮圖與原尺寸才會框到同一塊。
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Region {
     pub x0: f32,
     pub y0: f32,
@@ -289,7 +290,8 @@ impl Region {
 
 /// 線性漸層：拖曳的起點是全效果，沿著拖曳方向漸弱，到終點歸零；
 /// 與拖曳方向垂直的兩側無限延伸（比照 Lightroom 的線性漸層）
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Linear {
     pub x0: f32,
     pub y0: f32,
@@ -307,7 +309,8 @@ impl Linear {
 
 /// 放射性漸層：橢圓內全效果，往外在羽化帶裡漸弱到 0。
 /// `invert` 打開就反過來——橢圓外才去煙、裡面保持原樣
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Radial {
     pub cx: f32,
     pub cy: f32,
@@ -327,7 +330,8 @@ impl Radial {
 /// 一筆之內自己交疊不會變濃（同一筆繞回來塗，那一塊還是同一個濃度），
 /// **筆與筆之間才相加**——想加濃就再刷一遍，這是筆刷該有的手感
 /// （見 [`ShapeMask`]）
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Brush {
     /// 筆跡經過的點（相對座標 0~1）
     pub pts: Vec<[f32; 2]>,
@@ -342,7 +346,7 @@ impl Brush {
 }
 
 /// 遮色片的一個形狀。同一張遮色片可以疊好幾個，怎麼合起來見 [`ShapeMask`]
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Shape {
     /// 矩形框：框內去煙、框外原樣
     Rect(Region),
@@ -364,7 +368,11 @@ pub enum Shape {
 /// 而不是整張照片：框選通常只圈畫面的一小塊，整張存等於把格子鋪在沒選到的
 /// 地方，同樣的格數只鋪在框裡，邊界就細得多。座標一律用相對值，
 /// 預覽縮圖與原尺寸才共用得了同一份——兩邊選到的必須是同一塊
-#[derive(Clone, Debug)]
+///
+/// 存進專案檔時只寫 `raw`（連同 w、h、area 與那兩條滑桿），`mask` 開檔後
+/// 從它重算——那是 [`refine_object`] 的產物，存了等於同一張圖寫兩遍
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(from = "ObjectData", into = "ObjectData")]
 pub struct Object {
     /// 分割出來的原始權重圖，`w`×`h`，0~255，**還沒套羽化與邊緣**。
     ///
@@ -385,6 +393,97 @@ pub struct Object {
     pub edge: i32,
 }
 
+/// [`Object`] 在專案檔裡的樣子。權重圖是上萬個位元組，寫成 JSON 陣列要
+/// 「255,」這樣一格四個字元；改成 base64 只要四分之三個字元，檔案小一半有餘
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ObjectData {
+    /// 原始權重圖的 base64（長度應為 `w`×`h`）
+    raw: String,
+    w: usize,
+    h: usize,
+    area: Region,
+    feather: i32,
+    edge: i32,
+}
+
+impl Default for ObjectData {
+    fn default() -> Self {
+        Self {
+            raw: String::new(),
+            w: 0,
+            h: 0,
+            area: Region::default(),
+            feather: OBJECT_FEATHER,
+            edge: 0,
+        }
+    }
+}
+
+impl From<Object> for ObjectData {
+    fn from(o: Object) -> Self {
+        Self {
+            raw: b64_encode(&o.raw),
+            w: o.w,
+            h: o.h,
+            area: o.area,
+            feather: o.feather,
+            edge: o.edge,
+        }
+    }
+}
+
+impl From<ObjectData> for Object {
+    fn from(d: ObjectData) -> Self {
+        let raw = b64_decode(&d.raw);
+        // 專案檔可能被手改、或是別的版本寫的：尺寸與資料對不上時退成空的，
+        // 它會被 is_usable 擋掉當作沒畫過這個形狀，總比拿著錯的長度去
+        // 索引好（refine_object 假設 raw.len() == w*h）
+        let (w, h) = if raw.len() == d.w * d.h { (d.w, d.h) } else { (0, 0) };
+        let raw = if w * h == 0 { Vec::new() } else { raw };
+        Object::from_raw(raw, w, h, d.area, d.feather, d.edge)
+    }
+}
+
+/// base64 的字母表（RFC 4648 標準版）
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            // 來源不足三個位元組時，尾端補 '='（而不是真的把補的 0 寫出去）
+            if i <= c.len() {
+                out.push(B64[(n >> (18 - i * 6)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// base64 解回位元組；認不得的字元（含換行與 '='）一律略過，
+/// 湊不滿一組的尾巴丟掉——壞掉的字串解出來會長度不符，呼叫端會擋下
+fn b64_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for ch in s.bytes() {
+        let Some(v) = B64.iter().position(|&c| c == ch) else {
+            continue;
+        };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
 impl PartialEq for Object {
     /// 同一份（Arc 指向同一塊）就相等，不必逐位元組比。
     /// 這個比較每幀都要做好幾次（判斷要不要重算預覽），
@@ -399,6 +498,36 @@ impl PartialEq for Object {
 }
 
 impl Object {
+    /// 從分割出來的原始權重圖做一個物件。
+    ///
+    /// `mask` 一律由 `raw` 套上羽化與邊緣算出來，不另外傳進來——那兩者
+    /// 只有一種對應關係，分開傳遲早會出現對不上的一份（開專案檔時也走這裡）
+    pub fn from_raw(
+        raw: Vec<u8>,
+        w: usize,
+        h: usize,
+        area: Region,
+        feather: i32,
+        edge: i32,
+    ) -> Object {
+        let (feather, edge) = (feather.clamp(0, 100), edge.clamp(-100, 100));
+        // 空的別進 refine_object：那裡假設影像至少有一格
+        let mask = if w * h == 0 {
+            Vec::new()
+        } else {
+            refine_object(&raw, w, h, feather, edge)
+        };
+        Object {
+            mask: std::sync::Arc::new(mask),
+            raw: std::sync::Arc::new(raw),
+            w,
+            h,
+            area,
+            feather,
+            edge,
+        }
+    }
+
     /// 選到的面積佔這張小圖的比例；小到看不出來的就不算數
     fn coverage(&self) -> f32 {
         if self.mask.is_empty() {
@@ -446,6 +575,8 @@ impl Object {
         if feather == self.feather && edge == self.edge {
             return self.clone();
         }
+        // 這裡不走 from_raw：那要把 raw 整份搬進去，而這個函式每動一格
+        // 滑桿就跑一次；共用同一份 Arc 才不會每次都複製一張小圖
         Object {
             mask: std::sync::Arc::new(refine_object(&self.raw, self.w, self.h, feather, edge)),
             raw: self.raw.clone(),
@@ -808,17 +939,7 @@ pub fn select_object(img: &RgbImage, sel: Region, feather: i32, edge: i32) -> Op
             (v * 255.0).round() as u8
         })
         .collect();
-    let raw = std::sync::Arc::new(raw);
-    let (feather, edge) = (feather.clamp(0, 100), edge.clamp(-100, 100));
-    let obj = Object {
-        mask: std::sync::Arc::new(refine_object(&raw, w, h, feather, edge)),
-        raw,
-        w,
-        h,
-        area,
-        feather,
-        edge,
-    };
+    let obj = Object::from_raw(raw, w, h, area, feather, edge);
     obj.is_usable().then_some(obj)
 }
 
@@ -888,7 +1009,8 @@ const OBJECT_FEATHER_R: f32 = 0.05;
 pub const OBJECT_FEATHER: i32 = 15;
 
 /// 去煙參數
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SmokeParams {
     /// 去除強度 0~100：煙霧層要扣掉多少，100 時幾乎移除全部散射光
     pub strength: i32,
@@ -2890,20 +3012,13 @@ pub fn select_sky(img: &RgbImage, source_long: u32, feather: i32, edge: i32) -> 
         .map(|(&a, &b)| ((a * b).clamp(0.0, 1.0) * 255.0).round() as u8)
         .collect();
     let (feather, edge) = (feather.clamp(0, 100), edge.clamp(-100, 100));
-    let o = Object {
-        mask: std::sync::Arc::new(refine_object(&raw, w, h, feather, edge)),
-        raw: std::sync::Arc::new(raw),
-        w,
-        h,
-        area: Region {
-            x0: 0.0,
-            y0: 0.0,
-            x1: 1.0,
-            y1: 1.0,
-        },
-        feather,
-        edge,
+    let area = Region {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 1.0,
+        y1: 1.0,
     };
+    let o = Object::from_raw(raw, w, h, area, feather, edge);
     o.is_usable().then_some(o)
 }
 
@@ -3098,7 +3213,8 @@ const AUTO_RANGE_HEADROOM: f32 = 2.2;
 
 /// 一張照片自動量出來的建議值。只涵蓋四條數值滑桿——遮色片、保護色與
 /// 夜空顏色取決於使用者想留下什麼，不是照片本身量得出來的
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct AutoParams {
     pub strength: i32,
     pub detail: i32,

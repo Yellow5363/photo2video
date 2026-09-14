@@ -25,7 +25,8 @@ use crate::{Adjustments, Crop, SubtitleStyle};
 /// 一段疊在照片上的文字。位置是中心點在畫面上的比例（0~1），
 /// 大小以 1080p 高度為基準（與主畫面的文字同一個尺規），
 /// 旋轉單位為度（順時針）
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TextItem {
     pub text: String,
     pub x: f32,
@@ -57,7 +58,8 @@ impl TextItem {
 ///
 /// 與去煙參數分開存放是刻意的——去煙要算上近一秒，調色與文字卻是即時的；
 /// 分開才能在拖動調色滑桿時只重跑這一段（見 `App::spawn_smoke_finish`）
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Finish {
     pub grade: Adjustments,
     pub texts: Vec<TextItem>,
@@ -543,7 +545,8 @@ pub fn apply_grade_masked(img: &mut RgbImage, adj: &Adjustments, weights: &[f32]
 ///
 /// 座標是相對座標（0~1）、半徑是佔影像長邊的比例，預覽縮圖與原尺寸才會
 /// 清掉同一塊（與遮色片筆刷 `dehaze::Brush` 同一套規矩）
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Wipe {
     /// 筆跡經過的點
     pub pts: Vec<[f32; 2]>,
@@ -1001,7 +1004,8 @@ fn stamp_disc(cov: &mut [f32], bw: usize, bh: usize, at: [f32; 2], r: f32, inner
 /// 位置是中心點在畫面上的比例（0~1）、大小是**寬度佔照片寬度的比例**、
 /// 旋轉單位為度（順時針）——全是相對值，所以預覽上擺好的樣子，
 /// 存檔用原尺寸畫出來也是同一個位置與大小
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ImageItem {
     /// 來源檔（剪貼簿貼上的會先落地成暫存 PNG）
     pub path: PathBuf,

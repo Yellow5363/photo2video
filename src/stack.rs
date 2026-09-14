@@ -22,9 +22,10 @@ use image::RgbImage;
 use crate::dehaze::{self, Shape};
 
 /// 疊圖的混合方式
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum BlendMode {
     /// 加亮：逐通道取兩張比較亮的那個
+    #[default]
     Lighten,
     /// 濾色：兩張的光相加（不會超過純白）
     Screen,
@@ -65,7 +66,8 @@ impl BlendMode {
 ///
 /// 三個量都是**相對的**（平移是佔畫面寬高的比例、縮放是倍率、旋轉是角度），
 /// 所以同一組數字套在預覽縮圖與原尺寸照片上，擺出來的構圖一模一樣
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Xform {
     /// 平移，佔畫面寬／高的比例（正值往右、往下）
     pub dx: f32,

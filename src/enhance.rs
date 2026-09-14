@@ -46,7 +46,7 @@ const MASK_LONG_EDGE: u32 = 384;
 
 /// 優化的類型。三種的差別不在「用不用得到哪一段程式」，而在**目標值**：
 /// 同一套量測、不同的期望亮度、對比、彩度與銳利度
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Preset {
     /// 鳥類：主體小、背景多半是天空或散景，靠細節密度就圈得很準。
     /// 調色偏「通透 ＋ 對比」，主體再另外提亮、加銳
@@ -125,7 +125,8 @@ impl Preset {
 
 /// 量一張照片得到的建議。`grade` 就是那十二條滑桿該停的位置；
 /// 另外兩個佔比是拿來在畫面上講一句「這張測到什麼」用的
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Auto {
     pub grade: Adjustments,
     /// 主體佔畫面的比例 0~1
@@ -153,7 +154,8 @@ impl Auto {
 }
 
 /// 主體強化與柔膚的強度（都是 0~100，0＝不做）
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Local {
     /// 主體強化：提亮、加清晰、加銳利，把主體從背景裡拉出來
     pub subject: i32,
