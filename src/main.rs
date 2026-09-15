@@ -77,6 +77,12 @@ mod theme {
     pub const TRACK: Color32 = Color32::from_rgb(0xFF, 0x8A, 0x3D);
     pub const ERROR: Color32 = Color32::from_rgb(0xE5, 0x60, 0x5A);
     pub const PREVIEW_BG: Color32 = Color32::from_rgb(0x19, 0x1A, 0x1D);
+    /// 「最近的專案」那幾個檔名（起始畫面與照片轉影片的空狀態）。
+    /// ACCENT 的藍畫在近黑的卡片上、字又不大，遠看整排糊在背景裡；
+    /// 換成標誌上那個暖金最跳得出來
+    pub const LINK: Color32 = Color32::from_rgb(0xFF, 0xC9, 0x78);
+    /// 同上，滑鼠指到時再亮一階
+    pub const LINK_HOVER: Color32 = Color32::from_rgb(0xFF, 0xE2, 0xB0);
 }
 
 /// 主畫面右上角的功能模組（比照 Lightroom 的「圖庫｜編輯相片｜地圖…」）。
@@ -85,8 +91,16 @@ mod theme {
 /// 1. 這裡加一個 variant，並補進 [`Module::ALL`]（順序＝模組列由左到右的順序）
 /// 2. [`Module::label`] / [`Module::icon`] / [`Module::hint`] 各補一條分支
 /// 3. [`App::ui_module_body`] 加一條分支，畫這個模組自己的面板
+///
+/// [`Module::Home`]（起始畫面）是唯一的例外：它不在 [`Module::ALL`] 裡
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Module {
+    /// 起始畫面：程式一開啟停在這裡，**不屬於任何功能**。
+    ///
+    /// 故意不放進 [`Module::ALL`]：它不是模組列上的一格，而是「還沒挑功能」
+    /// 的狀態——模組列因此一格都不亮，畫面上只有標誌與開啟專案。
+    /// 從這裡按一格模組、或開一個專案，就會切到那個模組去
+    Home,
     /// 照片轉影片（本程式最早、也是主要的功能）
     Video,
     /// 去煙霧（把煙火照片裡的煙霧散掉，只留線條）
@@ -114,6 +128,7 @@ impl Module {
 
     fn label(self) -> &'static str {
         match self {
+            Module::Home => "起始畫面",
             Module::Video => "照片轉影片",
             Module::Dehaze => "去煙霧",
             Module::Stack => "煙火疊圖",
@@ -125,6 +140,7 @@ impl Module {
 
     fn icon(self) -> &'static str {
         match self {
+            Module::Home => "🏠",
             Module::Video => "🎬",
             Module::Dehaze => "💨",
             Module::Stack => "🎆",
@@ -137,6 +153,7 @@ impl Module {
     /// 滑鼠停在模組名稱上時的一句話說明
     fn hint(self) -> &'static str {
         match self {
+            Module::Home => "回到起始畫面：開啟之前存的專案，或從上面挑一個功能開始",
             Module::Video => "把一疊照片排成影片：調色、加文字、配背景音樂後輸出 MP4",
             Module::Dehaze => "去掉煙火照片裡的煙霧、保留煙火線條，處理後另存新檔",
             Module::Stack => "把多張煙火用加亮／濾色疊成一張，可調色後存檔",
@@ -148,9 +165,10 @@ impl Module {
         }
     }
 
-    /// 專案檔裡的模組識別字串；檔案管理沒有專案可存
+    /// 專案檔裡的模組識別字串；起始畫面與檔案管理沒有專案可存
     fn project_kind(self) -> Option<&'static str> {
         Some(match self {
+            Module::Home => return None,
             Module::Video => project::KIND_VIDEO,
             Module::Dehaze => project::KIND_DEHAZE,
             Module::Stack => project::KIND_STACK,
@@ -169,10 +187,23 @@ impl Module {
             Module::Stack => "疊圖",
             Module::Movie => "影片去煙",
             Module::Enhance => "優化",
-            Module::Files => "",
+            Module::Home | Module::Files => "",
         }
     }
 
+    /// 停止回應紀錄裡的模組編號（見 [`ACTIVE_MODULE`]）：[`Module::ALL`] 的
+    /// 索引，不在裡面的起始畫面排在最後一號
+    fn index(self) -> u8 {
+        Module::ALL
+            .iter()
+            .position(|m| *m == self)
+            .unwrap_or(Module::ALL.len()) as u8
+    }
+
+    /// [`Module::index`] 的反向：認不得的編號一律當成起始畫面
+    fn from_index(i: u8) -> Module {
+        Module::ALL.get(i as usize).copied().unwrap_or(Module::Home)
+    }
 }
 
 /// 功能表列點下去要做的事。選單的 closure 借著 `self`，開檔案／訊息對話框
@@ -1381,9 +1412,9 @@ static UI_PHASE: AtomicU8 = AtomicU8::new(PHASE_STARTUP);
 static UI_TICK: AtomicU64 = AtomicU64::new(0);
 /// 看門狗最後一次成功送出重畫請求的時刻（同上時間軸）
 static WAKE_TICK: AtomicU64 = AtomicU64::new(0);
-/// 目前停在哪個功能模組（[`Module::ALL`] 的索引）：只在某個模組才發生的
-/// 問題，回報時看得出來
-static ACTIVE_MODULE: AtomicU8 = AtomicU8::new(0);
+/// 目前停在哪個功能模組（見 [`Module::index`]）：只在某個模組才發生的
+/// 問題，回報時看得出來。初值＝起始畫面，程式一開啟就停在那裡
+static ACTIVE_MODULE: AtomicU8 = AtomicU8::new(Module::ALL.len() as u8);
 /// 主視窗的 HWND（第一次 update 從 eframe 拿到就記著；0＝還沒拿到）。
 /// 對話框一律綁在它上面，見 [`owner_hwnd`]
 #[cfg(windows)]
@@ -1603,11 +1634,7 @@ fn write_hang_log(stalled_ms: u64, phase: u8) {
     }
     report.push_str(&format!(
         "{wake}\n目前模組：{}\n",
-        Module::ALL
-            .get(ACTIVE_MODULE.load(Ordering::Relaxed) as usize)
-            .copied()
-            .unwrap_or(Module::Video)
-            .label(),
+        Module::from_index(ACTIVE_MODULE.load(Ordering::Relaxed)).label(),
     ));
     #[cfg(windows)]
     {
@@ -2264,7 +2291,8 @@ impl LastDir {
             Module::Stack => LastDir::StackProject,
             Module::Movie => LastDir::MovieProject,
             Module::Enhance => LastDir::EnhanceProject,
-            Module::Files => return None,
+            // 起始畫面不屬於任何模組、檔案管理沒有專案：都沒有自己的位置
+            Module::Home | Module::Files => return None,
         })
     }
 }
@@ -7712,6 +7740,9 @@ struct App {
     crash_report: Option<LastRunReport>,
     /// 剛選的資料夾/檔案沒有找到任何照片；在空狀態顯示提示，避免使用者以為沒反應
     import_found_nothing: bool,
+    /// 在起始畫面拖進了照片或影片（不是專案檔）：那裡還沒挑功能，收不了。
+    /// 在起始畫面顯示一行提示，免得使用者以為程式沒反應
+    home_drop_note: bool,
     /// 最近開啟/儲存的專案檔（新的在前），顯示在空狀態畫面供一鍵開啟
     recent_projects: Vec<PathBuf>,
     /// 最近一次「專案儲存／開啟」的提示與時間，在按鈕旁短暫顯示。
@@ -7784,10 +7815,12 @@ impl App {
             });
         }
         let mut app = Self {
-            module: Module::Video,
+            // 一開啟停在起始畫面：不預先進到任何一個功能，讓使用者自己挑
+            // （帶著 .p2v 啟動的話，下面的 open_project_path 會切到專案那個模組）
+            module: Module::Home,
             menu_bar_visible: true,
             top_bars_bottom: 0.0,
-            menu_bar_module: Module::Video,
+            menu_bar_module: Module::Home,
             photos: Vec::new(),
             fps: load_saved_fps().unwrap_or(10),
             export_size: load_export_size(),
@@ -7840,6 +7873,7 @@ impl App {
             fps_pending_save: None,
             crash_report: take_last_run_report(),
             import_found_nothing: false,
+            home_drop_note: false,
             recent_projects: load_recent_projects(),
             project_note: None,
             convert_output: None,
@@ -7887,6 +7921,10 @@ impl App {
             if let Some(proj) = initial_files.iter().find(|p| is_project_file(p)) {
                 app.open_project_path(proj, &cc.egui_ctx);
             } else {
+                // 一疊照片丟在執行檔上＝要把它們排成影片：不停在起始畫面，
+                // 直接進照片轉影片，否則剛丟的照片一張都看不到
+                app.module = Module::Video;
+                app.menu_bar_module = Module::Video;
                 app.add_photos(initial_files);
             }
         }
@@ -9215,6 +9253,8 @@ impl App {
     fn set_module(&mut self, m: Module) {
         if self.module != m {
             self.project_note = None;
+            // 起始畫面那句「這裡收不了照片」只在那一頁有意義
+            self.home_drop_note = false;
         }
         self.module = m;
     }
@@ -9228,7 +9268,7 @@ impl App {
             Module::Stack => self.stack.photos.first()?,
             Module::Movie => self.movie.src.as_ref()?,
             Module::Enhance => self.enhance.photos.first()?,
-            Module::Files => return None,
+            Module::Home | Module::Files => return None,
         };
         Some(p.as_path())
     }
@@ -9241,7 +9281,7 @@ impl App {
             Module::Stack => !self.stack.photos.is_empty(),
             Module::Movie => self.movie.src.is_some(),
             Module::Enhance => !self.enhance.photos.is_empty(),
-            Module::Files => false,
+            Module::Home | Module::Files => false,
         }
     }
 
@@ -9275,7 +9315,8 @@ impl App {
                 saved_at: at(),
                 ..self.enhance_project_data()
             }),
-            Module::Files => Ok(String::new()),
+            // 都沒有專案可存（見 [`Module::project_kind`]）：走不到這裡
+            Module::Home | Module::Files => Ok(String::new()),
         }
     }
 
@@ -9374,6 +9415,31 @@ impl App {
                     .set_description(format!("無法寫入檔案：\n{e}"))
                     .show();
             }
+        }
+    }
+
+    /// 起始畫面的「開啟之前存的專案…」。這裡還沒挑功能，沒有所屬模組的
+    /// 專案資料夾可指，就從上一次開過的那份專案旁邊找起——那才是使用者
+    /// 真的在放專案的地方。開起來的檔案自己記得是哪個模組的，
+    /// 由 [`App::open_project_path`] 切過去
+    fn open_any_project(&mut self, ctx: &egui::Context) {
+        let start = self
+            .recent_projects
+            .first()
+            .and_then(|p| p.parent())
+            .filter(|d| d.is_dir())
+            .map(|d| d.to_path_buf())
+            .or_else(|| load_last_dir(LastDir::VideoProject));
+        let mut dialog = file_dialog();
+        if let Some(dir) = start {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog
+            .set_title("開啟專案")
+            .add_filter("Photo2Video 專案", &[PROJECT_EXT])
+            .pick_file()
+        {
+            self.open_project_path(&path, ctx);
         }
     }
 
@@ -9919,6 +9985,15 @@ impl App {
 
                     ui.menu_button("編輯(E)", |ui| {
                         match self.module {
+                            // 起始畫面還沒挑功能，沒有東西可以清；空選單看起來
+                            // 像壞掉，講一句話說明
+                            Module::Home => {
+                                ui.label(
+                                    egui::RichText::new("（先從模組列挑一個功能）")
+                                        .size(12.0)
+                                        .color(theme::TEXT_WEAK),
+                                );
+                            }
                             Module::Video => {
                                 if ui
                                     .add_enabled(
@@ -10014,7 +10089,9 @@ impl App {
                     });
 
                     ui.menu_button("模組(M)", |ui| {
-                        for m in Module::ALL {
+                        // 起始畫面排在最前面、單獨一組：它不是功能，是「還沒
+                        // 挑功能」的那一頁（見 [`Module::Home`]）
+                        for m in std::iter::once(Module::Home).chain(Module::ALL) {
                             let on = self.module == m;
                             if check_label(ui, on, format!("{}  {}", m.icon(), m.label()))
                                 .on_hover_text(m.hint())
@@ -10022,6 +10099,9 @@ impl App {
                             {
                                 act = Some(MenuAction::Switch(m));
                                 ui.close_menu();
+                            }
+                            if m == Module::Home {
+                                ui.separator();
                             }
                         }
                     });
@@ -10111,13 +10191,13 @@ impl App {
                     self.new_project();
                 }
             }
-            MenuAction::OpenProject => {
-                let m = match self.module {
-                    Module::Files => Module::Video,
-                    other => other,
-                };
-                self.open_module_project(m, ctx);
-            }
+            MenuAction::OpenProject => match self.module {
+                // 起始畫面：還沒挑功能，從最近開過的專案旁邊找起
+                Module::Home => self.open_any_project(ctx),
+                // 檔案管理沒有專案可開，比照原本的行為用影片模組的位置
+                Module::Files => self.open_module_project(Module::Video, ctx),
+                other => self.open_module_project(other, ctx),
+            },
             MenuAction::OpenRecent(p) => self.open_project_path(&p, ctx),
             MenuAction::SaveProject => self.quick_save_project(),
             MenuAction::SaveProjectAs => self.save_project_dialog(),
@@ -10206,35 +10286,85 @@ impl App {
                     }
 
                     // 程式名稱與目前專案挪到右邊（由右往左畫：先加的在最右邊，
-                    // 所以文字先、圖示後，看起來才是「🎬 Photo2Video」）
+                    // 所以文字先、圖示後，看起來才是「🎬 Photo2Video」）。
+                    //
+                    // 這一塊同時是「回到起始畫面」的鈕：起始畫面不是一個功能，
+                    // 不該在模組列上佔一格（見 [`Module::Home`]），掛在程式
+                    // 標誌上最合乎直覺——按商標回首頁是到處都是的慣例
+                    let mut mark_rect = egui::Rect::NOTHING;
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 模組名稱排完剩多少寬度。視窗一窄就會不夠，這一塊
+                        // 硬畫下去只會疊在模組名稱上面——那就整塊不畫，
+                        // 名字與副標各有各的門檻（副標比較長，先犧牲它）
+                        let room = ui.available_width();
+                        if room < 140.0 {
+                            return;
+                        }
                         // 這裡要用 top_down(Align::Max) 不能用 ui.vertical()：
                         // vertical 是 top_down(Align::Min)，它拿到的可用區域是
                         // 「左邊剩下的一整條」，於是兩行字會靠到那條的最左邊
                         // ——也就是緊貼在模組名稱旁邊，圖示還會疊上去。
                         // 靠右對齊才會真的貼在視窗右緣
                         ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                            // 視窗一窄，這兩行字左邊就沒空間了。預設會換行——
+                            // 而中文沒有空格可斷，egui 只好一個字一行，整條
+                            // 模組列被撐成好幾百點高，底下的內容全被擠出畫面。
+                            // 一律不換行：擠不下就讓它被裁掉
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                             ui.add_space(1.0);
-                            ui.label(
+                            let top = ui.label(
                                 egui::RichText::new("Photo2Video")
                                     .size(13.5)
                                     .strong()
                                     .color(theme::TEXT),
                             );
+                            mark_rect = top.rect;
                             // 目前編輯的專案；沒有就講一句這個模組在做什麼
-                            let sub = match &self.current_project {
-                                Some(p) => p
-                                    .file_stem()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_default(),
-                                None => self.module.hint().to_string(),
-                            };
-                            ui.label(
-                                egui::RichText::new(sub).size(11.0).color(theme::TEXT_WEAK),
-                            );
+                            // （起始畫面還沒挑功能，改放一句總括的）
+                            if room >= 300.0 {
+                                let sub = match &self.current_project {
+                                    Some(p) => p
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_default(),
+                                    None if self.module == Module::Home => {
+                                        "煙火與夜空的照片・影片後製".to_string()
+                                    }
+                                    None => self.module.hint().to_string(),
+                                };
+                                let bottom = ui.label(
+                                    egui::RichText::new(sub).size(11.0).color(theme::TEXT_WEAK),
+                                );
+                                mark_rect = mark_rect.union(bottom.rect);
+                            }
                         });
-                        ui.label(egui::RichText::new("🎬").size(19.0));
+                        mark_rect = mark_rect
+                            .union(ui.label(egui::RichText::new("🎬").size(19.0)).rect);
                     });
+                    // 已經在起始畫面就不必再按一次（也少一個會亮的東西）
+                    if self.module != Module::Home && mark_rect.is_positive() {
+                        let r = ui
+                            .interact(
+                                mark_rect,
+                                ui.id().with("home_mark"),
+                                egui::Sense::click(),
+                            )
+                            .on_hover_text("回到起始畫面");
+                        if r.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            // 與模組列同一套視覺：指到就在底下壓一條線
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(mark_rect.left(), mark_rect.bottom() + 1.0),
+                                    egui::pos2(mark_rect.right(), mark_rect.bottom() + 1.0),
+                                ],
+                                egui::Stroke::new(1.5, theme::ACCENT),
+                            );
+                        }
+                        if r.clicked() {
+                            switch_to = Some(Module::Home);
+                        }
+                    }
                 });
                 ui.add_space(4.0);
             });
@@ -10309,6 +10439,10 @@ impl App {
     /// 依目前模組畫內容面板。加新模組時在這裡多一條分支
     fn ui_module_body(&mut self, ctx: &egui::Context) {
         match self.module {
+            Module::Home => {
+                self.ui_bottom_bar(ctx);
+                self.ui_home(ctx);
+            }
             Module::Video => {
                 self.ui_bottom_bar(ctx);
                 self.ui_side_panel(ctx);
@@ -11704,6 +11838,124 @@ impl App {
         }
     }
 
+    /// 起始畫面（程式一開啟就停在這裡）：中央一個標誌，底下只有「開啟之前
+    /// 存的專案」與最近的專案。**不預先進到任何功能**——這裡不收照片、不放
+    /// 調色面板，要做什麼從上面的模組列挑（見 [`Module::Home`]）
+    fn ui_home(&mut self, ctx: &egui::Context) {
+        // 中央那張卡的底色：比工作區亮一階，整塊浮起來。標誌畫在它上面，
+        // 淡出的地方也要用同一個色（見 [`paint_hero_logo`]）
+        const BACKDROP: egui::Color32 = egui::Color32::from_rgb(0x23, 0x24, 0x2A);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ctx, |ui| {
+                let card = ui.available_rect_before_wrap().shrink(4.0);
+                ui.painter().rect_filled(card, 14, BACKDROP);
+
+                let recent: Vec<PathBuf> =
+                    self.recent_projects.iter().take(5).cloned().collect();
+                // 標誌的大小跟著視窗縮：視窗矮的時候先讓圖讓位，
+                // 底下的「開啟專案」不管怎樣都要看得到
+                let logo_h = (card.height() * 0.36).clamp(96.0, 240.0);
+                let logo_w = (logo_h * 2.5).min(card.width() - 48.0).max(120.0);
+                let content_h = logo_h
+                    + 44.0 // 程式名稱
+                    + 20.0 // 底下那一句
+                    + 24.0 // 間距
+                    + 40.0 // 開啟專案
+                    + if recent.is_empty() {
+                        0.0
+                    } else {
+                        28.0 + recent.len() as f32 * 24.0
+                    };
+
+                // 視窗矮到擺不下時可以捲：整頁就這幾樣東西，一樣都不能被
+                // 切在畫面外（尤其是那幾個最近的專案）
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            // 擺得下就置中，擺不下就從上面開始排（剩下的用捲的）
+                            ui.add_space(((card.height() - content_h) / 2.0).max(16.0));
+
+                            let (logo_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(logo_w, logo_h),
+                                egui::Sense::hover(),
+                            );
+                            paint_hero_logo(ui.painter(), logo_rect, BACKDROP);
+
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Photo2Video")
+                                    .size(28.0)
+                                    .strong()
+                                    .color(theme::TEXT),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "從上面的模組列挑一個功能開始，或開啟之前存的專案",
+                                )
+                                .size(12.5)
+                                .color(theme::TEXT_WEAK),
+                            );
+                            ui.add_space(22.0);
+                            if primary_button(ui, "📂  開啟之前存的專案…", true).clicked() {
+                                let ctx = ui.ctx().clone();
+                                self.open_any_project(&ctx);
+                            }
+
+                            // 最近的專案：點檔名直接開啟，不用再走檔案對話框。
+                            // 不在這裡檢查檔案是否存在（每幀摸磁碟太浪費），
+                            // 開啟失敗時 open_project_path 會提示並把它移出清單
+                            if !recent.is_empty() {
+                                ui.add_space(16.0);
+                                ui.label(
+                                    egui::RichText::new("最近的專案")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(theme::TEXT_WEAK),
+                                );
+                                ui.add_space(2.0);
+                                for p in recent {
+                                    let name = p
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                                    let r = recent_link(ui, format!("🕘  {name}"))
+                                        .on_hover_text(p.to_string_lossy());
+                                    if r.clicked() {
+                                        let ctx = ui.ctx().clone();
+                                        self.open_project_path(&p, &ctx);
+                                    }
+                                }
+                            }
+
+                            // 照片、影片拖到這一頁來了：這裡還沒挑功能，收不了
+                            if self.home_drop_note {
+                                ui.add_space(14.0);
+                                ui.label(
+                                    egui::RichText::new("⚠ 起始畫面收不了照片與影片")
+                                        .size(12.5)
+                                        .strong()
+                                        .color(theme::ERROR),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "先從上面挑一個功能，再把檔案拖進去；專案檔（.p2v）拖到這裡就會直接開啟",
+                                    )
+                                    .size(11.5)
+                                    .color(theme::TEXT_WEAK),
+                                );
+                            }
+                            ui.add_space(16.0);
+                        });
+                    });
+            });
+    }
+
     fn ui_central(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(
@@ -11805,14 +12057,9 @@ impl App {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| p.to_string_lossy().into_owned());
-                let btn = egui::Button::new(
-                    egui::RichText::new(format!("🕘  {name}"))
-                        .size(13.5)
-                        .color(theme::ACCENT),
-                )
-                .frame(false);
-                if child
-                    .add(btn)
+                // 與起始畫面同一套（見 [`recent_link`]）：藍字畫在這片深色上
+                // 太不起眼，換成標誌上那個暖金
+                if recent_link(&mut child, format!("🕘  {name}"))
                     .on_hover_text(p.to_string_lossy())
                     .clicked()
                 {
@@ -26830,6 +27077,8 @@ impl App {
         p.rect_filled(card, 12, theme::CARD);
         // 放開後檔案會進哪個模組，先在這裡講清楚
         let (accent, icon, msg) = match self.module {
+            // 起始畫面還沒挑功能，只收得了「自己記得是哪個模組」的專案檔
+            Module::Home => (theme::ACCENT, "📂", "放開滑鼠開啟專案檔（.p2v）"),
             Module::Dehaze if self.smoke.busy == SmokeBusy::Saving => {
                 (theme::TEXT_WEAK, "⏳", "存檔中，暫時無法加入照片")
             }
@@ -27038,10 +27287,7 @@ impl eframe::App for App {
         #[cfg(not(windows))]
         let _ = &frame;
 
-        ACTIVE_MODULE.store(
-            Module::ALL.iter().position(|m| *m == self.module).unwrap_or(0) as u8,
-            Ordering::Relaxed,
-        );
+        ACTIVE_MODULE.store(self.module.index(), Ordering::Relaxed);
 
         // 關閉視窗前，若有尚未儲存的專案變更就攔下確認，避免辛苦設定的照片、
         // 調色、文字、音樂一按 X 就無聲無息全丟。轉檔進行中不攔（讓使用者能中止
@@ -27163,7 +27409,10 @@ impl eframe::App for App {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default()
             ),
-            None => "Photo2Video — 照片轉影片".to_string(),
+            // 沒開專案就寫現在停在哪個功能（原本一律寫「照片轉影片」，
+            // 在別的模組、以及一開啟的起始畫面都對不上）
+            None if self.module == Module::Home => "Photo2Video".to_string(),
+            None => format!("Photo2Video — {}", self.module.label()),
         };
         if self.applied_title != desired_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(desired_title.clone()));
@@ -27201,11 +27450,19 @@ impl eframe::App for App {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        // 去煙霧模組：拖進來的照片就是要去煙的那批，不會跑去影片專案裡
-        if !dropped.is_empty()
+        // 起始畫面：還沒挑功能，拖進來的照片要進哪個模組是猜不出來的
+        // （同一疊煙火照可以去煙、可以疊圖、也可以排成影片）。專案檔倒是
+        // 自己記著是哪個模組的，拖進來就開
+        if !dropped.is_empty() && self.module == Module::Home {
+            match dropped.iter().find(|p| is_project_file(p)) {
+                Some(proj) => self.open_project_path(&proj.clone(), ctx),
+                None => self.home_drop_note = true,
+            }
+        } else if !dropped.is_empty()
             && self.module == Module::Dehaze
             && self.smoke.busy != SmokeBusy::Saving
         {
+            // 去煙霧模組：拖進來的照片就是要去煙的那批，不會跑去影片專案裡
             let mut files = Vec::new();
             for p in &dropped {
                 if p.is_dir() {
@@ -27403,12 +27660,13 @@ impl eframe::App for App {
             // Ctrl+O 開專案。五個模組都有自己的專案檔，從哪個模組按只決定
             // 對話框從哪個資料夾開始找——開起來會照檔案自己記的模組切過去
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
-                // 檔案管理沒有專案可開，比照原本的行為切到影片模組
-                let m = match self.module {
-                    Module::Files => Module::Video,
-                    other => other,
-                };
-                self.open_module_project(m, ctx);
+                match self.module {
+                    // 起始畫面：還沒挑功能，從最近開過的專案旁邊找起
+                    Module::Home => self.open_any_project(ctx),
+                    // 檔案管理沒有專案可開，比照原本的行為用影片模組的位置
+                    Module::Files => self.open_module_project(Module::Video, ctx),
+                    other => self.open_module_project(other, ctx),
+                }
             }
         }
 
@@ -28913,12 +29171,261 @@ fn enhance_empty_state(ui: &mut egui::Ui, loading: bool) -> Option<bool> {
     act
 }
 
+/// 起始畫面正中央的標誌：一朵在膠捲上炸開的煙火，爆心是播放鍵
+/// ——影像（膠捲）、煙火（花火）、影片（播放鍵）三件事一次講完，
+/// 播放鍵也和工作列上的程式圖示是同一個符號。
+///
+/// 整個用向量畫、不嵌點陣圖：任何 DPI、任何視窗大小邊緣都是實心銳利的，
+/// 也不必為了高解析度螢幕在執行檔裡多帶一張大圖。畫面是靜止的（不做動畫），
+/// 停在這一頁不會一直重畫。
+///
+/// `backdrop` 是它畫在什麼底色上：膠捲兩端要淡進那個顏色，不能有硬邊
+fn paint_hero_logo(p: &egui::Painter, rect: egui::Rect, backdrop: egui::Color32) {
+    use egui::{pos2, Color32, Shape, Stroke};
+    use std::f32::consts::TAU;
+
+    // 設計稿的大小：底下所有座標都以它為準（原點在正中央、y 軸向下），
+    // 最後再等比縮到實際的 rect
+    const DW: f32 = 520.0;
+    const DH: f32 = 208.0;
+    let s = (rect.width() / DW).min(rect.height() / DH).max(0.05);
+    let c = rect.center();
+    // 設計座標 → 螢幕座標
+    let at = |x: f32, y: f32| pos2(c.x + x * s, c.y + y * s);
+    // 膠捲整條壓 5°：水平線四平八穩像一張表格，斜一點才有速度感
+    let tilt = |x: f32, y: f32| {
+        const A: f32 = -5.0 * TAU / 360.0;
+        at(x * A.cos() - y * A.sin(), x * A.sin() + y * A.cos())
+    };
+    // 固定的擬亂數：每次畫出來都一模一樣，但看起來不規則
+    let noise = |k: f32| ((k * 12.9898).sin() * 43758.5453).fract().abs();
+    let fade = |col: Color32, a: u8| Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a);
+
+    // 爆心的位置（設計座標）
+    const BX: f32 = 0.0;
+    const BY: f32 = -18.0;
+
+    // ---- 夜空的光暈 ----
+    // 一圈圈半透明的同心圓疊不出漸層——每一圈的邊界都看得見，會變成一顆
+    // 洋蔥。改用網格：中心一個頂點給顏色、外圈一整圈頂點給全透明，
+    // 交給 GPU 在頂點之間內插，才是真正平滑的放射漸層
+    let glow = |cx: f32, cy: f32, r: f32, col: Color32| {
+        const SIDES: u32 = 64;
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(at(cx, cy), col);
+        for i in 0..=SIDES {
+            let a = TAU * i as f32 / SIDES as f32;
+            mesh.colored_vertex(at(cx + a.cos() * r, cy + a.sin() * r), fade(col, 0));
+        }
+        for i in 0..SIDES {
+            mesh.add_triangle(0, 1 + i, 2 + i);
+        }
+        p.add(Shape::mesh(mesh));
+    };
+    // 很淡就好：這是「夜空被照亮」，不是一顆發光的球。太濃會蓋掉花瓣，
+    // 整個標誌就變成一團色塊
+    glow(BX, BY, 130.0, fade(Color32::from_rgb(0x4E, 0x62, 0xC0), 54)); // 夜空的藍
+    glow(BX, BY, 62.0, fade(Color32::from_rgb(0xFF, 0xA8, 0x4A), 60)); // 爆心的暖光
+
+    // ---- 膠捲 ----
+    const F_TOP: f32 = 52.0;
+    const F_BOT: f32 = 78.0;
+    const F_HALF: f32 = 224.0;
+    let quad = |x0: f32, y0: f32, x1: f32, y1: f32, fill: Color32| {
+        p.add(Shape::convex_polygon(
+            vec![tilt(x0, y0), tilt(x1, y0), tilt(x1, y1), tilt(x0, y1)],
+            fill,
+            Stroke::NONE,
+        ));
+    };
+    quad(-F_HALF, F_TOP, F_HALF, F_BOT, Color32::from_rgb(0x2E, 0x31, 0x3B));
+    // 上下兩道亮邊，帶子才有厚度
+    for (a, b) in [(F_TOP, F_TOP + 1.2), (F_BOT - 1.2, F_BOT)] {
+        quad(-F_HALF, a, F_HALF, b, Color32::from_rgb(0x3F, 0x43, 0x51));
+    }
+    // 一格一格的相片與它上下的齒孔。整條帶子的明暗差要壓得很小——它是
+    // 襯在煙火後面的背景，對比一拉開就變成畫面主角，還會像一排鍵盤
+    let mut x = -F_HALF + 6.0;
+    while x < F_HALF - 30.0 {
+        quad(x + 2.5, F_TOP + 8.0, x + 25.5, F_BOT - 8.0, Color32::from_rgb(0x26, 0x29, 0x32));
+        // 齒孔對齊相片格的正中央，一格一個；密密麻麻一排會像條碼
+        quad(x + 10.0, F_TOP + 2.8, x + 18.0, F_TOP + 6.2, Color32::from_rgb(0x22, 0x24, 0x2B));
+        quad(x + 10.0, F_BOT - 6.2, x + 18.0, F_BOT - 2.8, Color32::from_rgb(0x22, 0x24, 0x2B));
+        x += 28.0;
+    }
+    // 兩端淡進底色：一條帶子不該有硬生生切斷的邊。同樣用網格頂點內插
+    // （一片片半透明的長條貼過去會留下一道道接縫）
+    const FADE_W: f32 = 86.0;
+    for side in [-1.0_f32, 1.0] {
+        let (x_out, x_in) = (side * F_HALF, side * (F_HALF - FADE_W));
+        let mut mesh = egui::Mesh::default();
+        for (x, a) in [(x_out, 255), (x_in, 0)] {
+            mesh.colored_vertex(tilt(x, F_TOP - 2.0), fade(backdrop, a));
+            mesh.colored_vertex(tilt(x, F_BOT + 2.0), fade(backdrop, a));
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(1, 2, 3);
+        p.add(Shape::mesh(mesh));
+    }
+
+    // ---- 煙火 ----
+    // 一根花瓣：根部寬、往外收成一點；內半段暖、外半段轉冷，尖端再點一顆
+    // 火星——真的煙火就是這樣一路褪色的
+    let ray = |cx: f32, cy: f32, ang: f32, r0: f32, r1: f32, w: f32, warm: Color32, cool: Color32| {
+        let (sn, cs) = ang.sin_cos();
+        // 垂直於方向的單位向量，用來撐出寬度
+        let (nx, ny) = (-sn, cs);
+        let on = |r: f32, h: f32| at(cx + cs * r + nx * h, cy + sn * r + ny * h);
+        let mid = r0 + (r1 - r0) * 0.55;
+        let (h0, h1) = (w * 0.5, w * 0.2);
+        p.add(Shape::convex_polygon(
+            vec![on(r0, h0), on(mid, h1), on(mid, -h1), on(r0, -h0)],
+            warm,
+            Stroke::NONE,
+        ));
+        p.add(Shape::convex_polygon(
+            vec![on(mid, h1), on(r1, 0.0), on(mid, -h1)],
+            cool,
+            Stroke::NONE,
+        ));
+        // 尖端的火星，外面再掉一顆更小更暗的：煙火的線末端是散開的，
+        // 不是切齊的一刀
+        p.circle_filled(on(r1 + w * 0.7, 0.0), (w * 0.62 * s).max(0.8), cool);
+        p.circle_filled(on(r1 + w * 2.8, 0.0), (w * 0.3 * s).max(0.5), fade(cool, 150));
+    };
+    // 陪襯的兩小朵：小、暗、少幾根，把畫面撐開成一片夜空
+    // 只用一個顏色（不像主花那樣內暖外冷）：小小一朵還分兩段色，
+    // 每根都變成兩截的棍子，看起來像雪花而不像煙火
+    let small = |cx: f32, cy: f32, scale: f32, col: Color32| {
+        for i in 0..9 {
+            let ang = TAU * i as f32 / 9.0 + 0.3;
+            let j = noise(i as f32 + cx);
+            let long = if i % 2 == 0 { 1.0 } else { 0.72 };
+            ray(
+                cx,
+                cy,
+                ang,
+                (7.0 + j * 3.0) * scale,
+                (30.0 + j * 8.0) * scale * long,
+                2.2 * scale,
+                col,
+                col,
+            );
+        }
+        p.circle_filled(
+            at(cx, cy),
+            (2.4 * scale * s).max(0.8),
+            fade(Color32::from_rgb(0xFF, 0xEC, 0xCC), 200),
+        );
+    };
+    small(-176.0, -58.0, 0.92, fade(Color32::from_rgb(0x6F, 0xDC, 0xFF), 150));
+    small(178.0, -22.0, 0.66, fade(Color32::from_rgb(0xFF, 0x8F, 0xC4), 150));
+
+    // 主花：18 根，一長一短交錯。根數少、線細、起點離核心遠一點，花瓣之間
+    // 才有縫；擠在一起的話近核心那一圈會糊成一個實心的太陽。
+    // 朝下那幾根再縮一點，免得整根插進膠捲裡
+    const WARM: Color32 = Color32::from_rgb(0xFF, 0xC4, 0x66);
+    // 以金色為主，每隔幾根摻一根冷色（程式的藍與青）當點綴：四色輪流會
+    // 變成一把彩色紙花，反而不像煙火
+    let tips = [
+        Color32::from_rgb(0xFF, 0xD7, 0x86), // 金
+        Color32::from_rgb(0xFF, 0xA8, 0x5C), // 琥珀
+        Color32::from_rgb(0xFF, 0xD7, 0x86),
+        Color32::from_rgb(0x7A, 0xA6, 0xFF), // 程式的藍
+        Color32::from_rgb(0xFF, 0xC0, 0x70),
+        Color32::from_rgb(0x6F, 0xDC, 0xFF), // 青
+    ];
+    const N: usize = 18;
+    for i in 0..N {
+        let ang = TAU * i as f32 / N as f32;
+        let j = noise(i as f32);
+        let down = ang.sin().max(0.0); // 0＝朝上、1＝正下方
+        let long = if i % 2 == 0 { 1.0 } else { 0.74 };
+        let r1 = (76.0 + j * 12.0) * long * (1.0 - 0.22 * down);
+        // 起點也錯開一點：全部從同一個半徑出發，根部會連成一圈完美的圓，
+        // 看起來像機械零件而不是炸開的火花
+        ray(BX, BY, ang, 29.0 + j * 5.0, r1, 2.8 + j * 1.2, WARM, tips[i % tips.len()]);
+    }
+    // 飛得比花瓣更遠的散星：爆開才不那麼規矩
+    for i in 0..11 {
+        let (j, k) = (noise(i as f32 * 3.7), noise(i as f32 * 8.3 + 5.0));
+        let ang = TAU * (i as f32 + j * 0.8) / 11.0;
+        let down = ang.sin().max(0.0);
+        let r = (94.0 + k * 16.0) * (1.0 - 0.45 * down);
+        let (sn, cs) = ang.sin_cos();
+        p.circle_filled(
+            at(BX + cs * r, BY + sn * r),
+            (0.9 + k * 1.1) * s.max(0.4),
+            fade(tips[i % tips.len()], 165),
+        );
+    }
+
+    // ---- 爆心＝播放鍵 ----
+    let core = at(BX, BY);
+    let cr = 22.0 * s;
+    p.circle_filled(core, cr + 3.0 * s, fade(Color32::from_rgb(0xFF, 0xD2, 0x7A), 60));
+    p.circle_filled(core, cr, Color32::from_rgb(0x14, 0x15, 0x1A));
+    p.circle_stroke(core, cr, Stroke::new((1.8 * s).max(1.0), theme::ACCENT));
+    // 三角形的視覺重心比幾何重心偏右，整個往左挪一點看起來才在正中央
+    let t = 11.0 * s;
+    let dx = core.x - 1.2 * s;
+    p.add(Shape::convex_polygon(
+        vec![
+            pos2(dx - t * 0.5, core.y - t * 0.9),
+            pos2(dx + t, core.y),
+            pos2(dx - t * 0.5, core.y + t * 0.9),
+        ],
+        Color32::from_rgb(0xF4, 0xF6, 0xFC),
+        Stroke::NONE,
+    ));
+}
+
+/// 「最近的專案」清單的一列：沒有按鈕框，只有一行字，指過去亮一階。
+/// 起始畫面與「照片轉影片」還沒加照片時的空狀態共用這一個。
+///
+/// 不用 [`egui::Button`]：整體樣式設了 `override_text_color`
+/// （見 [`apply_theme`]），Button 上的文字顏色會被它整個蓋掉，
+/// 怎麼設都還是那個灰白。自己排版自己畫才管得到顏色
+fn recent_link(ui: &mut egui::Ui, text: String) -> egui::Response {
+    // 顏色留給下面的 fallback 決定：排版時就把顏色寫死的話，
+    // 畫的時候再傳一個顏色進去是沒有用的（非 PLACEHOLDER 的顏色優先）
+    let galley = ui.painter().layout_no_wrap(
+        text,
+        egui::FontId::proportional(14.0),
+        egui::Color32::PLACEHOLDER,
+    );
+    let size = galley.size() + egui::vec2(18.0, 9.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if resp.hovered() {
+        theme::LINK_HOVER
+    } else {
+        theme::LINK
+    };
+    ui.painter().galley(
+        egui::pos2(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        color,
+    );
+    resp
+}
+
 /// 模組列上的一個模組名稱。比照 Lightroom：沒有按鈕框，選中的那個亮起來
 /// 並在下面壓一條底線，其餘是灰字、指過去才轉亮
 fn module_tab(ui: &mut egui::Ui, m: Module, active: bool) -> egui::Response {
     let text = format!("{}  {}", m.icon(), m.label());
     let font = egui::FontId::proportional(14.0);
-    let galley = ui.painter().layout_no_wrap(text, font, theme::TEXT);
+    // 顏色留給下面畫的時候再決定，所以排版時放 PLACEHOLDER：
+    // 這裡若填一個真的顏色，畫的時候傳進去的那個就完全不算數
+    // （`Painter::galley` 的顏色只是 fallback，galley 自己有顏色就以它為準）
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, font, egui::Color32::PLACEHOLDER);
     // 底線畫在文字下方 6px，所以高度要留得比字高一些
     let size = egui::vec2(galley.size().x + 14.0, galley.size().y + 12.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -28954,10 +29461,11 @@ fn module_tab(ui: &mut egui::Ui, m: Module, active: bool) -> egui::Response {
 /// 「檔案管理」底下的功能列上的一項（「1. 資料備份」）。與上面的模組列同一
 /// 套視覺：選中的亮起來並壓一條底線，字小一號表示它是模組底下的一層
 fn files_tab(ui: &mut egui::Ui, text: &str, active: bool) {
+    // PLACEHOLDER 的理由同 [`module_tab`]：顏色要等畫的時候才決定
     let galley = ui.painter().layout_no_wrap(
         text.to_string(),
         egui::FontId::proportional(13.0),
-        theme::TEXT,
+        egui::Color32::PLACEHOLDER,
     );
     let size = egui::vec2(galley.size().x + 12.0, galley.size().y + 10.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
