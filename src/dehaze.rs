@@ -142,12 +142,22 @@ const CORE_AREA_RADIUS: f32 = 0.007;
 /// 上下，勉強沾到門檻的下緣，於是同一叢裡忽保忽扣，黃色的線條被壓成一團
 /// 灰褐（實照 L1003680 的噴泉回報過）。
 ///
-/// 真正分得開的是「有多少像素亮到兩個通道都頂上去」：噴泉的亮芯一帶
-/// 實測 45%～56%（黃、白的線條），該扣的橘紅濃煙即使紅通道整片頂到 255，
-/// 綠藍也只有一百上下，佔比 3%～6%；零星穿過煙的線條 9% 以下。
-/// 門檻取在兩者中間，判準同樣是一帶的平均，同一叢會被一致對待
-const CLUSTER_MID: u8 = 225;
-const CLUSTER_FILL: (f32, f32) = (0.15, 0.40);
+/// 真正分得開的是「有多少像素亮到兩個通道都亮」：五張實照量下來，噴泉的亮芯
+/// 一帶 53%～63%、金柳的中心 19%～47%、牡丹的橘色核心環 42%（都是黃、白、
+/// 金的線條擠在一起），該扣的煙——即使紅通道整片頂到 255 的橘紅濃煙——
+/// 綠藍也只有一百上下，佔比全在 5.5% 以下；零星穿過煙的線條也到不了 8%。
+/// 門檻取在兩者中間，判準同樣是一帶的平均，同一叢會被一致對待。
+///
+/// 金柳的中心保住之後，往外那一片線條之間的金色底（實測與紅煙分不開：
+/// 底亮度 147 對 127、佔比 8% 對 5.5%）就靠平台既有的暈開（[`CORE_SKIRT`]）
+/// 接過去：離中心越遠、越暗，留得越少
+const CLUSTER_MID: u8 = 200;
+const CLUSTER_FILL: (f32, f32) = (0.08, 0.22);
+
+/// 佔比那條路還要**一帶本身夠亮**（一帶的平均亮度，sRGB 0~255）才算數：
+/// 該扣的煙最亮的一帶實測 148（噴泉旁被照亮的橘煙），煙火簇則在 164 以上。
+/// 暗處偶爾聚在一起的幾顆亮點不是簇，不該因為佔比過了門檻就整片留著
+const CLUSTER_GLOW: (f32, f32) = (120.0, 160.0);
 
 /// 「整帶夠亮」的平台往外暈開多寬（佔影像長邊）：平台邊緣之外，保護權重
 /// 平滑地降到 0，約在這個寬度的一倍半處收尾（暈法見 [`dehaze_to_linear`] 裡的說明）。
@@ -3803,6 +3813,8 @@ fn dehaze_to_linear(
         let area_hi = srgb_to_linear(CORE_KEEP_AREA.1 / 255.0);
         let glow_lo = srgb_to_linear(CORE_SKIRT_GLOW.0 / 255.0);
         let glow_hi = srgb_to_linear(CORE_SKIRT_GLOW.1 / 255.0);
+        let cl_lo = srgb_to_linear(CLUSTER_GLOW.0 / 255.0);
+        let cl_hi = srgb_to_linear(CLUSTER_GLOW.1 / 255.0);
         // 一帶的平均亮度；平台＝亮到門檻以上的那一片
         let area = box_mean(y, r);
         // 平台的另一條路（見 [`CLUSTER_FILL`]）：一帶被「兩個通道都頂上去」的
@@ -3819,11 +3831,11 @@ fn dehaze_to_linear(
         };
         let mut w = area.clone();
         for (v, dn) in w.d.iter_mut().zip(&dense.d) {
-            *v = smoothstep(area_lo, area_hi, *v).max(smoothstep(
-                CLUSTER_FILL.0,
-                CLUSTER_FILL.1,
-                *dn,
-            ));
+            // 佔比那條路還要一帶本身夠亮（見 [`CLUSTER_GLOW`]）
+            let a = *v;
+            *v = smoothstep(area_lo, area_hi, a).max(
+                smoothstep(CLUSTER_FILL.0, CLUSTER_FILL.1, *dn) * smoothstep(cl_lo, cl_hi, a),
+            );
         }
         drop(dense);
         // 暈開的方式：連抹三次方框平均（三次方框疊起來近似高斯，等高線是圓角的），
