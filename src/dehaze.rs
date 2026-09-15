@@ -149,7 +149,7 @@ const CORE_AREA_RADIUS: f32 = 0.007;
 /// 門檻取在兩者中間，判準同樣是一帶的平均，同一叢會被一致對待。
 ///
 /// 金柳的中心保住之後，往外那一片線條之間的金色底（實測與紅煙分不開：
-/// 底亮度 147 對 127、佔比 8% 對 5.5%）就靠平台既有的暈開（[`CORE_SKIRT`]）
+/// 底亮度 147 對 127、佔比 8% 對 5.5%）就靠平台既有的暈開（[`CORE_FEATHER`]）
 /// 接過去：離中心越遠、越暗，留得越少
 const CLUSTER_MID: u8 = 200;
 const CLUSTER_FILL: (f32, f32) = (0.08, 0.22);
@@ -174,11 +174,13 @@ const CLUSTER_GLOW: (f32, f32) = (120.0, 160.0);
 /// 整圈被關掉，平台邊緣又成了一道硬邊——牡丹的橘色核心、噴泉的粉紅光暈
 /// 都被切成一個圓盤（實照 DSC03635、DSC03637 回報過）。純距離的羽化保證
 /// 平台邊緣連續，代價是平台周圍這一圈的煙會留一部分、越遠越少。
-/// 3% 在 9984px 的照片上約 300px，是牡丹核心到光暈淡出的尺度；
-/// 1.5% 試過，邊還是看得出來。
+/// 寬度由「亮芯羽化」滑桿決定（[`SmokeParams::core_feather`]，千分之幾的影像
+/// 長邊），這裡是預設值：3% 在 9984px 的照片上約 300px。1.5% 試過，邊還是
+/// 看得出來；拉到 5%～7% 牡丹的橘色核心才會像原圖那樣一路淡出去，但噴泉旁、
+/// 牡丹裡的煙也跟著多留——五張實照上沒有一個寬度兩邊都好，所以交給滑桿逐張調。
 /// 只有平台會暈開；逐點判定的白芯與過曝像素不會，
 /// 煙火線條之間的煙才不會跟著被保護
-const CORE_SKIRT: f32 = 0.03;
+pub const CORE_FEATHER: i32 = 30;
 
 /// 純距離羽化的膝點：平台抹過兩次方框平均之後，值在這之上就拉回 1，
 /// 之下才往外平滑降到 0。
@@ -1064,6 +1066,11 @@ pub struct SmokeParams {
     pub strength: i32,
     /// 細節保留 0~100：數值越高，煙霧層越貼合原圖邊緣（煙火線條越不被削）
     pub detail: i32,
+    /// 亮芯羽化 0~100：太亮的煙火簇（噴泉亮芯、金柳中心、牡丹核心）整團原樣
+    /// 留著之後，保護區往外暈開多寬（千分之幾的影像長邊，見 [`CORE_FEATHER`]）。
+    /// 拉寬，核心的光暈才會像原圖那樣一路淡出去；拉窄，煙火簇旁邊的煙扣得
+    /// 比較乾淨——兩者不可兼得，逐張調
+    pub core_feather: i32,
     /// 補回煙裡的軌跡：煙散掉之後，把被連同煙一起扣掉的煙火軌跡救回來。
     ///
     /// 煙是**平順**的一層，軌跡是高出來的那一點。濃煙很亮時估出來的煙霧層
@@ -1148,6 +1155,7 @@ impl Default for SmokeParams {
             // 尤其影片動起來特別顯眼；煙沒扣乾淨還可以再把滑桿拉上去
             strength: 60,
             detail: 80,
+            core_feather: CORE_FEATHER,
             restore_trails: true,
             sky_only: true,
             shapes: Vec::new(),
@@ -1171,6 +1179,7 @@ impl SmokeParams {
     pub fn clamped(&self) -> Self {
         let mut s = self.clone();
         s.strength = s.strength.clamp(0, 100);
+        s.core_feather = s.core_feather.clamp(0, 100);
         s.detail = s.detail.clamp(0, 100);
         s.feather = s.feather.clamp(0, 100);
         s.tolerance = s.tolerance.clamp(0, 100);
@@ -3824,7 +3833,7 @@ fn dehaze_to_linear(
     });
     tick("lum", &mut t);
     // 亮芯的「一帶有多亮」（見 [`CORE_KEEP_AREA`]），已換算成保護權重 0~1，
-    // 平台再往外暈開一圈（見 [`CORE_SKIRT`]）
+    // 平台再往外暈開一圈（見 [`CORE_FEATHER`]）
     let core_area = lum.as_ref().map(|y| {
         let long = fw.max(fh) as f32;
         let r = ((long * CORE_AREA_RADIUS).round() as usize).clamp(3, 80);
@@ -3864,7 +3873,9 @@ fn dehaze_to_linear(
         // 之前是「先方形膨脹再方框平均」：暈出來的是一圈帶直邊的方框，斜坡又是
         // 線性的、到底時有個折角，100% 檢視就看得到一道階（實照 L1003436 的
         // 噴泉周圍回報過）
-        let r_s = ((long * CORE_SKIRT).round() as usize).clamp(2, 400);
+        // 寬度照「亮芯羽化」滑桿（千分之幾的長邊）；上限只是防呆，
+        // 方框平均的成本不隨半徑變
+        let r_s = ((long * p.core_feather as f32 / 1000.0).round() as usize).clamp(2, 1500);
         let s2 = box_mean(&box_mean(&w, r_s), r_s);
         // 貼著平台的第一圈是純距離的羽化：不看亮度，貼著平台邊緣往外平滑降到零
         // （膝點見 [`CORE_FEATHER_KNEE`]）。平台邊緣上因此一定連續——
@@ -4947,6 +4958,42 @@ mod tests {
         assert!(
             smoke.iter().all(|&v| v < 60),
             "煙火簇的保護漫到煙上了：角落的煙 {smoke:?} 應該幾乎被扣光"
+        );
+    }
+
+    /// 「亮芯羽化」拉寬，煙火簇旁邊的煙會多留一些、越遠越少（見 [`CORE_FEATHER`]）；
+    /// 離簇很遠的煙不受影響
+    #[test]
+    fn a_wider_core_feather_keeps_more_next_to_the_cluster() {
+        let mut img = solid(160, 128, [190, 150, 110]);
+        for y in 40..88 {
+            for x in 30..78 {
+                let c = if x % 6 < 3 { [255, 230, 0] } else { [255, 120, 0] };
+                img.put_pixel(x, y, Rgb(c));
+            }
+        }
+        let run = |f: i32| {
+            remove_smoke(
+                &img,
+                &SmokeParams {
+                    core_feather: f,
+                    ..Default::default()
+                },
+            )
+        };
+        let (narrow, wide) = (run(0), run(100));
+        // 簇的右邊 8 px：寬的羽化要比窄的留下更多
+        let n = narrow.get_pixel(86, 64).0;
+        let w = wide.get_pixel(86, 64).0;
+        assert!(
+            w[0] as i32 >= n[0] as i32 + 40,
+            "羽化拉寬後簇旁邊的煙沒有多留：窄 {n:?}、寬 {w:?}"
+        );
+        // 離簇很遠的角落照樣扣光
+        let far = wide.get_pixel(150, 4).0;
+        assert!(
+            far.iter().all(|&v| v < 60),
+            "羽化漫到離簇很遠的煙上了：{far:?}"
         );
     }
 

@@ -94,6 +94,10 @@ fn main() {
     if let Ok(v) = std::env::var("SMOKE_FAST") {
         p.fast = v != "0";
     }
+    // SMOKE_FEATHER=0~100：亮芯羽化（煙火簇的保護區往外暈開多寬）
+    if let Ok(v) = std::env::var("SMOKE_FEATHER") {
+        p.core_feather = v.parse().unwrap_or(dehaze::CORE_FEATHER);
+    }
     // SMOKE_PREVIEW_OF=原圖長邊：把手上這張當成那張原圖的縮圖來處理
     // （GUI 畫預覽時做的就是這件事，見 dehaze::SmokeParams::preview_of）。
     // 想確認「預覽與成品是不是同一個結果」，拿它跑最快

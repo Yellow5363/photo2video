@@ -4722,6 +4722,9 @@ impl SmokeTool {
         if after.feather != before.feather {
             dst.feather = after.feather;
         }
+        if after.core_feather != before.core_feather {
+            dst.core_feather = after.core_feather;
+        }
         if after.mask_density != before.mask_density {
             dst.mask_density = after.mask_density;
         }
@@ -17019,11 +17022,12 @@ impl App {
             let mut p = eff.clone();
             slider_row(ui, &mut p.strength, 0, 100, "去除煙霧");
             slider_row(ui, &mut p.detail, 0, 100, "細節");
+            slider_row(ui, &mut p.core_feather, 0, 100, "亮芯羽化");
             // 這兩條是自動值管的：自己動過就把自動判參數關掉，
             // 否則下次換一格又被蓋回去（那兩個勾選不屬於自動值，不算數）
             let tuned_moved = p.strength != eff.strength || p.detail != eff.detail;
             ui.label(
-                egui::RichText::new("去除煙霧＝煙霧扣掉多少 · 細節＝煙火線條的保留程度")
+                egui::RichText::new("去除煙霧＝煙霧扣掉多少 · 細節＝煙火線條的保留程度 · 亮芯羽化＝煙火簇周圍的光暈留多寬")
                     .size(11.0)
                     .color(theme::TEXT_WEAK),
             );
@@ -23403,6 +23407,7 @@ impl App {
                             let mut p = eff.clone();
                             slider_row(ui, &mut p.strength, 0, 100, "去除煙霧");
                             slider_row(ui, &mut p.detail, 0, 100, "細節");
+                            slider_row(ui, &mut p.core_feather, 0, 100, "亮芯羽化");
                             // 羽化與濃度搬到下面的「遮色片」區去了：它們是遮色片
                             // 自己的設定，跟尺寸擺在一起才看得懂（與煙火疊圖一致）
                             if p.has_protect() {
@@ -23417,7 +23422,7 @@ impl App {
                             // 右邊時視窗一窄就被裁掉，看不到後半句
                             ui.label(
                                 egui::RichText::new(
-                                    "去除煙霧＝煙霧扣掉多少 · 細節＝煙火線條的保留程度",
+                                    "去除煙霧＝煙霧扣掉多少 · 細節＝煙火線條的保留程度 · 亮芯羽化＝煙火簇周圍的光暈留多寬",
                                 )
                                 .size(11.0)
                                 .color(theme::TEXT_WEAK),
