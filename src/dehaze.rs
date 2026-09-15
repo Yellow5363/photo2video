@@ -131,6 +131,24 @@ const CORE_KEEP_AREA: (f32, f32) = (190.0, 220.0);
 /// 0.7% 在 8000px 的照片上約 58px
 const CORE_AREA_RADIUS: f32 = 0.007;
 
+/// 「整帶夠亮」平台的另一條路：一帶裡**兩個通道都頂上去**的像素佔了幾成
+/// （最亮的通道以外，次亮的那個也到 [`CLUSTER_MID`] 以上，sRGB 0~255）。
+///
+/// 噴泉、密集的金柳這種擠成一片的煙火簇，最小值池化與開運算都掃不掉——
+/// 線條之間沒有縫，整團就是一片連續的亮面，煙霧層估出來等於它自己
+/// （yi/ys ≈ 1），逐像素那幾條保護（過曝、自發光、夠白）全都過不了。
+/// 平均亮度那條（[`CORE_KEEP_AREA`]）本來就是為這種簇設的，可是暖色的簇
+/// 紅通道頂到 255、綠只有 120～230、藍是 0，線性亮度平均下來只到 sRGB 190
+/// 上下，勉強沾到門檻的下緣，於是同一叢裡忽保忽扣，黃色的線條被壓成一團
+/// 灰褐（實照 L1003680 的噴泉回報過）。
+///
+/// 真正分得開的是「有多少像素亮到兩個通道都頂上去」：噴泉的亮芯一帶
+/// 實測 45%～56%（黃、白的線條），該扣的橘紅濃煙即使紅通道整片頂到 255，
+/// 綠藍也只有一百上下，佔比 3%～6%；零星穿過煙的線條 9% 以下。
+/// 門檻取在兩者中間，判準同樣是一帶的平均，同一叢會被一致對待
+const CLUSTER_MID: u8 = 225;
+const CLUSTER_FILL: (f32, f32) = (0.15, 0.40);
+
 /// 「整帶夠亮」的平台往外暈開多寬（佔影像長邊）：平台邊緣之外，保護權重
 /// 平滑地降到 0，約在這個寬度的一倍半處收尾（暈法見 [`dehaze_to_linear`] 裡的說明）。
 ///
@@ -3787,10 +3805,27 @@ fn dehaze_to_linear(
         let glow_hi = srgb_to_linear(CORE_SKIRT_GLOW.1 / 255.0);
         // 一帶的平均亮度；平台＝亮到門檻以上的那一片
         let area = box_mean(y, r);
+        // 平台的另一條路（見 [`CLUSTER_FILL`]）：一帶被「兩個通道都頂上去」的
+        // 像素佔掉幾成。暖色的煙火簇平均亮度不到門檻，這個佔比卻只有煙火簇才會高
+        let dense = {
+            let mut d = Plane::new(fw, fh);
+            for (v, px) in d.d.iter_mut().zip(img.pixels()) {
+                let (a, b, c) = (px[0], px[1], px[2]);
+                // 三個通道裡排中間的那個
+                let mid = a.max(b).min(a.min(b).max(c));
+                *v = if mid >= CLUSTER_MID { 1.0 } else { 0.0 };
+            }
+            box_mean(&d, r)
+        };
         let mut w = area.clone();
-        for v in w.d.iter_mut() {
-            *v = smoothstep(area_lo, area_hi, *v);
+        for (v, dn) in w.d.iter_mut().zip(&dense.d) {
+            *v = smoothstep(area_lo, area_hi, *v).max(smoothstep(
+                CLUSTER_FILL.0,
+                CLUSTER_FILL.1,
+                *dn,
+            ));
         }
+        drop(dense);
         // 暈開的方式：連抹三次方框平均（三次方框疊起來近似高斯，等高線是圓角的），
         // 再把平台邊緣上的 0.5 拉回 1——平台裡仍是 1，邊緣之外一路平滑降到 0，
         // 兩頭都沒有折角。
@@ -3800,13 +3835,12 @@ fn dehaze_to_linear(
         // 噴泉周圍回報過）
         let r_s = ((long * CORE_SKIRT).round() as usize).clamp(2, 120);
         let s = box_mean(&w, r_s);
-        drop(w);
         let mut s = box_mean(&box_mean(&s, r_s), r_s);
         for (i, v) in s.d.iter_mut().enumerate() {
             // 暈開的圈再照「這一帶本身亮不亮」打折（見 [`CORE_SKIRT_GLOW`]），
             // 平台本身則一律保住
             let skirt = smoothstep(0.0, 0.5, *v) * smoothstep(glow_lo, glow_hi, area.d[i]);
-            *v = skirt.max(smoothstep(area_lo, area_hi, area.d[i]));
+            *v = skirt.max(w.d[i]);
         }
         s
     });
@@ -4826,6 +4860,45 @@ mod tests {
         assert!(
             smoke.iter().all(|&v| v < 60),
             "亮芯的保護漫到煙上了：角落的煙 {smoke:?} 應該幾乎被扣光"
+        );
+    }
+
+    /// 太亮看不到細節的煙火簇要原樣留著（見 [`CLUSTER_FILL`]）：噴泉的黃橘色
+    /// 線條擠成一片，煙霧層掃不掉它、平均亮度又不到「整帶夠亮」的門檻，
+    /// 逐像素判就會把橘色的線條壓成一團灰褐
+    #[test]
+    fn a_dense_warm_cluster_keeps_its_colour() {
+        // 暖煙上放一叢擠在一起的線條：六欄一組，三欄亮黃、三欄橘（藍通道全是 0）。
+        // 線性亮度平均約 sRGB 195，只勉強沾到 CORE_KEEP_AREA 的下緣；
+        // 「兩個通道都頂上去」的像素則佔了一半
+        let mut img = solid(128, 128, [190, 150, 110]);
+        for y in 40..88 {
+            for x in 40..88 {
+                let c = if x % 6 < 3 {
+                    [255, 230, 0]
+                } else {
+                    [255, 120, 0]
+                };
+                img.put_pixel(x, y, Rgb(c));
+            }
+        }
+        let out = remove_smoke(&img, &SmokeParams::default());
+        // x=64 → 64 % 6 = 4 → 橘；x=61 → 1 → 黃
+        let p = out.get_pixel(64, 64).0;
+        assert!(
+            p[0] >= 245 && (110..=130).contains(&p[1]) && p[2] <= 10,
+            "煙火簇裡的橘色線條被壓暗了：{p:?} 應維持接近原本的 [255, 120, 0]"
+        );
+        let q = out.get_pixel(61, 64).0;
+        assert!(
+            q[0] >= 245 && q[1] >= 220,
+            "煙火簇裡的黃色線條被壓暗了：{q:?} 應維持接近原本的 [255, 230, 0]"
+        );
+        // 同一張裡的煙照樣要被扣掉，不能因為旁邊有簇就整片留著
+        let smoke = out.get_pixel(4, 4).0;
+        assert!(
+            smoke.iter().all(|&v| v < 60),
+            "煙火簇的保護漫到煙上了：角落的煙 {smoke:?} 應該幾乎被扣光"
         );
     }
 
