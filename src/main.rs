@@ -857,6 +857,9 @@ struct ProjectFile {
     module: String,
     /// 存檔當下的程式版本（僅供除錯參考）
     app_version: String,
+    /// 存檔時這個專案檔自己的位置。整個資料夾被搬到別處之後，靠它與現在的
+    /// 位置比對就接得回照片（見 [`project::Relocator`]）
+    saved_at: PathBuf,
     photos: Vec<PathBuf>,
     fps: u32,
     /// 輸出格式副檔名（mp4/mkv/mov/avi/webm）
@@ -903,6 +906,7 @@ impl Default for ProjectFile {
             version: 1,
             module: project::KIND_VIDEO.into(),
             app_version: String::new(),
+            saved_at: PathBuf::new(),
             photos: Vec::new(),
             fps: 10,
             format: "mp4".into(),
@@ -8890,6 +8894,8 @@ impl App {
             version: 1,
             module: project::KIND_VIDEO.into(),
             app_version: env!("CARGO_PKG_VERSION").into(),
+            // 存放位置要等存檔路徑定了才填（見 [`App::project_json`]）
+            saved_at: PathBuf::new(),
             photos: self.photos.clone(),
             fps: self.fps,
             format: self.format.ext().into(),
@@ -8964,7 +8970,7 @@ impl App {
 
     /// 寫入專案檔到指定路徑；成功時更新最近清單與「目前專案」
     fn save_project_to(&mut self, path: &Path) {
-        let json = match serde_json::to_string_pretty(&self.project_data()) {
+        let json = match self.project_json(Module::Video, path) {
             Ok(j) => j,
             Err(e) => {
                 message_dialog()
@@ -9062,27 +9068,26 @@ impl App {
         // 除了檔案存在，也要求是支援的圖片格式：專案檔可能被手改塞入
         // 非圖片路徑，不先擋下會直到轉檔才由 ffmpeg 失敗
         let orig_n = pf.photos.len();
-        let exists: Vec<bool> = pf
+        // 整個資料夾被搬到別處時，把記著的絕對路徑接回新位置
+        // （見 [`project::Relocator`]）；位置與原清單一一對應，
+        // 下面平移文字段落的編號要靠它
+        let reloc = project::Relocator::new(none_if_empty(&pf.saved_at), path);
+        let found = resolve_photos(&pf.photos, &reloc);
+        let missing = found.iter().filter(|f| f.is_none()).count();
+        // 逐張的設定是以**原路徑**當鍵存的，要照這份對照表換成新位置
+        let moved: HashMap<PathBuf, PathBuf> = pf
             .photos
             .iter()
-            // 0 位元組的照片視同遺失：留著會在轉檔時讓 concat 靜默丟掉其後所有
-            // 照片（見 is_nonempty_file），當作缺檔略過並提示才安全
-            .map(|p| p.is_file() && is_image(p) && is_nonempty_file(p))
+            .zip(&found)
+            .filter_map(|(old, new)| new.clone().map(|n| (old.clone(), n)))
             .collect();
-        let missing = exists.iter().filter(|e| !**e).count();
         let mut kept_before = vec![0usize; orig_n + 1];
-        for (i, e) in exists.iter().enumerate() {
-            kept_before[i + 1] = kept_before[i] + usize::from(*e);
+        for (i, f) in found.iter().enumerate() {
+            kept_before[i + 1] = kept_before[i] + usize::from(f.is_some());
         }
 
         self.clear_photos(); // 內含轉換結果橫幅（state）的重置
-        self.photos = pf
-            .photos
-            .iter()
-            .zip(&exists)
-            .filter(|(_, e)| **e)
-            .map(|(p, _)| p.clone())
-            .collect();
+        self.photos = found.into_iter().flatten().collect();
         self.fps = pf.fps.clamp(1, 60);
         // 取消尚未落盤的 fps 延遲寫入：設定檔的 fps 是「使用者慣用值」，
         // 若剛拖完滑桿（計時器還掛著）就載入專案，時間一到會把「專案的
@@ -9096,12 +9101,11 @@ impl App {
             .find(|r| (r.w, r.h) == pf.resolution)
             .unwrap_or(Resolution { w: 1920, h: 1080 });
         self.adj = pf.adj.clamped();
-        let photo_set: HashSet<&PathBuf> = self.photos.iter().collect();
         self.adj_overrides = pf
             .adj_overrides
             .into_iter()
-            .filter(|(p, _)| photo_set.contains(p))
-            .map(|(p, a)| (p, a.clamped()))
+            // 鍵換成照片現在的位置（見 [`restore_map`]）
+            .filter_map(|(p, a)| Some((moved.get(&p)?.clone(), a.clamped())))
             .collect();
         // 主體框：照片還在的才留。裁切框已經在 adj_overrides 裡原樣載回來了，
         // 所以開檔後是「框都在、鏡頭也在」的狀態，接著檢查或改參數都可以
@@ -9110,15 +9114,15 @@ impl App {
             boxes: pf
                 .track_boxes
                 .into_iter()
-                .filter(|(p, ..)| photo_set.contains(p))
-                .map(|(p, r, src, score)| {
+                .filter_map(|(p, r, src, score)| {
+                    let p = moved.get(&p)?.clone();
                     let src = match src {
                         0 => BoxSrc::Manual,
                         1 => BoxSrc::Auto,
                         _ => BoxSrc::Tracked,
                     };
                     let score = if score.is_finite() { score.clamp(0.0, 1.0) } else { 0.0 };
-                    (p, Subject { rect: clamp_rect(r), src, score })
+                    Some((p, Subject { rect: clamp_rect(r), src, score }))
                 })
                 .collect(),
             zoom: if pf.track_zoom.is_finite() {
@@ -9130,8 +9134,7 @@ impl App {
             prev: pf
                 .track_prev
                 .into_iter()
-                .filter(|(p, _)| photo_set.contains(p))
-                .map(|(p, a)| (p, a.map(|a| a.clamped())))
+                .filter_map(|(p, a)| Some((moved.get(&p)?.clone(), a.map(|a| a.clamped()))))
                 .collect(),
             ..TrackTool::default()
         };
@@ -9173,9 +9176,11 @@ impl App {
         self.transition = Transition::from_id(&pf.transition).unwrap_or(Transition::None);
         self.ken_burns = pf.ken_burns;
         self.fade_out = pf.fade_out;
-        // 音樂檔遺失就整組略過（照片少幾張還能用，音樂缺檔設定就沒意義）
-        let music_missing = matches!(&pf.music_path, Some(p) if !p.is_file());
-        self.music_path = pf.music_path.filter(|p| p.is_file());
+        // 音樂檔遺失就整組略過（照片少幾張還能用，音樂缺檔設定就沒意義）。
+        // 不在原路徑時先照專案檔搬動的方式接一次（見 [`relocated`]）
+        let music = pf.music_path.map(|p| relocated(&p, &reloc));
+        let music_missing = matches!(&music, Some(p) if !p.is_file());
+        self.music_path = music.filter(|p| p.is_file());
         self.music_volume = pf.music_volume.clamp(0, 200);
         self.music_fade = pf.music_fade;
 
@@ -9241,13 +9246,35 @@ impl App {
     }
 
     /// 把目前模組的編輯狀態打包成專案檔的 JSON
-    fn project_json(&self, m: Module) -> Result<String, serde_json::Error> {
+    /// `saved_at` 是這一份要寫到哪裡：記進檔案裡，整個資料夾之後被搬到別處
+    /// 時才接得回照片（見 [`project::Relocator`]）。
+    ///
+    /// **只在這裡填**，不在各模組的 `*_project_data` 裡——那幾個也拿來做
+    /// 「有沒有未儲存變更」的比對快照，把存放位置混進去會讓另存一份就被
+    /// 當成內容改過
+    fn project_json(&self, m: Module, saved_at: &Path) -> Result<String, serde_json::Error> {
+        let at = || saved_at.to_path_buf();
         match m {
-            Module::Video => serde_json::to_string_pretty(&self.project_data()),
-            Module::Dehaze => serde_json::to_string_pretty(&self.smoke_project_data()),
-            Module::Stack => serde_json::to_string_pretty(&self.stack_project_data()),
-            Module::Movie => serde_json::to_string_pretty(&self.movie_project_data()),
-            Module::Enhance => serde_json::to_string_pretty(&self.enhance_project_data()),
+            Module::Video => serde_json::to_string_pretty(&ProjectFile {
+                saved_at: at(),
+                ..self.project_data()
+            }),
+            Module::Dehaze => serde_json::to_string_pretty(&project::DehazeProject {
+                saved_at: at(),
+                ..self.smoke_project_data()
+            }),
+            Module::Stack => serde_json::to_string_pretty(&project::StackProject {
+                saved_at: at(),
+                ..self.stack_project_data()
+            }),
+            Module::Movie => serde_json::to_string_pretty(&project::MovieProject {
+                saved_at: at(),
+                ..self.movie_project_data()
+            }),
+            Module::Enhance => serde_json::to_string_pretty(&project::EnhanceProject {
+                saved_at: at(),
+                ..self.enhance_project_data()
+            }),
             Module::Files => Ok(String::new()),
         }
     }
@@ -9260,17 +9287,6 @@ impl App {
     fn save_module_project(&mut self, m: Module) {
         let (Some(kind), Some(which)) = (m.project_kind(), LastDir::project_of(m)) else {
             return;
-        };
-        let json = match self.project_json(m) {
-            Ok(j) => j,
-            Err(e) => {
-                message_dialog()
-                    .set_level(rfd::MessageLevel::Error)
-                    .set_title("專案儲存失敗")
-                    .set_description(format!("無法產生專案內容：\n{e}"))
-                    .show();
-                return;
-            }
         };
         // 預設檔名**每次都帶現在的時間**，即使已經開著某個 .p2v 也一樣：
         // 規則就是「名字＋當天日期＋時間」，預帶舊檔名等於預設要蓋掉上一份
@@ -9323,6 +9339,18 @@ impl App {
         if let Some(s) = path.file_stem().and_then(|s| s.to_str()) {
             project::remember_name(kind, project::strip_stamp(s));
         }
+        // 內容要等路徑定了才能產生：存放位置也寫進檔案裡（見 project_json）
+        let json = match self.project_json(m, &path) {
+            Ok(j) => j,
+            Err(e) => {
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("專案儲存失敗")
+                    .set_description(format!("無法產生專案內容：\n{e}"))
+                    .show();
+                return;
+            }
+        };
         match write_project_atomic(&path, &json) {
             Ok(()) => {
                 self.remember_recent_project(&path);
@@ -9424,11 +9452,25 @@ impl App {
             return;
         }
         self.set_module(target);
+        // 整個資料夾被搬到別處（複製到另一顆硬碟、換一台電腦）時，靠它把
+        // 檔案裡記的絕對路徑接回新位置（見 [`project::Relocator`]）
         let missing = match any {
-            project::AnyProject::Dehaze(p) => self.smoke_load_project(*p, ctx),
-            project::AnyProject::Stack(p) => self.stack_load_project(*p, ctx),
-            project::AnyProject::Movie(p) => self.movie_load_project(*p, ctx),
-            project::AnyProject::Enhance(p) => self.enhance_load_project(*p, ctx),
+            project::AnyProject::Dehaze(p) => {
+                let r = project::Relocator::new(none_if_empty(&p.saved_at), &path);
+                self.smoke_load_project(*p, &r, ctx)
+            }
+            project::AnyProject::Stack(p) => {
+                let r = project::Relocator::new(none_if_empty(&p.saved_at), &path);
+                self.stack_load_project(*p, &r, ctx)
+            }
+            project::AnyProject::Movie(p) => {
+                let r = project::Relocator::new(none_if_empty(&p.saved_at), &path);
+                self.movie_load_project(*p, &r, ctx)
+            }
+            project::AnyProject::Enhance(p) => {
+                let r = project::Relocator::new(none_if_empty(&p.saved_at), &path);
+                self.enhance_load_project(*p, &r, ctx)
+            }
             project::AnyProject::Video(_) => unreachable!("影片專案在上面就處理掉了"),
         };
         self.remember_recent_project(&path);
@@ -12899,6 +12941,8 @@ impl App {
             version: project::VERSION,
             module: project::KIND_DEHAZE.into(),
             app_version: project::app_version(),
+            // 存放位置要等存檔路徑定了才填（見 [`App::project_json`]）
+            saved_at: PathBuf::new(),
             photos: order.clone(),
             cur: s.cur,
             params: s.params.clone(),
@@ -12949,22 +12993,31 @@ impl App {
     ///
     /// 先清乾淨再照專案重建：逐張的設定都以檔案路徑為鍵，上一批留著的話
     /// 只要有同名檔案就會悄悄套上去（與 [`App::smoke_clear_photos`] 同一個顧慮）
-    fn smoke_load_project(&mut self, p: project::DehazeProject, ctx: &egui::Context) -> usize {
-        let (photos, missing) = existing_photos(&p.photos);
+    fn smoke_load_project(
+        &mut self,
+        p: project::DehazeProject,
+        reloc: &project::Relocator,
+        ctx: &egui::Context,
+    ) -> usize {
+        let (photos, moved, missing) = existing_photos(&p.photos, reloc);
         self.smoke_clear_photos();
-        let keep: HashSet<PathBuf> = photos.iter().cloned().collect();
         // 量好的自動值要趕在 smoke_set_photos 之前放進去：它會照手上缺哪幾張
         // 排背景量測，這裡先補齊就一張都不必再量（一批幾十張要等上一陣子）
-        self.smoke.auto = restore_map(p.auto, &keep);
+        self.smoke.auto = restore_map(p.auto, &moved);
         if !photos.is_empty() {
             self.smoke_set_photos(photos, ctx);
         }
         let s = &mut self.smoke;
         s.params = p.params;
-        s.overrides = restore_map(p.overrides, &keep);
+        s.overrides = restore_map(p.overrides, &moved);
         s.finish = p.finish;
-        s.finish_overrides = restore_map(p.finish_overrides, &keep);
-        s.wipes = restore_map(p.wipes, &keep);
+        s.finish_overrides = restore_map(p.finish_overrides, &moved);
+        s.wipes = restore_map(p.wipes, &moved);
+        // 疊上去的圖片（logo、落款）也是絕對路徑，一起接回新位置
+        relocate_finish(&mut s.finish, reloc);
+        for f in s.finish_overrides.values_mut() {
+            relocate_finish(f, reloc);
+        }
         s.auto_on = p.auto_on;
         s.per_photo = p.per_photo;
         s.text_style = SubtitleStyle {
@@ -12990,7 +13043,11 @@ impl App {
         s.wipe_density = p.wipe_density.clamp(0, 100);
         s.wipe_keep = p.wipe_keep;
         s.crop_aspect = p.crop_aspect;
-        s.multi_sel = p.multi_sel.into_iter().filter(|q| keep.contains(q)).collect();
+        s.multi_sel = p
+            .multi_sel
+            .iter()
+            .filter_map(|q| moved.get(q).cloned())
+            .collect();
         s.sky_open = p.sky_open;
         s.grade_open = p.grade_open;
         s.text_open = p.text_open;
@@ -15363,6 +15420,8 @@ impl App {
             version: project::VERSION,
             module: project::KIND_MOVIE.into(),
             app_version: project::app_version(),
+            // 存放位置要等存檔路徑定了才填（見 [`App::project_json`]）
+            saved_at: PathBuf::new(),
             src: m.src.clone(),
             queue: m.queue.clone(),
             merge: m.merge,
@@ -15405,10 +15464,26 @@ impl App {
     ///
     /// 預覽的那一支不見時就把排隊的第一支遞補上來——整批共用同一組設定，
     /// 少了第一支其餘照樣跑得動，沒必要整份開不起來
-    fn movie_load_project(&mut self, p: project::MovieProject, ctx: &egui::Context) -> usize {
+    fn movie_load_project(
+        &mut self,
+        p: project::MovieProject,
+        reloc: &project::Relocator,
+        ctx: &egui::Context,
+    ) -> usize {
         let listed: Vec<PathBuf> = p.src.iter().chain(p.queue.iter()).cloned().collect();
-        let mut alive = listed.iter().filter(|q| q.is_file()).cloned();
-        let missing = listed.len() - listed.iter().filter(|q| q.is_file()).count();
+        // 不在原路徑的先照專案檔搬動的方式找一次（整批被複製到別顆硬碟時）
+        let found: Vec<PathBuf> = listed
+            .iter()
+            .filter_map(|q| {
+                if q.is_file() {
+                    Some(q.clone())
+                } else {
+                    reloc.fix(q)
+                }
+            })
+            .collect();
+        let missing = listed.len() - found.len();
+        let mut alive = found.into_iter();
         let Some(first) = alive.next() else {
             // 一支都不在了：回到空畫面，設定不必還原（沒有東西可以套）
             self.movie.reset_batch(None, None);
@@ -15460,7 +15535,11 @@ impl App {
             boxed: p.text_boxed,
         };
         // 音樂檔可能已經被搬走或刪掉，不在就當作沒配樂
-        m.music_path = p.music_path.filter(|q| q.is_file());
+        // 音樂也可能跟著整個資料夾被搬走了（見 [`relocated`]）
+        m.music_path = p
+            .music_path
+            .map(|q| relocated(&q, reloc))
+            .filter(|q| q.is_file());
         m.music_volume = p.music_volume.clamp(0, 200);
         m.src_volume = p.src_volume.clamp(0, 200);
         m.music_fade = p.music_fade;
@@ -19106,6 +19185,8 @@ impl App {
             version: project::VERSION,
             module: project::KIND_STACK.into(),
             app_version: project::app_version(),
+            // 存放位置要等存檔路徑定了才填（見 [`App::project_json`]）
+            saved_at: PathBuf::new(),
             photos: order.clone(),
             ground: s.ground,
             cur: s.cur,
@@ -19136,21 +19217,25 @@ impl App {
     }
 
     /// 還原一份「煙火疊圖」專案；回傳已經不在原路徑的照片張數
-    fn stack_load_project(&mut self, p: project::StackProject, ctx: &egui::Context) -> usize {
-        let (photos, missing) = existing_photos(&p.photos);
+    fn stack_load_project(
+        &mut self,
+        p: project::StackProject,
+        reloc: &project::Relocator,
+        ctx: &egui::Context,
+    ) -> usize {
+        let (photos, moved, missing) = existing_photos(&p.photos, reloc);
         self.stack_clear_photos();
-        let keep: HashSet<PathBuf> = photos.iter().cloned().collect();
         if !photos.is_empty() {
             self.stack_set_photos(photos, ctx);
         }
         let s = &mut self.stack;
         // 對齊結果要在 set_photos **之後**才放回去：它會把上一批的整批清掉
         // （對齊是相對於地景的）。放回去之後 spawn_stack_align 就只算還缺的那幾張
-        s.auto_offsets = restore_map(p.auto_offsets, &keep);
-        s.masks = restore_map(p.masks, &keep);
-        s.mask_polarity = restore_map(p.mask_polarity, &keep);
-        s.xforms = restore_map(p.xforms, &keep);
-        s.grades = restore_map(p.grades, &keep);
+        s.auto_offsets = restore_map(p.auto_offsets, &moved);
+        s.masks = restore_map(p.masks, &moved);
+        s.mask_polarity = restore_map(p.mask_polarity, &moved);
+        s.xforms = restore_map(p.xforms, &moved);
+        s.grades = restore_map(p.grades, &moved);
         // 張數可能因遺失（或超過上限被截掉）而變少，兩個索引都要夾回範圍內
         let last = s.photos.len().saturating_sub(1);
         s.ground = p.ground.min(last);
@@ -23979,6 +24064,8 @@ impl App {
             version: project::VERSION,
             module: project::KIND_ENHANCE.into(),
             app_version: project::app_version(),
+            // 存放位置要等存檔路徑定了才填（見 [`App::project_json`]）
+            saved_at: PathBuf::new(),
             photos: order.clone(),
             cur: e.cur,
             preset: e.preset,
@@ -24001,21 +24088,25 @@ impl App {
     }
 
     /// 還原一份「優化影像」專案；回傳已經不在原路徑的照片張數
-    fn enhance_load_project(&mut self, p: project::EnhanceProject, ctx: &egui::Context) -> usize {
-        let (photos, missing) = existing_photos(&p.photos);
+    fn enhance_load_project(
+        &mut self,
+        p: project::EnhanceProject,
+        reloc: &project::Relocator,
+        ctx: &egui::Context,
+    ) -> usize {
+        let (photos, moved, missing) = existing_photos(&p.photos, reloc);
         self.enhance_clear_photos();
-        let keep: HashSet<PathBuf> = photos.iter().cloned().collect();
         // 量好的自動建議趕在 set_photos 之前放回去，才不會整批再量一次
         // （與去煙霧同一個作法，見 [`App::smoke_load_project`]）
         self.enhance.auto = p
             .auto
             .into_iter()
-            .filter(|(q, _, _)| keep.contains(q))
-            .map(|(q, preset, a)| (q, (preset, a)))
+            // 鍵換成照片現在的位置（見 [`restore_map`]）
+            .filter_map(|(q, preset, a)| Some((moved.get(&q)?.clone(), (preset, a))))
             .collect();
         // 類型也要先設好：量測是照類型跑的，晚一步就會用舊類型量一輪
         self.enhance.preset = p.preset;
-        self.enhance.preset_overrides = restore_map(p.preset_overrides, &keep);
+        self.enhance.preset_overrides = restore_map(p.preset_overrides, &moved);
         if !photos.is_empty() {
             self.enhance_set_photos(photos, ctx);
         }
@@ -24023,8 +24114,8 @@ impl App {
         e.auto_on = p.auto_on;
         e.auto_amount = p.auto_amount.clamp(0, 200);
         e.params = p.params;
-        e.grade_overrides = restore_map(p.grade_overrides, &keep);
-        e.local_overrides = restore_map(p.local_overrides, &keep);
+        e.grade_overrides = restore_map(p.grade_overrides, &moved);
+        e.local_overrides = restore_map(p.local_overrides, &moved);
         e.per_photo = p.per_photo;
         e.crop_aspect = p.crop_aspect;
         e.grade_open = p.grade_open;
@@ -30770,24 +30861,74 @@ fn color_from_rgba(c: [u8; 4]) -> egui::Color32 {
 /// 專案檔裡的照片清單挑出還在的那幾張，回傳 (還在的, 不見了幾張)。
 /// 除了檔案存在，也要求是支援的圖片格式：專案檔可能被手改塞入別的東西，
 /// 或照片被改存成程式讀不了的格式
-fn existing_photos(list: &[PathBuf]) -> (Vec<PathBuf>, usize) {
-    let kept: Vec<PathBuf> = list
+fn resolve_photos(list: &[PathBuf], reloc: &project::Relocator) -> Vec<Option<PathBuf>> {
+    // 0 位元組的照片視同遺失（見 is_nonempty_file）：留著只會在存檔時
+    // 逐張報錯，不如現在就當作缺檔略過並提示
+    let usable = |p: &Path| p.is_file() && is_image(p) && is_nonempty_file(p);
+    list.iter()
+        .map(|p| {
+            if usable(p) {
+                return Some(p.clone());
+            }
+            // 不在原路徑：整個資料夾可能被搬到別顆硬碟了，照專案檔自己
+            // 搬動的方式找找看（見 [`project::Relocator`]）
+            reloc.fix(p).filter(|q| usable(q))
+        })
+        .collect()
+}
+
+/// 專案檔裡的照片清單接到新位置：回傳（還在的、**原路徑→現在的位置**、
+/// 不見了幾張）。
+///
+/// 那份對照表不能省：逐張的設定（個別調色、遮色片、筆跡、量好的自動值）
+/// 全是以**原路徑**當鍵存的，整個資料夾搬過家之後不照它換一次，
+/// 就會因為鍵對不上而整批被丟掉——照片是回來了，調了半天的設定卻沒了
+fn existing_photos(
+    list: &[PathBuf],
+    reloc: &project::Relocator,
+) -> (Vec<PathBuf>, HashMap<PathBuf, PathBuf>, usize) {
+    let found = resolve_photos(list, reloc);
+    let missing = found.iter().filter(|f| f.is_none()).count();
+    let moved: HashMap<PathBuf, PathBuf> = list
         .iter()
-        // 0 位元組的照片視同遺失（見 is_nonempty_file）：留著只會在存檔時
-        // 逐張報錯，不如現在就當作缺檔略過並提示
-        .filter(|p| p.is_file() && is_image(p) && is_nonempty_file(p))
-        .cloned()
+        .zip(&found)
+        .filter_map(|(old, new)| new.clone().map(|n| (old.clone(), n)))
         .collect();
-    let missing = list.len() - kept.len();
-    (kept, missing)
+    (found.into_iter().flatten().collect(), moved, missing)
+}
+
+/// 空的路徑當作「沒記過」：`saved_at` 這個欄位還不存在時存的舊專案，
+/// 讀出來就是空的（見 [`project::Relocator`]）
+fn none_if_empty(p: &Path) -> Option<&Path> {
+    (!p.as_os_str().is_empty()).then_some(p)
+}
+
+/// 單一個檔案（背景音樂、疊上去的圖片）不在原路徑時，照專案檔搬動的方式
+/// 接回去；接不回來就維持原樣，交給呼叫端當作遺失處理
+fn relocated(p: &Path, reloc: &project::Relocator) -> PathBuf {
+    if p.is_file() {
+        return p.to_path_buf();
+    }
+    reloc.fix(p).unwrap_or_else(|| p.to_path_buf())
+}
+
+/// 把一份後製裡疊上去的圖片路徑接回新位置（見 [`relocated`]）
+fn relocate_finish(f: &mut Finish, reloc: &project::Relocator) {
+    for img in &mut f.images {
+        img.path = relocated(&img.path, reloc);
+    }
 }
 
 /// 把 `Vec<(路徑, 值)>`（專案檔裡的存法）收回 HashMap，並丟掉不在這一批
 /// 裡的項目——照片清單可能因檔案遺失而少了幾張
-fn restore_map<T>(pairs: Vec<(PathBuf, T)>, keep: &HashSet<PathBuf>) -> HashMap<PathBuf, T> {
+fn restore_map<T>(
+    pairs: Vec<(PathBuf, T)>,
+    moved: &HashMap<PathBuf, PathBuf>,
+) -> HashMap<PathBuf, T> {
     pairs
         .into_iter()
-        .filter(|(k, _)| keep.contains(k))
+        // 鍵換成照片現在的位置；照片不見了就連它的設定一起丟
+        .filter_map(|(k, v)| Some((moved.get(&k)?.clone(), v)))
         .collect()
 }
 
@@ -33566,6 +33707,65 @@ mod tests {
                 res.label()
             );
         }
+    }
+
+    /// 專案檔連同整個資料夾被複製到另一顆硬碟之後，裡面記的絕對路徑要接得回來
+    /// ——照片明明都在，專案卻整份開不起來是實際回報過的狀況
+    #[test]
+    fn 專案搬家後照片接得回新位置() {
+        let base = std::env::temp_dir().join(format!("p2v_move_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // 新位置：<base>\新硬碟\20260912日月潭煙火\{照片, 專案\去煙霧\x.p2v}
+        let shoot = base.join("新硬碟").join("20260912日月潭煙火");
+        let proj_dir = shoot.join("專案").join("去煙霧");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let photo = shoot.join("DSC03621.jpg");
+        std::fs::write(&photo, b"x").unwrap();
+        let now_at = proj_dir.join("去煙霧-20260915-1344.p2v");
+        // 存檔時它在別顆硬碟上（那裡的照片與專案檔都已經不在了）。
+        // 用測試自己建的 base 底下一個沒建出來的資料夾當「舊硬碟」，
+        // 才不會不小心撞到這臺機器上真的存在的路徑
+        let old_shoot = base.join("舊硬碟").join("20260912日月潭煙火");
+        let old_at = old_shoot.join("專案").join("去煙霧").join("去煙霧-20260915-1344.p2v");
+        let old_photo = old_shoot.join("DSC03621.jpg");
+        assert!(!old_photo.is_file(), "這條路徑本來就不該存在");
+
+        // 一、有 saved_at（新版存的）：照專案檔自己搬動的方式換前綴
+        let r = project::Relocator::new(Some(&old_at), &now_at);
+        assert_eq!(r.fix(&old_photo).as_deref(), Some(photo.as_path()));
+        // 子資料夾的層次也對得回去
+        let sub = shoot.join("精選");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sub_photo = sub.join("DSC03999.jpg");
+        std::fs::write(&sub_photo, b"x").unwrap();
+        assert_eq!(
+            r.fix(&old_shoot.join("精選").join("DSC03999.jpg")).as_deref(),
+            Some(sub_photo.as_path())
+        );
+
+        // 二、沒有 saved_at（這個欄位還不存在時存的舊專案）：
+        // 從專案檔往上找三層拿檔名湊，正常放法就會落在照片資料夾上
+        let r0 = project::Relocator::new(None, &now_at);
+        assert_eq!(r0.fix(&old_photo).as_deref(), Some(photo.as_path()));
+        // 子資料夾那張湊不到（只拿檔名找），那才真的算遺失
+        assert_eq!(r0.fix(&old_shoot.join("精選").join("DSC03999.jpg")), None);
+
+        // 三、真的不見了就是不見了，不會亂接一個同名的東西回來
+        assert_eq!(r.fix(&old_shoot.join("根本沒有這張.jpg")), None);
+
+        // 四、逐張的設定是以**原路徑**當鍵存的，要跟著換成新位置，
+        // 否則照片回來了、調好的設定卻整批被丟掉
+        let (kept, moved, missing) = existing_photos(&[old_photo.clone()], &r);
+        assert_eq!(kept, vec![photo.clone()]);
+        assert_eq!(missing, 0);
+        assert_eq!(moved.get(&old_photo), Some(&photo));
+        let restored = restore_map(vec![(old_photo.clone(), 42)], &moved);
+        assert_eq!(restored.get(&photo), Some(&42), "設定要跟著照片搬過去");
+
+        // 五、沒搬過（還在原地）時不要亂動
+        let same = project::Relocator::new(Some(&now_at), &now_at);
+        assert_eq!(same.fix(&photo).as_deref(), Some(photo.as_path()));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 專案檔存在照片資料夾底下的「專案／<模組>」裡：存檔時不存在就建起來，

@@ -44,6 +44,9 @@ pub struct DehazeProject {
     pub module: String,
     /// 存檔當下的程式版本（僅供除錯參考）
     pub app_version: String,
+    /// 存檔時這個專案檔自己的位置。整個資料夾被搬到別處之後，靠它與現在的
+    /// 位置比對就接得回照片（見 [`Relocator`]）
+    pub saved_at: PathBuf,
     pub photos: Vec<PathBuf>,
     /// 存檔時停在第幾張
     pub cur: usize,
@@ -97,6 +100,7 @@ impl Default for DehazeProject {
             version: VERSION,
             module: KIND_DEHAZE.into(),
             app_version: String::new(),
+            saved_at: PathBuf::new(),
             photos: Vec::new(),
             cur: 0,
             params,
@@ -141,6 +145,8 @@ pub struct StackProject {
     pub version: u32,
     pub module: String,
     pub app_version: String,
+    /// 存檔時這個專案檔自己的位置（見 [`Relocator`]）
+    pub saved_at: PathBuf,
     /// 照片清單與順序（順序決定誰疊在誰上面）
     pub photos: Vec<PathBuf>,
     /// 哪一張當地景
@@ -183,6 +189,7 @@ impl Default for StackProject {
             version: VERSION,
             module: KIND_STACK.into(),
             app_version: String::new(),
+            saved_at: PathBuf::new(),
             photos: Vec::new(),
             ground: 0,
             cur: 0,
@@ -223,6 +230,8 @@ pub struct MovieProject {
     pub version: u32,
     pub module: String,
     pub app_version: String,
+    /// 存檔時這個專案檔自己的位置（見 [`Relocator`]）
+    pub saved_at: PathBuf,
     /// 正在預覽的那支影片
     pub src: Option<PathBuf>,
     /// 排在後面、要套同一組設定一起處理的其他影片
@@ -274,6 +283,7 @@ impl Default for MovieProject {
             version: VERSION,
             module: KIND_MOVIE.into(),
             app_version: String::new(),
+            saved_at: PathBuf::new(),
             src: None,
             queue: Vec::new(),
             merge: false,
@@ -318,6 +328,8 @@ pub struct EnhanceProject {
     pub version: u32,
     pub module: String,
     pub app_version: String,
+    /// 存檔時這個專案檔自己的位置（見 [`Relocator`]）
+    pub saved_at: PathBuf,
     pub photos: Vec<PathBuf>,
     pub cur: usize,
     /// 整批共用的類型
@@ -348,6 +360,7 @@ impl Default for EnhanceProject {
             version: VERSION,
             module: KIND_ENHANCE.into(),
             app_version: String::new(),
+            saved_at: PathBuf::new(),
             photos: Vec::new(),
             cur: 0,
             preset,
@@ -364,6 +377,98 @@ impl Default for EnhanceProject {
             show_mask: false,
         }
     }
+}
+
+// ---------- 專案檔跟著資料夾搬到別的地方 ----------
+
+/// 專案檔裡記的是照片與影片的**絕對路徑**。整個資料夾被複製到另一顆硬碟、
+/// 或換一台電腦之後，那些路徑就指不到東西了——檔案明明都在，專案卻整份
+/// 開不起來（實際回報過的狀況）。
+///
+/// 這個東西負責把它們接回新位置，兩條路：
+///
+/// 1. **照專案檔自己搬動的方式換前綴**：存檔時會把專案檔當時的位置寫進
+///    `saved_at`，拿它跟現在的位置從尾端比，相同的那一段以外就是「搬到哪去了」
+///    （`L:\yellow202609` → `M:\備份`）。整批一起搬時最準，照片放在子資料夾裡
+///    也對得回去。
+/// 2. **拿檔名到專案檔附近找**：`saved_at` 還不存在時存的舊專案沒得比，
+///    就從專案檔往上找幾層（正常放法是 `<照片資料夾>\專案\<模組>\`，
+///    所以第三層就是照片資料夾）拿檔名湊湊看。
+///
+/// 兩條都找不到才真的當作檔案不見了
+pub struct Relocator {
+    /// 專案檔自己搬動的前後綴（舊的 → 新的）；沒搬、或認不出是同一份就沒有
+    swap: Option<(PathBuf, PathBuf)>,
+    /// 拿檔名去碰運氣的幾個資料夾（由近而遠）
+    roots: Vec<PathBuf>,
+}
+
+impl Relocator {
+    /// `saved_at` 是專案檔存檔時記下的自己的位置（舊專案沒有就給 None），
+    /// `now_at` 是它現在的位置
+    pub fn new(saved_at: Option<&Path>, now_at: &Path) -> Self {
+        let swap = saved_at.and_then(|old| prefix_swap(old, now_at));
+        let mut roots = Vec::new();
+        let mut d = now_at.parent();
+        // 專案檔自己那一層、往上一層、再往上一層：正常放法是
+        // 「<照片資料夾>\專案\<模組>\」，所以第三個才是照片資料夾；
+        // 還沒分模組那一版是第二個，直接丟在照片旁邊的是第一個
+        for _ in 0..3 {
+            let Some(p) = d else { break };
+            roots.push(p.to_path_buf());
+            d = p.parent();
+        }
+        Self { swap, roots }
+    }
+
+    /// 這個檔案在新位置的哪裡；找不到就 None。
+    /// **只回真的存在的路徑**，呼叫端拿到就可以直接用
+    pub fn fix(&self, p: &Path) -> Option<PathBuf> {
+        if let Some((old, new)) = &self.swap {
+            if let Ok(rest) = p.strip_prefix(old) {
+                let q = new.join(rest);
+                if q.is_file() {
+                    return Some(q);
+                }
+            }
+        }
+        let name = p.file_name()?;
+        self.roots
+            .iter()
+            .map(|r| r.join(name))
+            .find(|q| q.is_file())
+    }
+}
+
+/// 兩條路徑從**尾端**往前比，相同的那一段以外就是「搬到哪去了」：
+/// `L:\a\煙火\專案\疊圖\x.p2v` 與 `M:\b\煙火\專案\疊圖\x.p2v`
+/// 比出來是 `L:\a` → `M:\b`。
+///
+/// 完全一樣（根本沒搬）或連檔名都對不上（不是同一份）時回 None。
+/// Windows 的路徑不分大小寫，所以逐段比較時也不分
+fn prefix_swap(old: &Path, new: &Path) -> Option<(PathBuf, PathBuf)> {
+    let o: Vec<_> = old.components().collect();
+    let n: Vec<_> = new.components().collect();
+    let same = |a: &std::path::Component, b: &std::path::Component| {
+        a.as_os_str().to_string_lossy().to_lowercase()
+            == b.as_os_str().to_string_lossy().to_lowercase()
+    };
+    let mut k = 0;
+    while k < o.len() && k < n.len() && same(&o[o.len() - 1 - k], &n[n.len() - 1 - k]) {
+        k += 1;
+    }
+    // 連檔名都不一樣：認不出是同一份，換前綴只會亂接
+    if k == 0 {
+        return None;
+    }
+    // 整條都一樣：沒搬過，不必換
+    if k == o.len() && k == n.len() {
+        return None;
+    }
+    Some((
+        o[..o.len() - k].iter().collect(),
+        n[..n.len() - k].iter().collect(),
+    ))
 }
 
 // ---------- 開檔：先認模組，再當成那一種讀 ----------
