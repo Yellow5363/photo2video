@@ -159,16 +159,26 @@ const CLUSTER_FILL: (f32, f32) = (0.08, 0.22);
 /// 暗處偶爾聚在一起的幾顆亮點不是簇，不該因為佔比過了門檻就整片留著
 const CLUSTER_GLOW: (f32, f32) = (120.0, 160.0);
 
-/// 「整帶夠亮」的平台往外暈開多寬（佔影像長邊）：平台邊緣之外，保護權重
-/// 平滑地降到 0，約在這個寬度的一倍半處收尾（暈法見 [`dehaze_to_linear`] 裡的說明）。
+/// 「整帶夠亮」的平台往外暈開多寬（佔影像長邊）。暈開分兩圈（暈法見
+/// [`dehaze_to_linear`] 裡的說明）：
+/// * 貼著平台的第一圈是**純距離的羽化**——不看亮度，從平台邊緣平滑降到
+///   這個寬度之外歸零。
+/// * 更外面那圈再往外三倍寬，但只保**本身仍然亮**的地方（見 [`CORE_SKIRT_GLOW`]）。
 ///
 /// 少了這一圈，平台裡原樣留著、一步之外就扣到近乎全黑——噴泉周圍被照亮的
 /// 濃煙是平的一面，煙霧層估出來就等於它自己——畫面上是一圈硬邊的斷階
 /// （實照 DSC00370 回報過）。噴泉的光暈本來就是一路淡出去的，這一圈讓它
-/// 照著淡出去，而不是被切一刀。1% 在 9984px 的照片上約 100px，斜坡 200px。
-/// 只有「整帶夠亮」的平台會暈開；逐點判定的白芯與過曝像素不會，
+/// 照著淡出去，而不是被切一刀。
+///
+/// 第一圈之所以不看亮度：之前整圈都乘了亮度門檻，核心外面的煙不到門檻時
+/// 整圈被關掉，平台邊緣又成了一道硬邊——牡丹的橘色核心、噴泉的粉紅光暈
+/// 都被切成一個圓盤（實照 DSC03635、DSC03637 回報過）。純距離的羽化保證
+/// 平台邊緣連續，代價是平台周圍這一圈的煙會留一部分、越遠越少。
+/// 3% 在 9984px 的照片上約 300px，是牡丹核心到光暈淡出的尺度；
+/// 1.5% 試過，邊還是看得出來。
+/// 只有平台會暈開；逐點判定的白芯與過曝像素不會，
 /// 煙火線條之間的煙才不會跟著被保護
-const CORE_SKIRT: f32 = 0.015;
+const CORE_SKIRT: f32 = 0.03;
 
 /// 暈開的那一圈只保護**本身仍然亮**的地方（一帶的平均亮度，sRGB 0~255）：
 /// 低於前一個數完全不保、高於後一個數完全照距離暈開的權重保。
@@ -3833,30 +3843,47 @@ fn dehaze_to_linear(
         for (v, dn) in w.d.iter_mut().zip(&dense.d) {
             // 佔比那條路還要一帶本身夠亮（見 [`CLUSTER_GLOW`]）
             let a = *v;
-            *v = smoothstep(area_lo, area_hi, a).max(
-                smoothstep(CLUSTER_FILL.0, CLUSTER_FILL.1, *dn) * smoothstep(cl_lo, cl_hi, a),
-            );
+            *v = smoothstep(area_lo, area_hi, a)
+                .max(smoothstep(CLUSTER_FILL.0, CLUSTER_FILL.1, *dn) * smoothstep(cl_lo, cl_hi, a));
         }
         drop(dense);
-        // 暈開的方式：連抹三次方框平均（三次方框疊起來近似高斯，等高線是圓角的），
-        // 再把平台邊緣上的 0.5 拉回 1——平台裡仍是 1，邊緣之外一路平滑降到 0，
+        // 暈開的方式：先抹一次方框平均，當成貼著平台的羽化；再抹兩次
+        // （三次方框疊起來近似高斯，等高線是圓角的）當成更外面那圈。
+        // 兩圈都把平台邊緣上的 0.5 拉回 1——平台裡仍是 1，邊緣之外一路平滑降到 0，
         // 兩頭都沒有折角。
         //
         // 之前是「先方形膨脹再方框平均」：暈出來的是一圈帶直邊的方框，斜坡又是
         // 線性的、到底時有個折角，100% 檢視就看得到一道階（實照 L1003436 的
         // 噴泉周圍回報過）
-        let r_s = ((long * CORE_SKIRT).round() as usize).clamp(2, 120);
-        let s = box_mean(&w, r_s);
-        let mut s = box_mean(&box_mean(&s, r_s), r_s);
+        let r_s = ((long * CORE_SKIRT).round() as usize).clamp(2, 400);
+        let s1 = box_mean(&w, r_s);
+        // 貼著平台的第一圈是純距離的羽化：不看亮度，從平台邊緣（一次方框平均在
+        // 邊緣上剛好是 0.5）平滑降到 r_s 之外歸零。平台邊緣上因此一定連續——
+        // 之前這一圈也乘了亮度門檻，核心外面的煙不到門檻時整圈被關掉，
+        // 平台邊緣就是一道硬邊（實照 DSC03635、DSC03637 回報過）
+        for (v, s) in w.d.iter_mut().zip(&s1.d) {
+            *v = v.max(smoothstep(0.0, 0.5, *s));
+        }
+        let mut s = box_mean(&box_mean(&s1, r_s), r_s);
+        drop(s1);
         for (i, v) in s.d.iter_mut().enumerate() {
-            // 暈開的圈再照「這一帶本身亮不亮」打折（見 [`CORE_SKIRT_GLOW`]），
-            // 平台本身則一律保住
-            let skirt = smoothstep(0.0, 0.5, *v) * smoothstep(glow_lo, glow_hi, area.d[i]);
-            *v = skirt.max(w.d[i]);
+            // 更外面那圈才照「這一帶本身亮不亮」打折（見 [`CORE_SKIRT_GLOW`]）：
+            // 噴泉的光暈一路淡出去就跟著保，旁邊只是被照亮的暗煙就不保
+            let far = smoothstep(0.0, 0.5, *v) * smoothstep(glow_lo, glow_hi, area.d[i]);
+            *v = far.max(w.d[i]);
         }
         s
     });
     tick("core_area（4 次 box_mean）", &mut t);
+    // 診斷用：SMOKE_CORE_MAP=路徑 把亮芯／煙火簇的保護權重存成灰階圖
+    // （白＝原樣保住、黑＝照扣）。查「保護區邊緣是不是硬邊」看這張最快
+    if let (Some(a), Ok(path)) = (core_area.as_ref(), std::env::var("SMOKE_CORE_MAP")) {
+        let mut m = image::GrayImage::new(fw as u32, fh as u32);
+        for (p, v) in m.pixels_mut().zip(&a.d) {
+            p.0[0] = (v.clamp(0.0, 1.0) * 255.0) as u8;
+        }
+        let _ = m.save(&path);
+    }
     // 補回煙裡的軌跡：先量出每個像素「比周圍高出多少」
     let excess = (p.restore_trails && p.strength > 0).then(|| {
         let long = fw.max(fh) as f32;
