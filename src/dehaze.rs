@@ -161,9 +161,9 @@ const CLUSTER_GLOW: (f32, f32) = (120.0, 160.0);
 
 /// 「整帶夠亮」的平台往外暈開多寬（佔影像長邊）。暈開分兩圈（暈法見
 /// [`dehaze_to_linear`] 裡的說明）：
-/// * 貼著平台的第一圈是**純距離的羽化**——不看亮度，從平台邊緣平滑降到
-///   這個寬度之外歸零。
-/// * 更外面那圈再往外三倍寬，但只保**本身仍然亮**的地方（見 [`CORE_SKIRT_GLOW`]）。
+/// * 貼著平台的第一圈是**純距離的羽化**——不看亮度，平台邊緣外約一倍寬內
+///   完全保住，再往外平滑降到約兩倍寬處歸零。
+/// * 更外面那圈再往外到約三倍寬，但只保**本身仍然亮**的地方（見 [`CORE_SKIRT_GLOW`]）。
 ///
 /// 少了這一圈，平台裡原樣留著、一步之外就扣到近乎全黑——噴泉周圍被照亮的
 /// 濃煙是平的一面，煙霧層估出來就等於它自己——畫面上是一圈硬邊的斷階
@@ -183,13 +183,18 @@ const CLUSTER_GLOW: (f32, f32) = (120.0, 160.0);
 pub const CORE_FEATHER: i32 = 30;
 
 /// 純距離羽化的膝點：平台抹過兩次方框平均之後，值在這之上就拉回 1，
-/// 之下才往外平滑降到 0。
+/// 之下才往外平滑降到 0。直的邊抹完在邊緣上是 0.5，膝點取 0.15，羽化從邊緣外
+/// 一段才開始降：邊緣外約 1.2 倍抹的半徑內完全保住、兩倍處歸零。
 ///
-/// 取得這麼低，是因為平台常常比抹的半徑還小（牡丹的橘色核心在 1600 的預覽上
-/// 半徑 40 多像素、暈開半徑 48）：平台小，抹過之後邊緣上的值到不了 0.5，
-/// 拿 0.5 當膝點就在平台邊緣留下一截落差，權重圖上是一塊實心白斑、成品上
-/// 還是個圓盤（實照 DSC03635 回報過）。膝點壓到 0.15，小平台的邊緣也拉得回 1；
-/// 大平台（直的邊）邊緣上本來就是 0.5，羽化改從邊緣外一段才開始降，只是更寬
+/// 平台比抹的半徑小很多時，抹完的值整片都到不了膝點，那一個尺度的羽化就垮掉、
+/// 平台邊緣又是硬邊——而且羽化拉得越寬垮得越徹底（實照 DSC03635 羽化 72 時
+/// 權重從 255 一步掉到 9；A1209363 回報過羽化 45 以上反而出現斷階）。
+/// 所以羽化在四個尺度上算（滑桿的寬度、一半、四分之一、八分之一）、取最大：
+/// 抹的半徑不超過平台半徑 1.6 倍的那些尺度邊緣上都過得了膝點，其中最寬的
+/// 那個決定羽化實際多寬——等於羽化最寬到平台半徑的三倍左右就封頂，小平台
+/// 不會硬邊、大平台拉滑桿照樣變寬，牡丹裡一顆顆線條密的小平台也不會各自
+/// 暈成一大片連起來（試過先用最大值濾波往外撐再抹：邊緣是接上了，但那些
+/// 小平台撐開之後連成一片，整團牡丹裡的煙全留下來，實照 L1003436）
 const CORE_FEATHER_KNEE: f32 = 0.15;
 
 /// 暈開的那一圈只保護**本身仍然亮**的地方（一帶的平均亮度，sRGB 0~255）：
@@ -1663,6 +1668,30 @@ impl<'a> Guide<'a> {
         }
         out
     }
+}
+
+/// 把平面縮小 f 倍（每 f×f 格取平均，邊上不足一格的照實際格數算）。
+/// 羽化這種低頻的東西縮小算完再 [`upscale`] 回來，成本只剩 1/f²
+fn shrink_plane(p: &Plane, f: usize) -> Plane {
+    if f <= 1 {
+        return p.clone();
+    }
+    let (cw, ch) = (p.w.div_ceil(f), p.h.div_ceil(f));
+    let mut out = Plane::new(cw, ch);
+    let mut n = vec![0u32; cw * ch];
+    for y in 0..p.h {
+        let row = &p.d[y * p.w..(y + 1) * p.w];
+        let oy = (y / f) * cw;
+        for (x, v) in row.iter().enumerate() {
+            let o = oy + x / f;
+            out.d[o] += *v;
+            n[o] += 1;
+        }
+    }
+    for (v, n) in out.d.iter_mut().zip(n) {
+        *v /= n.max(1) as f32;
+    }
+    out
 }
 
 /// 雙線性放大單通道平面到指定尺寸
@@ -3866,9 +3895,10 @@ fn dehaze_to_linear(
                 .max(smoothstep(CLUSTER_FILL.0, CLUSTER_FILL.1, *dn) * smoothstep(cl_lo, cl_hi, a));
         }
         drop(dense);
-        // 暈開的方式：先抹兩次方框平均，當成貼著平台的羽化；再抹第三次
-        // （三次方框疊起來近似高斯，等高線是圓角的）當成更外面那圈。
-        // 平台裡仍是 1，邊緣之外一路平滑降到 0，兩頭都沒有折角。
+        // 暈開的方式：把平台在四個尺度上各抹兩次方框平均（兩次方框疊起來
+        // 等高線是圓角的），過了膝點就拉回 1、取最大，當成貼著平台的羽化；
+        // 最大的尺度再抹第三次當成更外面那圈。平台裡仍是 1，邊緣之外一路
+        // 平滑降到 0，兩頭都沒有折角。
         //
         // 之前是「先方形膨脹再方框平均」：暈出來的是一圈帶直邊的方框，斜坡又是
         // 線性的、到底時有個折角，100% 檢視就看得到一道階（實照 L1003436 的
@@ -3876,21 +3906,39 @@ fn dehaze_to_linear(
         // 寬度照「亮芯羽化」滑桿（千分之幾的長邊）；上限只是防呆，
         // 方框平均的成本不隨半徑變
         let r_s = ((long * p.core_feather as f32 / 1000.0).round() as usize).clamp(2, 1500);
-        let s2 = box_mean(&box_mean(&w, r_s), r_s);
-        // 貼著平台的第一圈是純距離的羽化：不看亮度，貼著平台邊緣往外平滑降到零
-        // （膝點見 [`CORE_FEATHER_KNEE`]）。平台邊緣上因此一定連續——
-        // 之前這一圈也乘了亮度門檻，核心外面的煙不到門檻時整圈被關掉，
-        // 平台邊緣就是一道硬邊（實照 DSC03635、DSC03637 回報過）
-        for (v, s) in w.d.iter_mut().zip(&s2.d) {
-            *v = v.max(smoothstep(0.0, CORE_FEATHER_KNEE, *s));
+        // 羽化是低頻的東西：縮小 f 倍算完再放大回來就夠準，四個尺度九次方框平均
+        // 才不至於拖慢影片（最大的尺度縮完至少還有 12 格）。小照片與預覽縮圖不縮
+        let f = (r_s / 12).clamp(1, 4);
+        let w_lo = shrink_plane(&w, f);
+        let area_lo = shrink_plane(&area, f);
+        let r_lo = (r_s / f).max(2);
+        let mut keep = Plane::new(w_lo.w, w_lo.h);
+        // 四個尺度：滑桿的寬度、一半、四分之一、八分之一，各自抹兩次、過了膝點
+        // 就拉回 1，取最大。大尺度給大平台又寬又平滑的羽化；小尺度保住小平台的
+        // 邊緣（見 [`CORE_FEATHER_KNEE`]）
+        let scales = [r_lo, (r_lo / 2).max(2), (r_lo / 4).max(2), (r_lo / 8).max(2)];
+        for (i, r_j) in scales.into_iter().enumerate() {
+            let s2 = box_mean(&box_mean(&w_lo, r_j), r_j);
+            for (k, s) in keep.d.iter_mut().zip(&s2.d) {
+                *k = k.max(smoothstep(0.0, CORE_FEATHER_KNEE, *s));
+            }
+            if i == 0 {
+                // 最大的尺度再抹第三次當更外面那圈（三次方框疊起來近似高斯），
+                // 這一圈才照「這一帶本身亮不亮」打折（見 [`CORE_SKIRT_GLOW`]）：
+                // 噴泉的光暈一路淡出去就跟著保，旁邊只是被照亮的暗煙就不保
+                let s3 = box_mean(&s2, r_j);
+                for ((k, s), a) in keep.d.iter_mut().zip(&s3.d).zip(&area_lo.d) {
+                    let far = smoothstep(0.0, 0.5, *s) * smoothstep(glow_lo, glow_hi, *a);
+                    *k = k.max(far);
+                }
+            }
         }
-        let mut s = box_mean(&s2, r_s);
-        drop(s2);
-        for (i, v) in s.d.iter_mut().enumerate() {
-            // 更外面那圈才照「這一帶本身亮不亮」打折（見 [`CORE_SKIRT_GLOW`]）：
-            // 噴泉的光暈一路淡出去就跟著保，旁邊只是被照亮的暗煙就不保
-            let far = smoothstep(0.0, 0.5, *v) * smoothstep(glow_lo, glow_hi, area.d[i]);
-            *v = far.max(w.d[i]);
+        drop(w_lo);
+        drop(area_lo);
+        // 放大回原尺寸；平台本身則一律保住
+        let mut s = if f == 1 { keep } else { upscale(&keep, fw, fh) };
+        for (v, wv) in s.d.iter_mut().zip(&w.d) {
+            *v = v.max(*wv);
         }
         s
     });
@@ -4995,6 +5043,35 @@ mod tests {
             far.iter().all(|&v| v < 60),
             "羽化漫到離簇很遠的煙上了：{far:?}"
         );
+    }
+
+    /// 小小一團煙火簇配上很寬的羽化，平台邊緣也不能有落差（見 [`CORE_FEATHER_KNEE`]）：
+    /// 之前羽化一拉寬，小平台的羽化整個垮掉、邊緣反而變成硬邊
+    #[test]
+    fn a_small_cluster_with_a_wide_feather_has_no_step_at_its_edge() {
+        let mut img = solid(256, 256, [190, 150, 110]);
+        for y in 116..140 {
+            for x in 116..140 {
+                let c = if x % 6 < 3 { [255, 230, 0] } else { [255, 120, 0] };
+                img.put_pixel(x, y, Rgb(c));
+            }
+        }
+        let out = remove_smoke(
+            &img,
+            &SmokeParams {
+                core_feather: 100,
+                ..Default::default()
+            },
+        );
+        // 簇的右邊 4 px：要幾乎原樣留著，不能一步掉到扣光的程度
+        let p = out.get_pixel(144, 128).0;
+        assert!(
+            p[0] >= 170,
+            "小簇配寬羽化，平台邊緣外一步就掉下去了：{p:?} 應接近原本的 [190, 150, 110]"
+        );
+        // 離簇很遠的角落照樣扣光
+        let far = out.get_pixel(8, 8).0;
+        assert!(far.iter().all(|&v| v < 60), "羽化漫到離簇很遠的煙上了：{far:?}");
     }
 
     /// 亮到沒有細節的煙火芯不能被壓暗：濃煙底下的白芯扣完仍要是白的，

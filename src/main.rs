@@ -23193,6 +23193,11 @@ impl App {
                         pane_label(ui, bv, "編輯前");
                         pane_label(ui, view, "編輯後");
                     }
+                    // 參數一動就在照片右上角講一句，算完就消失：不然滑桿拖了
+                    // 之後畫面停個一兩秒沒動靜，會以為沒反應
+                    if self.smoke.busy == SmokeBusy::Rendering {
+                        pane_note(ui, view, "影像處理中…");
+                    }
                     let pct = r.width() / canvas_size.x * 100.0 * ppp;
                     // 這張照片在畫面上實際佔了多少實體像素：底圖至少要這麼細，
                     // 看到的才不是被放大的（見 [`fine_target`]）。判斷放在畫預覽
@@ -29793,6 +29798,24 @@ fn pane_label(ui: &egui::Ui, pane: egui::Rect, text: &str) {
     let chip = egui::Rect::from_min_size(
         egui::pos2(pane.center().x - galley.size().x / 2.0 - 9.0, pane.top() + 6.0),
         galley.size() + egui::vec2(18.0, 8.0),
+    );
+    let p = ui.painter();
+    p.rect_filled(chip, 6, egui::Color32::from_black_alpha(170));
+    p.galley(chip.min + egui::vec2(9.0, 4.0), galley, theme::TEXT);
+}
+
+/// 面板右上角的提示（「影像處理中…」之類），畫法與 [`pane_label`] 同一種，
+/// 只是靠右，才不會跟置中的那個標籤疊在一起
+fn pane_note(ui: &egui::Ui, pane: egui::Rect, text: &str) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        egui::FontId::proportional(12.0),
+        theme::TEXT,
+    );
+    let size = galley.size() + egui::vec2(18.0, 8.0);
+    let chip = egui::Rect::from_min_size(
+        egui::pos2(pane.right() - size.x - 8.0, pane.top() + 6.0),
+        size,
     );
     let p = ui.painter();
     p.rect_filled(chip, 6, egui::Color32::from_black_alpha(170));
