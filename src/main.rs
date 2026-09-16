@@ -6215,7 +6215,7 @@ impl Default for MovieTool {
             after: None,
             base_tex: None,
             after_tex: None,
-            params: SmokeParams::default(),
+            params: MovieTool::start_params(),
             grade: MovieGrade::default(),
             segments: vec![Segment::default()],
             grade_open: false,
@@ -6307,7 +6307,7 @@ impl MovieTool {
     /// 跟這一批的畫面沒有關係
     fn reset_batch(&mut self, src: Option<PathBuf>, info: Option<VideoInfo>) {
         let fast = self.params.fast;
-        self.params = SmokeParams::default();
+        self.params = Self::start_params();
         self.params.fast = fast;
         self.auto_on = false;
         self.auto = None;
@@ -6369,6 +6369,15 @@ impl MovieTool {
         self.batch_frames = 0;
         self.batch_name.clear();
         self.batch_errs.clear();
+    }
+
+    /// 這個模組的去煙起始值：與照片模組同一組，只有「亮芯羽化」自己一份
+    /// （見 [`dehaze::MOVIE_CORE_FEATHER`]）
+    fn start_params() -> SmokeParams {
+        SmokeParams {
+            core_feather: dehaze::MOVIE_CORE_FEATHER,
+            ..Default::default()
+        }
     }
 
     /// 去煙的滑桿現在停在哪：開著自動判參數就套上那一格量到的建議值。
@@ -16999,7 +17008,7 @@ impl App {
                          拖到別的時間點就照那一格重量一次；\n\
                          挑一格煙最濃的停著判，整支跟著它跑最保險。\n\
                          自己動過那兩條滑桿就會自動關掉，不再被蓋回去。\n\
-                         預設是關著的：不勾就用起始值（去除煙霧 60、細節 80），\
+                         預設是關著的：不勾就用起始值（去除煙霧 60、細節 80、亮芯羽化 60），\
                          實拍比下來比自動判的穩",
                     )
                     .changed()
@@ -36172,6 +36181,9 @@ mod tests {
         let d = SmokeParams::default();
         // 兩個模組共用的起始值（見 SmokeParams::default 的說明）
         assert_eq!((d.strength, d.detail), (60, 80));
+        // 亮芯羽化是例外：影片整支只調一組，寧可多留光暈（見 MOVIE_CORE_FEATHER）
+        assert_eq!(m.params.core_feather, dehaze::MOVIE_CORE_FEATHER);
+        assert_eq!(m.params.core_feather, 60);
         assert!(!m.auto_on, "自動判斷參數預設關著，起始值比自動判的穩");
         assert_eq!(m.tuned_params().strength, d.strength, "沒勾就是滑桿上那組");
 
