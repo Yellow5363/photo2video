@@ -18711,6 +18711,10 @@ impl App {
             c.set_clip_rect(view);
             c.painter().image(t.id(), r, uv, egui::Color32::WHITE);
             pane_label(ui, r.intersect(view), tag);
+            // 參數一動就在畫面右上角講一句，算完就消失（與去煙霧模組同一種）
+            if matches!(self.movie.busy, MovieBusy::Rendering) {
+                pane_note(ui, r.intersect(view), "影像處理中…");
+            }
             img = Some(r);
         }
         if compare {
@@ -18759,7 +18763,7 @@ impl App {
         // 還在忙就講一句，不然畫面停著不動像當掉
         let note: Option<String> = match self.movie.busy {
             MovieBusy::Grabbing => Some("讀取畫面…".into()),
-            MovieBusy::Rendering => Some("計算中…".into()),
+            MovieBusy::Rendering => Some("影像處理中…".into()),
             MovieBusy::Preparing => Some(format!(
                 "準備試播中：{} / {} 格…",
                 self.movie.clip_done, self.movie.clip_total
