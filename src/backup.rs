@@ -1166,7 +1166,14 @@ mod tests {
         assert!(!dst.join("多出來的").exists(), "巢狀的空殼要一路收掉");
         assert!(dst.join("還有東西").is_dir(), "裡面有檔案的不能刪");
         assert!(!dst.join("spring").exists(), "只剩雜檔的資料夾也要收掉");
+        // macOS 上這裡會是 1：trash 套件在 macOS 預設請 Finder 執行刪除，
+        // 而 Finder 在資料夾內容變動後會自己把 .DS_Store 收掉，輪到我們刪
+        // 它時已經不在了。回報數量是給 restore 用的，restore 本來就只有
+        // Windows 與 Linux 有（見它的 cfg），所以這條跟著分開寫
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(trashed.len(), 2, "順手丟掉的雜檔要回報，還原才放得回來");
+        #[cfg(target_os = "macos")]
+        assert!(!trashed.is_empty(), "至少要回報得出丟掉了東西");
 
         let _ = fs::remove_dir_all(&root);
     }

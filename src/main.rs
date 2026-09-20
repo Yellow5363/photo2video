@@ -33411,12 +33411,19 @@ mod tests {
     #[test]
     fn is_image_rejects_apple_double_sidecars() {
         // 從 Mac 複製過來的資料夾裡，每張照片旁都有一個 ._ 開頭的附屬檔：
-        // 副檔名一樣是 .jpg 但內容不是圖片，收進來會讓縮圖與預覽整批失敗
+        // 副檔名一樣是 .jpg 但內容不是圖片，收進來會讓縮圖與預覽整批失敗。
+        //
+        // 路徑一律用正斜線寫：反斜線在 Unix 不是分隔符，整串會被當成單一
+        // 檔名（開頭變成 "D:" 而不是 "._"），同一條斷言在 macOS 上就不成立。
+        // 正斜線在 Windows 也是合法分隔符，兩邊跑的都是同一段判斷
+        assert!(!is_image(Path::new("D:/photos/._A9301898.jpg")));
+        // Windows 上真實的路徑是反斜線，那條也要顧到
+        #[cfg(windows)]
         assert!(!is_image(Path::new(r"D:\photos\._A9301898.jpg")));
         assert!(!is_image(Path::new("._IMG_0001.PNG")));
         assert!(!is_audio(Path::new("._song.mp3")));
         // 只擋 "._" 前綴，正常檔名（含以單一點開頭的隱藏檔）不受影響
-        assert!(is_image(Path::new(r"D:\photos\A9301898.jpg")));
+        assert!(is_image(Path::new("D:/photos/A9301898.jpg")));
         assert!(is_image(Path::new(".hidden.jpg")));
         assert!(is_image(Path::new("my._weird.jpg")));
     }
@@ -34225,7 +34232,7 @@ mod tests {
     /// 照片的成品則不帶這些，維持「原檔名_後綴」（那部分在各自的存檔那裡）
     #[test]
     fn 影片檔名帶來源名稱與解析度() {
-        let photo = PathBuf::from(r"F:\20260718連拍1\A9300174.jpg");
+        let photo = PathBuf::from("F:/20260718連拍1/A9300174.jpg");
         let folder = folder_name(&photo).unwrap_or_default();
         assert_eq!(folder, "20260718連拍1");
         // 照片轉影片：資料夾名 ＋ 常用尺寸的短標籤，沒有額外的標記
@@ -34243,7 +34250,8 @@ mod tests {
             "20260718連拍1_8640x5760"
         );
         // 影片去煙：換成**來源影片的檔名**（不是資料夾），並標「去煙」
-        let movie = PathBuf::from(r"F:\20260830漁人碼頭煙火_video_去煙\20260802將軍吼_4k_1分33.mp4");
+        let movie =
+            PathBuf::from("F:/20260830漁人碼頭煙火_video_去煙/20260802將軍吼_4k_1分33.mp4");
         let name = movie
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -34294,7 +34302,7 @@ mod tests {
     /// [`MovieTool::out_dims`] 算的，所以走一遍下拉裡的每一個選項對一次
     #[test]
     fn 影片檔名跟著輸出尺寸換() {
-        let src = PathBuf::from(r"F:\20260830漁人碼頭煙火\20260802將軍吼_4k.mp4");
+        let src = PathBuf::from("F:/20260830漁人碼頭煙火/20260802將軍吼_4k.mp4");
         let mut m = MovieTool::default();
         m.src = Some(src.clone());
         m.info = Some(VideoInfo {
@@ -34342,7 +34350,7 @@ mod tests {
 
         // 照片轉影片的解析度下拉也走一遍（那邊是固定的畫布尺寸，不像影片
         // 要先套到來源上；「原始像素」是算出來的，不在這份清單裡對）
-        let photo = PathBuf::from(r"F:\20260718連拍1\A9300174.jpg");
+        let photo = PathBuf::from("F:/20260718連拍1/A9300174.jpg");
         let folder = folder_name(&photo).unwrap_or_default();
         for (res, want) in [
             (Resolution { w: 1280, h: 720 }, "20260718連拍1_720p"),
