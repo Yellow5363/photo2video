@@ -2,6 +2,9 @@
 name = "photo2video"
 version = "0.15.0"
 edition = "2021"
+# 專案有兩個執行檔（主程式與 smoke_cli），不指定的話 cargo run 會停下來問要
+# 跑哪一個。開發時想跑的一律是主程式
+default-run = "photo2video"
 # 下面三行會被 build.rs 經 winresource 寫進 exe 的版本資訊（CompanyName、
 # FileDescription）。空白的公司名稱是防毒啟發式掃描的加權指標之一
 authors = ["Yellow Huang"]
