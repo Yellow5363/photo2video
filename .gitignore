@@ -4,3 +4,6 @@
 # 是 main.rs 的 0.3MB）。進了版控就永久留在歷史裡拖慢每一次 clone。
 # test_images 原有的 *.png 是 3.6KB 的合成測試圖，那些照舊追蹤
 /test_images/*.jpg
+
+# macOS Finder 的資料夾中繼資料
+.DS_Store

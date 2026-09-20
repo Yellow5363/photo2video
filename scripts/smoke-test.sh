@@ -2,19 +2,32 @@
 # 煙霧測試：用 test_images 以 CLI 模式實際轉出影片，驗證核心轉檔沒有回歸。
 # 發版前可跑一次確認輸出的時長／解析度／格式正確。
 #
-# 需求：已建置的 release exe（會自動 cargo build --release）、dist/ffmpeg.exe
-# 用法：bash scripts/smoke-test.sh
+# 需求：已建置的 release 執行檔（會自動 cargo build --release）；驗證輸出用的
+# ffmpeg 先找 dist/ 裡的那支，沒有就用 PATH 上的（macOS 用 Homebrew 那支即可）。
+# Windows 與 macOS 都能跑；EXIF／排序／色階那幾條要 python3 + Pillow，沒裝就略過。
+# 用法：bash scripts/smoke-test.sh（放在專案根目錄的 scripts/，開頭的 cd 才對得上）
+# 要能在 macOS 內建的 bash 3.2 上跑（Apple 因授權停在這一版）。它有兩個解析 bug
+# 這裡都避開了：變數名後面緊接全形字（$label：）會把全形字的第一個位元組吃進
+# 變數名，一律寫 ${label}；雙引號裡的 $( ) 裡再放 \" 會壞掉，見下面的 want()
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
-EXE="./target/release/photo2video.exe"
-FF="./dist/ffmpeg.exe"
+# 執行檔名依平台決定：Windows 的 bash（Git Bash／MSYS）uname 開頭是 MINGW 或 MSYS
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) EXE="./target/release/photo2video.exe"; FFNAME="ffmpeg.exe" ;;
+  *)                    EXE="./target/release/photo2video";     FFNAME="ffmpeg" ;;
+esac
+# 驗證用的 ffmpeg：dist/ 優先（發版包附的那支），沒有就退回 PATH
+if [ -x "./dist/$FFNAME" ]; then FF="./dist/$FFNAME"; else FF="$(command -v ffmpeg || true)"; fi
+# python3 優先（macOS 只有這個名字），退回 python（Windows 多半只叫這個）
+PY="$(command -v python3 || command -v python || true)"
 IMAGES="test_images"
-TMP="${TEMP:-/tmp}/p2v_smoke"
+# 暫存資料夾：macOS 給的是 TMPDIR、Windows 的 bash 給的是 TEMP，都沒有才用 /tmp
+TMP="${TMPDIR:-${TEMP:-/tmp}}/p2v_smoke"
 FAIL=0
 
-[ -f "$FF" ] || { echo "✗ 找不到 $FF（驗證需要）"; exit 1; }
+[ -n "$FF" ] || { echo "✗ 找不到 ffmpeg（驗證需要）：放一支到 dist/ 或加到 PATH"; exit 1; }
 [ -d "$IMAGES" ] || { echo "✗ 找不到 $IMAGES"; exit 1; }
 
 echo "→ 建置 release…"
@@ -26,6 +39,10 @@ cargo build --release 2>&1 | tail -1
 
 mkdir -p "$TMP"
 N=$(ls "$IMAGES" | wc -l | tr -d ' ')
+# 期望時長：N 張 ÷ fps，兩位小數。用 -v 把數字傳進去、awk 程式用單引號包住，
+# 不要寫成 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"——macOS 內建的 bash 3.2 解析
+# 「雙引號裡的 $( ) 裡再有 \"」會出錯，awk 收到的程式是壞的
+want() { awk -v n="$N" -v f="$1" 'BEGIN{printf "%.2f", n/f}'; }
 
 # 取影片時長（秒，兩位小數）。解析完整 HH:MM:SS.ss 再換算成秒：
 # 不能像舊版用 `00:00:0*` 硬吃前導零——它會把「00.50」的整數位 0 也吃掉、
@@ -41,13 +58,13 @@ case_run() {
   local out="$TMP/smoke.$ext"
   rm -f "$out"
   "$EXE" --cli "$IMAGES" "$fps" "$out" >/dev/null 2>&1
-  if [ ! -f "$out" ]; then echo "✗ $label：沒有產出檔案"; FAIL=1; return; fi
+  if [ ! -f "$out" ]; then echo "✗ ${label}：沒有產出檔案"; FAIL=1; return; fi
   local got; got=$(duration "$out")
   local res; res=$("$FF" -i "$out" 2>&1 | sed -n 's/.*, \([0-9]*x[0-9]*\).*/\1/p' | head -1)
   if [ "$got" = "$want" ] && [ "$res" = "1920x1080" ]; then
-    echo "✓ $label：時長 ${got}s、解析度 $res"
+    echo "✓ ${label}：時長 ${got}s、解析度 $res"
   else
-    echo "✗ $label：時長 ${got}s（期望 ${want}s）、解析度 $res（期望 1920x1080）"; FAIL=1
+    echo "✗ ${label}：時長 ${got}s（期望 ${want}s）、解析度 ${res}（期望 1920x1080）"; FAIL=1
   fi
   rm -f "$out"
 }
@@ -58,22 +75,22 @@ error_case() {
   local label="$1" want="$2"; shift 2
   local out; out=$("$EXE" --cli "$@" 2>&1); local code=$?
   if [ "$code" != 0 ] && printf '%s' "$out" | grep -q "$want"; then
-    echo "✓ $label：正確拒絕（含「$want」）"
+    echo "✓ ${label}：正確拒絕（含「${want}」）"
   else
-    echo "✗ $label：退出碼 $code、輸出「$out」（期望非 0 且含「$want」）"; FAIL=1
+    echo "✗ ${label}：退出碼 ${code}、輸出「${out}」（期望非 0 且含「${want}」）"; FAIL=1
   fi
 }
 
 # 各容器格式，N 張、fps → 時長 = N/fps
-case_run "MP4 (H.264) fps=2" mp4  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
-case_run "MKV (H.264) fps=2" mkv  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
-case_run "MOV (H.264) fps=2" mov  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
-case_run "AVI (H.264) fps=2" avi  2 "$(awk "BEGIN{printf \"%.2f\", $N/2}")"
-case_run "WebM (VP9)  fps=3" webm 3 "$(awk "BEGIN{printf \"%.2f\", $N/3}")"
+case_run "MP4 (H.264) fps=2" mp4  2 "$(want 2)"
+case_run "MKV (H.264) fps=2" mkv  2 "$(want 2)"
+case_run "MOV (H.264) fps=2" mov  2 "$(want 2)"
+case_run "AVI (H.264) fps=2" avi  2 "$(want 2)"
+case_run "WebM (VP9)  fps=3" webm 3 "$(want 3)"
 # 極端 fps 邊界：最慢（每張 1 秒）與最快（每張 1/60 秒，考驗 concat 清單對
 # 極小 duration 的精度；不足一秒也順帶考驗 duration() 解析）
-case_run "MP4 fps=1（慢）"  mp4 1  "$(awk "BEGIN{printf \"%.2f\", $N/1}")"
-case_run "MP4 fps=60（快）" mp4 60 "$(awk "BEGIN{printf \"%.2f\", $N/60}")"
+case_run "MP4 fps=1（慢）"  mp4 1  "$(want 1)"
+case_run "MP4 fps=60（快）" mp4 60 "$(want 60)"
 
 # 單張照片：concat demuxer「最後一張要再列一次」的慣例在 N=1 時是唯一輸入
 # 又是結尾張，最容易出邊界問題；且時長不足一秒，順帶驗證 duration() 的解析。
@@ -87,7 +104,7 @@ single_dur=$(duration "$single_out")
 if [ "$single_dur" = "0.50" ] && [ "$single_res" = "1920x1080" ]; then
   echo "✓ 單張照片 fps=2：時長 ${single_dur}s、解析度 $single_res"
 else
-  echo "✗ 單張照片 fps=2：時長 ${single_dur}s（期望 0.50）、解析度 $single_res（期望 1920x1080）"; FAIL=1
+  echo "✗ 單張照片 fps=2：時長 ${single_dur}s（期望 0.50）、解析度 ${single_res}（期望 1920x1080）"; FAIL=1
 fi
 rm -rf "$SINGLE" "$single_out"
 
@@ -110,7 +127,7 @@ up_codec=$("$FF" -i "$up_out" 2>&1 | sed -n 's/.*Video: \([a-z0-9]*\).*/\1/p' | 
 if [ "$up_codec" = "vp9" ]; then
   echo "✓ 大寫副檔名 .WEBM：正確選用 VP9 編碼"
 else
-  echo "✗ 大寫副檔名 .WEBM：編碼為 $up_codec（期望 vp9；大小寫辨識失敗會產生不相容檔）"; FAIL=1
+  echo "✗ 大寫副檔名 .WEBM：編碼為 ${up_codec}（期望 vp9；大小寫辨識失敗會產生不相容檔）"; FAIL=1
 fi
 rm -f "$up_out"
 
@@ -129,7 +146,7 @@ mix_dur=$(duration "$mix_out")
 if [ "$mix_res" = "1920x1080" ] && [ "$mix_dur" = "2.00" ]; then
   echo "✓ 混合尺寸（橫/直/小/4K）：都輸出 1920x1080、時長 ${mix_dur}s"
 else
-  echo "✗ 混合尺寸：解析度 $mix_res（期望 1920x1080）、時長 ${mix_dur}s（期望 2.00）"; FAIL=1
+  echo "✗ 混合尺寸：解析度 ${mix_res}（期望 1920x1080）、時長 ${mix_dur}s（期望 2.00）"; FAIL=1
 fi
 rm -rf "$MIX" "$mix_out"
 
@@ -173,19 +190,32 @@ rm -rf "$SUBDIR" "$sub_out"
 # 會靜默丟格（成品少照片）甚至整個失敗。以 6 種格式各一張、fps=2 驗證時長 3.00s。
 FMTDIR="$TMP/fmts"
 rm -rf "$FMTDIR"; mkdir -p "$FMTDIR"
-n=1
+n=1; fmt_missing=""
 for f in jpg png bmp webp tif tiff; do
   "$FF" -f lavfi -i "color=red:s=640x480:d=1" -frames:v 1 -y "$FMTDIR/$n.$f" >/dev/null 2>&1
+  # Homebrew 等來源的 ffmpeg 常沒把 libwebp 編進去，webp 會生不出來。有 Pillow 就
+  # 用它補；都不行就把那個格式從期望值扣掉並註記——環境生不出夾具，不能算成
+  # 程式丟格（macOS 內建工具裡沒有任何一個能寫 webp，sips 也不行）
+  if [ ! -s "$FMTDIR/$n.$f" ] && [ -n "$PY" ]; then
+    "$PY" -c "import sys; from PIL import Image; Image.new('RGB',(640,480),(255,0,0)).save(sys.argv[1])" "$FMTDIR/$n.$f" >/dev/null 2>&1
+  fi
+  [ -s "$FMTDIR/$n.$f" ] || { rm -f "$FMTDIR/$n.$f"; fmt_missing="$fmt_missing $f"; }
   n=$((n+1))
 done
+fmt_n=$(ls "$FMTDIR" | wc -l | tr -d ' ')
+fmt_want=$(awk -v n="$fmt_n" 'BEGIN{printf "%.2f", n/2}')
 fmt_out="$TMP/fmts.mp4"; rm -f "$fmt_out"
 "$EXE" --cli "$FMTDIR" 2 "$fmt_out" >/dev/null 2>&1
 fmt_res=$("$FF" -i "$fmt_out" 2>&1 | sed -n 's/.*, \([0-9]*x[0-9]*\).*/\1/p' | head -1)
 fmt_dur=$(duration "$fmt_out")
-if [ "$fmt_dur" = "3.00" ] && [ "$fmt_res" = "1920x1080" ]; then
-  echo "✓ 混合格式（jpg/png/bmp/webp/tif/tiff）：6 張都在，時長 ${fmt_dur}s"
+if [ "$fmt_dur" = "$fmt_want" ] && [ "$fmt_res" = "1920x1080" ]; then
+  if [ -z "$fmt_missing" ]; then
+    echo "✓ 混合格式（jpg/png/bmp/webp/tif/tiff）：6 張都在，時長 ${fmt_dur}s"
+  else
+    echo "✓ 混合格式：${fmt_n} 張都在，時長 ${fmt_dur}s（↷ 本機生不出${fmt_missing} 的夾具，這幾種沒驗到；裝 Pillow 可補上）"
+  fi
 else
-  echo "✗ 混合格式：時長 ${fmt_dur}s（期望 3.00，短少代表有照片被丟格）、解析度 $fmt_res"; FAIL=1
+  echo "✗ 混合格式：時長 ${fmt_dur}s（期望 ${fmt_want}，短少代表有照片被丟格）、解析度 ${fmt_res}"; FAIL=1
 fi
 rm -rf "$FMTDIR" "$fmt_out"
 
@@ -222,16 +252,16 @@ sp_dur=$(duration "$sp_out")
 if [ "$sp_res" = "1920x1080" ] && [ "$sp_dur" = "1.50" ]; then
   echo "✓ 特殊字元路徑（單引號/空格/中文）：時長 ${sp_dur}s、解析度 $sp_res"
 else
-  echo "✗ 特殊字元路徑：時長 ${sp_dur}s（期望 1.50）、解析度 $sp_res（期望 1920x1080）"; FAIL=1
+  echo "✗ 特殊字元路徑：時長 ${sp_dur}s（期望 1.50）、解析度 ${sp_res}（期望 1920x1080）"; FAIL=1
 fi
 rm -rf "$SPDIR" "$sp_out"
 
 # EXIF 方向：手機直拍照片常以「未旋轉像素＋方向標記」儲存，轉檔必須依 EXIF
 # 自動轉正（與縮圖、預覽、原始像素解析度的判斷一致），否則直拍照片會躺著輸出。
 # 需 python3 + Pillow 產生帶 EXIF orientation 的測試圖；沒有就略過這個案例。
-if python -c "import PIL" >/dev/null 2>&1; then
+if [ -n "$PY" ] && "$PY" -c "import PIL" >/dev/null 2>&1; then
   EXIFDIR="$TMP/exif"; rm -rf "$EXIFDIR"; mkdir -p "$EXIFDIR"
-  python - "$EXIFDIR" <<'PY'
+  "$PY" - "$EXIFDIR" <<'PY'
 from PIL import Image
 import sys
 d = sys.argv[1]
@@ -245,7 +275,7 @@ PY
   exif_frame="$TMP/exif_frame.png"; rm -f "$exif_frame"
   "$FF" -i "$exif_out" -frames:v 1 -y "$exif_frame" >/dev/null 2>&1
   # 量出畫面中非黑內容的邊界框：已轉正→直向（高>寬），沒轉正→橫向（寬>高）
-  verdict=$(python - "$exif_frame" <<'PY'
+  verdict=$("$PY" - "$exif_frame" <<'PY'
 from PIL import Image
 import sys
 im = Image.open(sys.argv[1]).convert("RGB"); W, H = im.size; px = im.load()
@@ -261,7 +291,7 @@ PY
   if [ "$verdict" = portrait ]; then
     echo "✓ EXIF 方向：orientation=6 直拍照片自動轉正為直向輸出"
   else
-    echo "✗ EXIF 方向：未依 EXIF 轉正（輸出為 $verdict），直拍照片會躺著"; FAIL=1
+    echo "✗ EXIF 方向：未依 EXIF 轉正（輸出為 ${verdict}），直拍照片會躺著"; FAIL=1
   fi
   rm -rf "$EXIFDIR" "$exif_out" "$exif_frame"
 
@@ -277,7 +307,7 @@ PY
   "$EXE" --cli "$ORDDIR" 1 "$ord_out" >/dev/null 2>&1
   ord_fr="$TMP/order_frames"; rm -rf "$ord_fr"; mkdir -p "$ord_fr"
   "$FF" -v error -i "$ord_out" -vf fps=1 "$ord_fr/%02d.png" >/dev/null 2>&1
-  ord_res=$(PYTHONIOENCODING=utf-8 python - "$ord_fr" <<'PY'
+  ord_res=$(PYTHONIOENCODING=utf-8 "$PY" - "$ord_fr" <<'PY'
 import sys, glob, os
 from PIL import Image
 files = sorted(glob.glob(os.path.join(sys.argv[1], "*.png")))
@@ -301,7 +331,7 @@ PY
   # limited-range（16~235）或標錯 range 旗標，純黑會發灰、純白會變暗——照片
   # 明顯褪色。以左黑右白的 JPEG 轉檔後驗證黑仍是 0、白仍是 255。
   RNGDIR="$TMP/range"; rm -rf "$RNGDIR"; mkdir -p "$RNGDIR"
-  python - "$RNGDIR" <<'PY'
+  "$PY" - "$RNGDIR" <<'PY'
 from PIL import Image
 import sys
 img = Image.new("RGB", (640, 480), (0, 0, 0))
@@ -315,7 +345,7 @@ PY
   "$EXE" --cli "$RNGDIR" 2 "$rng_out" >/dev/null 2>&1
   rng_frame="$TMP/range_frame.png"; rm -f "$rng_frame"
   "$FF" -v error -i "$rng_out" -frames:v 1 -y "$rng_frame" >/dev/null 2>&1
-  rng_res=$(PYTHONIOENCODING=utf-8 python - "$rng_frame" <<'PY'
+  rng_res=$(PYTHONIOENCODING=utf-8 "$PY" - "$rng_frame" <<'PY'
 from PIL import Image
 import sys
 im = Image.open(sys.argv[1]).convert("RGB"); W, H = im.size
@@ -327,7 +357,7 @@ PY
   if [ "$rng_res" = ok ]; then
     echo "✓ 色階保留：full-range JPEG 的純黑(0)/純白(255)未被壓縮或標錯"
   else
-    echo "✗ 色階：$rng_res（黑發灰或白變暗＝range 被壓成 limited 或旗標錯）"; FAIL=1
+    echo "✗ 色階：${rng_res}（黑發灰或白變暗＝range 被壓成 limited 或旗標錯）"; FAIL=1
   fi
   rm -rf "$RNGDIR" "$rng_out" "$rng_frame"
 
@@ -335,7 +365,7 @@ PY
   # 正規化那步（pre_adjust_photo）也必須依 EXIF 轉正，否則直拍照片會躺著。
   # 這條路徑串起「EXIF 自動轉正」與「混合格式正規化」兩個功能的交互作用。
   EXMIX="$TMP/exmix"; rm -rf "$EXMIX"; mkdir -p "$EXMIX"
-  python - "$EXMIX" <<'PY'
+  "$PY" - "$EXMIX" <<'PY'
 from PIL import Image
 import sys
 img = Image.new("RGB", (800, 200), (200, 200, 200))   # 橫向、亮灰
@@ -347,7 +377,7 @@ PY
   "$EXE" --cli "$EXMIX" 1 "$exmix_out" >/dev/null 2>&1   # fps=1 好逐格抽
   exmix_fr="$TMP/exmix_fr"; rm -rf "$exmix_fr"; mkdir -p "$exmix_fr"
   "$FF" -v error -i "$exmix_out" -vf fps=1 "$exmix_fr/%02d.png" >/dev/null 2>&1
-  exmix_res=$(PYTHONIOENCODING=utf-8 python - "$exmix_fr" <<'PY'
+  exmix_res=$(PYTHONIOENCODING=utf-8 "$PY" - "$exmix_fr" <<'PY'
 import sys, glob, os
 from PIL import Image
 files = sorted(glob.glob(os.path.join(sys.argv[1], "*.png")))
@@ -363,7 +393,7 @@ PY
   if [ "$exmix_res" = portrait ]; then
     echo "✓ EXIF × 混合格式：直拍照片經正規化仍正確轉正為直向"
   else
-    echo "✗ EXIF × 混合格式：正規化後 EXIF 方向遺失（輸出 $exmix_res）"; FAIL=1
+    echo "✗ EXIF × 混合格式：正規化後 EXIF 方向遺失（輸出 ${exmix_res}）"; FAIL=1
   fi
   rm -rf "$EXMIX" "$exmix_out" "$exmix_fr"
 
@@ -371,7 +401,7 @@ PY
   # 上面已驗 orientation=6（90°→換成直向）；這裡補「不換寬高」那條路徑，
   # 防止日後把 180° 誤當成需要交換寬高（會把橫向照片壓成直向）。
   EX180="$TMP/ex180"; rm -rf "$EX180"; mkdir -p "$EX180"
-  python - "$EX180" <<'PY'
+  "$PY" - "$EX180" <<'PY'
 from PIL import Image
 import sys
 img = Image.new("RGB", (800, 200), (200, 200, 200))   # 橫向、亮灰
@@ -382,7 +412,7 @@ PY
   "$EXE" --cli "$EX180" 2 "$ex180_out" >/dev/null 2>&1
   ex180_fr="$TMP/ex180_fr.png"; rm -f "$ex180_fr"
   "$FF" -v error -i "$ex180_out" -frames:v 1 -y "$ex180_fr" >/dev/null 2>&1
-  ex180_res=$(PYTHONIOENCODING=utf-8 python - "$ex180_fr" <<'PY'
+  ex180_res=$(PYTHONIOENCODING=utf-8 "$PY" - "$ex180_fr" <<'PY'
 import sys
 from PIL import Image
 im = Image.open(sys.argv[1]).convert("RGB"); W, H = im.size; px = im.load()
@@ -397,11 +427,11 @@ PY
   if [ "$ex180_res" = landscape ]; then
     echo "✓ EXIF 方向＝3（180°）：橫向照片轉正後仍為橫向（未誤交換寬高）"
   else
-    echo "✗ EXIF 方向＝3：橫向照片被壓成 $ex180_res（180° 誤當成需交換寬高）"; FAIL=1
+    echo "✗ EXIF 方向＝3：橫向照片被壓成 ${ex180_res}（180° 誤當成需交換寬高）"; FAIL=1
   fi
   rm -rf "$EX180" "$ex180_out" "$ex180_fr"
 else
-  echo "↷ 略過 EXIF 方向與排序順序測試（環境未安裝 python3 + Pillow）"
+  echo "↷ 略過 EXIF 方向／排序順序／色階測試（環境未安裝 python3 + Pillow；pip3 install Pillow 即可補上）"
 fi
 
 # 錯誤路徑：確認各種不合法輸入都被明確拒絕（非 0 退出碼＋易懂訊息）
