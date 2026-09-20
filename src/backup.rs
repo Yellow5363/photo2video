@@ -988,7 +988,10 @@ mod tests {
         let src = root.join("src");
         let dst = root.join("dst");
         fs::create_dir_all(&src).unwrap();
-        let rel = PathBuf::from("spring").join("多出來的.txt");
+        // 檔名帶 pid：垃圾桶裡若已經有同名的舊檔（上一次跑留下的），macOS 會把
+        // 這次丟進去的改名，restore 照原名去找就會抓到舊的那個——而舊檔是別的
+        // 程序丟的，TCC 不讓這個程序碰它，rename 直接 EPERM。名字唯一就不會撞
+        let rel = PathBuf::from("spring").join(format!("多出來的_{}.txt", std::process::id()));
         let file = dst.join(&rel);
         write_at(&file, "x", 0);
         let act = Action {
