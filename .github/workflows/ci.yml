@@ -39,7 +39,23 @@ jobs:
           key: ${{ matrix.os }}
 
       - name: 建置並跑測試
-        run: cargo test -- ${{ matrix.skip }}
+        # 用 bash 而非各平台預設的 shell，兩邊才跑同一段腳本（Windows 執行器
+        # 也有 bash）。GitHub 預設會帶 -eo pipefail，所以管線的結束碼是 cargo 的
+        shell: bash
+        run: |
+          # Actions 的 log 要登入才讀得到，annotation 卻是公開可讀的。失敗時
+          # 把 cargo test 的失敗段落轉成 annotation，沒登入也看得出是哪幾條
+          # 測試紅了、panic 在哪一行，不必進 log 翻
+          if cargo test -- ${{ matrix.skip }} 2>&1 | tee test.log; then
+            exit 0
+          fi
+          sum=$( { awk '/^failures:/{f=1} f' test.log | head -60
+                   grep -E '^error(\[E[0-9]+\])?:' test.log | head -20; } | head -70 )
+          # annotation 的訊息不能含換行，依 workflow command 的規則編碼
+          enc=$(printf '%s' "$sum" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
+                | awk 'BEGIN{ORS="%0A"} {print}')
+          echo "::error title=測試失敗（${{ matrix.os }}）::$enc"
+          exit 1
 
       # Intel Mac 的執行檔在 Apple 晶片的 runner 上跑不起來，所以只做型別檢查。
       # 為的是守住依 target_arch 分家的程式碼（例如一鍵更新該抓哪個檔名），
