@@ -1,7 +1,9 @@
 name: CI
 
-# 每次推到 master（或開 PR）都建置一次並跑測試：這台開發機沒有 Rust 工具鏈，
-# 改完的程式在這裡先確認編得過、測試沒紅，再打 tag 發版
+# 每次推到 master（或開 PR）都在 Windows 與 macOS 各建置一次並跑測試。
+# 開發會在兩台機器之間換手，只驗單一平台的話，另一個平台專屬的程式碼要等到
+# 發版才會爆——v0.15.0 那次就是在 Windows 上全綠、到 macOS 才發現型別推導
+# 錯誤。兩邊都綠了再打 tag 發版
 on:
   push:
     branches: ["master"]
@@ -13,15 +15,37 @@ permissions:
 
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      # 一邊紅不要連帶取消另一邊，才分得出是單一平台的問題還是兩邊都有
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            # 資源回收筒那條測試在 GitHub 的 Windows 執行器上會紅：TEMP 是
+            # 8.3 短檔名（RUNNER~1），回收筒還原出來的是長檔名，路徑比對永遠
+            # 不同。本機跑得過，只在這裡跳過
+            skip: "--skip extra_files_go_to_the_recycle_bin_and_come_back"
+          - os: macos-latest
+            # macOS 沒有回收筒的實作（restore 是 cfg(any(windows, linux))），
+            # 測試裡那段連編都不會編，不必跳過
+            skip: ""
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
 
       - name: Rust 建置快取
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
-      # 資源回收筒那條測試在 GitHub 的執行器上會紅：TEMP 是 8.3 短檔名
-      # （RUNNER~1），回收筒還原出來的是長檔名，路徑比對永遠不同。本機跑得過，
-      # 只在這裡跳過
       - name: 建置並跑測試
-        run: cargo test -- --skip extra_files_go_to_the_recycle_bin_and_come_back
+        run: cargo test -- ${{ matrix.skip }}
+
+      # Intel Mac 的執行檔在 Apple 晶片的 runner 上跑不起來，所以只做型別檢查。
+      # 為的是守住依 target_arch 分家的程式碼（例如一鍵更新該抓哪個檔名），
+      # 那種分支只在 Apple 晶片上編譯是永遠驗不到的
+      - name: 順便確認 Intel Mac 編得過
+        if: matrix.os == 'macos-latest'
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo check --target x86_64-apple-darwin
