@@ -33091,7 +33091,10 @@ mod tests {
     /// 就在包裡多留一份十幾 MB 的舊執行檔，而且不會有任何錯誤訊息
     #[test]
     fn 更新暫存檔名接在執行檔名後面() {
-        let win = update_sidecar(Path::new(r"C:\app\photo2video.exe"), "old");
+        // 這裡刻意用正斜線寫「帶副檔名的執行檔」，不寫 r"C:\app\…"：反斜線
+        // 在 Unix 不是路徑分隔符，整串會被當成單一檔名，同一條斷言在 macOS
+        // 上就對不起來。正斜線兩邊都通，而要驗的本來就是副檔名的處理
+        let win = update_sidecar(Path::new("/app/photo2video.exe"), "old");
         assert_eq!(win.file_name().unwrap(), "photo2video.exe.old");
 
         let mac = update_sidecar(
