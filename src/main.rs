@@ -2941,15 +2941,38 @@ fn pick_folder_remembering(which: LastDir, title: &str, start: Option<&Path>) ->
     Some(picked)
 }
 
-/// 是否支援程式內一鍵更新。發佈頁目前只提供 Windows 執行檔
-/// （photo2video.exe），其他平台沒有可下載的對應檔案，UI 改成引導使用者
-/// 到發佈頁自行取得，而不是給一個按了必定失敗的「立即更新」
-const SELF_UPDATE_SUPPORTED: bool = cfg!(windows);
+/// 是否支援程式內一鍵更新。發佈頁提供 Windows 的 photo2video.exe 與 macOS
+/// 兩種架構的主程式；Linux 沒有對應的發佈檔案，UI 改成引導使用者到發佈頁
+/// 自行取得，而不是給一個按了必定失敗的「立即更新」
+const SELF_UPDATE_SUPPORTED: bool = cfg!(any(windows, target_os = "macos"));
 
-/// 下載指定版本的 photo2video.exe 並原地替換目前的執行檔
+/// 發佈頁上對應這個平台的主程式檔名。macOS 分架構發佈，Apple 晶片與 Intel
+/// 的執行檔不能互換，所以檔名要帶上架構
+#[cfg(windows)]
+const UPDATE_ASSET: &str = "photo2video.exe";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const UPDATE_ASSET: &str = "photo2video-macos-arm64";
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+const UPDATE_ASSET: &str = "photo2video-macos-x64";
+/// 這個平台不支援一鍵更新（SELF_UPDATE_SUPPORTED 為 false），實際用不到
+#[cfg(all(not(windows), not(target_os = "macos")))]
+const UPDATE_ASSET: &str = "";
+
+/// 一鍵更新期間的暫存檔路徑：在執行檔名後面直接接上 .new / .old。
+/// 不能用 with_extension，那在 Windows 上會把 .exe 換掉而不是接上
+fn update_sidecar(exe: &Path, suffix: &str) -> PathBuf {
+    let name = exe
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("photo2video");
+    exe.with_file_name(format!("{name}.{suffix}"))
+}
+
+/// 下載指定版本的主程式並原地替換目前的執行檔
 fn download_update(tag: &str, progress: &dyn Fn(f32)) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("無法取得程式路徑：{e}"))?;
-    let url = format!("https://github.com/{GITHUB_REPO}/releases/download/{tag}/photo2video.exe");
+    let url =
+        format!("https://github.com/{GITHUB_REPO}/releases/download/{tag}/{UPDATE_ASSET}");
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
@@ -2965,9 +2988,9 @@ fn download_update(tag: &str, progress: &dyn Fn(f32)) -> Result<(), String> {
         .unwrap_or(0.0);
 
     // 下載到同資料夾的暫存檔（同一磁碟才能直接改名替換）
-    let tmp = exe.with_extension("exe.new");
+    let tmp = update_sidecar(&exe, "new");
     // 下載＋驗證包成一段，任何一步失敗都清掉暫存檔：否則網路中斷（read/
-    // write 失敗）會在程式目錄留下殘缺的 exe.new，只有 MZ 驗證那步會清
+    // write 失敗）會在程式目錄留下殘缺的暫存檔，只有檔頭驗證那步會清
     let download = || -> Result<(), String> {
         let mut reader = resp.into_reader();
         let mut file =
@@ -2993,13 +3016,29 @@ fn download_update(tag: &str, progress: &dyn Fn(f32)) -> Result<(), String> {
         }
         drop(file);
 
-        // 簡單驗證是 Windows 執行檔（MZ 開頭），避免把錯誤頁面存成 exe
-        let mut magic = [0u8; 2];
+        // 簡單驗證檔頭，避免把錯誤頁面或半截檔案裝成主程式。Windows 是 MZ；
+        // macOS 是 Mach-O，我們發佈的是分架構的瘦檔（64 位元小端序為
+        // CF FA ED FE），順帶接受萬用二進位檔的 CA FE BA BE
+        let mut magic = [0u8; 4];
         std::fs::File::open(&tmp)
             .and_then(|mut f| f.read_exact(&mut magic))
             .map_err(|e| format!("暫存檔讀取失敗：{e}"))?;
-        if &magic != b"MZ" {
+        #[cfg(windows)]
+        let head_ok = magic.starts_with(b"MZ");
+        #[cfg(target_os = "macos")]
+        let head_ok = magic == [0xCF, 0xFA, 0xED, 0xFE] || magic == [0xCA, 0xFE, 0xBA, 0xBE];
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        let head_ok = true;
+        if !head_ok {
             return Err("下載的檔案不是有效的執行檔".into());
+        }
+        // 下載回來的檔案沒有執行權限。不補上的話替換會成功、下次啟動才失敗，
+        // 而且錯誤是「權限不足」，使用者完全看不出和更新有關
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("無法設定執行權限：{e}"))?;
         }
         Ok(())
     };
@@ -3009,7 +3048,7 @@ fn download_update(tag: &str, progress: &dyn Fn(f32)) -> Result<(), String> {
     }
 
     // 執行中的 exe 不能覆寫，但可以改名：舊檔改 .old、新檔補上原位
-    let old = exe.with_extension("exe.old");
+    let old = update_sidecar(&exe, "old");
     let _ = std::fs::remove_file(&old);
     if let Err(e) = std::fs::rename(&exe, &old) {
         // 舊 exe 改名失敗（如被防毒鎖住）：清掉已下載的新 exe，不留 8MB 殘檔
@@ -3024,16 +3063,37 @@ fn download_update(tag: &str, progress: &dyn Fn(f32)) -> Result<(), String> {
     Ok(())
 }
 
-/// 重新啟動程式（新版 exe 已放在原本的路徑上）
+/// 重新啟動程式（新版主程式已放在原本的路徑上）
 fn restart_app() {
     // process::exit 不執行解構子，App::drop 的暫存清理不會跑；
     // 暫存檔名帶行程 PID，重啟後的新行程也不會清到這些檔案，
     // 不在這裡先清掉的話，每次自動更新都會留下孤兒暫存檔持續累積
     clean_own_temp_files();
     if let Ok(exe) = std::env::current_exe() {
+        // 在 .app 包裡要用 open 重啟整個 bundle：直接 spawn 包裡的執行檔，
+        // 新行程不會經過 LaunchServices，Dock 圖示與視窗啟用都不正常。
+        // -n 強制開新的一份，否則 LaunchServices 會認為程式還開著（就是正要
+        // 結束的這個），只把將死的視窗叫到前景，看起來就像更新完沒反應
+        #[cfg(target_os = "macos")]
+        if let Some(app) = bundle_root(&exe) {
+            let _ = std::process::Command::new("open").arg("-n").arg(app).spawn();
+            std::process::exit(0);
+        }
         let _ = std::process::Command::new(exe).spawn();
     }
     std::process::exit(0);
+}
+
+/// 執行檔所在的 .app 包根目錄；直接跑編譯產物（開發時）則回傳 None
+#[cfg(target_os = "macos")]
+fn bundle_root(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?; // …/photo2video.app/Contents/MacOS
+    let contents = macos.parent()?;
+    let app = contents.parent()?;
+    let ok = macos.file_name()?.to_str()? == "MacOS"
+        && contents.file_name()?.to_str()? == "Contents"
+        && app.extension()?.to_str()? == "app";
+    ok.then(|| app.to_path_buf())
 }
 
 /// 系統字型資料夾（依優先順序；同名檔案出現在多處時取先找到的）
@@ -9723,7 +9783,7 @@ impl App {
 
     /// 在背景下載新版並替換執行檔，完成後自動重新啟動
     fn spawn_self_update(&mut self, ctx: &egui::Context, tag: String) {
-        // 非 Windows 沒有可下載的執行檔（見 SELF_UPDATE_SUPPORTED），UI 不會
+        // 不支援的平台沒有可下載的主程式（見 SELF_UPDATE_SUPPORTED），UI 不會
         // 給出觸發點，這裡再擋一次避免日後改 UI 時漏掉
         if !SELF_UPDATE_SUPPORTED || matches!(self.update_status, UpdateStatus::Downloading(_)) {
             return;
@@ -32961,7 +33021,7 @@ fn main() -> eframe::Result {
     // 清掉上次一鍵更新留下的舊版檔案（只有支援一鍵更新的平台會產生）
     if SELF_UPDATE_SUPPORTED {
         if let Ok(exe) = std::env::current_exe() {
-            let _ = std::fs::remove_file(exe.with_extension("exe.old"));
+            let _ = std::fs::remove_file(update_sidecar(&exe, "old"));
         }
     }
 
@@ -33023,6 +33083,46 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// 一鍵更新的暫存檔名是「接在執行檔名後面」，不是換掉副檔名。Windows 上
+    /// 兩種寫法剛好同名（photo2video.exe.old），所以改成跨平台時很容易以為
+    /// with_extension 也行；但 macOS 的執行檔沒有副檔名，換副檔名會生出
+    /// photo2video.old 以外的名字，啟動時清舊檔那段就永遠清不到，每更新一次
+    /// 就在包裡多留一份十幾 MB 的舊執行檔，而且不會有任何錯誤訊息
+    #[test]
+    fn 更新暫存檔名接在執行檔名後面() {
+        let win = update_sidecar(Path::new(r"C:\app\photo2video.exe"), "old");
+        assert_eq!(win.file_name().unwrap(), "photo2video.exe.old");
+
+        let mac = update_sidecar(
+            Path::new("/Applications/photo2video.app/Contents/MacOS/photo2video"),
+            "new",
+        );
+        assert_eq!(mac.file_name().unwrap(), "photo2video.new");
+        // 只換檔名、不換資料夾：要同一個磁碟／檔案系統才能直接改名替換
+        assert_eq!(
+            mac.parent(),
+            Some(Path::new("/Applications/photo2video.app/Contents/MacOS"))
+        );
+    }
+
+    /// 更新完要重新啟動，macOS 得認出自己在不在 .app 包裡才知道該用 open
+    /// 還是直接執行（見 restart_app）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 認得出_app_包的根目錄() {
+        assert_eq!(
+            bundle_root(Path::new(
+                "/Applications/photo2video.app/Contents/MacOS/photo2video"
+            )),
+            Some(PathBuf::from("/Applications/photo2video.app"))
+        );
+        // 開發時直接跑編譯產物，不在包裡
+        assert_eq!(
+            bundle_root(Path::new("/Users/me/photo2video/target/release/photo2video")),
+            None
+        );
+    }
 
     /// 建一個有 `n` 張假照片的優化影像工具（純狀態，不碰檔案系統）
     fn enhance_with(n: usize) -> EnhanceTool {

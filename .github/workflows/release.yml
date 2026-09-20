@@ -238,17 +238,27 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$DIR" "$ZIP"
           # 固定檔名的複本，讓 releases/latest/download/ 的連結永遠指向最新版
           cp "$ZIP" "photo2video-macos-${{ matrix.arch }}.zip"
+          # 單獨附上主程式，供程式內「立即更新」只下載這一支（不含 ffmpeg，
+          # 體積小）。發佈頁上的資產名取的是 basename，而工作目錄下已經有一個
+          # 同名的打包資料夾，所以先放進子目錄避開撞名
+          mkdir -p upload
+          cp "$DIR/photo2video.app/Contents/MacOS/photo2video" \
+             "upload/photo2video-macos-${{ matrix.arch }}"
 
       - name: 發佈到 GitHub Releases
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
-          files: photo2video-*macos-${{ matrix.arch }}.zip
+          files: |
+            photo2video-*macos-${{ matrix.arch }}.zip
+            upload/photo2video-macos-${{ matrix.arch }}
 
       - name: 手動試跑時留下成品供下載
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
-          path: photo2video-*macos-${{ matrix.arch }}.zip
+          path: |
+            photo2video-*macos-${{ matrix.arch }}.zip
+            upload/photo2video-macos-${{ matrix.arch }}
