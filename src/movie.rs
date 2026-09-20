@@ -1264,10 +1264,12 @@ mod tests {
             fade_out: true,
         };
         // 文字只蓋前 2.5 秒，時間外那一格才驗得出「沒被畫到」
-        let font = ["msjh.ttc", "msyh.ttc", "arial.ttf"]
-            .iter()
-            .map(|f| PathBuf::from(r"C:\Windows\Fonts").join(f))
-            .find_map(|p| edit::load_font(&p))
+        // 字型走程式自己那套跨平台查找（[`crate::detect_fonts`]，掃的是各平台
+        // 的字型資料夾）。原本寫死 C:\Windows\Fonts 底下那三個檔名，在
+        // macOS 上一個都找不到，這條測試只會 panic 在「找不到可用的系統字型」
+        let font = crate::detect_fonts()
+            .into_iter()
+            .find_map(|(_, p)| edit::load_font(&p))
             .expect("找不到可用的系統字型");
         let text = TextJob {
             items: vec![TimedText {
