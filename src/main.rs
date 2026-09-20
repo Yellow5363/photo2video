@@ -26993,9 +26993,9 @@ impl App {
         self.backup.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            #[cfg(any(windows, target_os = "linux"))]
+            #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
             let (back, errs) = backup::restore(&paths);
-            #[cfg(not(any(windows, target_os = "linux")))]
+            #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
             // 這條分支不呼叫 restore，back 的元素型別就無處可推。不標註的話
             // macOS 會同時吃到 E0282（Vec::new 的型別未定）與 E0283（下面
             // shown.contains 要找的 Borrow 目標在 PathBuf 與 Path 之間無法決定）

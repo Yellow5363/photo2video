@@ -650,6 +650,90 @@ fn trash_item_name(item: &trash::TrashItem) -> std::ffi::OsString {
     name
 }
 
+/// macOS 版的「放回」。
+///
+/// `trash` 套件的 `os_limited`（列出回收筒、把指定項目放回）明確排除 macOS，
+/// 所以這裡自己來。做得到的原因是 macOS 的垃圾桶很單純：檔案是原名搬進去的，
+/// 照原始路徑的檔名去那顆磁碟的垃圾桶資料夾找，搬回原位即可。
+///
+/// **限制**：垃圾桶裡已經有同名檔案時，macOS 會把新丟進去的那個改名
+/// （「照片 2.jpg」這種），改過名的就認不出來，會回報成找不到。與其猜一個
+/// 相似的名字搬回去、可能蓋錯或救錯檔案，寧可講清楚找不到
+#[cfg(target_os = "macos")]
+pub fn restore(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
+    let mut restored: Vec<PathBuf> = Vec::new();
+    let mut errs: Vec<String> = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        // 同一個路徑在清單裡出現兩次時，第二次本來就該撲空，不算錯誤
+        if paths[..i].iter().any(|q| norm(q) == norm(p)) {
+            continue;
+        }
+        let Some(name) = p.file_name() else {
+            errs.push(format!("{}：路徑沒有檔名", p.display()));
+            continue;
+        };
+        let Some(dir) = trash_dir_for(p) else {
+            errs.push(format!("{}：找不到這顆磁碟的垃圾桶資料夾", p.display()));
+            continue;
+        };
+        let from = dir.join(name);
+        if !from.exists() {
+            errs.push(format!(
+                "{}：資源回收筒裡找不到（可能已經被清空）",
+                p.display()
+            ));
+            continue;
+        }
+        if p.exists() {
+            errs.push(format!(
+                "{}：原位置已經有同名檔案，沒有放回去",
+                p.display()
+            ));
+            continue;
+        }
+        // 刪完檔案時空掉的資料夾也被收掉了（見 prune_empty_dirs），先建回來
+        if let Some(parent) = p.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::rename(&from, p) {
+            Ok(()) => restored.push(p.clone()),
+            Err(e) => errs.push(format!("{}：放回原位失敗（{e}）", p.display())),
+        }
+    }
+    (restored, errs)
+}
+
+/// 這個路徑上的檔案被丟掉之後會進哪個垃圾桶資料夾。
+///
+/// macOS 的垃圾桶是**分磁碟**的：外接磁碟丟掉的東西進那顆磁碟自己的
+/// `/Volumes/<卷名>/.Trashes/<uid>/`，不會進使用者的 `~/.Trash`，Finder 的
+/// 垃圾桶也常常不顯示它們。備份模組正好都在外接磁碟之間搬照片，這是主要情況
+#[cfg(target_os = "macos")]
+fn trash_dir_for(p: &Path) -> Option<PathBuf> {
+    if let Ok(rest) = p.strip_prefix("/Volumes") {
+        if let Some(vol) = rest.components().next() {
+            let uid = current_uid()?;
+            return Some(
+                Path::new("/Volumes")
+                    .join(vol)
+                    .join(".Trashes")
+                    .join(uid.to_string()),
+            );
+        }
+    }
+    // 其餘（開機磁碟）走使用者自己的垃圾桶
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".Trash"))
+}
+
+/// 目前使用者的 uid。專案沒有引入 libc，改用 `$HOME` 這個一定屬於自己的
+/// 目錄的擁有者來取
+#[cfg(target_os = "macos")]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let home = std::env::var_os("HOME")?;
+    fs::metadata(home).ok().map(|md| md.uid())
+}
+
 /// 建出 `rel` 這個檔案需要的每一層目的資料夾，並讓每一層的隱藏／系統屬性
 /// 跟來源那一層一致（見 [`copy_dir_attrs`]）
 fn create_dirs_for(src_root: &Path, dst_root: &Path, rel: &Path) -> Result<(), String> {
@@ -922,7 +1006,7 @@ mod tests {
         prune_empty_dirs(&src, &dst, &AtomicBool::new(false));
         assert!(!dst.join("spring").exists(), "測試前提：空資料夾已經被收掉");
 
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         {
             let (back, errs) = restore(&[file.clone()]);
             assert_eq!(errs, Vec::<String>::new(), "放回去不該出錯");
@@ -1145,6 +1229,26 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// macOS 的垃圾桶分磁碟：外接碟丟掉的東西不會進 ~/.Trash，而在那顆碟
+    /// 自己的 .Trashes 裡。備份模組正好都在外接碟之間搬照片，這條找錯地方
+    /// 就等於使用者的檔案再也放不回去
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 外接磁碟的垃圾桶在那顆磁碟自己身上() {
+        let ext = trash_dir_for(Path::new("/Volumes/Cru P510 2T/相簿/A1.jpg")).unwrap();
+        assert!(
+            ext.starts_with("/Volumes/Cru P510 2T/.Trashes"),
+            "外接碟應該用自己的垃圾桶：{}",
+            ext.display()
+        );
+        let boot = trash_dir_for(Path::new("/Users/me/Pictures/A1.jpg")).unwrap();
+        assert!(
+            boot.ends_with(".Trash"),
+            "開機碟應該用使用者的垃圾桶：{}",
+            boot.display()
+        );
+    }
+
     #[test]
     fn pruning_only_removes_empty_folders_the_source_does_not_have() {
         // 刪掉多餘檔案後留下的空殼要收掉，但來源也有的那個資料夾要留著
@@ -1168,8 +1272,7 @@ mod tests {
         assert!(!dst.join("spring").exists(), "只剩雜檔的資料夾也要收掉");
         // macOS 上這裡會是 1：trash 套件在 macOS 預設請 Finder 執行刪除，
         // 而 Finder 在資料夾內容變動後會自己把 .DS_Store 收掉，輪到我們刪
-        // 它時已經不在了。回報數量是給 restore 用的，restore 本來就只有
-        // Windows 與 Linux 有（見它的 cfg），所以這條跟著分開寫
+        // 它時已經不在了——檔案確實消失了，只是不是我們丟的，回報不到
         #[cfg(not(target_os = "macos"))]
         assert_eq!(trashed.len(), 2, "順手丟掉的雜檔要回報，還原才放得回來");
         #[cfg(target_os = "macos")]
