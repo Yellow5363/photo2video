@@ -1,15 +1,18 @@
 name: Release
 
-# 推送 v 開頭的 tag（例如 v0.2.0）時自動建置並發佈到 GitHub Releases
+# 推送 v 開頭的 tag（例如 v0.2.0）時自動建置並發佈到 GitHub Releases。
+# workflow_dispatch 讓人能從 Actions 頁面手動試跑：一樣會完整建置與打包，
+# 但不發佈，只把成品留成 artifact 供下載測試——不用先推一個 tag 出去才知道會不會失敗
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-and-release:
+  build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -56,6 +59,7 @@ jobs:
           Copy-Item target/release/photo2video.exe photo2video.exe
 
       - name: 發佈到 GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
@@ -63,3 +67,188 @@ jobs:
             photo2video-*.zip
             photo2video.exe
           generate_release_notes: true
+
+      - name: 手動試跑時留下成品供下載
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: photo2video-*.zip
+
+  # Mac 版分 Apple 晶片與 Intel 兩個包，而不是合成 universal：ffmpeg 單獨就
+  # 98MB，兩種架構併在一起會讓每個使用者都多載一份自己用不到的執行檔
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      # 一種架構掛掉不要連帶取消另一種，才看得出到底是哪邊的問題
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+            # lipo 報的架構名（和上面給人看的 arch 不一樣，x64 那邊是 x86_64）
+            mach_arch: arm64
+            # Apple 晶片最低就是 Big Sur，寫更低沒有意義
+            minos: "11.0"
+            # 裸執行檔優先（免解壓），失敗再退到壓縮檔來源
+            ffmpeg_bin: "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-arm64"
+            ffmpeg_zip: "https://www.osxexperts.net/ffmpeg80arm.zip"
+          - target: x86_64-apple-darwin
+            arch: x64
+            mach_arch: x86_64
+            minos: "10.15"
+            ffmpeg_bin: "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-x64"
+            ffmpeg_zip: "https://evermeet.cx/ffmpeg/getrelease/zip"
+    steps:
+      - uses: actions/checkout@v5
+
+      # runner 只預裝自己架構的目標，另一種要自己補
+      - name: 加入建置目標
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Rust 建置快取
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 建置 release 版
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.minos }}
+
+      - name: 取得 FFmpeg
+        run: |
+          set -euo pipefail
+          # 依序試每個來源、每個來源試兩次，全部失敗才算失敗（比照 Windows job）。
+          # 這裡不容許「抓不到就算了」：macOS 版在程式內自動下載走的是同一批
+          # 來源，包裡沒附等於使用者第一次開也一樣拿不到
+          ok=""
+          for i in 1 2; do
+            if curl -fsSL --max-time 300 -o ffmpeg "${{ matrix.ffmpeg_bin }}"; then ok=1; break; fi
+            echo "下載失敗（裸執行檔，第 $i 次）"; sleep 20
+          done
+          if [ -z "$ok" ]; then
+            for i in 1 2; do
+              if curl -fsSL --max-time 300 -o ffmpeg.zip "${{ matrix.ffmpeg_zip }}"; then ok=1; break; fi
+              echo "下載失敗（壓縮檔，第 $i 次）"; sleep 20
+            done
+            if [ -n "$ok" ]; then
+              mkdir ffmpeg_tmp && unzip -q -o ffmpeg.zip -d ffmpeg_tmp
+              found=$(find ffmpeg_tmp -type f -name ffmpeg | head -1)
+              [ -n "$found" ] || { echo "壓縮檔裡找不到 ffmpeg"; exit 1; }
+              mv "$found" ffmpeg
+            fi
+          fi
+          [ -n "$ok" ] || { echo "所有 FFmpeg 下載來源都失敗"; exit 1; }
+          chmod +x ffmpeg
+          # 確認抓到的真的是這個架構的執行檔。來源站換版或網址被導向別的檔案
+          # 時，這裡當場擋下來，比包出一個在使用者機器上「無法執行」的 app 好
+          file ffmpeg
+          lipo -archs ffmpeg | grep -qw '${{ matrix.mach_arch }}' \
+            || { echo "FFmpeg 架構不是 ${{ matrix.mach_arch }}"; exit 1; }
+
+      - name: 打包成 .app
+        run: |
+          set -euo pipefail
+          # 版號取自 Cargo.toml 而非 tag：手動試跑時 ref_name 是分支名，
+          # 塞進 Info.plist 會變成無效的版本字串
+          VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          # 打包目錄直接取成解壓後該有的名字：壓縮時用 ditto --keepParent 把
+          # 這層一起收進去，使用者解開得到一個乾淨資料夾，而不是三個散落的項目
+          DIR="photo2video-macos-${{ matrix.arch }}"
+          APP="$DIR/photo2video.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          cp "target/${{ matrix.target }}/release/photo2video" "$APP/Contents/MacOS/photo2video"
+          chmod +x "$APP/Contents/MacOS/photo2video"
+          # ffmpeg 要和主程式同一層：ffmpeg-sidecar 是拿 current_exe 的
+          # 上層目錄去找，放進 Resources 它看不到，會退回去網路下載
+          cp ffmpeg "$APP/Contents/MacOS/ffmpeg"
+
+          # 用 1024 的來源圖產生各尺寸；sips 與 iconutil 都是 macOS 內建
+          mkdir icon.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s assets/icon_1024.png --out "icon.iconset/icon_${s}x${s}.png" >/dev/null
+            sips -z $((s*2)) $((s*2)) assets/icon_1024.png --out "icon.iconset/icon_${s}x${s}@2x.png" >/dev/null
+          done
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>photo2video</string>
+            <key>CFBundleDisplayName</key><string>photo2video</string>
+            <key>CFBundleIdentifier</key><string>tw.com.shin-her.photo2video</string>
+            <key>CFBundleExecutable</key><string>photo2video</string>
+            <key>CFBundleIconFile</key><string>icon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VER}</string>
+            <key>CFBundleVersion</key><string>${VER}</string>
+            <key>LSMinimumSystemVersion</key><string>${{ matrix.minos }}</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # 格式壞掉就讓 job 當場失敗，而不是包出一個開不起來的 .app
+          plutil -lint "$APP/Contents/Info.plist"
+
+          cp "使用說明.md" "$DIR/"
+          # 沒有 Apple 開發者簽章，macOS 會擋下第一次開啟。把解法寫進包裡，
+          # 不然使用者只會看到「無法打開」然後以為程式壞了
+          cat > "$DIR/Mac 首次開啟說明.txt" <<'NOTE'
+          photo2video for macOS
+          =====================
+
+          安裝
+          ----
+          把 photo2video.app 拖進「應用程式」資料夾。
+
+          第一次開啟會被系統擋下
+          ----------------------
+          本程式沒有 Apple 開發者簽章，macOS 會顯示「無法打開，因為 Apple
+          無法檢查是否含有惡意軟體」。這是未付費簽章的程式都會有的提示，
+          並非程式有問題。請照以下任一方式放行：
+
+          方式一（建議）
+            1. 先點兩下 photo2video.app，讓系統跳出擋下的訊息，按「完成」。
+            2. 打開「系統設定」→「隱私權與安全性」。
+            3. 往下捲，會看到「已封鎖 photo2video」，按旁邊的「仍要打開」。
+            4. 再確認一次即可，之後就能正常開啟。
+
+          方式二（終端機一行指令）
+            xattr -dr com.apple.quarantine /Applications/photo2video.app
+
+          FFmpeg
+          ------
+          已附在 app 內（photo2video.app/Contents/MacOS/ffmpeg），
+          不需另外安裝。
+
+          其餘操作方式請看「使用說明.md」。
+          NOTE
+
+      - name: 壓縮
+        run: |
+          set -euo pipefail
+          DIR="photo2video-macos-${{ matrix.arch }}"
+          ZIP="photo2video-${{ github.ref_name }}-macos-${{ matrix.arch }}.zip"
+          # 用 ditto 而不是 zip：.app 是目錄，ditto 才會正確保留執行權限與
+          # 符號連結，用一般 zip 解開後主程式會失去 +x 而打不開
+          ditto -c -k --sequesterRsrc --keepParent "$DIR" "$ZIP"
+          # 固定檔名的複本，讓 releases/latest/download/ 的連結永遠指向最新版
+          cp "$ZIP" "photo2video-macos-${{ matrix.arch }}.zip"
+
+      - name: 發佈到 GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ github.ref_name }}
+          files: photo2video-*macos-${{ matrix.arch }}.zip
+
+      - name: 手動試跑時留下成品供下載
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: photo2video-*macos-${{ matrix.arch }}.zip
