@@ -7402,8 +7402,8 @@ enum BackupMsg {
     Done {
         ok: usize,
         errs: Vec<String>,
-        deleted: Vec<PathBuf>,
-        deleted_junk: Vec<PathBuf>,
+        deleted: Vec<backup::Trashed>,
+        deleted_junk: Vec<backup::Trashed>,
     },
     /// 從資源回收筒放回去做完了：放回幾個（只算看得見的）、失敗的訊息
     Restored(usize, Vec<String>),
@@ -7528,14 +7528,15 @@ struct BackupTool {
     /// 螢幕——在收到結果的當下就跳，螢幕上會一直停在「正在比對兩個
     /// 資料夾…」那一幀，看起來像比對卡在那裡
     confirm_pending: bool,
-    /// 最近一次備份丟進資源回收筒、而且**使用者看得見**的檔案（完整路徑）。
+    /// 最近一次備份丟進資源回收筒、而且**使用者看得見**的檔案（完整路徑，
+    /// 加上丟之前記下的身分——見 [`backup::Trashed`]）。
     /// 有東西就顯示「還原」鈕；畫面上的數字也是數這個。
     /// 放回去了、或下一次備份開始時清掉
-    last_deleted: Vec<PathBuf>,
+    last_deleted: Vec<backup::Trashed>,
     /// 同一批裡跟著收掉的雜檔（`._` 附屬檔那些，見 [`backup::prune_empty_dirs`]）。
     /// 還原時一起放回去，但**不算進數字**——檔案總管裡看不到的東西，
     /// 說「刪除了 6 個」只會讓人以為算錯了
-    last_deleted_junk: Vec<PathBuf>,
+    last_deleted_junk: Vec<backup::Trashed>,
     busy: BackupBusy,
     rx: Option<Receiver<BackupMsg>>,
     cancel: Arc<AtomicBool>,
@@ -26929,9 +26930,9 @@ impl App {
             let mut ok = 0usize;
             let mut errs: Vec<String> = Vec::new();
             // 真的丟進資源回收筒的那幾個，記完整路徑給「還原」用
-            let mut deleted: Vec<PathBuf> = Vec::new();
+            let mut deleted: Vec<backup::Trashed> = Vec::new();
             // 收資料夾時順手丟掉的 ._ 附屬檔那些：還原要放回去，但不計數
-            let mut deleted_junk: Vec<PathBuf> = Vec::new();
+            let mut deleted_junk: Vec<backup::Trashed> = Vec::new();
             // 全部組加起來做到第幾件（進度條看的是這個）
             let mut done = 0usize;
             'all: for job in &jobs {
@@ -26940,10 +26941,10 @@ impl App {
                         break 'all;
                     }
                     match backup::apply(act, &job.src, &job.dst, keep_extra) {
-                        Ok(()) => {
+                        Ok(trashed) => {
                             ok += 1;
-                            if act.kind == backup::Kind::Extra {
-                                deleted.push(job.dst.join(&act.rel));
+                            if let Some(t) = trashed {
+                                deleted.push(t);
                             }
                         }
                         Err(e) => errs.push(e),
@@ -26983,9 +26984,10 @@ impl App {
         }
         // 一起收掉的雜檔也放回去（不然照片回來了、旁邊的附屬檔沒回來），
         // 但數字只報看得見的那幾個
-        let shown: HashSet<PathBuf> = self.backup.last_deleted.iter().cloned().collect();
-        let mut paths = self.backup.last_deleted.clone();
-        paths.extend(self.backup.last_deleted_junk.iter().cloned());
+        let shown: HashSet<PathBuf> =
+            self.backup.last_deleted.iter().map(|t| t.path.clone()).collect();
+        let mut items = self.backup.last_deleted.clone();
+        items.extend(self.backup.last_deleted_junk.iter().cloned());
         self.backup.busy = BackupBusy::Restoring;
         self.backup.error = None;
         self.backup.result = None;
@@ -26994,7 +26996,7 @@ impl App {
         let ctx = ctx.clone();
         thread::spawn(move || {
             #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-            let (back, errs) = backup::restore(&paths);
+            let (back, errs) = backup::restore(&items);
             #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
             // 這條分支不呼叫 restore，back 的元素型別就無處可推。不標註的話
             // macOS 會同時吃到 E0282（Vec::new 的型別未定）與 E0283（下面
@@ -27003,7 +27005,7 @@ impl App {
                 Vec::new(),
                 vec![format!(
                     "這個平台不支援從資源回收筒放回（{} 個檔案）",
-                    paths.len()
+                    items.len()
                 )],
             );
             let n = back.iter().filter(|p| shown.contains(*p)).count();

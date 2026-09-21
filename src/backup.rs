@@ -521,29 +521,64 @@ pub fn plan(
     })
 }
 
+/// 丟進資源回收筒的一個檔案：原本的完整路徑，加上丟之前記下的身分。
+///
+/// 身分是 `(裝置, inode)`。放進回收筒是同一顆磁碟內的 rename，inode 不變，
+/// 放回去之前拿它比對，才分得出回收筒裡那個同名檔案是不是這次丟的那一份
+/// （見 macOS 版 [`restore`] 的說明）。Windows 的回收筒自己記得每一筆的
+/// 原路徑與刪除時間，不靠它，那邊永遠是 `None`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trashed {
+    pub path: PathBuf,
+    pub id: Option<(u64, u64)>,
+}
+
+/// 丟進資源回收筒，丟之前先記下身分（見 [`Trashed`]）。用 `symlink_metadata`：
+/// 丟的是連結本身時記的也得是連結本身。讀不到就記 `None`，macOS 的放回
+/// 會因此拒絕照名字亂猜，寧可請使用者自己到垃圾桶放回
+fn trash_file(p: &Path) -> Result<Trashed, trash::Error> {
+    #[cfg(unix)]
+    let id = {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()))
+    };
+    #[cfg(not(unix))]
+    let id = None;
+    trash::delete(p)?;
+    Ok(Trashed {
+        path: p.to_path_buf(),
+        id,
+    })
+}
+
 /// 做掉一件事。錯誤訊息裡帶相對路徑，整批跑完才一起顯示。
 ///
-/// 寫的一律是目的那一邊——`src_root` 只拿來讀
+/// 寫的一律是目的那一邊——`src_root` 只拿來讀。
+///
+/// 回傳真的丟進資源回收筒的那個檔案（只有多餘檔案、而且沒勾保留時才有），
+/// 「還原」靠這筆紀錄放回去
 pub fn apply(
     act: &Action,
     src_root: &Path,
     dst_root: &Path,
     keep_extra: bool,
-) -> Result<(), String> {
+) -> Result<Option<Trashed>, String> {
     let in_src = src_root.join(&act.rel);
     let in_dst = dst_root.join(&act.rel);
     match act.kind {
         Kind::Copy | Kind::Update | Kind::Overwrite => {
             create_dirs_for(src_root, dst_root, &act.rel)?;
-            copy_file(&in_src, &in_dst, &act.rel)
+            copy_file(&in_src, &in_dst, &act.rel)?;
+            Ok(None)
         }
         Kind::Extra => {
             if keep_extra {
-                return Ok(());
+                return Ok(None);
             }
             // 丟資源回收筒，不直接砍：這是整個備份唯一會讓檔案消失的地方，
             // 勾錯開關按下去的人得有路可退（見 [`restore`]）
-            trash::delete(&in_dst)
+            trash_file(&in_dst)
+                .map(Some)
                 .map_err(|e| format!("{}：無法移到資源回收筒（{e}）", act.rel.display()))
         }
     }
@@ -557,8 +592,11 @@ pub fn apply(
 /// 回傳（真的放回去的那幾個路徑, 錯誤訊息）。回的是路徑不是數字，
 /// 呼叫端才分得出裡面哪幾個是使用者看得見、該報進數字的
 #[cfg(any(windows, target_os = "linux"))]
-pub fn restore(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
+pub fn restore(items: &[Trashed]) -> (Vec<PathBuf>, Vec<String>) {
     use std::collections::HashMap;
+
+    // 回收筒自己記得每一筆的原路徑與刪除時間，這裡只用路徑；身分比對是 macOS 的事
+    let paths: Vec<PathBuf> = items.iter().map(|t| t.path.clone()).collect();
 
     let items = match trash::os_limited::list() {
         Ok(items) => items,
@@ -656,16 +694,22 @@ fn trash_item_name(item: &trash::TrashItem) -> std::ffi::OsString {
 /// 所以這裡自己來。做得到的原因是 macOS 的垃圾桶很單純：檔案是原名搬進去的，
 /// 照原始路徑的檔名去那顆磁碟的垃圾桶資料夾找，搬回原位即可。
 ///
-/// **限制**：垃圾桶裡已經有同名檔案時，macOS 會把新丟進去的那個改名
-/// （「照片 2.jpg」這種），改過名的就認不出來，會回報成找不到。與其猜一個
-/// 相似的名字搬回去、可能蓋錯或救錯檔案，寧可講清楚找不到
+/// **同名不等於同一份**：垃圾桶裡已經有同名檔案時，macOS 把**新丟進去的**
+/// 改名（加時間，像「照片 下午3.21.07.jpg」），原名留給舊的。照名字找到的
+/// 就是更早刪的另一個檔案——不同資料夾裡的 IMG_0001.jpg 很常見。所以放回
+/// 之前拿丟的時候記下的 `(裝置, inode)` 比對（見 [`Trashed`]；放進回收筒是
+/// 同一顆磁碟內的 rename，inode 不變），不是同一份就明白回報、不動它。
+/// 改過名的那份這裡找不到（沒有完整磁碟取用權列不了垃圾桶），請使用者到
+/// Finder 放回
 #[cfg(target_os = "macos")]
-pub fn restore(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
+pub fn restore(items: &[Trashed]) -> (Vec<PathBuf>, Vec<String>) {
+    use std::os::unix::fs::MetadataExt;
     let mut restored: Vec<PathBuf> = Vec::new();
     let mut errs: Vec<String> = Vec::new();
-    for (i, p) in paths.iter().enumerate() {
+    for (i, t) in items.iter().enumerate() {
+        let p = &t.path;
         // 同一個路徑在清單裡出現兩次時，第二次本來就該撲空，不算錯誤
-        if paths[..i].iter().any(|q| norm(q) == norm(p)) {
+        if items[..i].iter().any(|q| norm(&q.path) == norm(p)) {
             continue;
         }
         let Some(name) = p.file_name() else {
@@ -683,6 +727,26 @@ pub fn restore(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
                 p.display()
             ));
             continue;
+        }
+        // 同名不等於同一份（見上面的說明）：身分對不上就不動它
+        let have = fs::symlink_metadata(&from).ok().map(|m| (m.dev(), m.ino()));
+        match (t.id, have) {
+            (Some(want), Some(have)) if want == have => {}
+            (None, _) => {
+                errs.push(format!(
+                    "{}：丟的時候沒能記下檔案身分，不敢照名字亂放；請到 Finder 的垃圾桶自己放回",
+                    p.display()
+                ));
+                continue;
+            }
+            _ => {
+                errs.push(format!(
+                    "{}：回收筒裡的同名檔案不是這次丟的那一份（大概是更早刪的），沒有動它；\
+                     這次丟的被系統改了名，請到 Finder 的垃圾桶自己放回",
+                    p.display()
+                ));
+                continue;
+            }
         }
         if p.exists() {
             errs.push(format!(
@@ -789,9 +853,9 @@ fn copy_file(from: &Path, to: &Path, rel: &Path) -> Result<(), String> {
 /// 那幾個也一起丟回收筒。
 ///
 /// 回傳順手丟進資源回收筒的雜檔（「還原」要連它們一起放回去）
-pub fn prune_empty_dirs(src_root: &Path, dst_root: &Path, cancel: &AtomicBool) -> Vec<PathBuf> {
+pub fn prune_empty_dirs(src_root: &Path, dst_root: &Path, cancel: &AtomicBool) -> Vec<Trashed> {
     // 先把所有子資料夾收齊，再由深到淺刪——巢狀的空殼才會一層一層收掉
-    let mut trashed: Vec<PathBuf> = Vec::new();
+    let mut trashed: Vec<Trashed> = Vec::new();
     let mut all: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
@@ -832,8 +896,8 @@ pub fn prune_empty_dirs(src_root: &Path, dst_root: &Path, cancel: &AtomicBool) -
             });
             if only_junk {
                 for p in junk {
-                    if trash::delete(&p).is_ok() {
-                        trashed.push(p);
+                    if let Ok(t) = trash_file(&p) {
+                        trashed.push(t);
                     }
                 }
             }
@@ -979,6 +1043,49 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// 同名不等於同一份（見 [`restore`] 的說明）。這條釘住的是資料安全：
+    /// 放回錯的檔案還回報成功，比放不回來糟得多。
+    ///
+    /// 跑完會在垃圾桶留一個改過名的「同名探針_<pid> <時間>.txt」：那是系統
+    /// 改的名，沒有完整磁碟取用權從這裡列不到、也就清不掉；清垃圾桶就沒了
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 同名檔案先後丟兩次_放回的不能是舊的那份() {
+        let root = tmp("samename");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        let rel = PathBuf::from("spring").join(format!("同名探針_{}.txt", std::process::id()));
+        let file = dst.join(&rel);
+        let act = Action {
+            rel: rel.clone(),
+            kind: Kind::Extra,
+            bytes: 3,
+        };
+
+        write_at(&file, "OLD", 0);
+        let old = apply(&act, &src, &dst, false).unwrap().unwrap();
+        write_at(&file, "NEW", 0);
+        let new = apply(&act, &src, &dst, false).unwrap().unwrap();
+        assert!(!file.exists());
+        assert_ne!(old.id, new.id, "兩份是不同的檔案，身分不能一樣");
+
+        // 要放回的是 NEW，但垃圾桶裡掛著原名的是 OLD：不能動它、要講清楚
+        let (back, errs) = restore(&[new.clone()]);
+        assert!(back.is_empty(), "放回了不該放的：{back:?}");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("不是這次丟的"), "{}", errs[0]);
+        assert!(!file.exists(), "原位不該出現任何東西");
+
+        // 反過來拿 OLD 自己的紀錄就放得回來——身分對得上
+        let (back, errs) = restore(&[old.clone()]);
+        assert_eq!(errs, Vec::<String>::new());
+        assert_eq!(back, vec![file.clone()]);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "OLD");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn extra_files_go_to_the_recycle_bin_and_come_back() {
         // 「保留目的資料夾多餘的檔案」是使用者唯一會踩到刪除的地方：
@@ -1003,21 +1110,24 @@ mod tests {
         apply(&act, &src, &dst, true).unwrap();
         assert!(file.exists(), "勾了保留就不能刪");
 
-        apply(&act, &src, &dst, false).unwrap();
+        let gone = apply(&act, &src, &dst, false)
+            .unwrap()
+            .expect("沒勾保留要回報真的丟進回收筒的那個檔案");
         assert!(!file.exists(), "沒勾保留才刪掉");
+        assert_eq!(gone.path, file);
         // 刪完連空掉的資料夾也收走，放回來時要自己把它建回去
         prune_empty_dirs(&src, &dst, &AtomicBool::new(false));
         assert!(!dst.join("spring").exists(), "測試前提：空資料夾已經被收掉");
 
         #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         {
-            let (back, errs) = restore(&[file.clone()]);
+            let (back, errs) = restore(&[gone.clone()]);
             assert_eq!(errs, Vec::<String>::new(), "放回去不該出錯");
             assert_eq!(back, vec![file.clone()]);
             assert_eq!(fs::read_to_string(&file).unwrap(), "x", "要從回收筒放回原位");
 
             // 回收筒裡已經沒有它了：再放一次要講清楚找不到，不能裝作成功
-            let (back, errs) = restore(&[file.clone()]);
+            let (back, errs) = restore(&[gone.clone()]);
             assert!(back.is_empty());
             assert_eq!(errs.len(), 1, "找不到要有一條錯誤");
         }
