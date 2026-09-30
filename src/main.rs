@@ -1697,8 +1697,8 @@ fn exe_link_time() -> Option<u64> {
     None
 }
 
-/// unix 秒數換成本機時間的年、月、日、時、分、秒；換不出來（非 Windows、
-/// 或系統呼叫失敗）就是 None
+/// unix 秒數換成本機時間的年、月、日、時、分、秒；換不出來
+/// （系統呼叫失敗）就是 None
 #[cfg(windows)]
 fn local_parts(unix: u64) -> Option<(u16, u16, u16, u16, u16, u16)> {
     #[repr(C)]
@@ -1739,7 +1739,51 @@ fn local_parts(unix: u64) -> Option<(u16, u16, u16, u16, u16, u16)> {
     ok.then_some((st.year, st.month, st.day, st.hour, st.minute, st.second))
 }
 
-#[cfg(not(windows))]
+/// macOS／Linux 走 C 函式庫的 localtime_r（時區與日光節約都由系統算）。
+/// 少了這個，專案檔名就只剩名字、沒有後面的日期時間，和 Windows 存出來的對不上
+#[cfg(unix)]
+fn local_parts(unix: u64) -> Option<(u16, u16, u16, u16, u16, u16)> {
+    use std::ffi::{c_char, c_int, c_long};
+    // struct tm：macOS 與 Linux（glibc、musl）都是這個排法
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct Tm {
+        sec: c_int,
+        min: c_int,
+        hour: c_int,
+        mday: c_int,
+        mon: c_int,
+        year: c_int,
+        wday: c_int,
+        yday: c_int,
+        isdst: c_int,
+        gmtoff: c_long,
+        zone: *const c_char,
+    }
+    extern "C" {
+        // time_t 在 64 位元的 macOS 與 Linux 上都是 64 位元有號整數
+        fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
+    }
+    let t = i64::try_from(unix).ok()?;
+    let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+    let tm = unsafe {
+        if localtime_r(&t, tm.as_mut_ptr()).is_null() {
+            return None;
+        }
+        tm.assume_init()
+    };
+    // tm_year 從 1900 起算、tm_mon 從 0 起算
+    Some((
+        u16::try_from(tm.year + 1900).ok()?,
+        u16::try_from(tm.mon + 1).ok()?,
+        u16::try_from(tm.mday).ok()?,
+        u16::try_from(tm.hour).ok()?,
+        u16::try_from(tm.min).ok()?,
+        u16::try_from(tm.sec).ok()?,
+    ))
+}
+
+#[cfg(all(not(windows), not(unix)))]
 fn local_parts(_unix: u64) -> Option<(u16, u16, u16, u16, u16, u16)> {
     None
 }
@@ -34219,12 +34263,28 @@ mod tests {
         // 少了名字或少了時間都不該拼出多餘的「-」
         assert!(!project::file_stem("疊圖").ends_with('-'));
         assert!(!project::file_stem("").starts_with('-'));
-        // 取得到本機時間（Windows）時才驗得到完整格式
+        // Windows 與 macOS 都要取得到本機時間：取不到的話檔名會少掉日期時間，
+        // 兩邊存出來的專案名字就對不上
+        #[cfg(any(windows, unix))]
+        assert!(date_stamp().is_some(), "取不到本機時間");
         if let Some(stamp) = date_stamp() {
             assert_eq!(stamp.len(), 13, "時間戳應長得像 20260914-1300：{stamp}");
+            assert!(
+                stamp.bytes().enumerate().all(|(i, b)| if i == 8 { b == b'-' } else { b.is_ascii_digit() }),
+                "{stamp}"
+            );
             let stem = project::file_stem("優化");
-            assert_eq!(stem, format!("優化-{stamp}"));
+            // 剛好跨過一分鐘時兩次取到的時間會差一格，拆得回名字才是重點
+            assert!(stem.starts_with("優化-"), "{stem}");
+            assert_eq!(stem.len(), "優化-".len() + 13, "{stem}");
             assert_eq!(project::strip_stamp(&stem), "優化");
+        }
+        // 換算本身對不對：2026-09-14 13:00:00 UTC 在任何時區都還是 2026 年 9 月
+        #[cfg(any(windows, unix))]
+        {
+            let (y, mo, d, _, _, s) = local_parts(1_789_390_800).expect("換不出本機時間");
+            assert_eq!((y, mo, s), (2026, 9, 0));
+            assert!((13..=15).contains(&d), "{d}");
         }
     }
 
