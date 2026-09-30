@@ -1074,8 +1074,19 @@ fn install_panic_hook() {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        // 只保留最後一次：多次 panic 時最新的最接近使用者實際遇到的問題
-        let _ = std::fs::write(&path, &report);
+        // 同一次執行裡的第二個 panic 接在後面，不蓋掉第一個：真正的原因是
+        // 第一個。它若發生在不能展開的地方（系統回呼裡），Rust 會緊接著再丟
+        // 一個「panic in a function that cannot unwind」才中止，蓋掉的話
+        // 紀錄裡就只剩這句看不出原因的話
+        static PANICKED: AtomicBool = AtomicBool::new(false);
+        if PANICKED.swap(true, Ordering::SeqCst) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&path) {
+                let _ = write!(f, "\n\n----- 緊接著又發生 -----\n{report}");
+            }
+        } else {
+            let _ = std::fs::write(&path, &report);
+        }
         default_hook(info);
     }));
 }
