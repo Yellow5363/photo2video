@@ -7610,6 +7610,12 @@ struct BackupTool {
     /// 看起來像「這樣就好了嗎？」，而且很容易誤按把剛排好的幾組清光。
     /// 只要資料夾或選項一動就收回去（見 [`BackupTool::invalidate`]）
     batch_done: bool,
+    /// 剛才那一趟**完整跑完**：沒中止、也沒有哪一項失敗，兩邊現在已經一樣了。
+    /// 這時「開始備份」要關掉——再按一次只會重新比對、然後什麼也沒發生，
+    /// 而且它剛剛才刪過檔案，還亮著會讓人以為有事沒做完。
+    /// 中止或有失敗的不算（還有事要做，得能再按一次）。和 `batch_done` 一樣，
+    /// 資料夾、選項一動或重新比對、還原就收回去（見 [`BackupTool::invalidate`]）
+    settled: bool,
     error: Option<String>,
     /// 最近一次做完的結果（畫面上留一行）
     result: Option<String>,
@@ -7659,6 +7665,7 @@ impl BackupTool {
         self.done = 0;
         self.total = 0;
         self.batch_done = false;
+        self.settled = false;
     }
 
     /// 至少有一組兩個資料夾都挑好了（可以比對，也可以直接開始備份）
@@ -26365,18 +26372,31 @@ impl App {
             // 「比對」不是必經的一步：按下去一定會自己先重新比對一次
             // （畫面上那份可能是幾分鐘前的，兩邊的檔案早就變了）。
             // 但已經比出「一件事都不用做」時就把它關掉——這時按下去
-            // 只會再比一次然後什麼也沒發生，看起來像壞掉
+            // 只會再比一次然後什麼也沒發生，看起來像壞掉。
+            // 剛完整備份完也一樣（見 [`BackupTool::settled`]）
             let todo = self.backup.todo();
+            let settled = self.backup.settled;
             let label = format!("▶  {}", self.backup.verb());
-            if primary_button(ui, &label, idle && ready && todo != Some(0))
-                .on_hover_text(if todo == Some(0) {
+            let mut run = primary_button(ui, &label, idle && ready && todo != Some(0) && !settled)
+                .on_hover_text("先重新比對一次，再把要做的事列出來給你確認");
+            // 關著的時候講為什麼（還沒挑好資料夾、正在跑的那兩種不必講）
+            let why_off = if settled {
+                Some(
+                    "這一批已經備份完了，來源與目的現在一樣；\
+                     檔案有變動就按「🔍 比對」重新看一次，要換一批就按「↺ 重新選擇」",
+                )
+            } else if todo == Some(0) {
+                Some(
                     "來源與目的已經一樣，沒有東西要備份；\
-                     檔案有變動就按「🔍 比對」重新看一次"
-                } else {
-                    "先重新比對一次，再把要做的事列出來給你確認"
-                })
-                .clicked()
-            {
+                     檔案有變動就按「🔍 比對」重新看一次",
+                )
+            } else {
+                None
+            };
+            if let Some(why) = why_off {
+                run = run.on_disabled_hover_text(why);
+            }
+            if run.clicked() {
                 clicks.run = true;
             }
             if !idle {
@@ -27170,11 +27190,13 @@ impl App {
                         self.backup.error = Some(e);
                     }
                     self.backup.result = Some(msg);
+                    let clean = !cancelled && errs.is_empty();
                     // 檔案都動過了，剛才那份清單已經不算數：要再看就重新比對
                     self.backup.invalidate();
                     // 這一批跑完了，「✔ 完成備份」現在才出現（invalidate 會把
                     // 它收掉，所以立在後面）
                     self.backup.batch_done = true;
+                    self.backup.settled = clean;
                 }
                 Ok(BackupMsg::Restored(n, errs)) => {
                     self.backup.rx = None;
