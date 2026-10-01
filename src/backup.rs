@@ -1382,7 +1382,15 @@ mod tests {
         assert!(dst.join("兩邊都有").is_dir(), "來源也有的空資料夾要留著");
         assert!(!dst.join("多出來的").exists(), "巢狀的空殼要一路收掉");
         assert!(dst.join("還有東西").is_dir(), "裡面有檔案的不能刪");
-        assert!(!dst.join("spring").exists(), "只剩雜檔的資料夾也要收掉");
+        // 紅掉時把「還留著什麼、丟掉了什麼」一起印出來：丟回收筒在 macOS 上
+        // 是請 Finder 做的，只在 CI 上紅的話，光看這一行分不出是哪個檔案沒丟成
+        let left: Vec<String> = fs::read_dir(dst.join("spring"))
+            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        assert!(
+            !dst.join("spring").exists(),
+            "只剩雜檔的資料夾也要收掉；還留著 {left:?}，丟掉了 {trashed:?}"
+        );
         // macOS 上這裡會是 1：trash 套件在 macOS 預設請 Finder 執行刪除，
         // 而 Finder 在資料夾內容變動後會自己把 .DS_Store 收掉，輪到我們刪
         // 它時已經不在了——檔案確實消失了，只是不是我們丟的，回報不到
