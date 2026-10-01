@@ -7482,7 +7482,7 @@ struct BackupClicks {
     run: bool,
     stop: bool,
     restore: bool,
-    /// 「✔ 完成備份」：這一批做完了，把每一組清掉重新挑
+    /// 「✔ 完成備份」／「↺ 重新選擇」：把每一組清掉重新挑
     finish: bool,
     /// 「不覆蓋目的資料夾較新的檔案」被切成什麼。取消勾選要先跳一次警告，
     /// 而對話框會擋住 UI 執行緒，所以和其他動作一樣畫完再處理
@@ -26385,31 +26385,38 @@ impl App {
                     clicks.stop = true;
                 }
             }
-            // 把每一組清掉重新挑的那一顆，不必再繞到「編輯 ▸ 清除備份設定」。
-            // 做的事一樣，字看情況換：剛備份完是「這批收工」，其他時候是
-            // 「挑錯了重來」（見 [`BackupTool::batch_done`]）。
-            // 一個資料夾都還沒挑就不出現，沒有東西可以清
+            // 把每一組清掉重新挑，不必再繞到「編輯 ▸ 清除備份設定」。
+            // 「↺ 重新選擇」只要挑了資料夾就在；剛備份完再多一顆「✔ 完成備份」
+            // （見 [`BackupTool::batch_done`]）。兩顆做的是同一件事，字不一樣
+            // 是因為想的事不一樣：一個是「這批收工」，一個是「再挑一批」——
+            // 備份完只剩「完成備份」時，找「重新選擇」的人會以為它不見了。
+            // 一個資料夾都還沒挑就都不出現，沒有東西可以清
             let anything = self
                 .backup
                 .pairs
                 .iter()
                 .any(|p| p.src.is_some() || p.dst.is_some());
             if idle && anything {
-                let (label, hint) = if self.backup.batch_done {
-                    (
-                        "✔  完成備份",
-                        "這一批做完了：把每一組的來源與目的清掉，重新挑下一批。\n\
-                         只是清掉畫面上選好的資料夾，不會動到任何檔案",
-                    )
-                } else {
-                    (
-                        "↺  重新選擇",
+                ui.add_space(18.0);
+                if self.backup.batch_done
+                    && ui
+                        .button("✔  完成備份")
+                        .on_hover_text(
+                            "這一批做完了：把每一組的來源與目的清掉，重新挑下一批。\n\
+                             只是清掉畫面上選好的資料夾，不會動到任何檔案",
+                        )
+                        .clicked()
+                {
+                    clicks.finish = true;
+                }
+                if ui
+                    .button("↺  重新選擇")
+                    .on_hover_text(
                         "把每一組選好的來源與目的清掉，重新挑一遍。\n\
                          只是清掉畫面上選好的資料夾，不會動到任何檔案",
                     )
-                };
-                ui.add_space(18.0);
-                if ui.button(label).on_hover_text(hint).clicked() {
+                    .clicked()
+                {
                     clicks.finish = true;
                 }
             }
