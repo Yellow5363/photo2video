@@ -544,11 +544,34 @@ fn trash_file(p: &Path) -> Result<Trashed, trash::Error> {
     };
     #[cfg(not(unix))]
     let id = None;
-    trash::delete(p)?;
+    trash_delete(p)?;
     Ok(Trashed {
         path: p.to_path_buf(),
         id,
     })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trash_delete(p: &Path) -> Result<(), trash::Error> {
+    trash::delete(p)
+}
+
+/// macOS 不請 Finder 丟（`trash` 套件的預設），改叫系統的 `trashItemAtURL`。
+///
+/// 請 Finder 丟的話**每丟一個檔案就響一次**垃圾桶的音效——清掉幾千個多餘
+/// 檔案時喇叭會連響好幾分鐘；每個檔案還要另外跑一次 osascript，慢很多。
+/// Finder 丟走東西後還會在那個資料夾裡寫一個新的 .DS_Store，雜檔明明都丟光
+/// 了，資料夾卻因為多了它而收不掉（見 [`prune_empty_dirs`]）。
+///
+/// 代價是 Finder 垃圾桶的右鍵選單在某些系統上不會有「放回原處」。本程式的
+/// 「↩ 還原剛才刪除的…」不靠它（見 macOS 版 [`restore`]：照檔名與 inode 到
+/// 垃圾桶資料夾找），檔案一樣是原名搬進同一個垃圾桶，手動拖出來也行
+#[cfg(target_os = "macos")]
+fn trash_delete(p: &Path) -> Result<(), trash::Error> {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+    let mut ctx = trash::TrashContext::new();
+    ctx.set_delete_method(DeleteMethod::NsFileManager);
+    ctx.delete(p)
 }
 
 /// 做掉一件事。錯誤訊息裡帶相對路徑，整批跑完才一起顯示。
@@ -883,13 +906,9 @@ pub fn prune_empty_dirs(src_root: &Path, dst_root: &Path, cancel: &AtomicBool) -
         let dir = dst_root.join(&rel);
         // 只剩雜檔時把它們也收掉。有任何一個「看得見」的東西（含子資料夾）
         // 就整個放棄——底下的 remove_dir 會失敗，資料夾原樣留著
-        let mut only_junk = false;
-        // 丟之前就在的那個 .DS_Store（見 [`drop_new_ds_store`]）
-        #[cfg(target_os = "macos")]
-        let mut old_ds: Option<(u64, u64)> = None;
         if let Ok(rd) = fs::read_dir(&dir) {
             let mut junk: Vec<PathBuf> = Vec::new();
-            only_junk = rd.flatten().all(|e| {
+            let only_junk = rd.flatten().all(|e| {
                 let is_file = e.file_type().is_ok_and(|ft| ft.is_file() && !ft.is_symlink());
                 if is_file && is_junk(&e) {
                     junk.push(e.path());
@@ -899,10 +918,6 @@ pub fn prune_empty_dirs(src_root: &Path, dst_root: &Path, cancel: &AtomicBool) -
                 }
             });
             if only_junk {
-                #[cfg(target_os = "macos")]
-                {
-                    old_ds = file_id(&dir.join(DS_STORE));
-                }
                 for p in junk {
                     if let Ok(t) = trash_file(&p) {
                         trashed.push(t);
@@ -911,59 +926,9 @@ pub fn prune_empty_dirs(src_root: &Path, dst_root: &Path, cancel: &AtomicBool) -
             }
         }
         // 裡面還有東西的話 remove_dir 自己會擋下來，失敗不必回報
-        let gone = fs::remove_dir(&dir).is_ok();
-        #[cfg(target_os = "macos")]
-        if !gone && only_junk {
-            // Finder 可能慢一步才寫，多試兩次
-            for _ in 0..3 {
-                if !drop_new_ds_store(&dir, old_ds) || fs::remove_dir(&dir).is_ok() {
-                    break;
-                }
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = (gone, only_junk);
+        let _ = fs::remove_dir(&dir);
     }
     trashed
-}
-
-#[cfg(target_os = "macos")]
-const DS_STORE: &str = ".DS_Store";
-
-/// 檔案的身分（裝置＋inode）；讀不到（多半是不存在）就是 None
-#[cfg(target_os = "macos")]
-fn file_id(p: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()))
-}
-
-/// 資料夾裡只剩一個 **Finder 剛寫的** `.DS_Store` 時把它刪掉，回傳有沒有刪。
-///
-/// macOS 上丟回收筒是請 Finder 做的，而 Finder 從哪個資料夾丟走東西，就會
-/// 順手在那裡寫一個新的 `.DS_Store`——雜檔明明都丟光了，資料夾卻因為多了
-/// 這個而收不掉。它是這幾毫秒內才生出來的，裡面沒有使用者的東西，直接刪、
-/// 不進垃圾桶（再請 Finder 丟一次只會又生一個）。
-///
-/// `old` 是丟之前就在的那個 `.DS_Store` 的身分：還是同一個檔案的話代表它
-/// 沒丟成，那是使用者原本的東西，不能直接刪——資料夾就留著
-#[cfg(target_os = "macos")]
-fn drop_new_ds_store(dir: &Path, old: Option<(u64, u64)>) -> bool {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return false;
-    };
-    let left: Vec<fs::DirEntry> = rd.flatten().collect();
-    let [only] = left.as_slice() else {
-        return false;
-    };
-    let is_file = only.file_type().is_ok_and(|ft| ft.is_file() && !ft.is_symlink());
-    if !is_file || only.file_name() != DS_STORE {
-        return false;
-    }
-    let id = file_id(&only.path());
-    if id.is_none() || id == old {
-        return false;
-    }
-    fs::remove_file(only.path()).is_ok()
 }
 
 #[cfg(test)]
@@ -1434,13 +1399,10 @@ mod tests {
         // 照片刪光後只剩 Mac 留下的附屬檔：在檔案總管裡看起來已經是空的，
         // 不把它們一起收掉的話 remove_dir 會失敗，資料夾就留在那裡
         write_at(&dst.join("spring/._A1208228.jpg"), "resource fork", 0);
-        // 第二個雜檔在 macOS 上不用假的 .DS_Store：丟回收筒是請 Finder 做的，
-        // 而 .DS_Store 是 Finder 自己的檔案，內容不是它認得的格式時它會自己
-        // 處理掉，輪到我們丟時有時已經不在、有時丟不掉，全看 Finder 當下
-        // 多快——CI 上就這樣時紅時綠。真的 .DS_Store 它會乖乖丟進垃圾桶，
-        // 但測試裡造不出一個真的。
-        // 換成別的雜檔正好驗到另一件事：Finder 丟走東西後會在資料夾裡寫一個
-        // 新的 .DS_Store，那個也要收掉（見 drop_new_ds_store）
+        // 第二個雜檔在 macOS 上不用假的 .DS_Store：內容不是系統認得的格式時，
+        // 丟回收筒那一下系統會自己把它收掉、再回報「檔案不存在」——資料夾
+        // 收得掉，但回報的件數少一個（真的 .DS_Store 會正常丟進去、算得到，
+        // 只是測試裡造不出一個真的）。Finder 那條路更糟，CI 上時紅時綠
         #[cfg(not(target_os = "macos"))]
         write_at(&dst.join("spring/.DS_Store"), "finder", 0);
         #[cfg(target_os = "macos")]
@@ -1450,8 +1412,8 @@ mod tests {
         assert!(dst.join("兩邊都有").is_dir(), "來源也有的空資料夾要留著");
         assert!(!dst.join("多出來的").exists(), "巢狀的空殼要一路收掉");
         assert!(dst.join("還有東西").is_dir(), "裡面有檔案的不能刪");
-        // 紅掉時把「還留著什麼、丟掉了什麼」一起印出來：丟回收筒在 macOS 上
-        // 是請 Finder 做的，只在 CI 上紅的話，光看這一行分不出是哪個檔案沒丟成
+        // 紅掉時把「還留著什麼、丟掉了什麼」一起印出來：只在 CI 上紅的話，
+        // 光看這一行分不出是哪個檔案沒丟成、還是有人又寫了東西進去
         let left: Vec<String> = fs::read_dir(dst.join("spring"))
             .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
             .unwrap_or_default();
@@ -1459,34 +1421,9 @@ mod tests {
             !dst.join("spring").exists(),
             "只剩雜檔的資料夾也要收掉；還留著 {left:?}，丟掉了 {trashed:?}"
         );
+        // macOS 也是 2：不請 Finder 丟（見 trash_delete），它就不會在丟完之後
+        // 又寫一個新的 .DS_Store 回去
         assert_eq!(trashed.len(), 2, "順手丟掉的雜檔要回報，還原才放得回來");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// Finder 丟完東西留下的新 .DS_Store 要刪得掉，但不能誤刪別的：
-    /// 丟之前就在的那個、或資料夾裡還有其他東西時都不准動
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn 只收掉_finder_剛寫的那個_ds_store() {
-        let root = tmp("ds_store");
-        let dir = root.join("spring");
-        let ds = dir.join(DS_STORE);
-        write_at(&ds, "finder", 0);
-
-        // 還是丟之前那一個（沒丟成）：使用者原本的東西，留著
-        assert!(!drop_new_ds_store(&dir, file_id(&ds)));
-        assert!(ds.exists());
-        // 旁邊還有別的東西：資料夾反正收不掉，不要白白刪掉它
-        write_at(&dir.join("照片.jpg"), "x", 0);
-        assert!(!drop_new_ds_store(&dir, None));
-        assert!(ds.exists());
-        fs::remove_file(dir.join("照片.jpg")).unwrap();
-        // 只剩它、而且不是原本那個（原本沒有，或身分不同）：刪掉
-        assert!(drop_new_ds_store(&dir, Some((0, 0))));
-        assert!(!ds.exists());
-        // 空資料夾沒有東西可收
-        assert!(!drop_new_ds_store(&dir, None));
 
         let _ = fs::remove_dir_all(&root);
     }
