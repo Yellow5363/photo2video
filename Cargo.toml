@@ -1,6 +1,6 @@
 [package]
 name = "photo2video"
-version = "0.16.0"
+version = "0.16.1"
 edition = "2021"
 # 專案有兩個執行檔（主程式與 smoke_cli），不指定的話 cargo run 會停下來問要
 # 跑哪一個。開發時想跑的一律是主程式
