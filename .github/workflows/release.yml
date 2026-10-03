@@ -15,7 +15,13 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
+      # fetch-tags：預設的淺層抓取只會把 tag 解析成它指向的 commit，本地的
+      # refs/tags/<tag> 因此不是 annotated tag 物件，發佈說明那一步讀到的會是
+      # commit 訊息而不是 tag 說明（v0.16.1 就這樣把 commit 的 Co-Authored-By
+      # 印到公開的發佈頁上）
       - uses: actions/checkout@v5
+        with:
+          fetch-tags: true
 
       - name: Rust 建置快取
         uses: Swatinem/rust-cache@v2
@@ -128,17 +134,29 @@ jobs:
             '- **Windows**：出現「Windows 已保護您的電腦」→ 點左下角小字「其他資訊」→「仍要執行」。預設只看得到「不要執行」，所以一定要先點「其他資訊」。'
             '- **macOS**：照 zip 內「Mac 首次開啟說明.txt」放行（系統設定 ▸ 隱私權與安全性 ▸ 往下捲到「已封鎖 photo2video」▸ 仍要打開）。'
           )
-          # annotated tag 自己的說明。git tag -l 印的是 tag 物件的內容，不是它
-          # 指向的 commit；輕量 tag 或沒寫說明時會是空的，那就略過這一段
-          $summary = (@(git tag -l --format='%(contents)' $tag) -join "`n").Trim()
+          # annotated tag 自己的說明。只在確認那個 ref 真的是 tag 物件時才採用：
+          # 輕量 tag（或 checkout 沒抓到 tag 物件時）%(contents) 會退回成 commit
+          # 訊息，整段 commit 內文連 Co-Authored-By 之類的 trailer 都會印到發佈
+          # 頁上，寧可略過這一段也不要印錯的東西
+          $type = ((git for-each-ref "refs/tags/$tag" --format='%(objecttype)') -join '').Trim()
+          $summary = ''
+          if ($type -eq 'tag') {
+            $raw = (@(git for-each-ref "refs/tags/$tag" --format='%(contents)') -join "`n")
+            # 保險起見仍濾掉 trailer：那是給版本歷史看的，不是給使用者看的
+            $summary = (($raw -split "`n") | Where-Object { $_ -notmatch '^[A-Za-z][A-Za-z-]*-[Bb]y:\s' }) -join "`n"
+            $summary = $summary.Trim()
+          }
           if ($summary) {
             $lines += @('', '### 這一版', '', $summary)
           } else {
-            Write-Host "找不到 $tag 的 annotated tag 說明，略過「這一版」那一段"
+            Write-Host "refs/tags/$tag 的 objecttype 是「$type」而非 tag，或說明是空的，略過「這一版」那一段"
           }
           $lines | Set-Content -Path notes.md -Encoding utf8NoBOM
           Write-Host "--- notes.md ---"
           Get-Content notes.md
+          # GitHub 的 pwsh 會在步驟結尾照 $LASTEXITCODE 決定成敗，而上面最後一個
+          # 原生命令是 git。確保這一步不會因為 git 的殘留結束碼而被判失敗
+          exit 0
 
       - name: 發佈到 GitHub Releases
         if: startsWith(github.ref, 'refs/tags/')
