@@ -1,6 +1,7 @@
 name: Release
 
-# 推送 v 開頭的 tag（例如 v0.2.0）時自動建置並發佈到 GitHub Releases。
+# 推送 v 開頭的 tag（例如 v0.2.0）時自動建置、打包、上傳到 GitHub Releases，
+# 但存成草稿（draft: true，見發佈 step）：要到發佈頁按「Publish release」才公開。
 # workflow_dispatch 讓人能從 Actions 頁面手動試跑：一樣會完整建置與打包，
 # 但不發佈，只把成品留成 artifact 供下載測試——不用先推一個 tag 出去才知道會不會失敗
 on:
@@ -168,6 +169,13 @@ jobs:
             photo2video.exe
           body_path: notes.md
           generate_release_notes: true
+          # 先存成草稿：建置、打包、上傳照常自動跑完，但要到發佈頁按
+          # 「Publish release」才會公開——在那之前 releases/latest 不會動、
+          # 程式內的自動更新也不會推給任何人，留一道「測過才公開」的關卡。
+          # 三個 job 的發佈 step 都必須設 draft，缺一不可：這個 action 沒設
+          # draft 時是用「依 tag 查詢」找既有 release，而那個 API 看不到草稿，
+          # 找不到就會自己再建一份公開的 release
+          draft: true
 
       - name: 手動試跑時留下成品供下載
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -354,6 +362,8 @@ jobs:
           files: |
             photo2video-*macos-${{ matrix.arch }}.zip
             upload/photo2video-macos-${{ matrix.arch }}
+          # 與 Windows 那邊一致（原因見該處註解）：少了這行會找不到草稿而另建一份公開的
+          draft: true
 
       - name: 手動試跑時留下成品供下載
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
