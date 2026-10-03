@@ -52,11 +52,93 @@ jobs:
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
           $exe = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           Copy-Item $exe.FullName package/
+          # 沒有程式碼簽章，SmartScreen 會擋下第一次執行，而且預設只給一顆
+          # 「不要執行」——不先點「其他資訊」根本看不到放行的按鈕。把解法寫進
+          # 包裡，不然使用者只會以為程式是病毒（比照 macOS 那份首次開啟說明）。
+          # 用字串陣列而不是 here-string：YAML 區塊裡的 PowerShell here-string
+          # 結尾符號必須落在行首，縮排一變動就整段壞掉
+          @(
+            'photo2video for Windows'
+            '======================='
+            ''
+            '安裝'
+            '----'
+            '把整個 zip 解壓到任何位置（例如「文件」或桌面），直接執行'
+            'photo2video.exe 即可，沒有安裝程序。photo2video.exe 與'
+            'ffmpeg.exe 必須放在同一個資料夾。'
+            ''
+            '第一次開啟會被系統擋下'
+            '----------------------'
+            '本程式沒有購買程式碼簽章，Windows 會顯示藍底的「Windows 已保護'
+            '您的電腦」。這是未簽章的程式都會有的提示，並非程式有問題。'
+            '放行方式：'
+            ''
+            '  1. 在那個藍色視窗點左下角的小字「其他資訊」。'
+            '  2. 下面會多出一顆「仍要執行」，按它即可。'
+            ''
+            '預設只看得到「不要執行」，所以一定要先點「其他資訊」。放行過'
+            '一次之後，之後開啟就不會再問。'
+            ''
+            '如果防毒軟體擋下'
+            '----------------'
+            '部分防毒軟體會對沒有簽章、又會讀寫大量檔案的程式提出警告。'
+            '把解壓後的資料夾加入排除清單即可。'
+            ''
+            'FFmpeg'
+            '------'
+            '已附在同一個資料夾（ffmpeg.exe），不需另外安裝。'
+            ''
+            '其餘操作方式請看「使用說明.md」。'
+          ) | Set-Content -Path 'package/Windows 首次開啟說明.txt' -Encoding utf8BOM
           Compress-Archive -Path package/* -DestinationPath "photo2video-${{ github.ref_name }}-windows-x64.zip"
           # 另附固定檔名的複本，讓 releases/latest/download/photo2video-windows-x64.zip 永遠指向最新版
           Copy-Item "photo2video-${{ github.ref_name }}-windows-x64.zip" photo2video-windows-x64.zip
           # 單獨附上 exe，供程式內「立即更新」只下載主程式（不含 ffmpeg，體積小）
           Copy-Item target/release/photo2video.exe photo2video.exe
+
+      # 發佈頁原本只有 generate_release_notes 產生的 PR 清單，沒有一句告訴
+      # 使用者該下載哪一個檔案（發佈頁上有 9 個資產，其中三個是一鍵更新專用
+      # 的單檔），也沒提未簽章會被系統擋下。這裡把這兩段寫在前面，後面再接
+      # tag 自己寫的這版摘要；GitHub 的 API 會把自動產生的 commit 清單接在
+      # body 之後，所以兩者併存，不必自己組 changelog
+      - name: 組出發佈說明
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $lines = @(
+            '### 下載哪一個？'
+            ''
+            '| 你的電腦 | 檔案 |'
+            '| --- | --- |'
+            "| Windows | **photo2video-$tag-windows-x64.zip** |"
+            "| macOS（Apple 晶片 M1～M4） | **photo2video-$tag-macos-arm64.zip** |"
+            "| macOS（Intel） | **photo2video-$tag-macos-x64.zip** |"
+            ''
+            '解壓即可使用，zip 內含主程式、FFmpeg 與使用說明，**不需另外安裝 FFmpeg**。'
+            ''
+            '下面沒有 `.zip` 的 `photo2video.exe`、`photo2video-macos-arm64` 與'
+            '`photo2video-macos-x64` 是**給程式內「立即更新」下載用的**主程式單檔'
+            '（不含 FFmpeg，體積小），一般下載請用上表的 zip。'
+            ''
+            '### 第一次開啟會被系統擋下'
+            ''
+            '本程式沒有購買程式碼簽章，第一次執行時系統會擋下來。這是未簽章程式的'
+            '通例，不是程式有問題：'
+            ''
+            '- **Windows**：出現「Windows 已保護您的電腦」→ 點左下角小字「其他資訊」→「仍要執行」。預設只看得到「不要執行」，所以一定要先點「其他資訊」。'
+            '- **macOS**：照 zip 內「Mac 首次開啟說明.txt」放行（系統設定 ▸ 隱私權與安全性 ▸ 往下捲到「已封鎖 photo2video」▸ 仍要打開）。'
+          )
+          # annotated tag 自己的說明。git tag -l 印的是 tag 物件的內容，不是它
+          # 指向的 commit；輕量 tag 或沒寫說明時會是空的，那就略過這一段
+          $summary = (@(git tag -l --format='%(contents)' $tag) -join "`n").Trim()
+          if ($summary) {
+            $lines += @('', '### 這一版', '', $summary)
+          } else {
+            Write-Host "找不到 $tag 的 annotated tag 說明，略過「這一版」那一段"
+          }
+          $lines | Set-Content -Path notes.md -Encoding utf8NoBOM
+          Write-Host "--- notes.md ---"
+          Get-Content notes.md
 
       - name: 發佈到 GitHub Releases
         if: startsWith(github.ref, 'refs/tags/')
@@ -66,6 +148,7 @@ jobs:
           files: |
             photo2video-*.zip
             photo2video.exe
+          body_path: notes.md
           generate_release_notes: true
 
       - name: 手動試跑時留下成品供下載

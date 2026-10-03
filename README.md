@@ -4,12 +4,19 @@
 
 ## 下載
 
-不想自己建置的話：
+不想自己建置的話，下面三條連結永遠指向最新版：
 
-- **最新版直接下載**：<https://github.com/Yellow5363/photo2video/releases/latest/download/photo2video-windows-x64.zip>（永遠指向最新版）
-- [Releases 頁面](https://github.com/Yellow5363/photo2video/releases/latest) 可看歷史版本與更新紀錄
+| 你的電腦 | 下載 |
+| --- | --- |
+| Windows | [photo2video-windows-x64.zip](https://github.com/Yellow5363/photo2video/releases/latest/download/photo2video-windows-x64.zip) |
+| macOS（Apple 晶片 M1～M4） | [photo2video-macos-arm64.zip](https://github.com/Yellow5363/photo2video/releases/latest/download/photo2video-macos-arm64.zip) |
+| macOS（Intel） | [photo2video-macos-x64.zip](https://github.com/Yellow5363/photo2video/releases/latest/download/photo2video-macos-x64.zip) |
 
-zip 內含 `photo2video.exe`、`ffmpeg.exe` 與使用說明，解壓即可使用。程式啟動時會自動檢查更新並在視窗底部提示。
+[Releases 頁面](https://github.com/Yellow5363/photo2video/releases/latest) 可看歷史版本與更新紀錄。
+
+zip 內含主程式、FFmpeg 與使用說明，**解壓即可使用、不需另外安裝 FFmpeg**。程式啟動時會自動檢查更新並在視窗底部提示。
+
+> **第一次開啟會被系統擋下。** 本程式沒有購買程式碼簽章，所以：Windows 會顯示「Windows 已保護您的電腦」，請點左下小字「**其他資訊**」再按「**仍要執行**」（預設只看得到「不要執行」）；macOS 的放行步驟寫在 zip 內的「Mac 首次開啟說明.txt」。兩者都是未簽章程式的通例，不是程式有問題。
 
 ## 主畫面
 
