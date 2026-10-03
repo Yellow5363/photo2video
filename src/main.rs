@@ -964,18 +964,73 @@ impl Default for ProjectFile {
     }
 }
 
-/// 解析 "v1.2.3" 或 "1.2.3" 為可比較的版本號
-fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+/// 可以直接比大小的版本號：先比 X.Y.Z，同一個 X.Y.Z 底下**正式版大於預發布版**
+/// （0.16.0 > 0.16.0-beta.2 > 0.16.0-beta.1）。
+///
+/// 預發布之間只比尾巴的數字（beta.2 > beta.1、rc1 > beta.9 不成立——
+/// 這裡不分 beta 與 rc，沒有數字就當 0），夠分辨「同一輪測試的第幾版」
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    /// 正式版 true、預發布（-beta、-rc…）false：排在 patch 後面，
+    /// 同一個 X.Y.Z 時正式版才會比較大
+    release: bool,
+    /// 預發布後綴裡的數字（beta.2 → 2）；正式版是 0
+    pre: u64,
+}
+
+impl Version {
+    #[cfg(test)]
+    fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+            release: true,
+            pre: 0,
+        }
+    }
+}
+
+/// 解析 "v1.2.3"、"1.2.3" 或 "1.2.3-beta.2" 為可比較的版本號。
+///
+/// 預發布後綴（-beta.1）要認得而不是丟掉：丟掉的話 0.16.0-beta.1 和 0.16.0
+/// 一樣大，裝 beta 的人永遠收不到正式版的更新通知。組建資訊（+build）
+/// 照舊不算
+fn parse_version(s: &str) -> Option<Version> {
     let s = s.trim().trim_start_matches(['v', 'V']);
-    // 去掉 semver 的預發布（-rc1）與組建（+build）後綴，只取核心的 X.Y.Z：
-    // 否則帶後綴的 tag 會讓 patch 段（如「0-rc1」）解析失敗、parse_version
-    // 回 None，使整個更新檢查靜默失效——所有舊版使用者都收不到該次更新通知
-    let core = s.split(['-', '+']).next().unwrap_or(s);
+    let s = s.split('+').next().unwrap_or(s);
+    let (core, pre) = match s.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (s, None),
+    };
     let mut it = core.split('.');
     let major = it.next()?.parse().ok()?;
     let minor = it.next()?.parse().ok()?;
     let patch = it.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
+    // 後綴只取最後那串數字：beta.2、rc1、beta 分別是 2、1、0
+    let pre_num = pre
+        .map(|p| {
+            let digits: String = p
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            digits.parse().unwrap_or(0)
+        })
+        .unwrap_or(0);
+    Some(Version {
+        major,
+        minor,
+        patch,
+        release: pre.is_none(),
+        pre: pre_num,
+    })
 }
 
 /// 查詢 GitHub 最新 release：Ok(Some(tag)) 表示有新版、Ok(None) 表示已是最新
@@ -33546,18 +33601,30 @@ mod tests {
 
     #[test]
     fn parse_version_basic_and_ordering() {
-        assert_eq!(parse_version("v0.8.6"), Some((0, 8, 6)));
-        assert_eq!(parse_version("0.8"), Some((0, 8, 0))); // 缺 patch 補 0
+        assert_eq!(parse_version("v0.8.6"), Some(Version::new(0, 8, 6)));
+        assert_eq!(parse_version("0.8"), Some(Version::new(0, 8, 0))); // 缺 patch 補 0
         // 10 > 9：數值比較，非字典序
         assert!(parse_version("0.8.10") > parse_version("0.8.9"));
     }
 
+    /// 預發布版排在同號正式版**前面**，不同號之間照 X.Y.Z 比。
+    /// 這決定了誰會收到更新通知：裝 beta 的要收到正式版、裝舊正式版的
+    /// 要收到新正式版，而 beta 與正式版同號時不能算成「已是最新」
     #[test]
-    fn parse_version_strips_prerelease_and_build_suffix() {
-        // 帶 semver 後綴的 tag 也要能解析出核心版本，否則更新檢查會靜默失效
-        assert_eq!(parse_version("v0.9.0-rc1"), Some((0, 9, 0)));
-        assert_eq!(parse_version("0.9.0+build.7"), Some((0, 9, 0)));
-        assert_eq!(parse_version("v1.2.3-beta.2+meta"), Some((1, 2, 3)));
+    fn parse_version_orders_prerelease_before_release() {
+        let beta1 = parse_version("v0.16.0-beta.1").unwrap();
+        let beta2 = parse_version("v0.16.0-beta.2").unwrap();
+        let rel = parse_version("v0.16.0").unwrap();
+        let older = parse_version("v0.15.0").unwrap();
+        assert!(older < beta1, "舊正式版要看得到 beta 是新的");
+        assert!(beta1 < beta2, "同一輪測試的第二版要比第一版新");
+        assert!(beta2 < rel, "正式版出了，裝 beta 的要收得到通知");
+        assert!(rel > older);
+        // 組建資訊不算；沒有數字的後綴當 0
+        assert_eq!(parse_version("0.9.0+build.7"), Some(Version::new(0, 9, 0)));
+        assert_eq!(parse_version("v1.2.3-beta.2+meta"), parse_version("1.2.3-beta.2"));
+        assert!(parse_version("1.0.0-beta") < parse_version("1.0.0-beta.1"));
+        assert!(parse_version("1.0.0-rc1") < parse_version("1.0.0"));
     }
 
     #[test]
