@@ -26524,7 +26524,7 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("指定硬碟")
+                egui::RichText::new("💽  指定硬碟")
                     .size(13.0)
                     .strong()
                     .color(theme::TEXT),
@@ -26578,7 +26578,7 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("硬碟編號")
+                egui::RichText::new("🆔  硬碟編號")
                     .size(13.0)
                     .strong()
                     .color(theme::TEXT),
@@ -26610,7 +26610,7 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("路徑深度")
+                egui::RichText::new("📁  路徑深度")
                     .size(13.0)
                     .strong()
                     .color(theme::TEXT),
@@ -27257,7 +27257,7 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("關鍵字")
+                egui::RichText::new("🔍  關鍵字")
                     .size(13.0)
                     .strong()
                     .color(theme::TEXT),
@@ -27284,7 +27284,7 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("硬碟編號")
+                egui::RichText::new("🆔  硬碟編號")
                     .size(13.0)
                     .strong()
                     .color(theme::TEXT),
