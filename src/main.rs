@@ -23,6 +23,8 @@ mod backup;
 mod dehaze;
 use dehaze::SmokeParams;
 
+mod disk;
+
 mod edit;
 use edit::{Finish, TextItem};
 
@@ -2286,12 +2288,20 @@ enum LastDir {
     BackupSource,
     /// 硬碟管理 ▸ 資料備份：目的資料夾
     BackupDest,
+    /// 硬碟管理 ▸ 硬碟檔案管理：要建檔的那一顆硬碟
+    DiskRoot,
+    /// 硬碟管理 ▸ 硬碟檔案管理：總表放在哪個資料夾。
+    ///
+    /// 這一個與其他的用法不太一樣：別的只是「對話框從哪裡開始」，
+    /// 它是**設定本身**（總表就存在那裡，見 [`DiskTool::dir`]），
+    /// 沒設過就是「圖片」資料夾（見 [`pictures_dir`]）
+    DiskTable,
 }
 
 impl LastDir {
     /// 全部的用途。加新欄位時記得補進來——測試會拿它檢查沒有兩個用途
     /// 共用同一個 config 欄位
-    const ALL: [LastDir; 19] = [
+    const ALL: [LastDir; 21] = [
         LastDir::VideoPhotos,
         LastDir::VideoProject,
         LastDir::VideoMusic,
@@ -2311,6 +2321,8 @@ impl LastDir {
         LastDir::EnhanceProject,
         LastDir::BackupSource,
         LastDir::BackupDest,
+        LastDir::DiskRoot,
+        LastDir::DiskTable,
     ];
 
     /// config.json 裡的欄位名（改動會讓使用者的記錄重來一次，勿隨意更名）
@@ -2335,6 +2347,8 @@ impl LastDir {
             LastDir::EnhanceProject => "dir_enhance_project",
             LastDir::BackupSource => "dir_backup_source",
             LastDir::BackupDest => "dir_backup_dest",
+            LastDir::DiskRoot => "dir_disk_root",
+            LastDir::DiskTable => "dir_disk_table",
         }
     }
 
@@ -7465,6 +7479,202 @@ impl FilesTab {
     }
 }
 
+
+// ---------- 硬碟管理 ▸ 硬碟檔案管理 ----------
+
+/// 總表預設放哪裡：使用者的「圖片」資料夾（使用者定的位置，之後可以自己改，
+/// 改過就記在設定檔裡，見 [`LastDir::DiskTable`]）。
+///
+/// 走 `SHGetKnownFolderPath` 而不是自己把 `%USERPROFILE%\Pictures` 兜出來：
+/// 圖片資料夾可以被搬到別的碟，也可能被 OneDrive 接管，兜出來的那個路徑這時
+/// 根本不存在。問系統拿到的才是現在真的那一個
+#[cfg(windows)]
+fn pictures_dir() -> PathBuf {
+    use std::ffi::{c_void, OsString};
+    use std::os::windows::ffi::OsStringExt;
+    #[repr(C)]
+    struct Guid {
+        d1: u32,
+        d2: u16,
+        d3: u16,
+        d4: [u8; 8],
+    }
+    /// FOLDERID_Pictures {33E28130-4E1E-4676-835A-98395C3BC3BB}
+    const PICTURES: Guid = Guid {
+        d1: 0x33E2_8130,
+        d2: 0x4E1E,
+        d3: 0x4676,
+        d4: [0x83, 0x5A, 0x98, 0x39, 0x5C, 0x3B, 0xC3, 0xBB],
+    };
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(id: *const Guid, flags: u32, token: isize, out: *mut *mut u16)
+            -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(p: *mut c_void);
+    }
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    // 失敗時不會給出指標，也就不必（不可以）釋放
+    let got = unsafe {
+        if SHGetKnownFolderPath(&PICTURES, 0, 0, &mut raw) != 0 || raw.is_null() {
+            None
+        } else {
+            let mut len = 0;
+            while *raw.add(len) != 0 {
+                len += 1;
+            }
+            let s = OsString::from_wide(std::slice::from_raw_parts(raw, len));
+            CoTaskMemFree(raw.cast());
+            Some(PathBuf::from(s))
+        }
+    };
+    got.filter(|p| p.is_dir())
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(|h| PathBuf::from(h).join("Pictures"))
+                .filter(|p| p.is_dir())
+        })
+        .unwrap_or_else(config_dir)
+}
+
+#[cfg(not(windows))]
+fn pictures_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("Pictures"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(config_dir)
+}
+
+/// 硬碟檔案管理目前在背景做的事（同時間只會有一件）
+#[derive(PartialEq, Clone, Copy, Default)]
+enum DiskBusy {
+    #[default]
+    Idle,
+    /// 正在走這顆碟、把資料夾一個一個記下來
+    Scanning,
+    /// 掃完了，正在寫總表與匯出 Excel／PDF
+    Writing,
+}
+
+/// 背景執行緒回報給硬碟檔案管理的訊息
+enum DiskMsg {
+    /// 已經掃到幾個資料夾、現在走到哪一個
+    At(usize, String),
+    /// 掃描結束，開始寫檔
+    Writing,
+    /// 整件事做完了（Box 起來：成功那一份帶著整張總表，直接放進
+    /// enum 會讓每一則訊息都胖成那個大小）
+    Done(Box<Result<DiskDone, String>>),
+}
+
+/// 一次掃描做完之後的成果
+struct DiskDone {
+    /// 換好這顆碟的資料、已經存檔的總表
+    table: disk::Table,
+    /// 這顆碟掃到幾個資料夾
+    rows: usize,
+    /// 讀不進去而跳過的資料夾
+    skipped: Vec<String>,
+}
+
+/// 「硬碟管理 ▸ 硬碟檔案管理」的狀態。
+/// 切到別的模組時整份留著，切回來就是剛才離開的樣子
+struct DiskTool {
+    /// 要掃哪一顆碟（挑根目錄就是整顆，挑底下某個資料夾就只掃那一塊）
+    root: Option<PathBuf>,
+    /// 硬碟編號。畫面上是可以改的文字框，所以存字串
+    /// （四位數的寫法見 [`disk::fmt_no`]）
+    no_text: String,
+    /// 路徑深度（掃到第幾層為止）
+    depth_text: String,
+    /// 總表放在哪個資料夾
+    dir: PathBuf,
+    /// 總表本體
+    table: disk::Table,
+    /// 總表讀過了沒（第一次進這一頁才讀，不是開程式就讀）
+    loaded: bool,
+    /// 總表讀不回來的原因。**有值就不准掃描**：讀不回來的時候掃完一存，
+    /// 等於把舊的那一份整個蓋掉
+    load_error: Option<String>,
+    busy: DiskBusy,
+    rx: Option<Receiver<DiskMsg>>,
+    cancel: Arc<AtomicBool>,
+    /// 掃到幾個資料夾、現在走到哪（進度那兩行）
+    found: usize,
+    at: String,
+    result: Option<String>,
+    error: Option<String>,
+    /// 上一次掃描讀不進去而跳過的資料夾
+    skipped: Vec<String>,
+}
+
+impl Default for DiskTool {
+    fn default() -> Self {
+        Self {
+            root: None,
+            no_text: String::new(),
+            // 使用者舊工具的預設值，照搬
+            depth_text: "5".into(),
+            dir: load_last_dir(LastDir::DiskTable).unwrap_or_else(pictures_dir),
+            table: disk::Table::default(),
+            loaded: false,
+            load_error: None,
+            busy: DiskBusy::Idle,
+            rx: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            found: 0,
+            at: String::new(),
+            result: None,
+            error: None,
+            skipped: Vec::new(),
+        }
+    }
+}
+
+impl DiskTool {
+    /// 編號文字框現在是哪一號（空白、不是數字、超出 1~9999 都是 None）
+    fn no(&self) -> Option<u32> {
+        self.no_text
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=9999).contains(n))
+    }
+
+    /// 深度文字框現在是幾層（1~20 之外都是 None）。
+    /// 上限 20 不是技術限制，是「再深就不是在整理、是在抄整顆碟」
+    fn depth(&self) -> Option<u32> {
+        self.depth_text
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=20).contains(n))
+    }
+
+    /// 三個檔案（索引、Excel、PDF）的完整路徑
+    fn files(&self) -> [PathBuf; 3] {
+        [
+            disk::Table::path_in(&self.dir),
+            self.dir.join(format!("{}.xlsx", disk::TABLE_STEM)),
+            self.dir.join(format!("{}.pdf", disk::TABLE_STEM)),
+        ]
+    }
+}
+
+/// 硬碟檔案管理那一頁按了什麼（畫的時候只記下來，畫完才動狀態）
+#[derive(Default)]
+struct DiskClicks {
+    pick_root: bool,
+    pick_dir: bool,
+    scan: bool,
+    stop: bool,
+    open_dir: bool,
+}
+
+// ---------- 硬碟管理 ▸ 資料備份 ----------
+
 /// 資料備份目前在背景做的事（同時間只會有一件）
 #[derive(PartialEq, Clone, Copy, Default)]
 enum BackupBusy {
@@ -7946,6 +8156,8 @@ struct App {
     enhance: EnhanceTool,
     /// 「硬碟管理 ▸ 資料備份」的狀態
     backup: BackupTool,
+    /// 「硬碟管理 ▸ 硬碟檔案管理」的狀態
+    disk: DiskTool,
     /// 「硬碟管理」現在停在哪一項功能（見 [`FilesTab`]）
     files_tab: FilesTab,
 }
@@ -8072,6 +8284,7 @@ impl App {
                 e
             },
             backup: BackupTool::new(),
+            disk: DiskTool::default(),
             files_tab: FilesTab::default(),
         };
         // 監看 UI 執行緒有沒有卡住（見 spawn_ui_watchdog）
@@ -26093,7 +26306,8 @@ impl App {
     fn ui_files_module(&mut self, ctx: &egui::Context) {
         match self.files_tab {
             FilesTab::Backup => self.ui_files_backup(ctx),
-            FilesTab::Disk | FilesTab::Search => self.ui_files_todo(ctx),
+            FilesTab::Disk => self.ui_files_disk(ctx),
+            FilesTab::Search => self.ui_files_todo(ctx),
         }
     }
 
@@ -26114,8 +26328,635 @@ impl App {
         ui.add_space(6.0);
     }
 
-    /// 「2. 硬碟檔案管理」與「3. 檔案搜尋」：功能還沒做，先把功能列上的位置
-    /// 佔著——點得進來、看得到名字，才知道這兩項是排在哪裡
+    /// 「2. 硬碟檔案管理」：把一顆碟掃成清單，收進總表再匯出。
+    /// 左邊挑碟與設定，右邊一欄是總表現況（收了哪幾顆碟、各幾筆）
+    fn ui_files_disk(&mut self, ctx: &egui::Context) {
+        self.disk_ensure_loaded();
+        let mut clicks = DiskClicks::default();
+        egui::SidePanel::right("disk_table")
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(14, 12)),
+            )
+            .resizable(true)
+            .default_width(380.0)
+            .width_range(300.0..=700.0)
+            .show(ctx, |ui| self.ui_disk_table(ui, &mut clicks));
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::same(12)),
+            )
+            .show(ctx, |ui| {
+                self.ui_files_tabs(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("disk_page")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.ui_disk_body(ui, &mut clicks));
+            });
+        if clicks.pick_root {
+            self.disk_pick_root();
+        }
+        if clicks.pick_dir {
+            self.disk_pick_table_dir();
+        }
+        if clicks.scan {
+            self.disk_scan(ctx);
+        }
+        if clicks.stop {
+            self.disk.cancel.store(true, Ordering::Relaxed);
+        }
+        if clicks.open_dir {
+            open_in_explorer(&self.disk.dir);
+        }
+    }
+
+    /// 左半邊：挑碟、編號、深度、開始掃描、進度與結果
+    fn ui_disk_body(&mut self, ui: &mut egui::Ui, clicks: &mut DiskClicks) {
+        let busy = self.disk.busy;
+        let idle = busy == DiskBusy::Idle;
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("指定硬碟")
+                    .size(13.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            if ui
+                .add_enabled(idle, egui::Button::new("📂  選擇"))
+                .on_hover_text(
+                    "要建檔的那一顆硬碟。\n\
+                     挑它的根目錄（例如 H:\\）就是整顆碟；只想記其中一塊，挑那個資料夾就好",
+                )
+                .clicked()
+            {
+                clicks.pick_root = true;
+            }
+            match &self.disk.root {
+                Some(p) => {
+                    ui.label(
+                        egui::RichText::new(p.to_string_lossy().into_owned())
+                            .size(13.0)
+                            .color(theme::TEXT),
+                    );
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("尚未選擇（也可以直接把資料夾拖進視窗）")
+                            .size(13.0)
+                            .color(theme::TEXT_WEAK),
+                    );
+                }
+            }
+        });
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("硬碟編號")
+                    .size(13.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.add_enabled(
+                idle,
+                egui::TextEdit::singleline(&mut self.disk.no_text)
+                    .desired_width(60.0)
+                    .char_limit(4),
+            )
+            .on_hover_text("這顆碟的號碼（1~9999）。每一顆碟一個號，不能重複");
+            // 這一號現在是什麼狀況，當場講：按下去才知道「原來會蓋掉」就太晚了
+            let (msg, color) = match self.disk.no() {
+                None => (
+                    "編號請填 1 到 9999 的數字".to_string(),
+                    theme::ERROR,
+                ),
+                Some(n) => match self.disk.table.count_of(n) {
+                    0 => ("還沒用過的編號".to_string(), theme::TEXT_WEAK),
+                    had => (
+                        format!("這一號已經有 {had} 筆資料，掃完會整批換掉"),
+                        theme::TRACK,
+                    ),
+                },
+            };
+            ui.label(egui::RichText::new(msg).size(12.0).color(color));
+        });
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("路徑深度")
+                    .size(13.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.add_enabled(
+                idle,
+                egui::TextEdit::singleline(&mut self.disk.depth_text)
+                    .desired_width(40.0)
+                    .char_limit(2),
+            )
+            .on_hover_text("往下掃幾層資料夾就停（1~20）");
+            ui.label(egui::RichText::new("層").size(13.0).color(theme::TEXT));
+            let msg = if self.disk.depth().is_some() {
+                "更深的資料夾不走進去，所以掃一顆碟要多久是可以預期的".to_string()
+            } else {
+                "深度請填 1 到 20 的數字".to_string()
+            };
+            let color = if self.disk.depth().is_some() {
+                theme::TEXT_WEAK
+            } else {
+                theme::ERROR
+            };
+            ui.label(egui::RichText::new(msg).size(12.0).color(color));
+        });
+        ui.add_space(12.0);
+
+        ui.horizontal(|ui| {
+            let ready = self.disk.root.is_some()
+                && self.disk.no().is_some()
+                && self.disk.depth().is_some()
+                && self.disk.load_error.is_none();
+            let run = primary_button(ui, "▶  開始建檔", idle && ready).on_hover_text(
+                "走過這顆碟、把每一個資料夾記下來，收進總表，\n\
+                 再把總表匯出成 Excel 與 PDF",
+            );
+            if run.clicked() {
+                clicks.scan = true;
+            }
+            if !idle {
+                ui.add_space(6.0);
+                if ui.button("✖  中止").clicked() {
+                    clicks.stop = true;
+                }
+            }
+        });
+        ui.add_space(8.0);
+
+        match busy {
+            DiskBusy::Scanning => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "正在走這顆碟…已經記下 {} 個資料夾",
+                            self.disk.found
+                        ))
+                        .size(12.5)
+                        .color(theme::TEXT),
+                    );
+                });
+                if !self.disk.at.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&self.disk.at)
+                            .size(11.5)
+                            .color(theme::TEXT_WEAK),
+                    );
+                }
+            }
+            DiskBusy::Writing => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("正在寫總表、匯出 Excel 與 PDF…")
+                            .size(12.5)
+                            .color(theme::TEXT),
+                    );
+                });
+            }
+            DiskBusy::Idle => {}
+        }
+
+        if let Some(e) = &self.disk.load_error {
+            ui.label(
+                egui::RichText::new(format!("✖ {e}"))
+                    .size(12.0)
+                    .color(theme::ERROR),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "讀不回舊的總表就先不要建檔：這時候存檔會把原本那一份整個蓋掉。\n\
+                     把那個檔案移走或修好，再回到這一頁",
+                )
+                .size(12.0)
+                .color(theme::TEXT_WEAK),
+            );
+            ui.add_space(6.0);
+        }
+        if let Some(e) = &self.disk.error {
+            ui.label(
+                egui::RichText::new(format!("✖ {e}"))
+                    .size(12.0)
+                    .color(theme::ERROR),
+            );
+            ui.add_space(6.0);
+        }
+        if let Some(r) = &self.disk.result {
+            ui.label(
+                egui::RichText::new(format!("✔ {r}"))
+                    .size(12.5)
+                    .color(theme::SUCCESS),
+            );
+            ui.add_space(6.0);
+        }
+        // 讀不進去的資料夾：不是錯誤，但要講——少了它們，這份清單就不是全部
+        if !self.disk.skipped.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "有 {} 個資料夾讀不進去，沒有記進表裡：",
+                    self.disk.skipped.len()
+                ))
+                .size(12.0)
+                .color(theme::TRACK),
+            );
+            for s in self.disk.skipped.iter().take(10) {
+                ui.label(
+                    egui::RichText::new(format!("· {s}"))
+                        .size(11.5)
+                        .color(theme::TEXT_WEAK),
+                );
+            }
+            if self.disk.skipped.len() > 10 {
+                ui.label(
+                    egui::RichText::new(format!("· …另外還有 {} 個", self.disk.skipped.len() - 10))
+                        .size(11.5)
+                        .color(theme::TEXT_WEAK),
+                );
+            }
+        }
+    }
+
+    /// 右半邊：總表現在收了什麼，以及它存在哪裡
+    fn ui_disk_table(&mut self, ui: &mut egui::Ui, clicks: &mut DiskClicks) {
+        // 內容一律撐滿面板寬（理由同 [`App::ui_backup_result`]：可拖曳的
+        // 側欄記的是「內容畫到多寬」，不撐滿會一幀比一幀窄）
+        ui.set_min_width(ui.available_width());
+        ui.label(
+            egui::RichText::new("總表")
+                .size(13.0)
+                .strong()
+                .color(theme::TEXT),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("存放位置")
+                .size(12.0)
+                .color(theme::TEXT_WEAK),
+        );
+        ui.label(
+            egui::RichText::new(self.disk.dir.to_string_lossy().into_owned())
+                .size(12.5)
+                .color(theme::TEXT),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.disk.busy == DiskBusy::Idle,
+                    egui::Button::new("📂  變更…").small(),
+                )
+                .on_hover_text("換一個資料夾放總表。換過之後會記住，下次直接用那裡")
+                .clicked()
+            {
+                clicks.pick_dir = true;
+            }
+            if ui
+                .add(egui::Button::new("↗  開啟").small())
+                .on_hover_text("在檔案總管裡打開這個資料夾")
+                .clicked()
+            {
+                clicks.open_dir = true;
+            }
+        });
+        ui.add_space(6.0);
+        // 三個檔案各自在不在（第一次用的時候一個都還沒有，講清楚免得以為壞了）
+        for p in self.disk.files() {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (mark, color) = if p.is_file() {
+                ("✔", theme::TEXT_WEAK)
+            } else {
+                ("·", theme::TEXT_WEAK)
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "{mark} {name}{}",
+                    if p.is_file() { "" } else { "（還沒有）" }
+                ))
+                .size(11.5)
+                .color(color),
+            );
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        let disks = self.disk.table.disks();
+        ui.label(
+            egui::RichText::new(format!(
+                "收了 {} 顆硬碟，共 {} 筆",
+                disks.len(),
+                self.disk.table.rows.len()
+            ))
+            .size(12.5)
+            .strong()
+            .color(theme::TEXT),
+        );
+        ui.add_space(4.0);
+        if disks.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "還沒有任何資料。左邊挑一顆碟、給它一個編號，按「開始建檔」就會記進來",
+                )
+                .size(12.0)
+                .color(theme::TEXT_WEAK),
+            );
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("disk_table_list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for n in disks {
+                    let rows = self.disk.table.count_of(n);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(disk::fmt_no(n))
+                                .size(12.5)
+                                .strong()
+                                .color(theme::TEXT),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{rows} 筆"))
+                                .size(12.0)
+                                .color(theme::TEXT_WEAK),
+                        );
+                    });
+                    if let Some(note) = self.disk.table.notes.get(&n) {
+                        let when = if note.at > 0 {
+                            disk::fmt_time(note.at)
+                        } else {
+                            String::new()
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("　{} {}", note.root, when).trim_end())
+                                .size(11.5)
+                                .color(theme::TEXT_WEAK),
+                        );
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+    }
+
+    /// 第一次進這一頁（或換過總表位置）時把總表讀進來，順手把編號預設成
+    /// **下一個空號**——「開程式就找空號、沒空號就接在最後一號後面」是
+    /// 使用者定的規矩（見 [`disk::Table::next_no`]）
+    fn disk_ensure_loaded(&mut self) {
+        if self.disk.loaded {
+            return;
+        }
+        self.disk.loaded = true;
+        match disk::Table::load(&self.disk.dir) {
+            Ok(t) => {
+                self.disk.table = t;
+                self.disk.load_error = None;
+                self.disk.no_text = disk::fmt_no(self.disk.table.next_no());
+            }
+            Err(e) => {
+                self.disk.table = disk::Table::default();
+                self.disk.load_error = Some(e);
+            }
+        }
+    }
+
+    /// 挑要建檔的那一顆碟
+    fn disk_pick_root(&mut self) {
+        if let Some(d) = pick_folder_remembering(
+            LastDir::DiskRoot,
+            "選擇要建檔的硬碟（挑根目錄就是整顆碟）",
+            None,
+        ) {
+            self.disk_set_root(d);
+        }
+    }
+
+    /// 設定要掃的碟（選的、拖進來的都走這裡）
+    fn disk_set_root(&mut self, dir: PathBuf) {
+        remember_dir(LastDir::DiskRoot, &dir);
+        self.disk.root = Some(dir);
+        self.disk.error = None;
+    }
+
+    /// 換一個資料夾放總表：換完**立刻把那裡的總表讀進來**。
+    /// 那個資料夾裡可能已經有一份（換電腦、或原本就放在同步資料夾裡），
+    /// 不讀進來的話下一次建檔就會拿手上這份把它蓋掉
+    fn disk_pick_table_dir(&mut self) {
+        let Some(d) = pick_folder_remembering(
+            LastDir::DiskTable,
+            "選擇總表要放在哪個資料夾",
+            Some(&self.disk.dir),
+        ) else {
+            return;
+        };
+        remember_dir(LastDir::DiskTable, &d);
+        self.disk.dir = d;
+        self.disk.loaded = false;
+        self.disk.result = None;
+        self.disk_ensure_loaded();
+    }
+
+    /// 按下「開始建檔」：檢查過設定、必要時問一聲，再開一條執行緒把整件事
+    /// 從頭做到尾（走碟 → 併進總表 → 存總表 → 匯出 Excel 與 PDF）。
+    ///
+    /// **一條執行緒做完**：中間每一步都可能跑上幾分鐘，分段回到 UI 執行緒
+    /// 只會讓畫面在「掃完了嗎」「存好了嗎」之間閃；要讓使用者看的只有
+    /// 「現在做到哪、好了沒」
+    fn disk_scan(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.disk.root.clone() else {
+            self.disk.error = Some("還沒挑要建檔的硬碟".into());
+            return;
+        };
+        let Some(no) = self.disk.no() else {
+            self.disk.error = Some("硬碟編號請填 1 到 9999 的數字".into());
+            return;
+        };
+        let Some(depth) = self.disk.depth() else {
+            self.disk.error = Some("路徑深度請填 1 到 20 的數字".into());
+            return;
+        };
+        if let Some(e) = self.disk.load_error.clone() {
+            self.disk.error = Some(format!("總表讀不回來，先處理再建檔：{e}"));
+            return;
+        }
+        // 這個編號已經有資料：掃完會整批換掉，先問過。
+        //
+        // 「換掉」才是對的——硬碟隨時在新增、刪改檔案，同一顆碟本來就會再讀
+        // 第二次、第三次；疊上去的話，早就刪掉的資料夾會永遠留在表上，而那
+        // 正是最會害人白找一場的假資料。但換掉得是使用者點頭的
+        let had = self.disk.table.count_of(no);
+        if had > 0 {
+            let from = self
+                .disk
+                .table
+                .notes
+                .get(&no)
+                .map(|n| {
+                    let when = if n.at > 0 {
+                        format!("、{}", disk::fmt_time(n.at))
+                    } else {
+                        String::new()
+                    };
+                    format!("（上次從「{}」{}建的）", n.root, when)
+                })
+                .unwrap_or_default();
+            if !ask2(
+                rfd::MessageLevel::Warning,
+                "這個編號已經有資料了",
+                &format!(
+                    "編號 {} 底下已經有 {had} 筆資料{from}。\n\n\
+                     繼續的話會重新走一次這顆碟，掃到的結果整批換掉那 {had} 筆——\
+                     上次建檔之後被刪掉的資料夾就不會再留在表上。\n\n\
+                     如果這是另一顆碟，請改一個還沒用過的編號。",
+                    disk::fmt_no(no)
+                ),
+                "重新建檔，換掉舊的",
+                "取消",
+            ) {
+                return;
+            }
+        }
+
+        let dir = self.disk.dir.clone();
+        // 把目前這份總表交給背景執行緒去改（複製一份：掃描期間右邊那一欄
+        // 還是要看得到現在的內容）
+        let mut table = disk::Table {
+            ver: self.disk.table.ver,
+            rows: self.disk.table.rows.clone(),
+            notes: self.disk.table.notes.clone(),
+        };
+        // PDF 要把中文字嵌進去，字型是開程式時就載好的那一份（20MB，
+        // 這裡只複製一個 Arc，不是再讀一次檔）
+        let font = CJK_FONT.get().cloned();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.disk.cancel = cancel.clone();
+        self.disk.busy = DiskBusy::Scanning;
+        self.disk.error = None;
+        self.disk.result = None;
+        self.disk.skipped.clear();
+        self.disk.found = 0;
+        self.disk.at.clear();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.disk.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let mut last = Instant::now();
+            let scanned = disk::scan(&root, depth, no, &cancel, &mut |n, at| {
+                // 節流：幾萬個資料夾一個一個回報會把通道塞爆，畫面也只是
+                // 跳得人眼看不清。十分之一秒更新一次就夠了
+                if last.elapsed() >= Duration::from_millis(100) {
+                    last = Instant::now();
+                    let _ = tx.send(DiskMsg::At(n, at.to_string_lossy().into_owned()));
+                    ctx.request_repaint();
+                }
+            });
+            let done = scanned.and_then(|s| {
+                let _ = tx.send(DiskMsg::Writing);
+                ctx.request_repaint();
+                let rows = s.rows.len();
+                table.replace_disk(
+                    no,
+                    s.rows,
+                    disk::DiskNote {
+                        root: root.to_string_lossy().into_owned(),
+                        at: SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    },
+                );
+                // 索引檔先存：Excel 與 PDF 是「人看的那一份」，萬一匯出失敗
+                // （檔案被 Excel 開著是最常見的），掃到的資料至少已經收好了
+                table.save(&dir)?;
+                disk::export_xlsx(&table.rows, &dir.join(format!("{}.xlsx", disk::TABLE_STEM)))?;
+                match font.as_ref() {
+                    Some(f) => disk::export_pdf(
+                        &table.rows,
+                        &dir.join(format!("{}.pdf", disk::TABLE_STEM)),
+                        f.font.as_ref(),
+                    )?,
+                    None => {
+                        return Err(
+                            "找不到系統中文字型，PDF 沒有匯出（總表與 Excel 已經存好）".into()
+                        )
+                    }
+                }
+                Ok(DiskDone {
+                    table,
+                    rows,
+                    skipped: s.skipped,
+                })
+            });
+            let _ = tx.send(DiskMsg::Done(Box::new(done)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 收背景執行緒的訊息（每一幀叫一次）
+    fn poll_disk(&mut self, _ctx: &egui::Context) {
+        loop {
+            let Some(rx) = &self.disk.rx else { break };
+            match rx.try_recv() {
+                Ok(DiskMsg::At(n, at)) => {
+                    self.disk.found = n;
+                    self.disk.at = at;
+                }
+                Ok(DiskMsg::Writing) => self.disk.busy = DiskBusy::Writing,
+                Ok(DiskMsg::Done(res)) => {
+                    self.disk.rx = None;
+                    self.disk.busy = DiskBusy::Idle;
+                    self.disk.at.clear();
+                    match *res {
+                        Ok(done) => {
+                            let no = self.disk.no().unwrap_or(0);
+                            self.disk.skipped = done.skipped;
+                            self.disk.table = done.table;
+                            self.disk.result = Some(format!(
+                                "編號 {} 建好了：{} 個資料夾，總表現在有 {} 筆（Excel 與 PDF 也更新了）",
+                                disk::fmt_no(no),
+                                done.rows,
+                                self.disk.table.rows.len()
+                            ));
+                            // 下一顆碟接著用下一個空號，不必自己改
+                            self.disk.no_text = disk::fmt_no(self.disk.table.next_no());
+                        }
+                        Err(e) if e == disk::CANCELLED => {
+                            self.disk.result = Some("已中止，總表沒有被動到".into());
+                        }
+                        Err(e) => {
+                            self.disk.error = Some(e);
+                            // 寫到一半失敗時，手上這份總表未必與檔案裡的一致，
+                            // 下一幀重讀一次，以檔案為準
+                            self.disk.loaded = false;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.disk.rx = None;
+                    self.disk.busy = DiskBusy::Idle;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 「3. 檔案搜尋」：功能還沒做，先把功能列上的位置佔著——點得進來、
+    /// 看得到名字，才知道它排在哪裡
     fn ui_files_todo(&mut self, ctx: &egui::Context) {
         let name = self.files_tab.name();
         egui::CentralPanel::default()
@@ -27360,9 +28201,16 @@ impl App {
                 (theme::TEXT_WEAK, "⏳", "存檔中，暫時無法加入照片")
             }
             Module::Enhance => (theme::ACCENT, "⬇", "放開滑鼠加入要優化的照片"),
-            // 還沒做好的那兩項：拖什麼進來都不收
-            Module::Files if self.files_tab != FilesTab::Backup => {
+            // 還沒做好的那一項：拖什麼進來都不收
+            Module::Files if self.files_tab == FilesTab::Search => {
                 (theme::TEXT_WEAK, "✖", "這個功能還在做，暫時不能拖東西進來")
+            }
+            Module::Files if self.files_tab == FilesTab::Disk => {
+                if self.disk.busy == DiskBusy::Idle {
+                    (theme::ACCENT, "⬇", "放開滑鼠設為要建檔的硬碟")
+                } else {
+                    (theme::TEXT_WEAK, "⏳", "建檔進行中，暫時不能換硬碟")
+                }
             }
             Module::Files if self.backup.busy != BackupBusy::Idle => {
                 (theme::TEXT_WEAK, "⏳", "備份進行中，暫時不能換資料夾")
@@ -27617,6 +28465,29 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.module = Module::Files;
                 self.files_tab = FilesTab::Backup;
+            } else if self.disk.busy == DiskBusy::Writing {
+                // 正在寫總表：這時關掉，留下的可能是半份檔案
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.module = Module::Files;
+                self.files_tab = FilesTab::Disk;
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Info)
+                    .set_title("正在寫總表")
+                    .set_description("硬碟檔案管理正在存總表與匯出檔案，請等它寫完再關閉。")
+                    .show();
+            } else if self.disk.busy == DiskBusy::Scanning
+                && !ask2(
+                    rfd::MessageLevel::Info,
+                    "正在建檔",
+                    "硬碟檔案管理還在走這顆碟（還沒寫出任何檔案）。\
+                     現在關掉的話這次建檔就白跑了，下次得整顆重走一遍。",
+                    "放棄建檔，直接關閉",
+                    "回去看",
+                )
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.module = Module::Files;
+                self.files_tab = FilesTab::Disk;
             } else {
                 // 專案與去煙霧各自可能有沒存的東西，一次講完再問一次就好
                 let mut pending: Vec<&str> = Vec::new();
@@ -27708,6 +28579,7 @@ impl eframe::App for App {
         self.poll_movie(ctx);
         self.poll_enhance(ctx);
         self.poll_backup(ctx);
+        self.poll_disk(ctx);
 
         // 支援直接拖曳檔案/資料夾進視窗
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -27856,6 +28728,12 @@ impl eframe::App for App {
                     0 => self.backup.error = Some("請拖曳「資料夾」進來，不是檔案".into()),
                     1 => self.backup_drop_one(dirs[0].clone()),
                     _ => self.backup_drop_two(dirs[0].clone(), dirs[1].clone()),
+                }
+            } else if self.files_tab == FilesTab::Disk && self.disk.busy == DiskBusy::Idle {
+                // 硬碟檔案管理一次只對一顆碟建檔，拖進來一疊也只取第一個資料夾
+                match dropped.iter().find(|p| p.is_dir()) {
+                    Some(d) => self.disk_set_root(d.clone()),
+                    None => self.disk.error = Some("請拖曳「資料夾」進來，不是檔案".into()),
                 }
             }
         } else if !dropped.is_empty() && !self.is_working() {
