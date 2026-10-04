@@ -111,7 +111,7 @@ enum Module {
     Movie,
     /// 優化影像（自動判斷該怎麼調色與強化主體，整批處理）
     Enhance,
-    /// 檔案管理（目前只有資料備份，之後再加別的）
+    /// 硬碟管理（資料備份、硬碟檔案管理、檔案搜尋）
     Files,
 }
 
@@ -134,7 +134,7 @@ impl Module {
             Module::Stack => "煙火疊圖",
             Module::Movie => "煙火影片去煙霧",
             Module::Enhance => "優化影像",
-            Module::Files => "檔案管理",
+            Module::Files => "硬碟管理",
         }
     }
 
@@ -161,11 +161,11 @@ impl Module {
             Module::Enhance => {
                 "整批照片自動調色並強化主體：層次、光影、通透度一次調好，處理後另存新檔"
             }
-            Module::Files => "資料備份：把來源資料夾同步到目的，新的蓋掉舊的、缺的補齊",
+            Module::Files => "整理硬碟上的檔案：資料備份、硬碟檔案管理、檔案搜尋",
         }
     }
 
-    /// 專案檔裡的模組識別字串；起始畫面與檔案管理沒有專案可存
+    /// 專案檔裡的模組識別字串；起始畫面與硬碟管理沒有專案可存
     fn project_kind(self) -> Option<&'static str> {
         Some(match self {
             Module::Home => return None,
@@ -2282,9 +2282,9 @@ enum LastDir {
     EnhanceOutput,
     /// 優化影像模組：專案檔（預設位置見 [`project::project_dir`]）
     EnhanceProject,
-    /// 檔案管理 ▸ 資料備份：來源資料夾
+    /// 硬碟管理 ▸ 資料備份：來源資料夾
     BackupSource,
-    /// 檔案管理 ▸ 資料備份：目的資料夾
+    /// 硬碟管理 ▸ 資料備份：目的資料夾
     BackupDest,
 }
 
@@ -2338,7 +2338,7 @@ impl LastDir {
         }
     }
 
-    /// 這個模組的專案檔上次停在哪個資料夾；檔案管理沒有專案
+    /// 這個模組的專案檔上次停在哪個資料夾；硬碟管理沒有專案
     fn project_of(m: Module) -> Option<LastDir> {
         Some(match m {
             Module::Video => LastDir::VideoProject,
@@ -2346,7 +2346,7 @@ impl LastDir {
             Module::Stack => LastDir::StackProject,
             Module::Movie => LastDir::MovieProject,
             Module::Enhance => LastDir::EnhanceProject,
-            // 起始畫面不屬於任何模組、檔案管理沒有專案：都沒有自己的位置
+            // 起始畫面不屬於任何模組、硬碟管理沒有專案：都沒有自己的位置
             Module::Home | Module::Files => return None,
         })
     }
@@ -7427,7 +7427,43 @@ const ENHANCE_AMOUNT_MAX: i32 = 200;
 /// 瓶頸是解 JPEG，開太多只會跟預覽、縮圖搶 CPU
 const ENHANCE_AUTO_WORKERS: usize = 3;
 
-// ---------- 檔案管理 ----------
+// ---------- 硬碟管理 ----------
+
+/// 「硬碟管理」底下的三項功能：模組畫面最上面那條功能列就是在這幾項之間切。
+/// 各項的狀態各自留著，切走再切回來就是離開時的樣子
+#[derive(PartialEq, Eq, Clone, Copy, Default)]
+enum FilesTab {
+    /// 1. 資料備份：把來源資料夾同步到目的（見 [`BackupTool`]）
+    #[default]
+    Backup,
+    /// 2. 硬碟檔案管理
+    Disk,
+    /// 3. 檔案搜尋
+    Search,
+}
+
+impl FilesTab {
+    /// 功能列的顯示順序（編號就是照這個順序標的）
+    const ALL: [FilesTab; 3] = [FilesTab::Backup, FilesTab::Disk, FilesTab::Search];
+
+    /// 功能列上的字：前面那個編號就是使用者口中的「第幾項」
+    fn label(self) -> &'static str {
+        match self {
+            FilesTab::Backup => "1. 資料備份",
+            FilesTab::Disk => "2. 硬碟檔案管理",
+            FilesTab::Search => "3. 檔案搜尋",
+        }
+    }
+
+    /// 功能本身的名字（不含編號），寫進句子裡時用
+    fn name(self) -> &'static str {
+        match self {
+            FilesTab::Backup => "資料備份",
+            FilesTab::Disk => "硬碟檔案管理",
+            FilesTab::Search => "檔案搜尋",
+        }
+    }
+}
 
 /// 資料備份目前在背景做的事（同時間只會有一件）
 #[derive(PartialEq, Clone, Copy, Default)]
@@ -7548,7 +7584,7 @@ impl BackupPair {
     }
 }
 
-/// 「檔案管理 ▸ 資料備份」的狀態：幾組資料夾、各自的比對結果。
+/// 「硬碟管理 ▸ 資料備份」的狀態：幾組資料夾、各自的比對結果。
 /// 切到別的模組時整份留著，切回來就是剛才離開的樣子
 #[derive(Default)]
 struct BackupTool {
@@ -7908,8 +7944,10 @@ struct App {
     movie: MovieTool,
     /// 「優化影像」工具的狀態
     enhance: EnhanceTool,
-    /// 「檔案管理 ▸ 資料備份」的狀態
+    /// 「硬碟管理 ▸ 資料備份」的狀態
     backup: BackupTool,
+    /// 「硬碟管理」現在停在哪一項功能（見 [`FilesTab`]）
+    files_tab: FilesTab,
 }
 
 impl App {
@@ -8034,6 +8072,7 @@ impl App {
                 e
             },
             backup: BackupTool::new(),
+            files_tab: FilesTab::default(),
         };
         // 監看 UI 執行緒有沒有卡住（見 spawn_ui_watchdog）
         spawn_ui_watchdog(&cc.egui_ctx);
@@ -10329,7 +10368,7 @@ impl App {
             MenuAction::OpenProject => match self.module {
                 // 起始畫面：還沒挑功能，從最近開過的專案旁邊找起
                 Module::Home => self.open_any_project(ctx),
-                // 檔案管理沒有專案可開，比照原本的行為用影片模組的位置
+                // 硬碟管理沒有專案可開，比照原本的行為用影片模組的位置
                 Module::Files => self.open_module_project(Module::Video, ctx),
                 other => self.open_module_project(other, ctx),
             },
@@ -26047,11 +26086,65 @@ impl App {
         set_preset
     }
 
-    // ---------- 檔案管理 ----------
+    // ---------- 硬碟管理 ----------
 
-    /// 「檔案管理」模組。底下的功能不只一項（之後還會再加），所以最上面
-    /// 留一條功能列；目前只有「1. 資料備份」這一項
+    /// 「硬碟管理」模組。最上面一條功能列在三項功能之間切（見 [`FilesTab`]），
+    /// 底下是那一項自己的畫面
     fn ui_files_module(&mut self, ctx: &egui::Context) {
+        match self.files_tab {
+            FilesTab::Backup => self.ui_files_backup(ctx),
+            FilesTab::Disk | FilesTab::Search => self.ui_files_todo(ctx),
+        }
+    }
+
+    /// 功能列：三項排成一列，正在看的那一項亮著並壓一條底線，按別的就換過去。
+    /// 每一項的畫面都從這一列開始畫，切來切去這一列的位置才不會跳
+    fn ui_files_tabs(&mut self, ui: &mut egui::Ui) {
+        let mut pick = None;
+        ui.horizontal(|ui| {
+            for tab in FilesTab::ALL {
+                if files_tab(ui, tab.label(), tab == self.files_tab) {
+                    pick = Some(tab);
+                }
+            }
+        });
+        if let Some(tab) = pick {
+            self.files_tab = tab;
+        }
+        ui.add_space(6.0);
+    }
+
+    /// 「2. 硬碟檔案管理」與「3. 檔案搜尋」：功能還沒做，先把功能列上的位置
+    /// 佔著——點得進來、看得到名字，才知道這兩項是排在哪裡
+    fn ui_files_todo(&mut self, ctx: &egui::Context) {
+        let name = self.files_tab.name();
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::same(12)),
+            )
+            .show(ctx, |ui| {
+                self.ui_files_tabs(ui);
+                ui.add_space(48.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("「{name}」還在做"))
+                            .size(15.0)
+                            .color(theme::TEXT),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("功能列上的位置先留著，做好了就會出現在這裡")
+                            .size(13.0)
+                            .color(theme::TEXT_WEAK),
+                    );
+                });
+            });
+    }
+
+    /// 「1. 資料備份」：左邊挑資料夾與開關，右邊一欄放比對結果
+    fn ui_files_backup(&mut self, ctx: &egui::Context) {
         self.backup.ensure_one();
         let mut clicks = BackupClicks::default();
 
@@ -26105,11 +26198,7 @@ impl App {
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(ctx, |ui| {
-                // 功能列。之後多一項功能就在這裡多畫一顆，版面不必動
-                ui.horizontal(|ui| {
-                    files_tab(ui, "1. 資料備份", true);
-                });
-                ui.add_space(6.0);
+                self.ui_files_tabs(ui);
                 // 組數一多就超出視窗，整頁要能捲
                 egui::ScrollArea::vertical()
                     .id_salt("files_page")
@@ -27271,6 +27360,10 @@ impl App {
                 (theme::TEXT_WEAK, "⏳", "存檔中，暫時無法加入照片")
             }
             Module::Enhance => (theme::ACCENT, "⬇", "放開滑鼠加入要優化的照片"),
+            // 還沒做好的那兩項：拖什麼進來都不收
+            Module::Files if self.files_tab != FilesTab::Backup => {
+                (theme::TEXT_WEAK, "✖", "這個功能還在做，暫時不能拖東西進來")
+            }
             Module::Files if self.backup.busy != BackupBusy::Idle => {
                 (theme::TEXT_WEAK, "⏳", "備份進行中，暫時不能換資料夾")
             }
@@ -27511,6 +27604,7 @@ impl eframe::App for App {
                 // 關掉會留下一個拷到一半的檔案，還看不出停在哪一件
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.module = Module::Files;
+                self.files_tab = FilesTab::Backup;
                 message_dialog()
                     .set_level(rfd::MessageLevel::Info)
                     .set_title("正在備份")
@@ -27522,6 +27616,7 @@ impl eframe::App for App {
                 // 選了「回去看」：留下來，順手把畫面帶回資料備份那一頁
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.module = Module::Files;
+                self.files_tab = FilesTab::Backup;
             } else {
                 // 專案與去煙霧各自可能有沒存的東西，一次講完再問一次就好
                 let mut pending: Vec<&str> = Vec::new();
@@ -27746,18 +27841,22 @@ impl eframe::App for App {
                     self.enhance_append(files, ctx);
                 }
             }
-        } else if !dropped.is_empty()
-            && self.module == Module::Files
-            && self.backup.busy == BackupBusy::Idle
-        {
-            // 檔案管理模組：拖資料夾進來就填進來源／目的。一次拖一個就填
-            // 由上往下第一個空著的格子（每一格都滿了就多加一組）；一次拖
-            // 兩個就照順序當成一組「來源、目的」
-            let dirs: Vec<PathBuf> = dropped.iter().filter(|p| p.is_dir()).cloned().collect();
-            match dirs.len() {
-                0 => self.backup.error = Some("請拖曳「資料夾」進來，不是檔案".into()),
-                1 => self.backup_drop_one(dirs[0].clone()),
-                _ => self.backup_drop_two(dirs[0].clone(), dirs[1].clone()),
+        } else if !dropped.is_empty() && self.module == Module::Files {
+            // 硬碟管理模組拖進來的東西由它自己收掉，收不收都不會再往下掉到
+            // 「加進影片模組」那一段去——備份跑到一半、或停在還沒做好的那兩項
+            // 時，拖進來的資料夾本來就不該變成影片模組的照片。
+            //
+            // 「1. 資料備份」接的是資料夾：一次拖一個就填由上往下第一個空著的
+            // 格子（每一格都滿了就多加一組）；一次拖兩個就照順序當成一組
+            // 「來源、目的」
+            if self.files_tab == FilesTab::Backup && self.backup.busy == BackupBusy::Idle {
+                let dirs: Vec<PathBuf> =
+                    dropped.iter().filter(|p| p.is_dir()).cloned().collect();
+                match dirs.len() {
+                    0 => self.backup.error = Some("請拖曳「資料夾」進來，不是檔案".into()),
+                    1 => self.backup_drop_one(dirs[0].clone()),
+                    _ => self.backup_drop_two(dirs[0].clone(), dirs[1].clone()),
+                }
             }
         } else if !dropped.is_empty() && !self.is_working() {
             // 這批含專案檔就只開專案：開專案是「取代整個工作狀態」的操作，
@@ -27835,7 +27934,7 @@ impl eframe::App for App {
                 match self.module {
                     // 起始畫面：還沒挑功能，從最近開過的專案旁邊找起
                     Module::Home => self.open_any_project(ctx),
-                    // 檔案管理沒有專案可開，比照原本的行為用影片模組的位置
+                    // 硬碟管理沒有專案可開，比照原本的行為用影片模組的位置
                     Module::Files => self.open_module_project(Module::Video, ctx),
                     other => self.open_module_project(other, ctx),
                 }
@@ -29630,9 +29729,10 @@ fn module_tab(ui: &mut egui::Ui, m: Module, active: bool) -> egui::Response {
     resp.on_hover_text(m.hint())
 }
 
-/// 「檔案管理」底下的功能列上的一項（「1. 資料備份」）。與上面的模組列同一
-/// 套視覺：選中的亮起來並壓一條底線，字小一號表示它是模組底下的一層
-fn files_tab(ui: &mut egui::Ui, text: &str, active: bool) {
+/// 「硬碟管理」底下的功能列上的一項（「1. 資料備份」那幾顆）。與上面的模組列
+/// 同一套視覺：選中的亮起來並壓一條底線，字小一號表示它是模組底下的一層。
+/// 回傳 true＝按了這一項
+fn files_tab(ui: &mut egui::Ui, text: &str, active: bool) -> bool {
     // PLACEHOLDER 的理由同 [`module_tab`]：顏色要等畫的時候才決定
     let galley = ui.painter().layout_no_wrap(
         text.to_string(),
@@ -29640,12 +29740,23 @@ fn files_tab(ui: &mut egui::Ui, text: &str, active: bool) {
         egui::Color32::PLACEHOLDER,
     );
     let size = egui::vec2(galley.size().x + 12.0, galley.size().y + 10.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    // 沒選中的那幾項滑鼠指過去才轉亮，與上面的模組列同一套回饋
+    let color = if active {
+        theme::TEXT
+    } else if resp.hovered() {
+        theme::ACCENT_HOVER
+    } else {
+        theme::TEXT_WEAK
+    };
+    if resp.hovered() && !active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     let p = ui.painter();
     p.galley(
         egui::pos2(rect.center().x - galley.size().x / 2.0, rect.top() + 2.0),
         galley,
-        if active { theme::TEXT } else { theme::TEXT_WEAK },
+        color,
     );
     if active {
         let y = rect.bottom() - 2.0;
@@ -29657,6 +29768,7 @@ fn files_tab(ui: &mut egui::Ui, text: &str, active: bool) {
             egui::Stroke::new(2.0, theme::ACCENT),
         );
     }
+    resp.clicked()
 }
 
 /// 資料備份的一列資料夾：標題、選擇鈕、現在選到哪裡。
