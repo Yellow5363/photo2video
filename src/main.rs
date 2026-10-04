@@ -7678,6 +7678,15 @@ struct SearchTool {
     page: usize,
     /// 「刪除硬碟編號」選的那一號
     del_no: Option<u32>,
+    /// 選起來的那一列（在 `hits` 裡的位置）。鍵盤上下移動的就是它
+    sel: Option<usize>,
+    /// 鍵盤把選取移到看不見的地方時，下一幀要把清單捲到這一列
+    scroll_to: Option<usize>,
+    /// 上一幀畫清單時的捲動位置、可視高度與列高。
+    /// 鍵盤要算「一個畫面幾列」「要不要捲」都得靠它們
+    offset: f32,
+    view_h: f32,
+    row_h: f32,
 }
 
 impl Default for SearchTool {
@@ -7694,6 +7703,11 @@ impl Default for SearchTool {
             per_page: 100,
             page: 0,
             del_no: None,
+            sel: None,
+            scroll_to: None,
+            offset: 0.0,
+            view_h: 0.0,
+            row_h: 20.0,
         }
     }
 }
@@ -27110,6 +27124,10 @@ impl App {
     fn ui_files_search(&mut self, ctx: &egui::Context) {
         self.disk_ensure_loaded();
         self.search_sync();
+        // **要在畫之前收鍵盤**：收完才畫，這一幀就看得到選取移動與捲動。
+        // 放在畫完之後的話，改到的狀態要等下一幀才生效，而 egui 平常只在
+        // 有新的輸入時才重畫——按一下 End 之後畫面就停在原地不動
+        self.search_keys(ctx);
         let mut del: Option<u32> = None;
         egui::CentralPanel::default()
             .frame(
@@ -27168,6 +27186,68 @@ impl App {
         {
             self.search.del_no = None;
         }
+    }
+
+    /// 鍵盤操作：**↑↓ 移動選取的那一列**、**PageUp／PageDown 翻頁**
+    /// （沒分頁時就是一次一個畫面）、**Home／End 跳到頭尾**。
+    ///
+    /// **打字時不接管**：關鍵字欄位或「每頁幾筆」有焦點時，方向鍵要留給
+    /// 它們自己用（在輸入框裡按 ↑ 應該是移動游標，不是跳下一列）
+    fn search_keys(&mut self, ctx: &egui::Context) {
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let n = self.search.hits.len();
+        if n == 0 {
+            return;
+        }
+        let (first, _) = self.search.range();
+        // 一個畫面放得下幾列（沒分頁時 PageUp／PageDown 就跳這麼多）
+        let screen = (self.search.view_h / self.search.row_h.max(1.0))
+            .floor()
+            .max(1.0) as usize;
+        let jump = if self.search.paged {
+            self.search.per_page
+        } else {
+            screen
+        };
+        let mut sel = self.search.sel.unwrap_or(first).min(n - 1);
+        let mut moved = false;
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::ArrowDown) {
+                sel = (sel + 1).min(n - 1);
+                moved = true;
+            }
+            if i.key_pressed(egui::Key::ArrowUp) {
+                sel = sel.saturating_sub(1);
+                moved = true;
+            }
+            if i.key_pressed(egui::Key::PageDown) {
+                sel = (sel + jump).min(n - 1);
+                moved = true;
+            }
+            if i.key_pressed(egui::Key::PageUp) {
+                sel = sel.saturating_sub(jump);
+                moved = true;
+            }
+            if i.key_pressed(egui::Key::Home) {
+                sel = 0;
+                moved = true;
+            }
+            if i.key_pressed(egui::Key::End) {
+                sel = n - 1;
+                moved = true;
+            }
+        });
+        if !moved {
+            return;
+        }
+        self.search.sel = Some(sel);
+        // 分頁時選到別頁去就跟著翻過去（↓ 按到最後一列會自己進下一頁）
+        if self.search.paged {
+            self.search.page = sel / self.search.per_page.max(1);
+        }
+        self.search.scroll_to = Some(sel);
     }
 
     /// 搜尋條件那幾列：關鍵字、硬碟編號範圍、分頁、刪除某一號
@@ -27240,6 +27320,13 @@ impl App {
             // 要一頁一頁看再打開
             ui.checkbox(&mut self.search.paged, "分頁顯示")
                 .on_hover_text("關著就是一路捲到底；打開才一頁一頁翻");
+            ui.add_space(10.0);
+            // 鍵盤能做什麼要寫出來——沒寫的話不會有人想到去按
+            ui.label(
+                egui::RichText::new("↑↓ 選上下一筆　PageUp／PageDown 翻頁　Home／End 到頭尾")
+                    .size(11.5)
+                    .color(theme::TEXT_WEAK),
+            );
             if self.search.paged {
                 ui.add_space(8.0);
                 // 一次跳幾筆**自己打**：舊系統只能從 100~500 裡挑，但「一頁
@@ -27347,7 +27434,7 @@ impl App {
 
     /// 查到的那幾列。第一欄是**流水號**（在這份結果裡的第幾筆），
     /// 其餘六欄就是總表的六個欄位
-    fn ui_search_table(&self, ui: &mut egui::Ui) {
+    fn ui_search_table(&mut self, ui: &mut egui::Ui) {
         if self.disk.table.rows.is_empty() {
             ui.add_space(20.0);
             ui.label(
@@ -27370,24 +27457,38 @@ impl App {
         }
         // 這一頁要畫哪一段（不分頁就是全部）
         let (first, count) = self.search.range();
+        // 列高要用**中文字**量。`row_height` 給的是主要字型（拉丁字母）的
+        // 高度，中文是從備用字型來的、比它高：差幾點而已，但 show_rows 是照
+        // 這個值一列一列算位置的，幾千列累積下來就差了幾百列——實測捲到底
+        // 只到第 1,251 列，後面四百多列看不到
         let row_h = ui
-            .fonts(|f| f.row_height(&egui::FontId::proportional(12.0)))
+            .fonts(|f| {
+                f.layout_no_wrap(
+                    "資料夾".to_string(),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::PLACEHOLDER,
+                )
+                .size()
+                .y
+            })
             .max(16.0)
             + 4.0;
-        // 路徑那一欄吃掉剩下的寬度：它最長，而且是看清單時最需要看完的一欄
+        // 欄位順序照使用者舊系統：編號、硬碟編號擺在最前面兩欄，
+        // 一眼就看得出「這一筆是哪一顆碟的第幾筆」。
+        // 路徑那一欄吃掉剩下的寬度：它最長，也是最需要看完的一欄
         let fixed = [64.0, 72.0, 200.0, 78.0, 128.0, 96.0];
         let path_w = (ui.available_width() - fixed.iter().sum::<f32>() - 24.0).max(240.0);
         let widths = [
-            fixed[0], path_w, fixed[2], fixed[3], fixed[4], fixed[5], fixed[1],
+            fixed[0], fixed[1], path_w, fixed[2], fixed[3], fixed[4], fixed[5],
         ];
         let titles = [
             "編號",
+            "硬碟編號",
             "資料夾路徑",
             "資料夾名稱",
             "資料夾大小",
             "資料夾修改時間",
             "資料夾大小(byte)",
-            "硬碟編號",
         ];
         ui.horizontal(|ui| {
             for (w, t) in widths.iter().zip(titles) {
@@ -27395,59 +27496,103 @@ impl App {
             }
         });
         ui.separator();
-        egui::ScrollArea::vertical()
+        let sel = self.search.sel;
+        let mut click: Option<usize> = None;
+        // 清單的可視高度要**在這裡量**（ScrollArea 不縮，會填滿剩下的空間）。
+        // 本來用 ScrollAreaOutput 的 inner_rect，但那是「內容畫在哪裡」、不是
+        // 看得到的那一塊：幾萬列的內容讓它變成好幾萬點高，於是 PageDown 一次
+        // 跳了一千多列
+        let view_h = ui.available_height();
+        let mut area = egui::ScrollArea::vertical()
             .id_salt("search_rows")
-            .auto_shrink([false, false])
-            .show_rows(ui, row_h, count, |ui, range| {
-                for i in range {
-                    let at = first + i;
-                    let r = &self.disk.table.rows[self.search.hits[at] as usize];
-                    ui.horizontal(|ui| {
-                        search_cell(
-                            ui,
-                            widths[0],
-                            row_h,
-                            &thousands(at as u64 + 1),
-                            theme::TEXT_WEAK,
-                            false,
-                        );
-                        search_cell(ui, widths[1], row_h, &r.path, theme::TEXT_WEAK, false);
-                        search_cell(ui, widths[2], row_h, &r.name, theme::TEXT, false);
-                        search_cell(
-                            ui,
-                            widths[3],
-                            row_h,
-                            &disk::fmt_gb(r.bytes),
-                            theme::TEXT,
-                            false,
-                        );
-                        search_cell(
-                            ui,
-                            widths[4],
-                            row_h,
-                            &disk::fmt_time(r.mtime),
-                            theme::TEXT_WEAK,
-                            false,
-                        );
-                        search_cell(
-                            ui,
-                            widths[5],
-                            row_h,
-                            &thousands(r.bytes),
-                            theme::TEXT_WEAK,
-                            false,
-                        );
-                        search_cell(
-                            ui,
-                            widths[6],
-                            row_h,
-                            &disk::fmt_no(r.disk),
-                            theme::TEXT_WEAK,
-                            false,
-                        );
-                    });
+            .auto_shrink([false, false]);
+        // 鍵盤把選取移到看不見的地方時才捲，而且**只捲剛好露出來的那一點**：
+        // 每次都置中的話，按一下 ↓ 整個清單就跳半個畫面，看不出自己在哪裡
+        if let Some(at) = self.search.scroll_to.take() {
+            let top = at.saturating_sub(first) as f32 * row_h;
+            let view = view_h.max(row_h);
+            let off = self.search.offset;
+            // 上下各留三列的餘裕，有兩個理由：選到的那一列不會貼著邊
+            // （看不出上下文），而且 `view_h` 只是「畫之前的可用高度」、
+            // 比捲動區真正看得到的那一塊略高幾十點，不留餘裕的話按 ↓ 到
+            // 底部時，選取會剛好落在看不見的那幾列上。
+            // 捲過頭沒關係：egui 會自己夾在可捲範圍內（End 因此剛好到底）
+            let edge = row_h * 3.0;
+            let want = if top < off + edge {
+                (top - edge).max(0.0)
+            } else if top + row_h > off + view - edge {
+                top + row_h - view + edge
+            } else {
+                off
+            };
+            area = area.vertical_scroll_offset(want);
+        }
+        // **列間距要在這一層歸零**：`show_rows` 是拿**外層** ui 的
+        // `item_spacing.y` 去算「一列佔多高」與「第 n 列在哪裡」的，只把
+        // 裡面那層歸零，兩邊就對不起來——它照 26 點一列算位置，我照 20 點
+        // 一列畫，捲到底時最後四百多列落在看不見的地方（實測只捲得到第
+        // 1,251 列，而總共有 1,687 列）。歸零之後兩邊都是 row_h
+        let out = ui
+            .scope(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                area.show_rows(ui, row_h, count, |ui, range| {
+            for i in range {
+                let at = first + i;
+                let r = &self.disk.table.rows[self.search.hits[at] as usize];
+                // 整列都能點，點了就選起來（反白要畫在文字底下，所以先算
+                // 出這一列的矩形、先塗底色再畫字）
+                let rect = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(ui.available_width(), row_h),
+                );
+                if sel == Some(at) {
+                    ui.painter().rect_filled(rect, 4.0, theme::CARD_HOVER);
                 }
-            });
+                ui.horizontal(|ui| {
+                    let cells = [
+                        thousands(at as u64 + 1),
+                        disk::fmt_no(r.disk),
+                        r.path.clone(),
+                        r.name.clone(),
+                        disk::fmt_gb(r.bytes),
+                        disk::fmt_time(r.mtime),
+                        thousands(r.bytes),
+                    ];
+                    // 名稱那一欄亮一點：找東西時眼睛掃的就是它
+                    let colors = [
+                        theme::TEXT_WEAK,
+                        theme::TEXT_WEAK,
+                        theme::TEXT_WEAK,
+                        theme::TEXT,
+                        theme::TEXT,
+                        theme::TEXT_WEAK,
+                        theme::TEXT_WEAK,
+                    ];
+                    for ((w, c), col) in widths.iter().zip(cells.iter()).zip(colors) {
+                        search_cell(ui, *w, row_h, c, col, false);
+                    }
+                });
+                if ui
+                    .interact(
+                        rect,
+                        egui::Id::new(("search_row", at)),
+                        egui::Sense::click(),
+                    )
+                    .clicked()
+                {
+                    click = Some(at);
+                }
+            }
+                })
+            })
+            .inner;
+        // 下一次鍵盤移動要靠這三個值算「一個畫面幾列」「要不要捲」
+        self.search.offset = out.state.offset.y;
+        self.search.view_h = view_h;
+        self.search.row_h = row_h;
+        if let Some(at) = click {
+            self.search.sel = Some(at);
+        }
     }
 
     /// 刪掉某一個硬碟編號的全部資料。
