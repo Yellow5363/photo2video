@@ -107,6 +107,37 @@ fn is_junk(name: &str) -> bool {
     name.starts_with("._") || JUNK.iter().any(|j| name.eq_ignore_ascii_case(j))
 }
 
+/// 這個資料夾是不是**隱藏的**——隱藏的不進清單，也不走進去。
+///
+/// 這張表要回答的是「我把東西放在哪裡」，而隱藏資料夾裝的是程式自己的
+/// 東西：掃一顆放著原始碼的碟，四千多筆裡有一大半是 `.git\objects\xx`，
+/// 真正要找的照片資料夾反而被淹掉了。使用者在檔案總管裡看不到的，這裡
+/// 也不該看到。
+///
+/// Windows 認的是**隱藏屬性**，另外**名字開頭是點**的也一律當隱藏
+/// （`.git`、`.vscode` 那種，在 macOS／Linux 上本來就是隱藏的慣例；
+/// Windows 上 git 也會順手把 `.git` 設成隱藏，但不是每個工具都會設）。
+///
+/// 注意**只擋資料夾**：被列出來的那個資料夾裡，隱藏的檔案照樣算進大小——
+/// 那是這個資料夾實際佔掉的空間（與資料備份的理由一致，隱藏不等於不重要）
+fn is_hidden(e: &fs::DirEntry) -> bool {
+    if e.file_name().to_string_lossy().starts_with('.') {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        /// FILE_ATTRIBUTE_HIDDEN
+        const HIDDEN: u32 = 0x2;
+        return e
+            .metadata()
+            .map(|m| m.file_attributes() & HIDDEN != 0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 /// 掃完一顆碟的結果
 pub struct Scanned {
     /// 掃到的每一個資料夾
@@ -167,7 +198,10 @@ pub fn scan(
                 continue;
             }
             if ft.is_dir() {
-                subs.push(e.path());
+                // 隱藏的資料夾不列、也不走進去（見 [`is_hidden`]）
+                if !is_hidden(&e) {
+                    subs.push(e.path());
+                }
             } else if ft.is_file() {
                 if let Ok(md) = e.metadata() {
                     bytes += md.len();
@@ -895,6 +929,20 @@ mod tests {
         assert!(names.contains(&"新的"));
         assert_eq!(t.count_of(1), 2);
         assert_eq!(t.count_of(2), 1, "別顆碟的資料不能被動到");
+    }
+
+    #[test]
+    fn 隱藏資料夾不進清單() {
+        let base = std::env::temp_dir().join(format!("p2v_hidden_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("照片")).unwrap();
+        // 名字開頭是點的：三個平台都當隱藏
+        fs::create_dir_all(base.join(".git").join("objects")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let out = scan(&base, 5, 1, &cancel, &mut |_, _| {}).unwrap();
+        let names: Vec<&str> = out.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["照片"], "隱藏資料夾與它底下的都不該出現");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

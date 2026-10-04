@@ -26428,13 +26428,13 @@ impl App {
             {
                 clicks.refresh = true;
             }
-            if self.disk.drive.is_none() {
-                ui.label(
-                    egui::RichText::new("也可以把那顆碟裡的任何檔案或資料夾拖進視窗")
-                        .size(12.0)
-                        .color(theme::TEXT_WEAK),
-                );
-            }
+            // 這一格只收「一整顆碟」。講清楚它不是資料夾選擇器——
+            // 沒講的話，第一個反應會是把資料夾拖進來
+            ui.label(
+                egui::RichText::new("只能挑一整顆碟：不是挑資料夾，也不能把資料夾拖進來")
+                    .size(12.0)
+                    .color(theme::TEXT_WEAK),
+            );
         });
         ui.add_space(6.0);
 
@@ -26782,21 +26782,6 @@ impl App {
         }
         self.disk.drive = Some(d);
         self.disk.error = None;
-    }
-
-    /// 拖進來的檔案或資料夾：取它**所在的那一顆碟**。
-    /// 挑的是整顆碟，所以拖什麼進來都只是用來指出「是哪一顆」
-    fn disk_drop(&mut self, p: &Path) {
-        if self.disk.drives.is_empty() {
-            self.disk.drives = disk::list_drives();
-        }
-        match self.disk.drives.iter().find(|d| p.starts_with(&d.root)).cloned() {
-            Some(d) => self.disk_set_drive(d),
-            None => {
-                self.disk.error =
-                    Some(format!("「{}」不在目前看得到的硬碟上", p.display()))
-            }
-        }
     }
 
     /// 換一個資料夾放總表：換完**立刻把那裡的總表讀進來**。
@@ -28255,12 +28240,9 @@ impl App {
             Module::Files if self.files_tab == FilesTab::Search => {
                 (theme::TEXT_WEAK, "✖", "這個功能還在做，暫時不能拖東西進來")
             }
+            // 這一項挑的是一整顆碟，而且只從清單上挑：拖資料夾進來不收
             Module::Files if self.files_tab == FilesTab::Disk => {
-                if self.disk.busy == DiskBusy::Idle {
-                    (theme::ACCENT, "⬇", "放開滑鼠選它所在的那一顆硬碟")
-                } else {
-                    (theme::TEXT_WEAK, "⏳", "建檔進行中，暫時不能換硬碟")
-                }
+                (theme::TEXT_WEAK, "✖", "硬碟要從上面的清單挑，不收拖進來的資料夾")
             }
             Module::Files if self.backup.busy != BackupBusy::Idle => {
                 (theme::TEXT_WEAK, "⏳", "備份進行中，暫時不能換資料夾")
@@ -28780,11 +28762,10 @@ impl eframe::App for App {
                     _ => self.backup_drop_two(dirs[0].clone(), dirs[1].clone()),
                 }
             } else if self.files_tab == FilesTab::Disk && self.disk.busy == DiskBusy::Idle {
-                // 挑的是整顆碟：拖檔案或資料夾進來都只是用來指出「是哪一顆」，
-                // 所以一疊裡取第一個就夠了
-                if let Some(p) = dropped.first().cloned() {
-                    self.disk_drop(&p);
-                }
+                // 硬碟檔案管理只從清單挑一整顆碟，拖進來的東西一律不收；
+                // 這裡仍要把它接住（不能往下掉到影片模組去），順便講一句
+                self.disk.error =
+                    Some("「指定硬碟」只能從上面的清單挑一整顆碟，不收拖進來的資料夾".into());
             }
         } else if !dropped.is_empty() && !self.is_working() {
             // 這批含專案檔就只開專案：開專案是「取代整個工作狀態」的操作，
