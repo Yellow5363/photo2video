@@ -256,6 +256,12 @@ pub struct DiskNote {
     /// 上次掃完的時間（unix 秒）
     #[serde(rename = "a", default)]
     pub at: u64,
+    /// 磁碟區名稱。代號會換、名字不會，碟插回來時認的是這個
+    #[serde(rename = "l", default)]
+    pub label: String,
+    /// 磁碟區序號（見 [`Drive::serial`]）。0＝當時問不到
+    #[serde(rename = "s", default)]
+    pub serial: u32,
 }
 
 /// 現在寫出來的索引檔版本
@@ -316,6 +322,21 @@ impl Table {
         self.rows.iter().filter(|r| r.disk == disk).count()
     }
 
+    /// 這顆碟（照磁碟區序號認）上次是幾號。認不出來就是 None。
+    ///
+    /// 碟插到別台電腦、或別的碟先占走代號時，同一顆碟的代號就變了；序號
+    /// 不會變。靠它才能在碟插回來時直接帶出「上次的那個號」，而不是又給它
+    /// 一個新號、讓同一顆碟在表裡出現兩次
+    pub fn disk_of_serial(&self, serial: u32) -> Option<u32> {
+        if serial == 0 {
+            return None;
+        }
+        self.notes
+            .iter()
+            .find(|(_, n)| n.serial == serial)
+            .map(|(no, _)| *no)
+    }
+
     /// 下一個要用的編號：**從 1 開始找第一個空號**，中間沒有空號就接在
     /// 最大號後面加一。
     ///
@@ -348,6 +369,137 @@ impl Table {
     }
 }
 
+
+// ---------- 這台電腦上有哪些硬碟 ----------
+
+/// 一顆看得到的硬碟（磁碟機）。
+///
+/// 「指定硬碟」挑的是**一整顆碟**，不是某個資料夾——這個功能要記的就是
+/// 「這顆碟裡有哪些資料夾」
+#[derive(Clone, PartialEq)]
+pub struct Drive {
+    /// 根路徑，例如 `F:\`
+    pub root: PathBuf,
+    /// 磁碟機代號，例如 `F`
+    pub letter: String,
+    /// 磁碟區名稱（檔案總管上那個名字，例如「segate firecuda 530 2T #1」）。
+    /// 沒取名就是空字串
+    pub label: String,
+    /// 磁碟區序號。同一顆碟插到別台電腦、拿到別的代號，這個數字不會變——
+    /// 靠它認得出「這顆碟上次是幾號」（見 [`Table::disk_of_serial`]）
+    pub serial: u32,
+}
+
+impl Drive {
+    /// 畫面上的寫法，比照檔案總管：`segate firecuda 530 2T #1 (F:)`
+    pub fn show(&self) -> String {
+        if self.label.is_empty() {
+            format!("({}:)", self.letter)
+        } else {
+            format!("{} ({}:)", self.label, self.letter)
+        }
+    }
+}
+
+/// 列出現在接著的硬碟。
+///
+/// 只收**固定式與可卸除式**（內接碟、外接碟、隨身碟）：光碟機與網路磁碟機
+/// 不是要建檔的對象，列出來只會讓人多挑錯一次。讀不到名字的碟照樣列
+/// （沒取名的碟很常見），只有連類型都問不出來的才跳過
+#[cfg(windows)]
+pub fn list_drives() -> Vec<Drive> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+        fn GetDriveTypeW(root: *const u16) -> u32;
+        fn GetVolumeInformationW(
+            root: *const u16,
+            name: *mut u16,
+            name_len: u32,
+            serial: *mut u32,
+            max_component: *mut u32,
+            flags: *mut u32,
+            fs_name: *mut u16,
+            fs_name_len: u32,
+        ) -> i32;
+    }
+    /// DRIVE_REMOVABLE / DRIVE_FIXED
+    const WANT: [u32; 2] = [2, 3];
+
+    let mask = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
+        let root = PathBuf::from(format!("{letter}:\\"));
+        let wide: Vec<u16> = root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if !WANT.contains(&unsafe { GetDriveTypeW(wide.as_ptr()) }) {
+            continue;
+        }
+        // 名字與序號問不到（碟還在喚醒、沒放片）就留空，碟照樣列出來
+        let mut name = [0u16; 261];
+        let mut serial = 0u32;
+        let ok = unsafe {
+            GetVolumeInformationW(
+                wide.as_ptr(),
+                name.as_mut_ptr(),
+                name.len() as u32,
+                &mut serial,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+        };
+        let label = if ok {
+            let n = name.iter().position(|c| *c == 0).unwrap_or(0);
+            String::from_utf16_lossy(&name[..n])
+        } else {
+            String::new()
+        };
+        out.push(Drive {
+            root,
+            letter: letter.to_string(),
+            label,
+            serial: if ok { serial } else { 0 },
+        });
+    }
+    out
+}
+
+/// macOS／Linux：掛在 `/Volumes` 底下的那些，加上根目錄本身。
+/// 沒有磁碟區序號這種東西，序號一律 0（認碟的那一段就自動失效）
+#[cfg(not(windows))]
+pub fn list_drives() -> Vec<Drive> {
+    let mut out = vec![Drive {
+        root: PathBuf::from("/"),
+        letter: "/".into(),
+        label: "開機磁碟".into(),
+        serial: 0,
+    }];
+    if let Ok(rd) = fs::read_dir("/Volumes") {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let label = e.file_name().to_string_lossy().into_owned();
+                out.push(Drive {
+                    root: p,
+                    letter: label.clone(),
+                    label,
+                    serial: 0,
+                });
+            }
+        }
+    }
+    out
+}
 
 // ---------- 匯出 ----------
 

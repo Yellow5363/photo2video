@@ -2288,8 +2288,6 @@ enum LastDir {
     BackupSource,
     /// 硬碟管理 ▸ 資料備份：目的資料夾
     BackupDest,
-    /// 硬碟管理 ▸ 硬碟檔案管理：要建檔的那一顆硬碟
-    DiskRoot,
     /// 硬碟管理 ▸ 硬碟檔案管理：總表放在哪個資料夾。
     ///
     /// 這一個與其他的用法不太一樣：別的只是「對話框從哪裡開始」，
@@ -2301,7 +2299,7 @@ enum LastDir {
 impl LastDir {
     /// 全部的用途。加新欄位時記得補進來——測試會拿它檢查沒有兩個用途
     /// 共用同一個 config 欄位
-    const ALL: [LastDir; 21] = [
+    const ALL: [LastDir; 20] = [
         LastDir::VideoPhotos,
         LastDir::VideoProject,
         LastDir::VideoMusic,
@@ -2321,7 +2319,6 @@ impl LastDir {
         LastDir::EnhanceProject,
         LastDir::BackupSource,
         LastDir::BackupDest,
-        LastDir::DiskRoot,
         LastDir::DiskTable,
     ];
 
@@ -2347,7 +2344,6 @@ impl LastDir {
             LastDir::EnhanceProject => "dir_enhance_project",
             LastDir::BackupSource => "dir_backup_source",
             LastDir::BackupDest => "dir_backup_dest",
-            LastDir::DiskRoot => "dir_disk_root",
             LastDir::DiskTable => "dir_disk_table",
         }
     }
@@ -7582,8 +7578,11 @@ struct DiskDone {
 /// 「硬碟管理 ▸ 硬碟檔案管理」的狀態。
 /// 切到別的模組時整份留著，切回來就是剛才離開的樣子
 struct DiskTool {
-    /// 要掃哪一顆碟（挑根目錄就是整顆，挑底下某個資料夾就只掃那一塊）
-    root: Option<PathBuf>,
+    /// 要建檔的是哪一顆碟（整顆，從根目錄開始）
+    drive: Option<disk::Drive>,
+    /// 現在接著的硬碟有哪些（進這一頁時找一次，按「↻」再找一次：
+    /// 外接碟隨時會插上或拔掉）
+    drives: Vec<disk::Drive>,
     /// 硬碟編號。畫面上是可以改的文字框，所以存字串
     /// （四位數的寫法見 [`disk::fmt_no`]）
     no_text: String,
@@ -7613,7 +7612,8 @@ struct DiskTool {
 impl Default for DiskTool {
     fn default() -> Self {
         Self {
-            root: None,
+            drive: None,
+            drives: Vec::new(),
             no_text: String::new(),
             // 使用者舊工具的預設值，照搬
             depth_text: "5".into(),
@@ -7666,7 +7666,10 @@ impl DiskTool {
 /// 硬碟檔案管理那一頁按了什麼（畫的時候只記下來，畫完才動狀態）
 #[derive(Default)]
 struct DiskClicks {
-    pick_root: bool,
+    /// 從清單上挑了哪一顆碟
+    pick_drive: Option<disk::Drive>,
+    /// 按了「↻」重新找硬碟
+    refresh: bool,
     pick_dir: bool,
     scan: bool,
     stop: bool,
@@ -26356,8 +26359,11 @@ impl App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| self.ui_disk_body(ui, &mut clicks));
             });
-        if clicks.pick_root {
-            self.disk_pick_root();
+        if let Some(d) = clicks.pick_drive.take() {
+            self.disk_set_drive(d);
+        }
+        if clicks.refresh {
+            self.disk.drives = disk::list_drives();
         }
         if clicks.pick_dir {
             self.disk_pick_table_dir();
@@ -26385,31 +26391,49 @@ impl App {
                     .strong()
                     .color(theme::TEXT),
             );
+            // 挑的是**一整顆碟**，不是某個資料夾——這個功能要記的就是
+            // 「這顆碟裡有哪些資料夾」。清單寫法比照檔案總管（名字＋代號），
+            // 外接碟才認得出是哪一顆
+            let text = match &self.disk.drive {
+                Some(d) => d.show(),
+                None => "請選擇一顆硬碟".to_string(),
+            };
+            ui.add_enabled_ui(idle, |ui| {
+                egui::ComboBox::from_id_salt("disk_drive")
+                    .selected_text(egui::RichText::new(text).size(13.0))
+                    .width(330.0)
+                    // 預設的選單高度在高解析度螢幕上只排得下六顆碟，再多的
+                    // 要捲才看得到——外接碟多的人會以為清單漏了幾顆
+                    .height(560.0)
+                    .show_ui(ui, |ui| {
+                        if self.disk.drives.is_empty() {
+                            ui.label(
+                                egui::RichText::new("找不到硬碟")
+                                    .size(12.5)
+                                    .color(theme::TEXT_WEAK),
+                            );
+                        }
+                        for d in &self.disk.drives {
+                            let on = self.disk.drive.as_ref() == Some(d);
+                            if ui.selectable_label(on, d.show()).clicked() {
+                                clicks.pick_drive = Some(d.clone());
+                            }
+                        }
+                    });
+            });
             if ui
-                .add_enabled(idle, egui::Button::new("📂  選擇"))
-                .on_hover_text(
-                    "要建檔的那一顆硬碟。\n\
-                     挑它的根目錄（例如 H:\\）就是整顆碟；只想記其中一塊，挑那個資料夾就好",
-                )
+                .add_enabled(idle, egui::Button::new("↻").small())
+                .on_hover_text("重新找一次硬碟（剛插上的外接碟按這個）")
                 .clicked()
             {
-                clicks.pick_root = true;
+                clicks.refresh = true;
             }
-            match &self.disk.root {
-                Some(p) => {
-                    ui.label(
-                        egui::RichText::new(p.to_string_lossy().into_owned())
-                            .size(13.0)
-                            .color(theme::TEXT),
-                    );
-                }
-                None => {
-                    ui.label(
-                        egui::RichText::new("尚未選擇（也可以直接把資料夾拖進視窗）")
-                            .size(13.0)
-                            .color(theme::TEXT_WEAK),
-                    );
-                }
+            if self.disk.drive.is_none() {
+                ui.label(
+                    egui::RichText::new("也可以把那顆碟裡的任何檔案或資料夾拖進視窗")
+                        .size(12.0)
+                        .color(theme::TEXT_WEAK),
+                );
             }
         });
         ui.add_space(6.0);
@@ -26476,7 +26500,7 @@ impl App {
         ui.add_space(12.0);
 
         ui.horizontal(|ui| {
-            let ready = self.disk.root.is_some()
+            let ready = self.disk.drive.is_some()
                 && self.disk.no().is_some()
                 && self.disk.depth().is_some()
                 && self.disk.load_error.is_none();
@@ -26721,6 +26745,8 @@ impl App {
             return;
         }
         self.disk.loaded = true;
+        // 外接碟隨時會插上或拔掉，進這一頁就重新找一次
+        self.disk.drives = disk::list_drives();
         match disk::Table::load(&self.disk.dir) {
             Ok(t) => {
                 self.disk.table = t;
@@ -26734,22 +26760,43 @@ impl App {
         }
     }
 
-    /// 挑要建檔的那一顆碟
-    fn disk_pick_root(&mut self) {
-        if let Some(d) = pick_folder_remembering(
-            LastDir::DiskRoot,
-            "選擇要建檔的硬碟（挑根目錄就是整顆碟）",
-            None,
-        ) {
-            self.disk_set_root(d);
+    /// 選定要建檔的那一顆碟。
+    ///
+    /// **這顆碟以前建過的話，編號直接帶回上次那一號**（靠磁碟區序號認，
+    /// 見 [`disk::Table::disk_of_serial`]）：碟插回來重建一次是常態，
+    /// 再給它一個新號只會讓同一顆碟在表裡出現兩次。認不出來才回到空號
+    fn disk_set_drive(&mut self, d: disk::Drive) {
+        match self.disk.table.disk_of_serial(d.serial) {
+            Some(no) => self.disk.no_text = disk::fmt_no(no),
+            None => {
+                // 使用者自己打過一個還沒用過的號就尊重它，否則回到下一個空號
+                let keep = self
+                    .disk
+                    .no()
+                    .map(|n| self.disk.table.count_of(n) == 0)
+                    .unwrap_or(false);
+                if !keep {
+                    self.disk.no_text = disk::fmt_no(self.disk.table.next_no());
+                }
+            }
         }
+        self.disk.drive = Some(d);
+        self.disk.error = None;
     }
 
-    /// 設定要掃的碟（選的、拖進來的都走這裡）
-    fn disk_set_root(&mut self, dir: PathBuf) {
-        remember_dir(LastDir::DiskRoot, &dir);
-        self.disk.root = Some(dir);
-        self.disk.error = None;
+    /// 拖進來的檔案或資料夾：取它**所在的那一顆碟**。
+    /// 挑的是整顆碟，所以拖什麼進來都只是用來指出「是哪一顆」
+    fn disk_drop(&mut self, p: &Path) {
+        if self.disk.drives.is_empty() {
+            self.disk.drives = disk::list_drives();
+        }
+        match self.disk.drives.iter().find(|d| p.starts_with(&d.root)).cloned() {
+            Some(d) => self.disk_set_drive(d),
+            None => {
+                self.disk.error =
+                    Some(format!("「{}」不在目前看得到的硬碟上", p.display()))
+            }
+        }
     }
 
     /// 換一個資料夾放總表：換完**立刻把那裡的總表讀進來**。
@@ -26777,10 +26824,11 @@ impl App {
     /// 只會讓畫面在「掃完了嗎」「存好了嗎」之間閃；要讓使用者看的只有
     /// 「現在做到哪、好了沒」
     fn disk_scan(&mut self, ctx: &egui::Context) {
-        let Some(root) = self.disk.root.clone() else {
+        let Some(drive) = self.disk.drive.clone() else {
             self.disk.error = Some("還沒挑要建檔的硬碟".into());
             return;
         };
+        let root = drive.root.clone();
         let Some(no) = self.disk.no() else {
             self.disk.error = Some("硬碟編號請填 1 到 9999 的數字".into());
             return;
@@ -26872,11 +26920,13 @@ impl App {
                     no,
                     s.rows,
                     disk::DiskNote {
-                        root: root.to_string_lossy().into_owned(),
+                        root: drive.show(),
                         at: SystemTime::now()
                             .duration_since(SystemTime::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0),
+                        label: drive.label.clone(),
+                        serial: drive.serial,
                     },
                 );
                 // 索引檔先存：Excel 與 PDF 是「人看的那一份」，萬一匯出失敗
@@ -28207,7 +28257,7 @@ impl App {
             }
             Module::Files if self.files_tab == FilesTab::Disk => {
                 if self.disk.busy == DiskBusy::Idle {
-                    (theme::ACCENT, "⬇", "放開滑鼠設為要建檔的硬碟")
+                    (theme::ACCENT, "⬇", "放開滑鼠選它所在的那一顆硬碟")
                 } else {
                     (theme::TEXT_WEAK, "⏳", "建檔進行中，暫時不能換硬碟")
                 }
@@ -28730,10 +28780,10 @@ impl eframe::App for App {
                     _ => self.backup_drop_two(dirs[0].clone(), dirs[1].clone()),
                 }
             } else if self.files_tab == FilesTab::Disk && self.disk.busy == DiskBusy::Idle {
-                // 硬碟檔案管理一次只對一顆碟建檔，拖進來一疊也只取第一個資料夾
-                match dropped.iter().find(|p| p.is_dir()) {
-                    Some(d) => self.disk_set_root(d.clone()),
-                    None => self.disk.error = Some("請拖曳「資料夾」進來，不是檔案".into()),
+                // 挑的是整顆碟：拖檔案或資料夾進來都只是用來指出「是哪一顆」，
+                // 所以一疊裡取第一個就夠了
+                if let Some(p) = dropped.first().cloned() {
+                    self.disk_drop(&p);
                 }
             }
         } else if !dropped.is_empty() && !self.is_working() {
