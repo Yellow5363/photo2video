@@ -7464,15 +7464,6 @@ impl FilesTab {
             FilesTab::Search => "3. 檔案搜尋",
         }
     }
-
-    /// 功能本身的名字（不含編號），寫進句子裡時用
-    fn name(self) -> &'static str {
-        match self {
-            FilesTab::Backup => "資料備份",
-            FilesTab::Disk => "硬碟檔案管理",
-            FilesTab::Search => "檔案搜尋",
-        }
-    }
 }
 
 
@@ -7565,13 +7556,14 @@ enum DiskMsg {
     Done(Box<Result<DiskDone, String>>),
 }
 
-/// 一次掃描做完之後的成果
+/// 一件事（建檔或刪除）做完之後的成果
 struct DiskDone {
-    /// 換好這顆碟的資料、已經存檔的總表
+    /// 已經存好檔的總表
     table: disk::Table,
-    /// 這顆碟掃到幾個資料夾
-    rows: usize,
-    /// 讀不進去而跳過的資料夾
+    /// 做完要寫在畫面上的那句話。建檔與刪除講的不是同一件事，
+    /// 由做事的那一邊把話寫好，收訊息的地方就不必再分一次
+    msg: String,
+    /// 讀不進去而跳過的資料夾（刪除時是空的）
     skipped: Vec<String>,
 }
 
@@ -7661,6 +7653,135 @@ impl DiskTool {
             self.dir.join(format!("{}.pdf", disk::TABLE_STEM)),
         ]
     }
+}
+
+/// 「硬碟管理 ▸ 檔案搜尋」的狀態。
+///
+/// 查的是硬碟檔案管理建起來的那張總表（[`DiskTool::table`]），
+/// 兩頁看的是同一份資料，所以這裡只放「怎麼看」的部分
+struct SearchTool {
+    /// 關鍵字（空白＝都要有、逗號＝有一個就算，見 [`disk::Query`]）
+    text: String,
+    /// 只看這個範圍內的硬碟編號（None＝不指定）
+    from: Option<u32>,
+    to: Option<u32>,
+    /// 符合條件的那幾列（總表 rows 的索引）。條件變了才重算
+    hits: Vec<u32>,
+    /// 總表被動過了（建檔、刪除），下一幀重算
+    dirty: bool,
+    /// 上次算 hits 用的條件，拿來判斷要不要重算
+    last: (String, Option<u32>, Option<u32>, usize),
+    /// 一頁一頁翻。**預設關著**：幾萬列直接捲就好（只畫看得見的那幾列），
+    /// 翻頁反而多一道手續——要一頁一頁看的人再自己打開
+    paged: bool,
+    per_page: usize,
+    page: usize,
+    /// 「刪除硬碟編號」選的那一號
+    del_no: Option<u32>,
+}
+
+impl Default for SearchTool {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            from: None,
+            to: None,
+            hits: Vec::new(),
+            dirty: true,
+            // 一個不可能相等的起始值，確保第一次一定會算
+            last: (String::new(), None, None, usize::MAX),
+            paged: false,
+            per_page: 100,
+            page: 0,
+            del_no: None,
+        }
+    }
+}
+
+impl SearchTool {
+    /// 分頁時總共幾頁（至少一頁）
+    fn pages(&self) -> usize {
+        if !self.paged {
+            return 1;
+        }
+        self.hits.len().div_ceil(self.per_page).max(1)
+    }
+
+    /// 現在要畫的是第幾筆開始、共幾筆（不分頁就是全部）
+    fn range(&self) -> (usize, usize) {
+        if !self.paged {
+            return (0, self.hits.len());
+        }
+        let first = (self.page * self.per_page).min(self.hits.len());
+        (first, (self.hits.len() - first).min(self.per_page))
+    }
+}
+
+/// 三位一撇的數字。兩萬多筆的清單上，`24996` 與 `249960` 掃過去是一樣的，
+/// `24,996` 才看得出數量級
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 硬碟編號的下拉選單（「全部」或「選一號」＋總表裡有的那幾號）
+fn search_no_combo(
+    ui: &mut egui::Ui,
+    salt: &str,
+    none_text: &str,
+    disks: &[u32],
+    sel: &mut Option<u32>,
+) {
+    let text = match sel {
+        Some(n) => disk::fmt_no(*n),
+        None => none_text.to_string(),
+    };
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(egui::RichText::new(text).size(12.5))
+        .width(92.0)
+        .height(520.0)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(sel.is_none(), none_text).clicked() {
+                *sel = None;
+            }
+            for n in disks {
+                if ui
+                    .selectable_label(*sel == Some(*n), disk::fmt_no(*n))
+                    .clicked()
+                {
+                    *sel = Some(*n);
+                }
+            }
+        });
+}
+
+/// 搜尋清單裡的一格：**固定寬、固定高**，放不下就截掉。
+///
+/// 高度固定是 `show_rows` 的前提（它要靠列高算捲軸多長）；寬度固定則是
+/// 為了讓每一欄對齊——一列一列自己排的話，中文長短不一，欄位會歪掉
+fn search_cell(ui: &mut egui::Ui, w: f32, h: f32, text: &str, color: egui::Color32, head: bool) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            // **一定要 set_min_size**：allocate_ui_with_layout 給的是上限，
+            // 內容比較窄時配出來的格子會跟著縮，於是每一列的欄位各寬各的、
+            // 整張表歪掉（標題與內容也對不起來）。撐住最小尺寸才會對齊
+            ui.set_min_size(egui::vec2(w, h));
+            let mut t = egui::RichText::new(text).size(12.0).color(color);
+            if head {
+                t = t.strong();
+            }
+            ui.add(egui::Label::new(t).truncate());
+        },
+    );
 }
 
 /// 硬碟檔案管理那一頁按了什麼（畫的時候只記下來，畫完才動狀態）
@@ -8161,6 +8282,8 @@ struct App {
     backup: BackupTool,
     /// 「硬碟管理 ▸ 硬碟檔案管理」的狀態
     disk: DiskTool,
+    /// 「硬碟管理 ▸ 檔案搜尋」的狀態
+    search: SearchTool,
     /// 「硬碟管理」現在停在哪一項功能（見 [`FilesTab`]）
     files_tab: FilesTab,
 }
@@ -8288,6 +8411,7 @@ impl App {
             },
             backup: BackupTool::new(),
             disk: DiskTool::default(),
+            search: SearchTool::default(),
             files_tab: FilesTab::default(),
         };
         // 監看 UI 執行緒有沒有卡住（見 spawn_ui_watchdog）
@@ -26310,7 +26434,7 @@ impl App {
         match self.files_tab {
             FilesTab::Backup => self.ui_files_backup(ctx),
             FilesTab::Disk => self.ui_files_disk(ctx),
-            FilesTab::Search => self.ui_files_todo(ctx),
+            FilesTab::Search => self.ui_files_search(ctx),
         }
     }
 
@@ -26752,6 +26876,7 @@ impl App {
                 self.disk.table = t;
                 self.disk.load_error = None;
                 self.disk.no_text = disk::fmt_no(self.disk.table.next_no());
+                self.search.dirty = true;
             }
             Err(e) => {
                 self.disk.table = disk::Table::default();
@@ -26900,7 +27025,7 @@ impl App {
             let done = scanned.and_then(|s| {
                 let _ = tx.send(DiskMsg::Writing);
                 ctx.request_repaint();
-                let rows = s.rows.len();
+                let found = s.rows.len();
                 table.replace_disk(
                     no,
                     s.rows,
@@ -26914,25 +27039,16 @@ impl App {
                         serial: drive.serial,
                     },
                 );
-                // 索引檔先存：Excel 與 PDF 是「人看的那一份」，萬一匯出失敗
-                // （檔案被 Excel 開著是最常見的），掃到的資料至少已經收好了
-                table.save(&dir)?;
-                disk::export_xlsx(&table.rows, &dir.join(format!("{}.xlsx", disk::TABLE_STEM)))?;
-                match font.as_ref() {
-                    Some(f) => disk::export_pdf(
-                        &table.rows,
-                        &dir.join(format!("{}.pdf", disk::TABLE_STEM)),
-                        f.font.as_ref(),
-                    )?,
-                    None => {
-                        return Err(
-                            "找不到系統中文字型，PDF 沒有匯出（總表與 Excel 已經存好）".into()
-                        )
-                    }
-                }
+                disk::write_all(&table, &dir, font.as_ref().map(|f| f.font.as_ref()))?;
+                let msg = format!(
+                    "編號 {} 建好了：{} 個資料夾，總表現在有 {} 筆（Excel 與 PDF 也更新了）",
+                    disk::fmt_no(no),
+                    thousands(found as u64),
+                    thousands(table.rows.len() as u64)
+                );
                 Ok(DiskDone {
                     table,
-                    rows,
+                    msg,
                     skipped: s.skipped,
                 })
             });
@@ -26957,17 +27073,13 @@ impl App {
                     self.disk.at.clear();
                     match *res {
                         Ok(done) => {
-                            let no = self.disk.no().unwrap_or(0);
                             self.disk.skipped = done.skipped;
                             self.disk.table = done.table;
-                            self.disk.result = Some(format!(
-                                "編號 {} 建好了：{} 個資料夾，總表現在有 {} 筆（Excel 與 PDF 也更新了）",
-                                disk::fmt_no(no),
-                                done.rows,
-                                self.disk.table.rows.len()
-                            ));
+                            self.disk.result = Some(done.msg);
                             // 下一顆碟接著用下一個空號，不必自己改
                             self.disk.no_text = disk::fmt_no(self.disk.table.next_no());
+                            // 總表換了一份，搜尋那一頁的結果要重算
+                            self.search.dirty = true;
                         }
                         Err(e) if e == disk::CANCELLED => {
                             self.disk.result = Some("已中止，總表沒有被動到".into());
@@ -26977,6 +27089,7 @@ impl App {
                             // 寫到一半失敗時，手上這份總表未必與檔案裡的一致，
                             // 下一幀重讀一次，以檔案為準
                             self.disk.loaded = false;
+                            self.search.dirty = true;
                         }
                     }
                 }
@@ -26990,10 +27103,14 @@ impl App {
         }
     }
 
-    /// 「3. 檔案搜尋」：功能還沒做，先把功能列上的位置佔著——點得進來、
-    /// 看得到名字，才知道它排在哪裡
-    fn ui_files_todo(&mut self, ctx: &egui::Context) {
-        let name = self.files_tab.name();
+    /// 「3. 檔案搜尋」：拿總表來查。
+    ///
+    /// 一進來就是**整張總表**（不先過濾），打了關鍵字才縮小範圍——
+    /// 使用者要先看得到「我總共存了幾筆」，才知道這張表有沒有他要的東西
+    fn ui_files_search(&mut self, ctx: &egui::Context) {
+        self.disk_ensure_loaded();
+        self.search_sync();
+        let mut del: Option<u32> = None;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -27002,21 +27119,393 @@ impl App {
             )
             .show(ctx, |ui| {
                 self.ui_files_tabs(ui);
-                ui.add_space(48.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("「{name}」還在做"))
-                            .size(15.0)
-                            .color(theme::TEXT),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("功能列上的位置先留著，做好了就會出現在這裡")
-                            .size(13.0)
-                            .color(theme::TEXT_WEAK),
-                    );
-                });
+                self.ui_search_bar(ui, &mut del);
+                ui.add_space(6.0);
+                self.ui_search_table(ui);
             });
+        if let Some(no) = del {
+            self.disk_delete(no, ctx);
+        }
+    }
+
+    /// 條件變了就重算一次符合的清單（總表最多幾萬列，一次全掃是毫秒等級，
+    /// 但沒必要每一幀都做）
+    fn search_sync(&mut self) {
+        let key = (
+            self.search.text.clone(),
+            self.search.from,
+            self.search.to,
+            self.disk.table.rows.len(),
+        );
+        if !self.search.dirty && self.search.last == key {
+            return;
+        }
+        self.search.dirty = false;
+        self.search.last = key;
+        let q = disk::Query::parse(&self.search.text);
+        let (from, to) = (self.search.from, self.search.to);
+        self.search.hits = self
+            .disk
+            .table
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                from.is_none_or(|f| r.disk >= f)
+                    && to.is_none_or(|t| r.disk <= t)
+                    && q.matches(&r.name)
+            })
+            .map(|(i, _)| i as u32)
+            .collect();
+        // 條件換了就回到第一頁，不然會停在一個已經不存在的頁數上
+        self.search.page = 0;
+        // 剛被刪掉的那一號不該繼續留在「刪除硬碟編號」上：按下去什麼都不會
+        // 發生，但看起來像壞掉
+        if self
+            .search
+            .del_no
+            .is_some_and(|n| self.disk.table.count_of(n) == 0)
+        {
+            self.search.del_no = None;
+        }
+    }
+
+    /// 搜尋條件那幾列：關鍵字、硬碟編號範圍、分頁、刪除某一號
+    fn ui_search_bar(&mut self, ui: &mut egui::Ui, del: &mut Option<u32>) {
+        let disks = self.disk.table.disks();
+        let busy = self.disk.busy != DiskBusy::Idle;
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("關鍵字")
+                    .size(13.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search.text)
+                    .desired_width(320.0)
+                    .hint_text("資料夾名稱"),
+            );
+            if ui
+                .add_enabled(!self.search.text.is_empty(), egui::Button::new("✖").small())
+                .on_hover_text("清掉關鍵字")
+                .clicked()
+            {
+                self.search.text.clear();
+            }
+            ui.label(
+                egui::RichText::new("空白隔開＝都要有，逗號隔開＝有一個就算（比對的是資料夾名稱）")
+                    .size(12.0)
+                    .color(theme::TEXT_WEAK),
+            );
+        });
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("硬碟編號")
+                    .size(13.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            search_no_combo(ui, "search_from", "全部", &disks, &mut self.search.from);
+            ui.label(egui::RichText::new("到").size(12.5).color(theme::TEXT_WEAK));
+            search_no_combo(ui, "search_to", "全部", &disks, &mut self.search.to);
+            ui.add_space(14.0);
+            // 幾筆：**先講符合幾筆、再講總表共幾筆**。沒打關鍵字時兩個一樣，
+            // 一打字就看得出縮小到多少
+            let hits = self.search.hits.len();
+            let all = self.disk.table.rows.len();
+            ui.label(
+                egui::RichText::new(format!("符合 {} 筆", thousands(hits as u64)))
+                    .size(13.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "／總表共 {} 筆（{} 顆硬碟）",
+                    thousands(all as u64),
+                    disks.len()
+                ))
+                .size(12.0)
+                .color(theme::TEXT_WEAK),
+            );
+        });
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            // 預設不分頁：幾萬列直接捲（只畫看得見的那幾列，捲起來一樣快），
+            // 要一頁一頁看再打開
+            ui.checkbox(&mut self.search.paged, "分頁顯示")
+                .on_hover_text("關著就是一路捲到底；打開才一頁一頁翻");
+            if self.search.paged {
+                ui.add_space(8.0);
+                // 一次跳幾筆**自己打**：舊系統只能從 100~500 裡挑，但「一頁
+                // 剛好放得下幾列」看的是視窗多高，給定幾個數字總有人不合用。
+                // 常用的那幾個仍然一按就換（就是舊系統那一組）
+                ui.label(egui::RichText::new("每頁").size(12.5).color(theme::TEXT_WEAK));
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut self.search.per_page)
+                            .range(10..=100_000)
+                            .speed(10.0),
+                    )
+                    .on_hover_text("一次顯示幾筆（可以直接打數字，也可以左右拖）")
+                    .changed()
+                {
+                    self.search.page = 0;
+                }
+                ui.label(egui::RichText::new("筆").size(12.5).color(theme::TEXT_WEAK));
+                for n in [100usize, 200, 300, 400, 500] {
+                    if ui
+                        .selectable_label(self.search.per_page == n, n.to_string())
+                        .clicked()
+                    {
+                        self.search.per_page = n;
+                        self.search.page = 0;
+                    }
+                }
+                let pages = self.search.pages();
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(self.search.page > 0, egui::Button::new("◀").small())
+                    .clicked()
+                {
+                    self.search.page -= 1;
+                }
+                ui.label(
+                    egui::RichText::new(format!("第 {} / {} 頁", self.search.page + 1, pages))
+                        .size(12.5)
+                        .color(theme::TEXT),
+                );
+                if ui
+                    .add_enabled(
+                        self.search.page + 1 < pages,
+                        egui::Button::new("▶").small(),
+                    )
+                    .clicked()
+                {
+                    self.search.page += 1;
+                }
+            }
+
+            // 刪除某一顆碟的資料：靠右放，和查詢條件分開——這是唯一會動到
+            // 總表的操作，不該與「只是看看」的控制項混在一起
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can = self.search.del_no.is_some() && !busy;
+                if ui
+                    .add_enabled(can, egui::Button::new("🗑  刪除這一號的資料"))
+                    .on_hover_text(
+                        "把那個編號底下的紀錄整批從總表刪掉，Excel 與 PDF 一起更新。\n\
+                         只動總表，硬碟本身的檔案不會被刪",
+                    )
+                    .clicked()
+                {
+                    *del = self.search.del_no;
+                }
+                search_no_combo(ui, "search_del", "選一號", &disks, &mut self.search.del_no);
+                ui.label(
+                    egui::RichText::new("刪除硬碟編號")
+                        .size(12.5)
+                        .color(theme::TEXT_WEAK),
+                );
+            });
+        });
+
+        if let Some(e) = &self.disk.error {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("✖ {e}"))
+                    .size(12.0)
+                    .color(theme::ERROR),
+            );
+        }
+        // 做完的那句話也要在這一頁看得到：刪除是在這裡按的，結果卻只寫在
+        // 「2. 硬碟檔案管理」那一頁的話，按完等於沒有任何回應
+        if let Some(r) = &self.disk.result {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("✔ {r}"))
+                    .size(12.5)
+                    .color(theme::SUCCESS),
+            );
+        }
+        if self.disk.busy == DiskBusy::Writing {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new("正在更新總表、Excel 與 PDF…")
+                        .size(12.5)
+                        .color(theme::TEXT),
+                );
+            });
+        }
+    }
+
+    /// 查到的那幾列。第一欄是**流水號**（在這份結果裡的第幾筆），
+    /// 其餘六欄就是總表的六個欄位
+    fn ui_search_table(&self, ui: &mut egui::Ui) {
+        if self.disk.table.rows.is_empty() {
+            ui.add_space(20.0);
+            ui.label(
+                egui::RichText::new(
+                    "總表還是空的。先到「2. 硬碟檔案管理」挑一顆碟建檔，這裡才查得到東西",
+                )
+                .size(13.0)
+                .color(theme::TEXT_WEAK),
+            );
+            return;
+        }
+        if self.search.hits.is_empty() {
+            ui.add_space(20.0);
+            ui.label(
+                egui::RichText::new("沒有符合的資料夾。換個關鍵字，或把硬碟編號改回「全部」")
+                    .size(13.0)
+                    .color(theme::TEXT_WEAK),
+            );
+            return;
+        }
+        // 這一頁要畫哪一段（不分頁就是全部）
+        let (first, count) = self.search.range();
+        let row_h = ui
+            .fonts(|f| f.row_height(&egui::FontId::proportional(12.0)))
+            .max(16.0)
+            + 4.0;
+        // 路徑那一欄吃掉剩下的寬度：它最長，而且是看清單時最需要看完的一欄
+        let fixed = [64.0, 72.0, 200.0, 78.0, 128.0, 96.0];
+        let path_w = (ui.available_width() - fixed.iter().sum::<f32>() - 24.0).max(240.0);
+        let widths = [
+            fixed[0], path_w, fixed[2], fixed[3], fixed[4], fixed[5], fixed[1],
+        ];
+        let titles = [
+            "編號",
+            "資料夾路徑",
+            "資料夾名稱",
+            "資料夾大小",
+            "資料夾修改時間",
+            "資料夾大小(byte)",
+            "硬碟編號",
+        ];
+        ui.horizontal(|ui| {
+            for (w, t) in widths.iter().zip(titles) {
+                search_cell(ui, *w, row_h, t, theme::TEXT, true);
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("search_rows")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_h, count, |ui, range| {
+                for i in range {
+                    let at = first + i;
+                    let r = &self.disk.table.rows[self.search.hits[at] as usize];
+                    ui.horizontal(|ui| {
+                        search_cell(
+                            ui,
+                            widths[0],
+                            row_h,
+                            &thousands(at as u64 + 1),
+                            theme::TEXT_WEAK,
+                            false,
+                        );
+                        search_cell(ui, widths[1], row_h, &r.path, theme::TEXT_WEAK, false);
+                        search_cell(ui, widths[2], row_h, &r.name, theme::TEXT, false);
+                        search_cell(
+                            ui,
+                            widths[3],
+                            row_h,
+                            &disk::fmt_gb(r.bytes),
+                            theme::TEXT,
+                            false,
+                        );
+                        search_cell(
+                            ui,
+                            widths[4],
+                            row_h,
+                            &disk::fmt_time(r.mtime),
+                            theme::TEXT_WEAK,
+                            false,
+                        );
+                        search_cell(
+                            ui,
+                            widths[5],
+                            row_h,
+                            &thousands(r.bytes),
+                            theme::TEXT_WEAK,
+                            false,
+                        );
+                        search_cell(
+                            ui,
+                            widths[6],
+                            row_h,
+                            &disk::fmt_no(r.disk),
+                            theme::TEXT_WEAK,
+                            false,
+                        );
+                    });
+                }
+            });
+    }
+
+    /// 刪掉某一個硬碟編號的全部資料。
+    ///
+    /// **只動總表**，被掃過的那顆碟上一個檔案都不會少——確認框裡會把這件事
+    /// 講明白，不然「刪除」兩個字很容易讓人以為是在刪硬碟上的東西
+    fn disk_delete(&mut self, no: u32, ctx: &egui::Context) {
+        let had = self.disk.table.count_of(no);
+        if had == 0 || self.disk.busy != DiskBusy::Idle {
+            return;
+        }
+        if !ask2(
+            rfd::MessageLevel::Warning,
+            "要刪掉這一號的資料嗎？",
+            &format!(
+                // 系統對話框是純文字，寫 **粗體** 只會原樣印出星號
+                "編號 {} 底下有 {} 筆紀錄，刪掉之後總表、Excel 與 PDF 裡都不會再有它們。\n\n\
+                 刪的只是「總表裡的紀錄」——那顆硬碟上的檔案一個都不會少。\n\n\
+                 刪完這個號就空出來，下一顆新碟會自動補上它。",
+                disk::fmt_no(no),
+                thousands(had as u64)
+            ),
+            "刪掉這一號",
+            "取消",
+        ) {
+            return;
+        }
+        let mut table = disk::Table {
+            ver: self.disk.table.ver,
+            rows: self.disk.table.rows.clone(),
+            notes: self.disk.table.notes.clone(),
+        };
+        let dir = self.disk.dir.clone();
+        let font = CJK_FONT.get().cloned();
+        self.disk.busy = DiskBusy::Writing;
+        self.disk.error = None;
+        self.disk.result = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.disk.rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            table.remove_disk(no);
+            let left = table.rows.len();
+            let done = disk::write_all(&table, &dir, font.as_ref().map(|f| f.font.as_ref())).map(
+                |()| DiskDone {
+                    table,
+                    msg: format!(
+                        "編號 {} 的 {} 筆資料已經刪掉，總表現在有 {} 筆（Excel 與 PDF 也更新了）",
+                        disk::fmt_no(no),
+                        thousands(had as u64),
+                        thousands(left as u64)
+                    ),
+                    skipped: Vec::new(),
+                },
+            );
+            let _ = tx.send(DiskMsg::Done(Box::new(done)));
+            ctx.request_repaint();
+        });
     }
 
     /// 「1. 資料備份」：左邊挑資料夾與開關，右邊一欄放比對結果

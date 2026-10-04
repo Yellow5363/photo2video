@@ -390,6 +390,15 @@ impl Table {
         want
     }
 
+    /// 把某一個編號的資料整批刪掉（連附註一起）。
+    ///
+    /// 碟報廢、或那一號根本建錯了才會用到。刪掉之後那個號就空出來，
+    /// 下一顆新碟會補上它（見 [`Table::next_no`]）
+    pub fn remove_disk(&mut self, disk: u32) {
+        self.rows.retain(|r| r.disk != disk);
+        self.notes.remove(&disk);
+    }
+
     /// 把某一個編號的資料整批換成新掃到的這一批。
     ///
     /// 硬碟隨時在新增、刪改檔案，所以同一顆碟會掃第二次、第三次——
@@ -832,6 +841,65 @@ fn fit(font: &ab_glyph::FontRef, s: &str, limit: f32, keep_tail: bool) -> String
     }
 }
 
+// ---------- 搜尋 ----------
+
+/// 關鍵字條件：**空白隔開＝都要有，逗號隔開＝有一個就算**。
+///
+/// `漁人 煙火, 2025` ＝「名字裡同時有漁人與煙火」**或**「有 2025」。
+/// 不另外放 And／Or 兩個欄位——打字的習慣本來就是這樣，一格講得完。
+/// 全形逗號與全形空白一樣算（中文輸入法打出來的是那一種）。
+///
+/// 比對的是**資料夾名稱**，不是整條路徑：打「鳥」要找的是名字裡有鳥的
+/// 那個資料夾，不是 `2025_鳥_精選` 底下的幾百個子資料夾
+#[derive(Default)]
+pub struct Query {
+    /// 外層是「或」、內層是「且」；一律先轉小寫（英數字不分大小寫）
+    groups: Vec<Vec<String>>,
+}
+
+impl Query {
+    pub fn parse(s: &str) -> Query {
+        let groups = s
+            .split([',', '，'])
+            .map(|g| {
+                g.split_whitespace()
+                    .map(|w| w.to_lowercase())
+                    .collect::<Vec<String>>()
+            })
+            .filter(|g| !g.is_empty())
+            .collect();
+        Query { groups }
+    }
+
+    /// 這個資料夾名稱符不符合
+    pub fn matches(&self, name: &str) -> bool {
+        if self.groups.is_empty() {
+            return true;
+        }
+        let name = name.to_lowercase();
+        self.groups
+            .iter()
+            .any(|g| g.iter().all(|w| name.contains(w.as_str())))
+    }
+}
+
+/// 把總表存檔，並重新匯出 Excel 與 PDF——**三個檔案一起更新**。
+///
+/// 建檔完、刪掉一顆碟的資料之後都走這裡：少更新一個，手上的 Excel 就與
+/// 總表對不起來，而使用者真正會去看的正是 Excel。
+///
+/// 索引檔**先存**：Excel 被開著而寫不進去是最常見的失敗，那時候掃到的資料
+/// 至少已經收好了，不必整顆碟重走一次。`font`＝中文字型（見
+/// `load_cjk_font_bytes`），沒有就只存總表與 Excel
+pub fn write_all(table: &Table, dir: &Path, font: Option<&[u8]>) -> Result<(), String> {
+    table.save(dir)?;
+    export_xlsx(&table.rows, &dir.join(format!("{TABLE_STEM}.xlsx")))?;
+    match font {
+        Some(f) => export_pdf(&table.rows, &dir.join(format!("{TABLE_STEM}.pdf")), f),
+        None => Err("找不到系統中文字型，PDF 沒有更新（總表與 Excel 已經存好）".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,6 +997,56 @@ mod tests {
         assert!(names.contains(&"新的"));
         assert_eq!(t.count_of(1), 2);
         assert_eq!(t.count_of(2), 1, "別顆碟的資料不能被動到");
+    }
+
+    #[test]
+    fn 關鍵字空白是且_逗號是或() {
+        let q = Query::parse("漁人 煙火");
+        assert!(q.matches("20260830漁人碼頭煙火"), "兩個詞都有就算符合");
+        assert!(!q.matches("20260830漁人碼頭"), "少一個詞就不算");
+
+        let q = Query::parse("漁人,煙火");
+        assert!(q.matches("20260830漁人碼頭"), "逗號隔開＝有一個就算");
+        assert!(q.matches("日月潭煙火"));
+        assert!(!q.matches("2025_鳥_精選"));
+
+        // 兩種混用：(漁人 且 煙火) 或 (2025)
+        let q = Query::parse("漁人 煙火, 2025");
+        assert!(q.matches("20260830漁人碼頭煙火"));
+        assert!(q.matches("2025_鳥_精選"));
+        assert!(!q.matches("20260830漁人碼頭"));
+
+        // 全形逗號、全形空白照樣認（中文輸入法打出來的是那一種）
+        let q = Query::parse("漁人，煙火");
+        assert!(q.matches("日月潭煙火"));
+        let q = Query::parse("漁人　煙火");
+        assert!(q.matches("20260830漁人碼頭煙火"));
+        assert!(!q.matches("日月潭煙火"));
+
+        // 英文不分大小寫
+        assert!(Query::parse("IMG").matches("img20230126"));
+        // 沒打字＝不過濾
+        assert!(Query::parse("   ").matches("隨便一個名字"), "只有空白＝不過濾");
+        assert!(Query::parse("").matches("什麼都符合"));
+    }
+
+    #[test]
+    fn 刪掉一顆碟連附註一起走() {
+        let mut t = Table::default();
+        let row = |d: u32| Row {
+            disk: d,
+            path: String::new(),
+            name: String::new(),
+            bytes: 0,
+            mtime: 0,
+        };
+        t.replace_disk(3, vec![row(3), row(3)], DiskNote::default());
+        t.replace_disk(4, vec![row(4)], DiskNote::default());
+        t.remove_disk(3);
+        assert_eq!(t.count_of(3), 0);
+        assert_eq!(t.count_of(4), 1, "別顆碟不能被動到");
+        assert!(!t.notes.contains_key(&3), "附註要跟著刪掉");
+        assert_eq!(t.next_no(), 1, "刪掉之後那個號要空出來給下一顆碟");
     }
 
     #[test]
