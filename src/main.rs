@@ -7834,7 +7834,6 @@ struct DiskClicks {
     pick_dir: bool,
     scan: bool,
     stop: bool,
-    open_dir: bool,
 }
 
 // ---------- 硬碟管理 ▸ 資料備份 ----------
@@ -26538,9 +26537,6 @@ impl App {
         if clicks.stop {
             self.disk.cancel.store(true, Ordering::Relaxed);
         }
-        if clicks.open_dir {
-            open_in_explorer(&self.disk.dir);
-        }
     }
 
     /// 左半邊：挑碟、編號、深度、開始掃描、進度與結果
@@ -26799,25 +26795,16 @@ impl App {
                 .size(12.5)
                 .color(theme::TEXT),
         );
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    self.disk.busy == DiskBusy::Idle,
-                    egui::Button::new("📂  變更…").small(),
-                )
-                .on_hover_text("換一個資料夾放總表。換過之後會記住，下次直接用那裡")
-                .clicked()
-            {
-                clicks.pick_dir = true;
-            }
-            if ui
-                .add(egui::Button::new("↗  開啟").small())
-                .on_hover_text("在檔案總管裡打開這個資料夾")
-                .clicked()
-            {
-                clicks.open_dir = true;
-            }
-        });
+        if ui
+            .add_enabled(
+                self.disk.busy == DiskBusy::Idle,
+                egui::Button::new("📂  變更…").small(),
+            )
+            .on_hover_text("換一個資料夾放總表。換過之後會記住，下次直接用那裡")
+            .clicked()
+        {
+            clicks.pick_dir = true;
+        }
         ui.add_space(6.0);
         // 三個檔案各自在不在（第一次用的時候一個都還沒有，講清楚免得以為壞了）
         for p in self.disk.files() {
