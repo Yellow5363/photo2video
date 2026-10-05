@@ -26626,7 +26626,10 @@ impl App {
                 Some(n) => match self.disk.table.count_of(n) {
                     0 => ("還沒用過的編號".to_string(), theme::TEXT_WEAK),
                     had => (
-                        format!("這一號已經有 {had} 筆資料，掃完會整批換掉"),
+                        format!(
+                            "這一號已經有 {} 筆資料，按下去會問要「加進去」還是「整批換掉」",
+                            thousands(had as u64)
+                        ),
                         theme::TRACK,
                     ),
                 },
@@ -26988,8 +26991,14 @@ impl App {
         // 「換掉」才是對的——硬碟隨時在新增、刪改檔案，同一顆碟本來就會再讀
         // 第二次、第三次；疊上去的話，早就刪掉的資料夾會永遠留在表上，而那
         // 正是最會害人白找一場的假資料。但換掉得是使用者點頭的
+        // 這一號已經有資料：是「同一顆碟的另一個磁區」還是「重掃同一塊」？
+        //
+        // 一顆大碟常被切成好幾個磁區（K:、L:），它們是同一顆實體碟、該用
+        // 同一個編號——所以不能只給「換掉／取消」兩條路，不然掃完第二個
+        // 磁區就把第一個洗掉了。預設那顆放「加進去」：它不會弄丟任何東西
+        // （同一個磁區重掃只換掉它自己那一段，見 [`disk::Merge`]）
         let had = self.disk.table.count_of(no);
-        if had > 0 {
+        let how = if had > 0 {
             let from = self
                 .disk
                 .table
@@ -27004,22 +27013,31 @@ impl App {
                     format!("（上次從「{}」{}建的）", n.root, when)
                 })
                 .unwrap_or_default();
-            if !ask2(
+            match ask3(
                 rfd::MessageLevel::Warning,
                 "這個編號已經有資料了",
                 &format!(
-                    "編號 {} 底下已經有 {had} 筆資料{from}。\n\n\
-                     繼續的話會重新走一次這顆碟，掃到的結果整批換掉那 {had} 筆——\
-                     上次建檔之後被刪掉的資料夾就不會再留在表上。\n\n\
-                     如果這是另一顆碟，請改一個還沒用過的編號。",
-                    disk::fmt_no(no)
+                    "編號 {} 底下已經有 {} 筆資料{from}，這次要掃的是「{}」。\n\n\
+                     ・加進去：一顆碟切成好幾個磁區（K:、L:）時用這個。\
+                     這次掃到的收進同一個編號，其他磁區的資料留著；\
+                     這個磁區本來就有的那一段會換成最新的。\n\n\
+                     ・整批換掉：這一號只留這次掃到的，其他磁區的資料也會不見。\
+                     重掃同一塊、或這個號本來就給錯了才用它。",
+                    disk::fmt_no(no),
+                    thousands(had as u64),
+                    drive.show()
                 ),
-                "重新建檔，換掉舊的",
+                "加進去（同一顆碟的另一個磁區）",
+                "整批換掉",
                 "取消",
             ) {
-                return;
+                Ask3::First => disk::Merge::Append,
+                Ask3::Second => disk::Merge::Replace,
+                Ask3::Cancel => return,
             }
-        }
+        } else {
+            disk::Merge::Replace
+        };
 
         let dir = self.disk.dir.clone();
         // 把目前這份總表交給背景執行緒去改（複製一份：掃描期間右邊那一欄
@@ -27058,8 +27076,9 @@ impl App {
                 let _ = tx.send(DiskMsg::Writing);
                 ctx.request_repaint();
                 let found = s.rows.len();
-                table.replace_disk(
+                table.put_disk(
                     no,
+                    &root.to_string_lossy(),
                     s.rows,
                     disk::DiskNote {
                         root: drive.show(),
@@ -27069,13 +27088,22 @@ impl App {
                             .unwrap_or(0),
                         label: drive.label.clone(),
                         serial: drive.serial,
+                        serials: Vec::new(),
                     },
+                    how,
                 );
                 disk::write_all(&table, &dir, font.as_ref().map(|f| f.font.as_ref()))?;
                 let msg = format!(
-                    "編號 {} 建好了：{} 個資料夾，總表現在有 {} 筆（Excel 與 PDF 也更新了）",
+                    "編號 {} {}：這個磁區 {} 個資料夾，這一號現在有 {} 筆，\
+                     總表共 {} 筆（Excel 與 PDF 也更新了）",
                     disk::fmt_no(no),
+                    if how == disk::Merge::Append {
+                        "加好了"
+                    } else {
+                        "建好了"
+                    },
                     thousands(found as u64),
+                    thousands(table.count_of(no) as u64),
                     thousands(table.rows.len() as u64)
                 );
                 Ok(DiskDone {

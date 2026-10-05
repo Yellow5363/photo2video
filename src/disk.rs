@@ -343,9 +343,29 @@ pub struct DiskNote {
     /// 磁碟區名稱。代號會換、名字不會，碟插回來時認的是這個
     #[serde(rename = "l", default)]
     pub label: String,
-    /// 磁碟區序號（見 [`Drive::serial`]）。0＝當時問不到
+    /// 最後一次掃的那個磁區的序號（見 [`Drive::serial`]）。0＝當時問不到
     #[serde(rename = "s", default)]
     pub serial: u32,
+    /// 這個編號收過的**所有**磁區序號。
+    ///
+    /// 一顆大碟常被切成好幾個磁區（`K:`、`L:`），它們是同一顆碟、同一個
+    /// 編號；插回來時不管先認到哪一個磁區，都要能帶出同一個號
+    #[serde(rename = "ss", default)]
+    pub serials: Vec<u32>,
+}
+
+/// 同一個編號再建一次檔時，新掃到的東西要怎麼進表
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Merge {
+    /// **整批換掉**：這一號只留這次掃到的。同一個磁區重掃、或這個號本來
+    /// 就給錯了，用這個
+    Replace,
+    /// **加進去**：一顆碟切成好幾個磁區（`K:`、`L:`）時，各磁區各記各的，
+    /// 合起來就是這一顆碟的全部。
+    ///
+    /// **同一個磁區重掃只會換掉它自己那一段**（照路徑開頭認），不會疊成
+    /// 兩份——否則同一個資料夾會在表裡出現好幾次，比沒資料還糟
+    Append,
 }
 
 /// 現在寫出來的索引檔版本
@@ -423,7 +443,7 @@ impl Table {
         }
         self.notes
             .iter()
-            .find(|(_, n)| n.serial == serial)
+            .find(|(_, n)| n.serial == serial || n.serials.contains(&serial))
             .map(|(no, _)| *no)
     }
 
@@ -455,13 +475,60 @@ impl Table {
         self.notes.remove(&disk);
     }
 
-    /// 把某一個編號的資料整批換成新掃到的這一批。
+    /// 把這次掃到的結果放進某一個編號。`part` 是這次掃的那個磁區的根路徑
+    /// （`K:\`），`how` 決定原本那一號的資料怎麼辦（見 [`Merge`]）。
     ///
-    /// 硬碟隨時在新增、刪改檔案，所以同一顆碟會掃第二次、第三次——
-    /// 這時要的是**換掉**，不是把兩次的結果疊在一起（疊起來的話，刪掉的
-    /// 資料夾永遠留在表上，而那正是最容易找錯的一種假資料）
-    pub fn replace_disk(&mut self, disk: u32, rows: Vec<Row>, note: DiskNote) {
-        self.rows.retain(|r| r.disk != disk);
+    /// 硬碟隨時在新增、刪改檔案，所以同一顆碟會掃第二次、第三次——不論哪
+    /// 一種放法，**同一個磁區的舊資料一定會被換掉**，不會疊成兩份：疊起來
+    /// 的話，刪掉的資料夾永遠留在表上，而那正是最容易害人白找一場的假資料
+    pub fn put_disk(
+        &mut self,
+        disk: u32,
+        part: &str,
+        rows: Vec<Row>,
+        note: DiskNote,
+        how: Merge,
+    ) {
+        let note = match how {
+            Merge::Replace => {
+                self.rows.retain(|r| r.disk != disk);
+                DiskNote {
+                    serials: vec![note.serial],
+                    ..note
+                }
+            }
+            Merge::Append => {
+                // 只清掉這個磁區自己那一段，別的磁區留著
+                let part = part.to_lowercase();
+                self.rows
+                    .retain(|r| r.disk != disk || !r.path.to_lowercase().starts_with(&part));
+                match self.notes.get(&disk) {
+                    // 原本就有這一號：把磁區的名字接在後面，序號收進清單
+                    Some(old) => {
+                        let mut serials = old.serials.clone();
+                        for s in [old.serial, note.serial] {
+                            if s != 0 && !serials.contains(&s) {
+                                serials.push(s);
+                            }
+                        }
+                        let root = if old.root.contains(&note.root) {
+                            old.root.clone()
+                        } else {
+                            format!("{} ＋ {}", old.root, note.root)
+                        };
+                        DiskNote {
+                            root,
+                            serials,
+                            ..note
+                        }
+                    }
+                    None => DiskNote {
+                        serials: vec![note.serial],
+                        ..note
+                    },
+                }
+            }
+        };
         self.rows.extend(rows);
         sort_rows(&mut self.rows);
         self.notes.insert(disk, note);
@@ -1028,14 +1095,75 @@ mod tests {
             mtime: 0,
         };
         // 故意後放的碟號比較小、每一批裡的名稱也是倒的
-        t.replace_disk(2, vec![row(2, "b2"), row(2, "a10"), row(2, "a9")], DiskNote::default());
-        t.replace_disk(1, vec![row(1, "z"), row(1, "y")], DiskNote::default());
+        t.put_disk(
+            2,
+            "X:\\",
+            vec![row(2, "b2"), row(2, "a10"), row(2, "a9")],
+            DiskNote::default(),
+            Merge::Replace,
+        );
+        t.put_disk(
+            1,
+            "X:\\",
+            vec![row(1, "z"), row(1, "y")],
+            DiskNote::default(),
+            Merge::Replace,
+        );
         let got: Vec<(u32, &str)> = t.rows.iter().map(|r| (r.disk, r.name.as_str())).collect();
         assert_eq!(
             got,
             vec![(1, "y"), (1, "z"), (2, "a9"), (2, "a10"), (2, "b2")],
             "先照硬碟編號，同一顆碟裡再照名稱（數字要自然排序：a9 在 a10 前面）"
         );
+    }
+
+    #[test]
+    fn 同一顆碟的兩個磁區共用一個編號() {
+        let mut t = Table::default();
+        let row = |d: u32, p: &str| Row {
+            disk: d,
+            path: p.into(),
+            name: p.rsplit('\\').next().unwrap_or(p).into(),
+            bytes: 0,
+            mtime: 0,
+        };
+        let note = |root: &str, serial: u32| DiskNote {
+            root: root.into(),
+            at: 1,
+            label: root.into(),
+            serial,
+            serials: Vec::new(),
+        };
+        // 先掃 K:（這一號還沒有東西）
+        t.put_disk(94, "K:\\", vec![row(94, "K:\\一")], note("新碟 (K:)", 11), Merge::Replace);
+        // 再掃 L:：同一顆碟的另一個磁區，選「加進去」
+        t.put_disk(94, "L:\\", vec![row(94, "L:\\二")], note("新碟 (L:)", 22), Merge::Append);
+        let paths: Vec<&str> = t.rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths.len(), 2, "兩個磁區的資料都要在");
+        assert!(paths.contains(&"K:\\一") && paths.contains(&"L:\\二"));
+        assert_eq!(t.count_of(94), 2);
+
+        // 兩個磁區的序號都要認得（碟插回來時先認到哪一個都一樣）
+        assert_eq!(t.disk_of_serial(11), Some(94));
+        assert_eq!(t.disk_of_serial(22), Some(94));
+        // 附註把兩個磁區都寫出來
+        assert_eq!(t.notes[&94].root, "新碟 (K:) ＋ 新碟 (L:)");
+
+        // 同一個磁區再掃一次（還是「加進去」）：只換掉它自己那一段
+        t.put_disk(
+            94,
+            "K:\\",
+            vec![row(94, "K:\\一的新內容")],
+            note("新碟 (K:)", 11),
+            Merge::Append,
+        );
+        let paths: Vec<&str> = t.rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths.len(), 2, "同一個磁區不該疊成兩份");
+        assert!(paths.contains(&"K:\\一的新內容") && paths.contains(&"L:\\二"));
+
+        // 選「覆蓋」就只剩這次掃到的
+        t.put_disk(94, "L:\\", vec![row(94, "L:\\只剩我")], note("新碟 (L:)", 22), Merge::Replace);
+        assert_eq!(t.count_of(94), 1);
     }
 
     #[test]
@@ -1066,9 +1194,12 @@ mod tests {
             mtime: 0,
         };
         let note = DiskNote::default();
-        t.replace_disk(1, vec![row(1, "舊的"), row(1, "兩邊都有")], note.clone());
-        t.replace_disk(2, vec![row(2, "別顆碟的")], note.clone());
-        t.replace_disk(1, vec![row(1, "兩邊都有"), row(1, "新的")], note);
+        let put = |t: &mut Table, d, rows| {
+            t.put_disk(d, "H:\\", rows, note.clone(), Merge::Replace);
+        };
+        put(&mut t, 1, vec![row(1, "舊的"), row(1, "兩邊都有")]);
+        put(&mut t, 2, vec![row(2, "別顆碟的")]);
+        put(&mut t, 1, vec![row(1, "兩邊都有"), row(1, "新的")]);
         let names: Vec<&str> = t.rows.iter().map(|r| r.name.as_str()).collect();
         assert!(!names.contains(&"舊的"), "被刪掉的資料夾不該留在表上");
         assert!(names.contains(&"新的"));
@@ -1117,8 +1248,8 @@ mod tests {
             bytes: 0,
             mtime: 0,
         };
-        t.replace_disk(3, vec![row(3), row(3)], DiskNote::default());
-        t.replace_disk(4, vec![row(4)], DiskNote::default());
+        t.put_disk(3, "H:\\", vec![row(3), row(3)], DiskNote::default(), Merge::Replace);
+        t.put_disk(4, "H:\\", vec![row(4)], DiskNote::default(), Merge::Replace);
         t.remove_disk(3);
         assert_eq!(t.count_of(3), 0);
         assert_eq!(t.count_of(4), 1, "別顆碟不能被動到");
