@@ -138,6 +138,20 @@ fn is_hidden(e: &fs::DirEntry) -> bool {
     false
 }
 
+/// 這個資料夾是不是**別的程式自己的資料**——跳過，底下的也不走。
+///
+/// 目前認的是 Lightroom 的目錄庫與預覽檔（`.lrdata`、`.lrcat-data`）：
+/// 一個 `xxx Previews.lrdata` 底下是好幾千個 `F\F632` 這種兩層雜湊資料夾，
+/// 全部記進表裡只會把真正放照片的那幾個淹掉——使用者要找的是「我把照片
+/// 放在哪」，不是 Lightroom 把預覽圖切成幾塊。
+///
+/// 認的是**副檔名**（資料夾也有副檔名），不分大小寫
+fn is_app_data(name: &str) -> bool {
+    const EXT: [&str; 2] = [".lrdata", ".lrcat-data"];
+    let lower = name.to_lowercase();
+    EXT.iter().any(|e| lower.ends_with(e))
+}
+
 /// 掃完一顆碟的結果
 pub struct Scanned {
     /// 掃到的每一個資料夾
@@ -198,8 +212,9 @@ pub fn scan(
                 continue;
             }
             if ft.is_dir() {
-                // 隱藏的資料夾不列、也不走進去（見 [`is_hidden`]）
-                if !is_hidden(&e) {
+                // 隱藏的、以及別的程式自己的資料夾都不列、也不走進去
+                // （見 [`is_hidden`]、[`is_app_data`]）
+                if !is_hidden(&e) && !is_app_data(&name) {
                     subs.push(e.path());
                 }
             } else if ft.is_file() {
@@ -1088,6 +1103,22 @@ mod tests {
         let out = scan(&base, 5, 1, &cancel, &mut |_, _| {}).unwrap();
         let names: Vec<&str> = out.rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["照片"], "隱藏資料夾與它底下的都不該出現");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lightroom的目錄庫不進清單() {
+        let base = std::env::temp_dir().join(format!("p2v_lr_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("2023")).unwrap();
+        // Lightroom 會在照片資料夾旁邊放這幾個，底下是好幾千個雜湊資料夾
+        fs::create_dir_all(base.join("yellow2023-v13 Previews.lrdata").join("F")).unwrap();
+        fs::create_dir_all(base.join("yellow2023-v13.lrcat-data").join("x")).unwrap();
+        fs::create_dir_all(base.join("yellow2023 Helper.lrdata")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let out = scan(&base, 5, 1, &cancel, &mut |_, _| {}).unwrap();
+        let names: Vec<&str> = out.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["2023"], "Lightroom 的目錄庫與預覽檔都不該出現");
         let _ = fs::remove_dir_all(&base);
     }
 

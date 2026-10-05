@@ -7669,8 +7669,11 @@ struct SearchTool {
     hits: Vec<u32>,
     /// 總表被動過了（建檔、刪除），下一幀重算
     dirty: bool,
+    /// 點了哪一欄的標題要排序（欄位索引，true＝由小到大）。
+    /// None＝總表原本的順序（先硬碟編號、再資料夾名稱）
+    sort: Option<(usize, bool)>,
     /// 上次算 hits 用的條件，拿來判斷要不要重算
-    last: (String, Option<u32>, Option<u32>, usize),
+    last: (String, Option<u32>, Option<u32>, usize, Option<(usize, bool)>),
     /// 一頁一頁翻。**預設關著**：幾萬列直接捲就好（只畫看得見的那幾列），
     /// 翻頁反而多一道手續——要一頁一頁看的人再自己打開
     paged: bool,
@@ -7701,8 +7704,9 @@ impl Default for SearchTool {
             to: None,
             hits: Vec::new(),
             dirty: true,
+            sort: None,
             // 一個不可能相等的起始值，確保第一次一定會算
-            last: (String::new(), None, None, usize::MAX),
+            last: (String::new(), None, None, usize::MAX, None),
             paged: false,
             per_page: 100,
             page: 0,
@@ -27176,6 +27180,7 @@ impl App {
             self.search.from,
             self.search.to,
             self.disk.table.rows.len(),
+            self.search.sort,
         );
         if !self.search.dirty && self.search.last == key {
             return;
@@ -27197,6 +27202,46 @@ impl App {
             })
             .map(|(i, _)| i as u32)
             .collect();
+        // 點過標題就照那一欄排。沒點過就維持總表原本的順序（先硬碟編號、
+        // 再資料夾名稱，見 [`disk::Table`]），那也是 Excel 與 PDF 的順序
+        if let Some((col, asc)) = self.search.sort {
+            let rows = &self.disk.table.rows;
+            let mut hits = std::mem::take(&mut self.search.hits);
+            if col == 2 || col == 3 {
+                // 文字那兩欄**先把排序鍵算好再排**：在比較函式裡現算的話，
+                // 兩萬列要多做幾十萬次字串切割
+                let mut keyed: Vec<(Vec<NatPart>, u32)> = hits
+                    .iter()
+                    .map(|&i| {
+                        let r = &rows[i as usize];
+                        (
+                            natural_key(if col == 2 { &r.path } else { &r.name }),
+                            i,
+                        )
+                    })
+                    .collect();
+                keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                hits = keyed.into_iter().map(|(_, i)| i).collect();
+            } else {
+                hits.sort_by(|a, b| {
+                    let (x, y) = (&rows[*a as usize], &rows[*b as usize]);
+                    match col {
+                        1 => x.disk.cmp(&y.disk),
+                        // 「資料夾大小」與「資料夾大小(byte)」是同一個數字
+                        4 | 6 => x.bytes.cmp(&y.bytes),
+                        5 => x.mtime.cmp(&y.mtime),
+                        // 0＝流水號：它本來就是「第幾筆」，照原順序
+                        _ => std::cmp::Ordering::Equal,
+                    }
+                    // 同值的維持原順序，排出來才穩定、不會每次重排都跳動
+                    .then_with(|| a.cmp(b))
+                });
+            }
+            if !asc {
+                hits.reverse();
+            }
+            self.search.hits = hits;
+        }
         // 順便記下這批結果裡最長的路徑與名稱：欄寬照它們決定（見
         // [`App::ui_search_table`]）。先用「字數」粗估挑出候選，真正的寬度
         // 再交給字型去量一次——幾萬列全部拿去量太慢，粗估挑出來的那一列
@@ -27557,7 +27602,8 @@ impl App {
                 .and_then(|i| self.disk.table.rows.get(i as usize))
                 .map(|r| text_w(ui, if path { &r.path } else { &r.name }))
                 .unwrap_or(0.0);
-            content.max(text_w(ui, title)) + 18.0
+            // 標題後面可能多一個排序箭頭，寬度要先留著
+            content.max(text_w(ui, &format!("{title} ↓"))) + 18.0
         };
         // 路徑再寬也有個限度：整批裡只要有一條特別長的（開發用的碟就會有
         // 一堆 `target\debug\build\xxx-1975357cfc9f6909`），整欄就被它撐開，
@@ -27584,15 +27630,46 @@ impl App {
             "資料夾修改時間",
             "資料夾大小(byte)",
         ];
+        // 標題列：**點一下照那一欄排，再點一次反過來**，排序中的那一欄
+        // 標一個箭頭。流水號那一欄排的是「總表原本的順序」
+        let sort = self.search.sort;
         let head = ui
             .horizontal(|ui| {
-                for (w, t) in widths.iter().zip(titles) {
-                    search_cell(ui, *w, row_h, t, theme::TEXT, true);
+                for (i, (w, t)) in widths.iter().zip(titles).enumerate() {
+                    let text = match sort {
+                        Some((c, asc)) if c == i => {
+                            format!("{t} {}", if asc { "↑" } else { "↓" })
+                        }
+                        _ => t.to_string(),
+                    };
+                    search_cell(ui, *w, row_h, &text, theme::TEXT, true);
                 }
             })
             .response
             .rect;
         search_grid(ui, head, &widths);
+        // 點擊區疊在標題那一格上（文字本身不是按鈕，整格都能點才好按）
+        let mut hx = head.left();
+        for (i, w) in widths.iter().enumerate() {
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(hx, head.top()),
+                egui::vec2(*w, head.height()),
+            );
+            hx += w;
+            let r = ui.interact(cell, egui::Id::new(("search_head", i)), egui::Sense::click());
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if r.clicked() {
+                self.search.sort = match self.search.sort {
+                    Some((c, asc)) if c == i => Some((i, !asc)),
+                    _ => Some((i, true)),
+                };
+                // 重排是下一幀的事（條件變了才重算），要主動要求再畫一幀，
+                // 否則按完畫面會停在舊順序上不動
+                ui.ctx().request_repaint();
+            }
+        }
         ui.separator();
         let sel = self.search.sel;
         let mut click: Option<usize> = None;
