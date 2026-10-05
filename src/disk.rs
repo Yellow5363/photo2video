@@ -243,19 +243,20 @@ fn dir_mtime(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// 總表的排序：**先照資料夾名稱**，同名的再照完整路徑。
+/// 總表的排序：**先照硬碟編號**，同一顆碟裡再照資料夾名稱，同名的才看路徑。
 ///
-/// 照名稱排是這張表的用法決定的——找東西時記得的是資料夾叫什麼
-/// （`0722農舍`），不是它掛在哪一層。同名的資料夾（同一批照片拷過好幾份）
-/// 因此會排在一起，一眼就看得出它在哪幾顆碟、哪幾個位置各有一份。
+/// 先分碟是使用者定的：一打開就是「這顆碟有什麼、那顆碟有什麼」，與他
+/// 手邊貼在碟上的標籤對得起來；Excel 與 PDF 也照同一個順序印，兩邊並排
+/// 看才不會錯亂。
 ///
-/// 名稱用自然排序（見 [`crate::natural_key`]）：`105` 排在 `15` 後面而不是
-/// 中間，與檔案總管看到的順序一致
+/// 同一顆碟裡照名稱排，是因為找東西時記得的是資料夾叫什麼（`0722農舍`），
+/// 不是它掛在哪一層。名稱用自然排序（見 [`crate::natural_key`]）：
+/// `105` 排在 `15` 後面而不是中間，與檔案總管看到的順序一致
 fn sort_rows(rows: &mut [Row]) {
     rows.sort_by(|a, b| {
-        crate::natural_key(&a.name)
-            .cmp(&crate::natural_key(&b.name))
-            .then_with(|| a.disk.cmp(&b.disk))
+        a.disk
+            .cmp(&b.disk)
+            .then_with(|| crate::natural_key(&a.name).cmp(&crate::natural_key(&b.name)))
             .then_with(|| crate::natural_key(&a.path).cmp(&crate::natural_key(&b.path)))
     });
 }
@@ -316,7 +317,13 @@ impl Table {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Table::default()),
             Err(e) => return Err(format!("讀不到總表「{}」：{e}", p.display())),
         };
-        serde_json::from_str(&text).map_err(|e| format!("總表「{}」的內容壞了：{e}", p.display()))
+        let mut t: Table = serde_json::from_str(&text)
+            .map_err(|e| format!("總表「{}」的內容壞了：{e}", p.display()))?;
+        // 讀回來再排一次：檔案裡的順序是「存檔當下」的規矩排的，而排序規矩
+        // 改過（現在先照硬碟編號）。不在這裡排的話，舊的總表要等到下一次
+        // 建檔才會變成新順序
+        sort_rows(&mut t.rows);
+        Ok(t)
     }
 
     /// 寫回總表。
@@ -959,6 +966,27 @@ mod tests {
         assert_eq!(fmt_gb(0), "0 GB");
         // 整數也不留小數點
         assert_eq!(fmt_gb(2 * 1024 * 1024 * 1024), "2 GB");
+    }
+
+    #[test]
+    fn 總表先照硬碟編號排() {
+        let mut t = Table::default();
+        let row = |d: u32, n: &str| Row {
+            disk: d,
+            path: format!("X:\\{n}"),
+            name: n.into(),
+            bytes: 0,
+            mtime: 0,
+        };
+        // 故意後放的碟號比較小、每一批裡的名稱也是倒的
+        t.replace_disk(2, vec![row(2, "b2"), row(2, "a10"), row(2, "a9")], DiskNote::default());
+        t.replace_disk(1, vec![row(1, "z"), row(1, "y")], DiskNote::default());
+        let got: Vec<(u32, &str)> = t.rows.iter().map(|r| (r.disk, r.name.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![(1, "y"), (1, "z"), (2, "a9"), (2, "a10"), (2, "b2")],
+            "先照硬碟編號，同一顆碟裡再照名稱（數字要自然排序：a9 在 a10 前面）"
+        );
     }
 
     #[test]

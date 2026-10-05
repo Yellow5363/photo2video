@@ -7682,6 +7682,10 @@ struct SearchTool {
     sel: Option<usize>,
     /// 鍵盤把選取移到看不見的地方時，下一幀要把清單捲到這一列
     scroll_to: Option<usize>,
+    /// 這批結果裡**最長的路徑**與**最長的名稱**各是哪一列（總表 rows 的
+    /// 索引）。欄寬照它們決定，見 [`App::ui_search_table`]
+    widest_path: Option<u32>,
+    widest_name: Option<u32>,
     /// 上一幀畫清單時的捲動位置、可視高度與列高。
     /// 鍵盤要算「一個畫面幾列」「要不要捲」都得靠它們
     offset: f32,
@@ -7705,6 +7709,8 @@ impl Default for SearchTool {
             del_no: None,
             sel: None,
             scroll_to: None,
+            widest_path: None,
+            widest_name: None,
             offset: 0.0,
             view_h: 0.0,
             row_h: 20.0,
@@ -7774,6 +7780,22 @@ fn search_no_combo(
                 }
             }
         });
+}
+
+/// 清單的格線：一列的底線，加上每一欄之間的直線（像 Excel 那樣一格一格）。
+///
+/// 標題列與每一列都畫同一組，兩邊才對得齊——用的是同一份欄寬，而且都從
+/// 這一列的最左邊算起
+fn search_grid(ui: &egui::Ui, rect: egui::Rect, widths: &[f32]) {
+    let stroke = egui::Stroke::new(1.0, theme::BORDER);
+    let p = ui.painter();
+    p.hline(rect.x_range(), rect.bottom(), stroke);
+    let mut x = rect.left();
+    p.vline(x, rect.y_range(), stroke);
+    for w in widths {
+        x += w;
+        p.vline(x, rect.y_range(), stroke);
+    }
 }
 
 /// 搜尋清單裡的一格：**固定寬、固定高**，放不下就截掉。
@@ -27175,6 +27197,29 @@ impl App {
             })
             .map(|(i, _)| i as u32)
             .collect();
+        // 順便記下這批結果裡最長的路徑與名稱：欄寬照它們決定（見
+        // [`App::ui_search_table`]）。先用「字數」粗估挑出候選，真正的寬度
+        // 再交給字型去量一次——幾萬列全部拿去量太慢，粗估挑出來的那一列
+        // 幾乎一定就是最寬的
+        let weigh = |s: &str| {
+            s.chars()
+                .map(|c| if c.is_ascii() { 1usize } else { 2 })
+                .sum::<usize>()
+        };
+        let (mut wp, mut wn) = ((0usize, None), (0usize, None));
+        for &i in &self.search.hits {
+            let r = &self.disk.table.rows[i as usize];
+            let p = weigh(&r.path);
+            if p > wp.0 {
+                wp = (p, Some(i));
+            }
+            let n = weigh(&r.name);
+            if n > wn.0 {
+                wn = (n, Some(i));
+            }
+        }
+        self.search.widest_path = wp.1;
+        self.search.widest_name = wn.1;
         // 條件換了就回到第一頁，不然會停在一個已經不存在的頁數上
         self.search.page = 0;
         // 剛被刪掉的那一號不該繼續留在「刪除硬碟編號」上：按下去什麼都不會
@@ -27475,11 +27520,60 @@ impl App {
             + 4.0;
         // 欄位順序照使用者舊系統：編號、硬碟編號擺在最前面兩欄，
         // 一眼就看得出「這一筆是哪一顆碟的第幾筆」。
-        // 路徑那一欄吃掉剩下的寬度：它最長，也是最需要看完的一欄
-        let fixed = [64.0, 72.0, 200.0, 78.0, 128.0, 96.0];
-        let path_w = (ui.available_width() - fixed.iter().sum::<f32>() - 24.0).max(240.0);
+        //
+        // 寬度：數字與日期那幾欄給固定寬（內容長度本來就固定）。最後一欄要
+        // 留得下「資料夾大小(byte)」整個標題，右邊再留一段給捲軸，不然那一欄
+        // 會被切掉。
+        //
+        // **路徑與名稱照實際內容決定**，不是把剩下的空間全部吃掉：吃掉的話
+        // 路徑那一欄會空出一大片（實際的路徑多半只佔三分之一），看起來像
+        // 兩欄中間破了個洞。量的是這批結果裡最長的那一條（見
+        // [`App::search_sync`]），所以捲動時欄寬不會跳來跳去；放不下才縮，
+        // 多出來的空間就留在表格右邊，與 Excel 一樣
+        const COL_NO: f32 = 64.0;
+        const COL_DISK: f32 = 76.0;
+        const COL_GB: f32 = 84.0;
+        const COL_TIME: f32 = 136.0;
+        const COL_BYTES: f32 = 124.0;
+        /// 捲軸與右邊留白
+        const COL_GAP: f32 = 34.0;
+        let rest = (ui.available_width()
+            - (COL_NO + COL_DISK + COL_GB + COL_TIME + COL_BYTES + COL_GAP))
+            .max(300.0);
+        let text_w = |ui: &egui::Ui, s: &str| {
+            ui.fonts(|f| {
+                f.layout_no_wrap(
+                    s.to_string(),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::PLACEHOLDER,
+                )
+                .size()
+                .x
+            })
+        };
+        // 內容與標題取較寬的那一個，再加一點左右留白
+        let want = |ui: &egui::Ui, row: Option<u32>, title: &str, path: bool| {
+            let content = row
+                .and_then(|i| self.disk.table.rows.get(i as usize))
+                .map(|r| text_w(ui, if path { &r.path } else { &r.name }))
+                .unwrap_or(0.0);
+            content.max(text_w(ui, title)) + 18.0
+        };
+        // 路徑再寬也有個限度：整批裡只要有一條特別長的（開發用的碟就會有
+        // 一堆 `target\debug\build\xxx-1975357cfc9f6909`），整欄就被它撐開，
+        // 其餘幾千列只用得到前三分之一。超過的尾巴收成「…」不可惜——
+        // 那一段就是資料夾名稱，隔壁一欄原樣寫著
+        let path_w = want(ui, self.search.widest_path, "資料夾路徑", true).min(rest * 0.6);
+        let name_w = want(ui, self.search.widest_name, "資料夾名稱", false);
+        // 兩欄加起來超過可用寬度才等比例縮
+        let (path_w, name_w) = if path_w + name_w > rest {
+            let k = rest / (path_w + name_w);
+            ((path_w * k).max(160.0), (name_w * k).max(120.0))
+        } else {
+            (path_w, name_w)
+        };
         let widths = [
-            fixed[0], fixed[1], path_w, fixed[2], fixed[3], fixed[4], fixed[5],
+            COL_NO, COL_DISK, path_w, name_w, COL_GB, COL_TIME, COL_BYTES,
         ];
         let titles = [
             "編號",
@@ -27490,11 +27584,15 @@ impl App {
             "資料夾修改時間",
             "資料夾大小(byte)",
         ];
-        ui.horizontal(|ui| {
-            for (w, t) in widths.iter().zip(titles) {
-                search_cell(ui, *w, row_h, t, theme::TEXT, true);
-            }
-        });
+        let head = ui
+            .horizontal(|ui| {
+                for (w, t) in widths.iter().zip(titles) {
+                    search_cell(ui, *w, row_h, t, theme::TEXT, true);
+                }
+            })
+            .response
+            .rect;
+        search_grid(ui, head, &widths);
         ui.separator();
         let sel = self.search.sel;
         let mut click: Option<usize> = None;
@@ -27546,8 +27644,11 @@ impl App {
                     egui::vec2(ui.available_width(), row_h),
                 );
                 if sel == Some(at) {
-                    ui.painter().rect_filled(rect, 4.0, theme::CARD_HOVER);
+                    ui.painter().rect_filled(rect, 0.0, theme::CARD_HOVER);
                 }
+                // 像 Excel 那樣一格一格：底線與欄位之間的直線。畫在反白
+                // 之後、文字之前，三層才不會互相蓋掉
+                search_grid(ui, rect, &widths);
                 ui.horizontal(|ui| {
                     let cells = [
                         thousands(at as u64 + 1),
