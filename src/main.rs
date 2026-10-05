@@ -7669,6 +7669,10 @@ struct SearchTool {
     hits: Vec<u32>,
     /// 總表被動過了（建檔、刪除），下一幀重算
     dirty: bool,
+    /// 使用者自己拖過的欄寬。None＝照內容自動算（見 [`App::ui_search_table`]）；
+    /// 拖過一次就整組記下來，之後只有他自己能再改（視窗變寬也不會被蓋掉——
+    /// 「我調成這樣」的意思就是要它保持這樣）
+    cols: Option<[f32; 7]>,
     /// 點了哪一欄的標題要排序（欄位索引，true＝由小到大）。
     /// None＝總表原本的順序（先硬碟編號、再資料夾名稱）
     sort: Option<(usize, bool)>,
@@ -7704,6 +7708,7 @@ impl Default for SearchTool {
             to: None,
             hits: Vec::new(),
             dirty: true,
+            cols: None,
             sort: None,
             // 一個不可能相等的起始值，確保第一次一定會算
             last: (String::new(), None, None, usize::MAX, None),
@@ -27398,12 +27403,27 @@ impl App {
             ui.checkbox(&mut self.search.paged, "分頁顯示")
                 .on_hover_text("關著就是一路捲到底；打開才一頁一頁翻");
             ui.add_space(10.0);
-            // 鍵盤能做什麼要寫出來——沒寫的話不會有人想到去按
+            // 鍵盤與滑鼠能做什麼要寫出來——沒寫的話不會有人想到去按
             ui.label(
-                egui::RichText::new("↑↓ 選上下一筆　PageUp／PageDown 翻頁　Home／End 到頭尾")
-                    .size(11.5)
-                    .color(theme::TEXT_WEAK),
+                egui::RichText::new(
+                    "↑↓ 選上下一筆　PageUp／PageDown 翻頁　Home／End 到頭尾　\
+                     點欄位名稱排序　拖欄位分隔線調寬度",
+                )
+                .size(11.5)
+                .color(theme::TEXT_WEAK),
             );
+            // 自己調過欄寬才出現：分隔線只有十點寬，雙擊它還原是精細動作，
+            // 給一顆按得到的鈕比較可靠
+            if self.search.cols.is_some() {
+                ui.add_space(6.0);
+                if ui
+                    .button("↺  欄寬")
+                    .on_hover_text("欄位寬度還原成自動（雙擊欄位分隔線也可以）")
+                    .clicked()
+                {
+                    self.search.cols = None;
+                }
+            }
             if self.search.paged {
                 ui.add_space(8.0);
                 // 一次跳幾筆**自己打**：舊系統只能從 100~500 裡挑，但「一頁
@@ -27460,7 +27480,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can = self.search.del_no.is_some() && !busy;
                 if ui
-                    .add_enabled(can, egui::Button::new("🗑  刪除這一號的資料"))
+                    .add_enabled(can, egui::Button::new("🗑  刪除硬碟編號的資料"))
                     .on_hover_text(
                         "把那個編號底下的紀錄整批從總表刪掉，Excel 與 PDF 一起更新。\n\
                          只動總表，硬碟本身的檔案不會被刪",
@@ -27469,11 +27489,13 @@ impl App {
                 {
                     *del = self.search.del_no;
                 }
-                search_no_combo(ui, "search_del", "選一號", &disks, &mut self.search.del_no);
-                ui.label(
-                    egui::RichText::new("刪除硬碟編號")
-                        .size(12.5)
-                        .color(theme::TEXT_WEAK),
+                // 下拉本身已經寫著「選硬碟編號」，前面不再多一行字
+                search_no_combo(
+                    ui,
+                    "search_del",
+                    "選硬碟編號",
+                    &disks,
+                    &mut self.search.del_no,
                 );
             });
         });
@@ -27605,9 +27627,10 @@ impl App {
         } else {
             (path_w, name_w)
         };
-        let widths = [
+        // 自己拖過就以他拖的為準
+        let widths = self.search.cols.unwrap_or([
             COL_NO, COL_DISK, path_w, name_w, COL_GB, COL_TIME, COL_BYTES,
-        ];
+        ]);
         let titles = [
             "編號",
             "硬碟編號",
@@ -27635,12 +27658,60 @@ impl App {
             .response
             .rect;
         search_grid(ui, head, &widths);
-        // 點擊區疊在標題那一格上（文字本身不是按鈕，整格都能點才好按）
+        // 標題列上有兩種操作：**點文字排序**、**拖分隔線調欄寬**。
+        //
+        // 兩個感應區**絕對不能重疊**：同一個位置上該算哪一個要看 egui 的
+        // 優先順序，實測重疊時一律被標題吃掉——拖欄寬變成排序、雙擊還原
+        // 也變成排序。所以分隔線左右各佔 5 點，標題的點擊區就從兩側讓開
+        const GRIP: f32 = 5.0;
+        let mut cols = widths;
+        let (mut dragged, mut reset) = (false, false);
+        let mut gx = head.left();
+        for i in 0..widths.len() {
+            gx += widths[i];
+            let handle = egui::Rect::from_min_max(
+                egui::pos2(gx - GRIP, head.top()),
+                egui::pos2(gx + GRIP, head.bottom()),
+            );
+            let r = ui.interact(
+                handle,
+                egui::Id::new(("search_colw", i)),
+                egui::Sense::click_and_drag(),
+            );
+            if r.hovered() || r.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                // 滑鼠一靠近就把分隔線點亮：游標變成左右箭頭的同時，
+                // 看得到「可以拖的是這一條」
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(gx - 1.0, head.top()),
+                        egui::pos2(gx + 1.0, head.bottom()),
+                    ),
+                    0.0,
+                    theme::ACCENT,
+                );
+            }
+            if r.dragged() {
+                // 太窄就看不出是哪一欄了，留個下限
+                cols[i] = (cols[i] + r.drag_delta().x).max(40.0);
+                dragged = true;
+            }
+            if r.double_clicked() {
+                reset = true;
+            }
+        }
+        if dragged {
+            self.search.cols = Some(cols);
+        }
+        if reset {
+            self.search.cols = None;
+        }
+        // 標題的點擊區（文字本身不是按鈕，整格都能點才好按），左右讓開把手
         let mut hx = head.left();
         for (i, w) in widths.iter().enumerate() {
             let cell = egui::Rect::from_min_size(
-                egui::pos2(hx, head.top()),
-                egui::vec2(*w, head.height()),
+                egui::pos2(hx + GRIP + 1.0, head.top()),
+                egui::vec2((w - 2.0 * (GRIP + 1.0)).max(1.0), head.height()),
             );
             hx += w;
             let r = ui.interact(cell, egui::Id::new(("search_head", i)), egui::Sense::click());
