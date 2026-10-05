@@ -138,18 +138,36 @@ fn is_hidden(e: &fs::DirEntry) -> bool {
     false
 }
 
-/// 這個資料夾是不是**別的程式自己的資料**——跳過，底下的也不走。
+/// 這個資料夾是不是**程式自己的工作檔**——跳過，底下的也不走。
 ///
-/// 目前認的是 Lightroom 的目錄庫與預覽檔（`.lrdata`、`.lrcat-data`）：
-/// 一個 `xxx Previews.lrdata` 底下是好幾千個 `F\F632` 這種兩層雜湊資料夾，
-/// 全部記進表裡只會把真正放照片的那幾個淹掉——使用者要找的是「我把照片
-/// 放在哪」，不是 Lightroom 把預覽圖切成幾塊。
+/// 使用者要找的是「我把照片放在哪」，不是某個程式把快取切成幾塊。這些
+/// 資料夾動輒幾千個、名字還都是雜湊值，列進表裡只會把真正放東西的那幾個
+/// 淹掉（實測一顆碟掃出來的 1,574 筆有一大半是這種）。
 ///
-/// 認的是**副檔名**（資料夾也有副檔名），不分大小寫
-fn is_app_data(name: &str) -> bool {
-    const EXT: [&str; 2] = [".lrdata", ".lrcat-data"];
+/// 認三種（都不分大小寫）：
+///
+/// 1. **Lightroom 的目錄庫與預覽檔**：`.lrdata`、`.lrcat-data` 結尾
+///    （`xxx Previews.lrdata` 底下是好幾千個 `F\F632` 這種雜湊資料夾）。
+/// 2. **Premiere 的工作資料夾**：`Adobe Premiere Pro` 開頭的那一票
+///    （`… Auto-Save`、`… Preview Files`、`… Audio Previews`…），
+///    自動存檔與預覽檔都在裡面。
+/// 3. **編譯產物**：`build`／`deps`／`incremental`／`.fingerprint`，而且上一層
+///    叫 `debug` 或 `release`。整個 `target` 多半已經被 `CACHEDIR.TAG` 擋掉
+///    （見 [`scan`]），但**拷貝出去的那一份沒有那個標記**，只好再認一次名字
+fn is_app_data(name: &str, parent: Option<&str>) -> bool {
     let lower = name.to_lowercase();
-    EXT.iter().any(|e| lower.ends_with(e))
+    if lower.ends_with(".lrdata") || lower.ends_with(".lrcat-data") {
+        return true;
+    }
+    if lower.starts_with("adobe premiere pro") {
+        return true;
+    }
+    const BUILD: [&str; 4] = ["build", "deps", "incremental", ".fingerprint"];
+    BUILD.contains(&lower.as_str())
+        && parent.is_some_and(|p| {
+            let p = p.to_lowercase();
+            p == "debug" || p == "release"
+        })
 }
 
 /// 掃完一顆碟的結果
@@ -197,8 +215,17 @@ pub fn scan(
                 continue;
             }
         };
+        // 這個資料夾自己叫什麼（`is_app_data` 要靠它分辨 `release\build`
+        // 與一般的 `build`）
+        let here = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut bytes: u64 = 0;
         let mut subs: Vec<PathBuf> = Vec::new();
+        // 裡面有 CACHEDIR.TAG 就代表「這是快取資料夾」——那是跨工具的
+        // 標準標記（cargo 的 target 就有，備份軟體也靠它略過），整棵不列
+        let mut cache_tag = false;
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
             // 捷徑（符號連結／junction）不跟進去：它可能指回自己形成無窮迴圈，
@@ -212,16 +239,23 @@ pub fn scan(
                 continue;
             }
             if ft.is_dir() {
-                // 隱藏的、以及別的程式自己的資料夾都不列、也不走進去
+                // 隱藏的、以及程式自己的工作資料夾都不列、也不走進去
                 // （見 [`is_hidden`]、[`is_app_data`]）
-                if !is_hidden(&e) && !is_app_data(&name) {
+                if !is_hidden(&e) && !is_app_data(&name, Some(&here)) {
                     subs.push(e.path());
                 }
             } else if ft.is_file() {
+                if name.eq_ignore_ascii_case("CACHEDIR.TAG") {
+                    cache_tag = true;
+                }
                 if let Ok(md) = e.metadata() {
                     bytes += md.len();
                 }
             }
+        }
+        // 快取資料夾：這一列不記，底下也不走
+        if cache_tag {
+            continue;
         }
         if level > 0 {
             rows.push(Row {
@@ -1119,6 +1153,35 @@ mod tests {
         let out = scan(&base, 5, 1, &cancel, &mut |_, _| {}).unwrap();
         let names: Vec<&str> = out.rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["2023"], "Lightroom 的目錄庫與預覽檔都不該出現");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn 程式自己的工作檔不進清單() {
+        let base = std::env::temp_dir().join(format!("p2v_app_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("照片")).unwrap();
+        // Premiere 的自動存檔（底下還有 RecoveryProjects，一起不列）
+        fs::create_dir_all(
+            base.join("Adobe Premiere Pro (Beta) Auto-Save")
+                .join("RecoveryProjects"),
+        )
+        .unwrap();
+        fs::create_dir_all(base.join("Adobe Premiere Pro Auto-Save")).unwrap();
+        // cargo 的 target：靠 CACHEDIR.TAG 認出來，整棵不列
+        fs::create_dir_all(base.join("target").join("debug").join("build")).unwrap();
+        fs::write(base.join("target").join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172").unwrap();
+        // 拷貝出去的那一份沒有標記，靠「上一層叫 release」認
+        fs::create_dir_all(base.join("照片轉影片").join("release").join("build")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let out = scan(&base, 5, 1, &cancel, &mut |_, _| {}).unwrap();
+        let mut names: Vec<&str> = out.rows.iter().map(|r| r.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["release", "照片", "照片轉影片"],
+            "Premiere 的工作資料夾、target 整棵、release 底下的 build 都不該出現"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
