@@ -7687,8 +7687,8 @@ struct SearchTool {
     del_no: Option<u32>,
     /// 選起來的那一列（在 `hits` 裡的位置）。鍵盤上下移動的就是它
     sel: Option<usize>,
-    /// 鍵盤把選取移到看不見的地方時，下一幀要把清單捲到這一列
-    scroll_to: Option<usize>,
+    /// 下一幀要把清單捲到哪裡（見 [`SearchScroll`]）
+    scroll: Option<SearchScroll>,
     /// 這批結果裡**最長的路徑**與**最長的名稱**各是哪一列（總表 rows 的
     /// 索引）。欄寬照它們決定，見 [`App::ui_search_table`]
     widest_path: Option<u32>,
@@ -7698,6 +7698,8 @@ struct SearchTool {
     offset: f32,
     view_h: f32,
     row_h: f32,
+    /// 上一幀整份清單有多高（egui 自己算的，見 [`App::ui_search_table`]）
+    content_h: f32,
 }
 
 impl Default for SearchTool {
@@ -7717,12 +7719,13 @@ impl Default for SearchTool {
             page: 0,
             del_no: None,
             sel: None,
-            scroll_to: None,
+            scroll: None,
             widest_path: None,
             widest_name: None,
             offset: 0.0,
             view_h: 0.0,
             row_h: 20.0,
+            content_h: 0.0,
         }
     }
 }
@@ -7744,6 +7747,18 @@ impl SearchTool {
         let first = (self.page * self.per_page).min(self.hits.len());
         (first, (self.hits.len() - first).min(self.per_page))
     }
+}
+
+/// 鍵盤按完之後，清單要捲到哪裡
+#[derive(Clone, Copy)]
+enum SearchScroll {
+    /// **讓這一列露出來就好**：已經看得到就不動。方向鍵用的——按一下 ↓
+    /// 整個清單就跳半個畫面的話，根本看不出自己移到哪裡了
+    Reveal(usize),
+    /// **直接捲到這個位置**（點數）。翻頁與 Home／End 用的：那幾顆的意思
+    /// 就是「換一個畫面」，不是「把選取挪進畫面」。
+    /// 超出可捲範圍沒關係，egui 會自己夾住（End 因此剛好到底）
+    At(f32),
 }
 
 /// 三位一撇的數字。兩萬多筆的清單上，`24996` 與 `249960` 掃過去是一樣的，
@@ -27312,17 +27327,19 @@ impl App {
             return;
         }
         let (first, _) = self.search.range();
-        // 一個畫面放得下幾列（沒分頁時 PageUp／PageDown 就跳這麼多）
-        let screen = (self.search.view_h / self.search.row_h.max(1.0))
-            .floor()
-            .max(1.0) as usize;
-        let jump = if self.search.paged {
-            self.search.per_page
-        } else {
-            screen
-        };
+        let row_h = self.search.row_h.max(1.0);
+        // 一個畫面放得下幾列。可視高度已經取整成整數列（見
+        // [`App::ui_search_table`]），所以這個數字就是「翻一頁跳幾列」
+        let screen = (self.search.view_h / row_h).round().max(1.0) as usize;
+        let paged = self.search.paged;
+        let per_page = self.search.per_page.max(1);
+        let pages = self.search.pages();
+        let off = self.search.offset;
         let mut sel = self.search.sel.unwrap_or(first).min(n - 1);
         let mut moved = false;
+        // 翻頁與 Home／End 自己決定要捲到哪裡；方向鍵交給 Reveal
+        let mut page: Option<usize> = None;
+        let mut scroll: Option<SearchScroll> = None;
         ctx.input(|i| {
             if i.key_pressed(egui::Key::ArrowDown) {
                 sel = (sel + 1).min(n - 1);
@@ -27332,32 +27349,64 @@ impl App {
                 sel = sel.saturating_sub(1);
                 moved = true;
             }
+            // **翻頁要真的換一個畫面**：只把選取往下移、再讓它「露出來」的話，
+            // 選取本來就在畫面裡，畫面只會挪個兩三列——按起來像沒反應
             if i.key_pressed(egui::Key::PageDown) {
-                sel = (sel + jump).min(n - 1);
                 moved = true;
+                if paged {
+                    let p = (self.search.page + 1).min(pages - 1);
+                    page = Some(p);
+                    sel = (p * per_page).min(n - 1);
+                    scroll = Some(SearchScroll::At(0.0));
+                } else {
+                    sel = (sel + screen).min(n - 1);
+                    scroll = Some(SearchScroll::At(off + screen as f32 * row_h));
+                }
             }
             if i.key_pressed(egui::Key::PageUp) {
-                sel = sel.saturating_sub(jump);
                 moved = true;
+                if paged {
+                    let p = self.search.page.saturating_sub(1);
+                    page = Some(p);
+                    sel = p * per_page;
+                    scroll = Some(SearchScroll::At(0.0));
+                } else {
+                    sel = sel.saturating_sub(screen);
+                    scroll = Some(SearchScroll::At(off - screen as f32 * row_h));
+                }
             }
             if i.key_pressed(egui::Key::Home) {
-                sel = 0;
                 moved = true;
+                sel = 0;
+                page = Some(0);
+                scroll = Some(SearchScroll::At(0.0));
             }
             if i.key_pressed(egui::Key::End) {
-                sel = n - 1;
                 moved = true;
+                sel = n - 1;
+                if paged {
+                    page = Some(pages - 1);
+                    scroll = Some(SearchScroll::At(0.0));
+                } else {
+                    // 捲到底：用上一幀的內容高度算，不要丟一個超大的值給
+                    // egui（會在它那邊整數溢位）。畫的時候還會再夾一次
+                    scroll = Some(SearchScroll::At(
+                        (self.search.content_h - self.search.view_h).max(0.0),
+                    ));
+                }
             }
         });
         if !moved {
             return;
         }
         self.search.sel = Some(sel);
-        // 分頁時選到別頁去就跟著翻過去（↓ 按到最後一列會自己進下一頁）
-        if self.search.paged {
-            self.search.page = sel / self.search.per_page.max(1);
+        match page {
+            Some(p) => self.search.page = p,
+            // 分頁時選到別頁去就跟著翻過去（↓ 按到最後一列會自己進下一頁）
+            None if paged => self.search.page = sel / per_page,
+            None => {}
         }
-        self.search.scroll_to = Some(sel);
+        self.search.scroll = Some(scroll.unwrap_or(SearchScroll::Reveal(sel)));
     }
 
     /// 搜尋條件那幾列：關鍵字、硬碟編號範圍、分頁、刪除某一號
@@ -27430,6 +27479,7 @@ impl App {
             // 要一頁一頁看再打開
             ui.checkbox(&mut self.search.paged, "分頁顯示")
                 .on_hover_text("關著就是一路捲到底；打開才一頁一頁翻");
+            ui.add_space(10.0);
             ui.add_space(10.0);
             // 鍵盤與滑鼠能做什麼要寫出來——沒寫的話不會有人想到去按
             ui.label(
@@ -27587,7 +27637,11 @@ impl App {
         // 列高要用**中文字**量。`row_height` 給的是主要字型（拉丁字母）的
         // 高度，中文是從備用字型來的、比它高：差幾點而已，但 show_rows 是照
         // 這個值一列一列算位置的，幾千列累積下來就差了幾百列——實測捲到底
-        // 只到第 1,251 列，後面四百多列看不到
+        // 只到第 1,251 列，後面四百多列看不到。
+        //
+        // 算出來的仍然只是估計值（實際還會多個一兩點），所以**畫完會量一次
+        // 真正的列距，下一幀用量到的那個**（見這個函式最後面）：估計值比實際
+        // 矮的話，內容會一列比一列往下多推一點，778 列就差了三列
         let row_h = ui
             .fonts(|f| {
                 f.layout_no_wrap(
@@ -27599,6 +27653,7 @@ impl App {
                 .y
             })
             .max(16.0)
+            .max(self.search.row_h - 4.0)
             + 4.0;
         // 欄位順序照使用者舊系統：編號、硬碟編號擺在最前面兩欄，
         // 一眼就看得出「這一筆是哪一顆碟的第幾筆」。
@@ -27759,34 +27814,55 @@ impl App {
         ui.separator();
         let sel = self.search.sel;
         let mut click: Option<usize> = None;
+        // 實際量到的列距（見下面的迴圈）
+        let mut advance: Option<f32> = None;
         // 清單的可視高度要**在這裡量**（ScrollArea 不縮，會填滿剩下的空間）。
         // 本來用 ScrollAreaOutput 的 inner_rect，但那是「內容畫在哪裡」、不是
         // 看得到的那一塊：幾萬列的內容讓它變成好幾萬點高，於是 PageDown 一次
-        // 跳了一千多列
-        let view_h = ui.available_height();
+        // 跳了一千多列。
+        //
+        // **再取整成「剛好幾列」**：高度不是列高的整數倍時，捲到任何位置都會
+        // 上下各切半列（內容也是一列一列排的）。取整之後每一個捲動位置都落在
+        // 列的邊界上——包含捲到底（內容高與可視高都是列高的倍數）
+        let view_h = {
+            let avail = ui.available_height();
+            (avail / row_h).floor().max(1.0) * row_h
+        };
         let mut area = egui::ScrollArea::vertical()
             .id_salt("search_rows")
-            .auto_shrink([false, false]);
-        // 鍵盤把選取移到看不見的地方時才捲，而且**只捲剛好露出來的那一點**：
-        // 每次都置中的話，按一下 ↓ 整個清單就跳半個畫面，看不出自己在哪裡
-        if let Some(at) = self.search.scroll_to.take() {
-            let top = at.saturating_sub(first) as f32 * row_h;
-            let view = view_h.max(row_h);
-            let off = self.search.offset;
-            // 上下各留三列的餘裕，有兩個理由：選到的那一列不會貼著邊
-            // （看不出上下文），而且 `view_h` 只是「畫之前的可用高度」、
-            // 比捲動區真正看得到的那一塊略高幾十點，不留餘裕的話按 ↓ 到
-            // 底部時，選取會剛好落在看不見的那幾列上。
-            // 捲過頭沒關係：egui 會自己夾在可捲範圍內（End 因此剛好到底）
-            let edge = row_h * 3.0;
-            let want = if top < off + edge {
-                (top - edge).max(0.0)
-            } else if top + row_h > off + view - edge {
-                top + row_h - view + edge
-            } else {
-                off
+            .auto_shrink([false, false])
+            // 高度也用取整過的那個值：捲動區真正看得到的那一塊才會剛好是
+            // 整數列，捲到底時最後一列才不會被切掉
+            .max_height(view_h);
+        // 捲到哪裡由鍵盤決定（見 [`SearchScroll`]）。兩種的位置都是列高的
+        // 整數倍，所以捲完不會上下各切半列
+        if let Some(s) = self.search.scroll.take() {
+            let want = match s {
+                SearchScroll::At(off) => off,
+                SearchScroll::Reveal(at) => {
+                    // 已經看得到就不動；看不到才捲到剛好露出來，
+                    // 另外留一列的餘裕，選取不會貼著邊
+                    let top = at.saturating_sub(first) as f32 * row_h;
+                    let edge = row_h;
+                    let off = self.search.offset;
+                    if top < off + edge {
+                        (top - edge).max(0.0)
+                    } else if top + row_h > off + view_h - edge {
+                        top + row_h - view_h + edge
+                    } else {
+                        off
+                    }
+                }
             };
-            area = area.vertical_scroll_offset(want);
+            // **一定要夾在可捲範圍內**：egui 的 show_rows 是直接拿捲動位置
+            // 去算「第一列是第幾列」的，給它一個超大的值（原本 End 送
+            // f32::MAX 讓它自己夾）會在那裡整數溢位而 panic ——實測按 End
+            // 就當掉。
+            //
+            // 上限用**上一幀 egui 自己算的內容高度**，不是「列數 × 列高」：
+            // 兩者差了幾十點，用後者會少捲三列左右
+            let content = self.search.content_h.max(count as f32 * row_h);
+            area = area.vertical_scroll_offset(want.clamp(0.0, (content - view_h).max(0.0)));
         }
         // **列間距要在這一層歸零**：`show_rows` 是拿**外層** ui 的
         // `item_spacing.y` 去算「一列佔多高」與「第 n 列在哪裡」的，只把
@@ -27797,7 +27873,16 @@ impl App {
             .scope(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 area.show_rows(ui, row_h, count, |ui, range| {
+            let mut prev_top: Option<f32> = None;
             for i in range {
+                // 量一次真正的列距（第一列與第二列的距離）
+                let top = ui.cursor().top();
+                if let Some(p) = prev_top {
+                    if advance.is_none() {
+                        advance = Some(top - p);
+                    }
+                }
+                prev_top = Some(top);
                 let at = first + i;
                 let r = &self.disk.table.rows[self.search.hits[at] as usize];
                 // 整列都能點，點了就選起來（反白要畫在文字底下，所以先算
@@ -27854,9 +27939,21 @@ impl App {
         self.search.offset = out.state.offset.y;
         self.search.view_h = view_h;
         self.search.row_h = row_h;
+        // 實際列距比估計值大就改用它，並要求再畫一幀：差一兩點而已，但
+        // show_rows 是一列一列累加的，幾百列之後就差了好幾列的高度
+        if let Some(a) = advance {
+            if a > row_h + 0.1 {
+                self.search.row_h = a;
+                ui.ctx().request_repaint();
+            }
+        }
         if let Some(at) = click {
             self.search.sel = Some(at);
         }
+        // 內容總高度**用 egui 自己算的**：它與「列數 × 列高」不一定相等
+        // （實測 778 列差了 64 點），拿後者去推「最多能捲到哪裡」會少捲
+        // 三列左右——按 End 時最後幾列就停在畫面外
+        self.search.content_h = out.content_size.y;
     }
 
     /// 刪掉某一個硬碟編號的全部資料。
