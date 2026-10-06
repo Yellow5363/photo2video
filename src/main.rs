@@ -7470,14 +7470,14 @@ impl FilesTab {
         match self {
             FilesTab::Backup => {
                 "把來源資料夾同步到目的：來源比較新就覆蓋、目的沒有的補過去，\
-                 可以一次排好幾組"
+                 可以一次備份好幾組"
             }
             FilesTab::Disk => {
                 "把一顆硬碟裡有哪些資料夾記成一張總表，匯出成 Excel 與 PDF，\
-                 日後要找東西就查它"
+                 日後要找資料夾檔案就查它"
             }
             FilesTab::Search => {
-                "拿總表查資料夾在哪一顆碟：打關鍵字過濾，也可以整批刪掉某一個\
+                "拿總表查資料夾在哪一顆碟：可輸入關鍵字過濾，也可以整批刪掉某一個\
                  硬碟編號的資料"
             }
         }
@@ -31648,7 +31648,8 @@ fn module_tab(ui: &mut egui::Ui, m: Module, active: bool) -> egui::Response {
             egui::Stroke::new(2.0, theme::ACCENT),
         );
     }
-    resp.on_hover_text(m.hint())
+    // 提示文字用暖金色，理由同 [`files_tab`]
+    resp.on_hover_text(egui::RichText::new(m.hint()).color(theme::LINK))
 }
 
 /// 「硬碟管理」底下的功能列上的一項（「1. 資料備份」那幾顆）。與上面的模組列
@@ -31691,7 +31692,10 @@ fn files_tab(ui: &mut egui::Ui, tab: FilesTab, active: bool) -> bool {
             egui::Stroke::new(2.0, theme::ACCENT),
         );
     }
-    resp.on_hover_text(tab.hint()).clicked()
+    // 提示文字用暖金色：整個介面是深灰底配白字，提示再用白字就全糊成一片，
+    // 看不出那是「另外跳出來的一句說明」。與模組列同一個顏色（見 [`module_tab`]）
+    resp.on_hover_text(egui::RichText::new(tab.hint()).color(theme::LINK))
+        .clicked()
 }
 
 /// 資料備份的一列資料夾：標題、選擇鈕、現在選到哪裡。
