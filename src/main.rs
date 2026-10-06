@@ -111,20 +111,28 @@ enum Module {
     Stack,
     /// 影片去煙霧（把整支影片逐格套上去煙霧，輸出成新影片）
     Movie,
-    /// 優化影像（自動判斷該怎麼調色與強化主體，整批處理）
+    /// 優化影像（自動判斷該怎麼調色與強化主體，整批處理）。
+    ///
+    /// **這一版暫時從模組列上收起來了**：它不在 [`Module::ALL`] 裡，所以模組
+    /// 列與 `模組(M)` 選單都看不到它，也切不過去。整套程式碼原封不動留著，
+    /// 等這個功能改好，把它補回 [`Module::ALL`] 就回來了
     Enhance,
     /// 硬碟管理（資料備份、硬碟檔案管理、檔案搜尋）
     Files,
 }
 
 impl Module {
-    /// 模組列的顯示順序
-    const ALL: [Module; 6] = [
+    /// 模組列的顯示順序。
+    ///
+    /// [`Module::Enhance`]（優化影像）**暫時不放進來**：那個功能還要再改，先
+    /// 從模組列上收起來，硬碟管理往前遞補一格。它的程式碼整套留著，改好了
+    /// 補回 [`Module::Movie`] 與 [`Module::Files`] 中間就回來了——順手把
+    /// [`App::open_project_path`] 擋舊專案的那一段一起看過
+    const ALL: [Module; 5] = [
         Module::Video,
         Module::Dehaze,
         Module::Stack,
         Module::Movie,
-        Module::Enhance,
         Module::Files,
     ];
 
@@ -10082,6 +10090,20 @@ impl App {
             }
         };
         let target = any.module();
+        // 模組列上沒有的功能（目前是「優化影像」，見 [`Module::ALL`]）：開進去
+        // 會卡在一個切不回來的模組，所以在這裡就擋下來、把話說清楚。專案檔
+        // 本身沒壞，最近清單也照留著，等那個功能回來還開得起來
+        if !Module::ALL.contains(&target) {
+            message_dialog()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("開啟專案")
+                .set_description(format!(
+                    "「{}」這個功能這一版暫時收起來了，這份專案等它回來再開。",
+                    target.label()
+                ))
+                .show();
+            return;
+        }
         // 下次要開專案時就從這裡開始找（拖曳進來的也算——那多半就是專案放的地方）
         if let Some(which) = LastDir::project_of(target) {
             remember_dir(which, &path);
