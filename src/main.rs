@@ -27483,7 +27483,16 @@ impl App {
             ui.add(
                 egui::TextEdit::singleline(&mut self.search.text)
                     .desired_width(320.0)
-                    .hint_text("資料夾名稱"),
+                    .hint_text("資料夾名稱")
+                    // **不理 Enter**：用注音選字時，按 Enter 確認的那一下會同時送出
+                    // 「Enter 鍵」與「選好的字」兩個事件。egui 的單行輸入框一看到
+                    // Enter 就放掉焦點、**這一幀剩下的事件全部不處理**——Enter 排在
+                    // 前面的那幾次，選好的字就被丟掉，框裡留下的是預設的第一個候選字
+                    // （使用者選「哥」卻跑出「歌」）。兩個事件誰先到看時機，所以時好
+                    // 時壞、試不太出來。
+                    //
+                    // 這一格是邊打邊過濾的，本來就用不到 Enter，拿掉沒有損失
+                    .return_key(None),
             );
             if ui
                 .add_enabled(!self.search.text.is_empty(), egui::Button::new("✖").small())
