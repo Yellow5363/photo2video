@@ -26621,7 +26621,7 @@ impl App {
             });
             if ui
                 .add_enabled(idle, egui::Button::new("↻").small())
-                .on_hover_text("重新找一次硬碟（剛插上的外接碟按這個）")
+                .tip("重新找一次硬碟（剛插上的外接碟按這個）")
                 .clicked()
             {
                 clicks.refresh = true;
@@ -26649,7 +26649,7 @@ impl App {
                     .desired_width(60.0)
                     .char_limit(4),
             )
-            .on_hover_text("這顆碟的號碼（1~9999）。每一顆碟一個號，不能重複");
+            .tip("這顆碟的號碼（1~9999）。每一顆碟一個號，不能重複");
             // 這一號現在是什麼狀況，當場講：按下去才知道「原來會蓋掉」就太晚了
             let (msg, color) = match self.disk.no() {
                 None => (
@@ -26684,7 +26684,7 @@ impl App {
                     .desired_width(40.0)
                     .char_limit(2),
             )
-            .on_hover_text("往下掃幾層資料夾就停（1~20）");
+            .tip("往下掃幾層資料夾就停（1~20）");
             ui.label(egui::RichText::new("層").size(13.0).color(theme::TEXT));
             let msg = if self.disk.depth().is_some() {
                 "更深的資料夾不走進去，所以掃一顆碟要多久是可以預期的".to_string()
@@ -26705,7 +26705,7 @@ impl App {
                 && self.disk.no().is_some()
                 && self.disk.depth().is_some()
                 && self.disk.load_error.is_none();
-            let run = primary_button(ui, "▶  開始建檔", idle && ready).on_hover_text(
+            let run = primary_button(ui, "▶  開始建檔", idle && ready).tip(
                 "走過這顆碟、把每一個資料夾記下來，收進總表，\n\
                  再把總表匯出成 Excel 與 PDF",
             );
@@ -26841,7 +26841,7 @@ impl App {
                 self.disk.busy == DiskBusy::Idle,
                 egui::Button::new("📂  變更…").small(),
             )
-            .on_hover_text("換一個資料夾放總表。換過之後會記住，下次直接用那裡")
+            .tip("換一個資料夾放總表。換過之後會記住，下次直接用那裡")
             .clicked()
         {
             clicks.pick_dir = true;
@@ -27446,7 +27446,7 @@ impl App {
             );
             if ui
                 .add_enabled(!self.search.text.is_empty(), egui::Button::new("✖").small())
-                .on_hover_text("清掉關鍵字")
+                .tip("清掉關鍵字")
                 .clicked()
             {
                 self.search.text.clear();
@@ -27496,7 +27496,7 @@ impl App {
             // 預設不分頁：幾萬列直接捲（只畫看得見的那幾列，捲起來一樣快），
             // 要一頁一頁看再打開
             ui.checkbox(&mut self.search.paged, "分頁顯示")
-                .on_hover_text("關著就是一路捲到底；打開才一頁一頁翻");
+                .tip("關著就是一路捲到底；打開才一頁一頁翻");
             ui.add_space(10.0);
             ui.add_space(10.0);
             // 鍵盤與滑鼠能做什麼要寫出來——沒寫的話不會有人想到去按
@@ -27514,7 +27514,7 @@ impl App {
                 ui.add_space(6.0);
                 if ui
                     .button("↺  欄寬")
-                    .on_hover_text("欄位寬度還原成自動（雙擊欄位分隔線也可以）")
+                    .tip("欄位寬度還原成自動（雙擊欄位分隔線也可以）")
                     .clicked()
                 {
                     self.search.cols = None;
@@ -27532,7 +27532,7 @@ impl App {
                             .range(10..=100_000)
                             .speed(10.0),
                     )
-                    .on_hover_text("一次顯示幾筆（可以直接打數字，也可以左右拖）")
+                    .tip("一次顯示幾筆（可以直接打數字，也可以左右拖）")
                     .changed()
                 {
                     self.search.page = 0;
@@ -27577,7 +27577,7 @@ impl App {
                 let can = self.search.del_no.is_some() && !busy;
                 if ui
                     .add_enabled(can, egui::Button::new("🗑  刪除硬碟編號的資料"))
-                    .on_hover_text(
+                    .tip(
                         "把那個編號底下的紀錄整批從總表刪掉，Excel 與 PDF 一起更新。\n\
                          只動總表，硬碟本身的檔案不會被刪",
                     )
@@ -28215,7 +28215,7 @@ impl App {
                     );
                     if ui
                         .add_enabled(idle, egui::Button::new("✖").small())
-                        .on_hover_text("移除這一組")
+                        .tip("移除這一組")
                         .clicked()
                     {
                         clicks.remove = Some(i);
@@ -28280,7 +28280,7 @@ impl App {
         }
         if ui
             .add_enabled(idle, egui::Button::new("＋  加入一組"))
-            .on_hover_text(
+            .tip(
                 "再多一組來源 → 目的，一次備份好幾個資料夾；\
                  比對與備份會照順序把每一組都做完",
             )
@@ -28297,7 +28297,7 @@ impl App {
                     idle,
                     egui::Checkbox::new(&mut self.backup.recursive, "含子資料夾"),
                 )
-                .on_hover_text("整棵資料夾一起備份；關掉就只比對最上面那一層")
+                .tip("整棵資料夾一起備份；關掉就只比對最上面那一層")
                 .changed()
             {
                 self.backup.invalidate();
@@ -28311,7 +28311,7 @@ impl App {
                     "保留目的資料夾多餘的檔案",
                 ),
             )
-            .on_hover_text(
+            .tip(
                 "勾著：來源沒有的檔案原封不動留在目的資料夾。\n\
                  取消勾選：目的資料夾會被整理成和來源一樣，多出來的檔案**會被刪掉**。",
             );
@@ -28325,7 +28325,7 @@ impl App {
                     idle,
                     egui::Checkbox::new(&mut keep_newer, "不覆蓋目的資料夾較新的檔案"),
                 )
-                .on_hover_text(
+                .tip(
                     "勾著：目的那份比來源新就原封不動留著（備份本來的規矩，\n\
                      只往目的寫、不會把新的內容換成舊的）。\n\
                      取消勾選：連那幾個也**用來源蓋回去**——目的那邊被別的程式\n\
@@ -28341,7 +28341,7 @@ impl App {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(idle && ready, egui::Button::new("🔍  比對"))
-                .on_hover_text("只是看看要做哪些事，這一步不會動到任何檔案")
+                .tip("只是看看要做哪些事，這一步不會動到任何檔案")
                 .clicked()
             {
                 clicks.scan = true;
@@ -28356,7 +28356,7 @@ impl App {
             let settled = self.backup.settled;
             let label = format!("▶  {}", self.backup.verb());
             let mut run = primary_button(ui, &label, idle && ready && todo != Some(0) && !settled)
-                .on_hover_text("先重新比對一次，再把要做的事列出來給你確認");
+                .tip("先重新比對一次，再把要做的事列出來給你確認");
             // 關著的時候講為什麼（還沒挑好資料夾、正在跑的那兩種不必講）
             let why_off = if settled {
                 Some(
@@ -28372,7 +28372,7 @@ impl App {
                 None
             };
             if let Some(why) = why_off {
-                run = run.on_disabled_hover_text(why);
+                run = run.tip_off(why);
             }
             if run.clicked() {
                 clicks.run = true;
@@ -28399,7 +28399,7 @@ impl App {
                 if self.backup.batch_done
                     && ui
                         .button("✔  完成備份")
-                        .on_hover_text(
+                        .tip(
                             "這一批做完了：把每一組的來源與目的清掉，重新挑下一批。\n\
                              只是清掉畫面上選好的資料夾，不會動到任何檔案",
                         )
@@ -28409,7 +28409,7 @@ impl App {
                 }
                 if ui
                     .button("↺  重新選擇")
-                    .on_hover_text(
+                    .tip(
                         "把每一組選好的來源與目的清掉，重新挑一遍。\n\
                          只是清掉畫面上選好的資料夾，不會動到任何檔案",
                     )
@@ -28444,7 +28444,7 @@ impl App {
             let n = self.backup.last_deleted.len();
             if ui
                 .button(format!("↩  還原剛才刪除的 {n} 個檔案"))
-                .on_hover_text(
+                .tip(
                     "從資源回收筒放回原來的位置（連同被收掉的空資料夾一起建回來）。\n\
                      只認最近一次備份刪的那批；回收筒已經清空的話就放不回來了",
                 )
@@ -31652,6 +31652,29 @@ fn module_tab(ui: &mut egui::Ui, m: Module, active: bool) -> egui::Response {
     resp.on_hover_text(egui::RichText::new(m.hint()).color(theme::LINK))
 }
 
+/// 硬碟管理底下的提示文字一律用**暖金色**（與模組列、功能列同一個顏色，
+/// 見 [`module_tab`]）。
+///
+/// 整個介面是深灰底配白字，提示再用白字就與內文糊成一片，看不出那是
+/// 「另外跳出來的一句說明」。用擴充方法而不是每一處自己包 `RichText`：
+/// 呼叫端只要把 `on_hover_text` 改成 `tip`，顏色就一致，日後要換也只改這裡
+trait DiskTip {
+    /// 同 `on_hover_text`，文字用暖金色
+    fn tip(self, text: impl Into<String>) -> Self;
+    /// 同 `on_disabled_hover_text`（按鈕關著時才出現的那一句）
+    fn tip_off(self, text: impl Into<String>) -> Self;
+}
+
+impl DiskTip for egui::Response {
+    fn tip(self, text: impl Into<String>) -> Self {
+        self.on_hover_text(egui::RichText::new(text).color(theme::LINK))
+    }
+
+    fn tip_off(self, text: impl Into<String>) -> Self {
+        self.on_disabled_hover_text(egui::RichText::new(text).color(theme::LINK))
+    }
+}
+
 /// 「硬碟管理」底下的功能列上的一項（「1. 資料備份」那幾顆）。與上面的模組列
 /// 同一套：選中的亮起來並壓一條底線、滑鼠停著有一句話說明，字小一號表示它是
 /// 模組底下的一層。回傳 true＝按了這一項
@@ -31719,7 +31742,7 @@ fn backup_dir_row(
         );
         if ui
             .add_enabled(enabled, egui::Button::new("📂  選擇"))
-            .on_hover_text(hint)
+            .tip(hint)
             .clicked()
         {
             pick = true;
@@ -31794,7 +31817,7 @@ fn ui_backup_stats(
                     .size(12.5)
                     .color(theme::TEXT_WEAK),
             )
-            .on_hover_text("這幾個檔案目的資料夾裡的比較新，備份只往目的寫，所以原封不動留著");
+            .tip("這幾個檔案目的資料夾裡的比較新，備份只往目的寫，所以原封不動留著");
         }
         // 隱藏檔沒被算進去，數字會跟檔案總管對不上，講一聲
         if !plan.ignored.is_empty() {
@@ -31804,7 +31827,7 @@ fn ui_backup_stats(
                     .size(12.5)
                     .color(theme::TEXT_WEAK),
             )
-            .on_hover_text(
+            .tip(
                 "隱藏檔、系統檔與 Mac 拷貝時留下的附屬檔（._開頭、.DS_Store）。\n\
                  這些在檔案總管裡本來就看不到，備份也當作不存在",
             );
@@ -31822,7 +31845,7 @@ fn ui_backup_stats(
             ui.add_space(6.0);
             if ui
                 .selectable_label(open, if open { "▾ 收起略過的" } else { "▸ 看略過的" })
-                .on_hover_text("列出被當作不存在的那幾個檔案在哪裡（來源與目的兩邊都算）")
+                .tip("列出被當作不存在的那幾個檔案在哪裡（來源與目的兩邊都算）")
                 .clicked()
             {
                 clicked = Some(BackupToggle::Ignored);
