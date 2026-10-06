@@ -27737,9 +27737,12 @@ impl App {
         // 多出來的空間就留在表格右邊，與 Excel 一樣
         const COL_NO: f32 = 64.0;
         const COL_DISK: f32 = 76.0;
-        const COL_GB: f32 = 84.0;
-        const COL_TIME: f32 = 136.0;
-        const COL_BYTES: f32 = 124.0;
+        // 最後三欄（大小、修改時間、byte）**固定寬度、不給拖**。數字照
+        // 使用者自己拖出來、說「就要這樣」的那一版量的：原本的 84／136／124
+        // 太擠，數字貼著格線，每次開程式都得重拖一次（拖過的寬度不會存）
+        const COL_GB: f32 = 112.0;
+        const COL_TIME: f32 = 188.0;
+        const COL_BYTES: f32 = 170.0;
         /// 捲軸與右邊留白
         const COL_GAP: f32 = 34.0;
         let rest = (ui.available_width()
@@ -27778,10 +27781,13 @@ impl App {
         } else {
             (path_w, name_w)
         };
-        // 自己拖過就以他拖的為準
-        let widths = self.search.cols.unwrap_or([
+        // 自己拖過就以他拖的為準——只有前四欄；最後三欄一律是固定寬度
+        let mut widths = self.search.cols.unwrap_or([
             COL_NO, COL_DISK, path_w, name_w, COL_GB, COL_TIME, COL_BYTES,
         ]);
+        widths[4] = COL_GB;
+        widths[5] = COL_TIME;
+        widths[6] = COL_BYTES;
         let titles = [
             "編號",
             "硬碟編號",
@@ -27820,6 +27826,11 @@ impl App {
         let mut gx = head.left();
         for i in 0..widths.len() {
             gx += widths[i];
+            // 大小、修改時間、byte 這三欄固定寬度：右邊界不給拖
+            // （名稱那一欄的右邊界還是可以拖，它調的是名稱的寬度）
+            if i >= 4 {
+                continue;
+            }
             let handle = egui::Rect::from_min_max(
                 egui::pos2(gx - GRIP, head.top()),
                 egui::pos2(gx + GRIP, head.bottom()),
