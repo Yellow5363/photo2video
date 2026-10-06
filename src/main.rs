@@ -7464,6 +7464,24 @@ impl FilesTab {
             FilesTab::Search => "3. 檔案搜尋",
         }
     }
+
+    /// 滑鼠停在功能名稱上時的一句話說明（與模組列同一套，見 [`Module::hint`]）
+    fn hint(self) -> &'static str {
+        match self {
+            FilesTab::Backup => {
+                "把來源資料夾同步到目的：來源比較新就覆蓋、目的沒有的補過去，\
+                 可以一次排好幾組"
+            }
+            FilesTab::Disk => {
+                "把一顆硬碟裡有哪些資料夾記成一張總表，匯出成 Excel 與 PDF，\
+                 日後要找東西就查它"
+            }
+            FilesTab::Search => {
+                "拿總表查資料夾在哪一顆碟：打關鍵字過濾，也可以整批刪掉某一個\
+                 硬碟編號的資料"
+            }
+        }
+    }
 }
 
 
@@ -26503,7 +26521,7 @@ impl App {
         let mut pick = None;
         ui.horizontal(|ui| {
             for tab in FilesTab::ALL {
-                if files_tab(ui, tab.label(), tab == self.files_tab) {
+                if files_tab(ui, tab, tab == self.files_tab) {
                     pick = Some(tab);
                 }
             }
@@ -31634,9 +31652,10 @@ fn module_tab(ui: &mut egui::Ui, m: Module, active: bool) -> egui::Response {
 }
 
 /// 「硬碟管理」底下的功能列上的一項（「1. 資料備份」那幾顆）。與上面的模組列
-/// 同一套視覺：選中的亮起來並壓一條底線，字小一號表示它是模組底下的一層。
-/// 回傳 true＝按了這一項
-fn files_tab(ui: &mut egui::Ui, text: &str, active: bool) -> bool {
+/// 同一套：選中的亮起來並壓一條底線、滑鼠停著有一句話說明，字小一號表示它是
+/// 模組底下的一層。回傳 true＝按了這一項
+fn files_tab(ui: &mut egui::Ui, tab: FilesTab, active: bool) -> bool {
+    let text = tab.label();
     // PLACEHOLDER 的理由同 [`module_tab`]：顏色要等畫的時候才決定
     let galley = ui.painter().layout_no_wrap(
         text.to_string(),
@@ -31672,7 +31691,7 @@ fn files_tab(ui: &mut egui::Ui, text: &str, active: bool) -> bool {
             egui::Stroke::new(2.0, theme::ACCENT),
         );
     }
-    resp.clicked()
+    resp.on_hover_text(tab.hint()).clicked()
 }
 
 /// 資料備份的一列資料夾：標題、選擇鈕、現在選到哪裡。
