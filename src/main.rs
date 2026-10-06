@@ -7880,6 +7880,8 @@ struct DiskClicks {
     pick_dir: bool,
     scan: bool,
     stop: bool,
+    /// 按了哪一個檔案的「開啟」
+    open: Option<PathBuf>,
 }
 
 // ---------- 硬碟管理 ▸ 資料備份 ----------
@@ -26591,6 +26593,9 @@ impl App {
         if clicks.pick_dir {
             self.disk_pick_table_dir();
         }
+        if let Some(p) = clicks.open.take() {
+            open_file(&p);
+        }
         if clicks.scan {
             self.disk_scan(ctx);
         }
@@ -26869,25 +26874,35 @@ impl App {
             clicks.pick_dir = true;
         }
         ui.add_space(6.0);
-        // 三個檔案各自在不在（第一次用的時候一個都還沒有，講清楚免得以為壞了）
+        // 三個檔案各自在不在（第一次用的時候一個都還沒有，講清楚免得以為壞了），
+        // 已經有的那幾個旁邊給一顆「開啟」——看總表是這個功能的重點，
+        // 不該還要自己去資料夾裡翻
         for p in self.disk.files() {
             let name = p
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let (mark, color) = if p.is_file() {
-                ("✔", theme::TEXT_WEAK)
-            } else {
-                ("·", theme::TEXT_WEAK)
-            };
-            ui.label(
-                egui::RichText::new(format!(
-                    "{mark} {name}{}",
-                    if p.is_file() { "" } else { "（還沒有）" }
-                ))
-                .size(11.5)
-                .color(color),
-            );
+            let there = p.is_file();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {name}{}",
+                        if there { "✔" } else { "·" },
+                        if there { "" } else { "（還沒有）" }
+                    ))
+                    .size(11.5)
+                    .color(theme::TEXT_WEAK),
+                );
+                // 檔案還沒建出來就不給按：按了只會跳一個「找不到檔案」
+                if there
+                    && ui
+                        .add(egui::Button::new("↗  開啟").small())
+                        .tip("用系統預設的程式打開它（Excel、PDF 閱讀器⋯）")
+                        .clicked()
+                {
+                    clicks.open = Some(p.clone());
+                }
+            });
         }
         ui.add_space(10.0);
         ui.separator();
