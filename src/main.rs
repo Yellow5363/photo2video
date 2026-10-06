@@ -26893,8 +26893,12 @@ impl App {
                     .size(11.5)
                     .color(theme::TEXT_WEAK),
                 );
-                // 檔案還沒建出來就不給按：按了只會跳一個「找不到檔案」
-                if there
+                // 索引檔不給開：那是程式自己讀的，沒有人要打開它來看。
+                // 檔案還沒建出來的也不給按，按了只會跳一個「找不到檔案」
+                let openable = there
+                    && p.extension()
+                        .is_some_and(|e| !e.eq_ignore_ascii_case("json"));
+                if openable
                     && ui
                         .add(egui::Button::new("↗  開啟").small())
                         .tip("用系統預設的程式打開它（Excel、PDF 閱讀器⋯）")
