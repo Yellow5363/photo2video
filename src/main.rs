@@ -3796,7 +3796,7 @@ fn run_track(
     }
     let photos = Arc::new(photos.to_vec());
     let need = vec![true; photos.len()];
-    let (locked, total) = follow_fill(&photos, marks, &seeds, &need, crop, true, send);
+    let (locked, total) = follow_fill(&photos, marks, &seeds, &need, &vec![false; need.len()], None, crop, true, send);
     send(TrackMsg::Done(locked + marks.len(), total + marks.len()));
 }
 
@@ -3814,6 +3814,8 @@ fn follow_fill(
     marks: &[(usize, [f32; 4])],
     seeds: &[track::Frame],
     need: &[bool],
+    keep_own: &[bool],
+    cands: Option<&[Vec<track::Found>]>,
     crop: Crop,
     step: bool,
     send: &dyn Fn(TrackMsg),
@@ -3850,10 +3852,33 @@ fn follow_fill(
         // 這一段的框都跟著出發那一張的大小走（追蹤只找位置、不量大小）
         let seed_rect = marks[seed].1;
         let (sw, sh) = (seed_rect[2] - seed_rect[0], seed_rect[3] - seed_rect[1]);
+        // 這一張的動態偵測有沒有在差不多的位置也看到東西：兩種獨立的方法
+        // 指向同一處，才敢說「這裡就是主體」
+        let seen_moving = |i: usize, cx: f32, cy: f32| -> bool {
+            cands.is_some_and(|cs| {
+                // 只看那一張「最明顯的移動物」：風吹的葉子到處都是，拿任何一個
+                // 候選來印證，補框幾乎總能在附近找到一片在晃的葉子
+                cs[i].iter().take(1).any(|f| {
+                    let (fx, fy) = ((f.rect[0] + f.rect[2]) / 2.0, (f.rect[1] + f.rect[3]) / 2.0);
+                    // 半個框以內才算同一處：放寬到一整個框的話，一片散景旁
+                    // 邊剛好有一截翅膀尖在動也會被當成「動態偵測看到了」
+                    (fx - cx).abs() < (sw * 0.5).max(0.015)
+                        && (fy - cy).abs() < (sh * 0.5).max(0.015)
+                })
+            })
+        };
+        let sure_fill = |i: usize, h: &track::Hit| -> bool {
+            h.same >= TRACK_FILL_ALONE
+                || (h.same >= TRACK_FILL_SURE && seen_moving(i, h.cx, h.cy))
+        };
         let to_boxes = |got: &[(usize, Option<track::Hit>)]| -> Vec<(usize, Option<Subject>)> {
             got.iter()
                 // 已經有可靠框的那幾張不覆蓋（自動框選只補看不見的那些）
                 .filter(|(i, _)| need[*i])
+                // 那一張原本有動態偵測的框（只是沒把握）：補框要有把握才蓋過去，
+                // 否則保留原本那個——兩個都沒把握時，動態偵測看到的至少是
+                // 「真的在動的東西」，補框卻可能是一片長得有點像的散景
+                .filter(|(i, h)| !keep_own[*i] || h.is_some_and(|h| sure_fill(*i, &h)))
                 .map(|(i, h)| {
                     (
                         *i,
@@ -3865,10 +3890,12 @@ fn follow_fill(
                                 h.cy + sh / 2.0,
                             ]),
                             src: BoxSrc::Tracked,
-                            // 比對分數直接當把握程度：勉強對上的（樣板在
-                            // 一片綠葉上總能找到「還算像」的地方）與照速度
-                            // 推出來的一樣要請使用者過目，不能默默放行
-                            score: if h.score >= TRACK_FILL_SURE {
+                            // 樣板比對的分數單獨拿來判斷並不可靠：實測一批
+                            // 164 張的連拍，框對的落在 0.40～0.98、框錯（落在
+                            // 散景上）的落在 0.42～0.80，中間大片重疊。所以要
+                            // 嘛分數高到錯的達不到，要嘛動態偵測也在同一處看到
+                            // 東西（兩種獨立方法互相印證），否則一律請使用者過目
+                            score: if sure_fill(*i, &h) {
                                 0.9
                             } else if h.locked {
                                 0.4
@@ -4000,6 +4027,9 @@ fn run_auto_boxes(
         send(TrackMsg::Step);
     }
 
+    // 先剔除釘在畫面上的東西（浮水印、日期戳記）：相機一移動它們反而像在動，
+    // 主體飛出畫面後整段都會黏在簽名上（見 track::drop_overlays）
+    track::drop_overlays(&mut cands);
     // 整批一起挑出最連貫的那一條軌跡，再按「與鄰張接不接得上」重估把握程度
     // （見 track::choose_path / track::path_scores）
     let picked = track::choose_path(&cands);
@@ -4007,6 +4037,8 @@ fn run_auto_boxes(
     let mut boxes: Vec<(usize, Option<Subject>)> = Vec::with_capacity(n);
     let mut marks: Vec<(usize, [f32; 4])> = Vec::new();
     let mut need = vec![false; n];
+    // 哪幾張已經有動態偵測的框（只是沒把握）：補框沒把握時不蓋掉它
+    let has_auto: Vec<bool> = (0..n).map(|i| !keep[i] && picked[i].is_some()).collect();
     for i in 0..n {
         if keep[i] {
             continue;
@@ -4049,7 +4081,7 @@ fn run_auto_boxes(
             }
         }
         if !ok.is_empty() {
-            let (filled, _) = follow_fill(&photos, &ok, &seeds, &need, crop, false, send);
+            let (filled, _) = follow_fill(&photos, &ok, &seeds, &need, &has_auto, Some(&cands), crop, false, send);
             found += filled;
         }
     }
@@ -5667,12 +5699,21 @@ struct Subject {
 /// 低於這個把握程度就請使用者自己看一眼（縮圖標 ⚠）
 const TRACK_SURE: f32 = 0.45;
 
-/// 補洞時的樣板比對分數要到這裡，才算「確實找到同一個主體」。
+/// 補洞時的樣板比對分數至少要到這裡，**而且**動態偵測也在同一處看到東西，
+/// 才算「確實找到同一個主體」。
 ///
 /// 比對本身用比較鬆的門檻去跟（跟丟一兩張還能靠預測滑回來），但「可以不必
 /// 請使用者過目」是另一回事——一片綠葉上總是找得到「還算像」的地方，
 /// 那種勉強對上的要標成要檢查
 const TRACK_FILL_SURE: f32 = 0.55;
+
+/// 與「出發時的樣子」（見 [`track::Hit::same`]）像到這裡，就算動態偵測沒看到
+/// （主體停住不動）也可以放行。
+///
+/// 實測一批 164 張的連拍：框錯的補框最高只到 0.727，框對的有一半在 0.82 以上；
+/// 鳥飛出畫面後樣板漂移到葉子上的那幾張，跟漂移後的樣板比高達 0.97，跟出發時
+/// 的樣子比只有 0.65——所以一定要用 `same` 判斷，門檻比錯的最高值留 0.05 餘裕
+const TRACK_FILL_ALONE: f32 = 0.78;
 
 impl Subject {
     fn manual(rect: [f32; 4]) -> Subject {
@@ -37196,7 +37237,7 @@ mod tests {
     /// 起點附近幾乎不動；但差太多時是「跟丟」不是「漂移」，原樣不動
     #[test]
     fn drift_is_spread_along_the_run_but_not_when_it_lost_track() {
-        let hit = |cx: f32| track::Hit { cx, cy: 0.5, score: 0.9, locked: true };
+        let hit = |cx: f32| track::Hit { cx, cy: 0.5, score: 0.9, locked: true, same: 0.9 };
         // 追出來一路往右偏，終點差了 0.04
         let mut run: Vec<(usize, Option<track::Hit>)> =
             (0..4).map(|i| (i, Some(hit(0.30 + 0.01 * i as f32)))).collect();
@@ -38770,3 +38811,4 @@ mod tests {
         assert_eq!(at(50.0, 150.0), None);
     }
 }
+

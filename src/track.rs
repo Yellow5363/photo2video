@@ -242,12 +242,21 @@ pub struct Hit {
     pub score: f32,
     /// 有沒有真的對上。false＝分數太低，回傳的是照速度預測的位置
     pub locked: bool,
+    /// 找到的那一塊與**出發時**的樣子有多像（−1 ~ 1）。
+    ///
+    /// `score` 比的是一路慢慢混進新樣子的樣板；主體離開畫面後追蹤器還在
+    /// 「勉強對上」，就會把背景一點一點混進樣板，混到後來跟葉子比得非常像
+    /// （樣板漂移）。拿它判斷「這張還是不是主體」會被騙；`same` 比的是
+    /// 最初那隻鳥，漂移騙不了它
+    pub same: f32,
 }
 
 /// 一條追蹤的狀態。從使用者框的那一張出發，往後（或往前）一張一張餵進去
 pub struct Tracker {
     /// 樣板，以及它取自金字塔的哪一層
     tmpl: Frame,
+    /// 出發時的樣板（不跟著更新），用來量 [`Hit::same`]
+    orig: Frame,
     level: usize,
     /// 上一張抓到的中心（相對座標）
     last: (f32, f32),
@@ -294,6 +303,7 @@ impl Tracker {
             th,
         );
         Some(Tracker {
+            orig: tmpl.clone(),
             tmpl,
             level,
             last: (cx, cy),
@@ -372,7 +382,16 @@ impl Tracker {
                 *old += (new - *old) * TMPL_MIX;
             }
         }
-        Hit { cx: centre.0, cy: centre.1, score: best.2, locked }
+        // 與出發時的樣子比一次（漂移過的樣板會把背景也當成主體，見 Hit::same）
+        let (tw, th) = (self.orig.w, self.orig.h);
+        let same = if fine.w >= tw && fine.h >= th {
+            let x = ((best.0 - tw as f32 / 2.0).round() as i32).clamp(0, (fine.w - tw) as i32);
+            let y = ((best.1 - th as f32 / 2.0).round() as i32).clamp(0, (fine.h - th) as i32);
+            zncc(fine, x as usize, y as usize, &Tmpl::new(self.orig.clone()))
+        } else {
+            -1.0
+        };
+        Hit { cx: centre.0, cy: centre.1, score: best.2, locked, same }
     }
 }
 
@@ -465,6 +484,12 @@ pub fn path_scores(cands: &[Vec<Found>], picked: &[Option<usize>]) -> Vec<f32> {
         }
     }
     let mut still = vec![false; n];
+    // 被「瞬移」夾在中間的小段。主體不會一下子跳到畫面另一頭、過一會兒又
+    // 跳回來——那一段多半是跟到了別的東西。實測一批 164 張的連拍：鳥飛出
+    // 畫面右緣的下一張，路徑瞬間跳到左上角一片在動的葉子（分數 0.99），
+    // 跟了七張之後鳥回來、又瞬間跳回右邊。位置一路平順、差值也很亮，只有
+    // 「兩頭都是瞬移」露了餡
+    let mut island = vec![false; n];
     {
         let mut breaks: Vec<usize> = vec![0];
         for i in 1..n {
@@ -473,8 +498,13 @@ pub fn path_scores(cands: &[Vec<Found>], picked: &[Option<usize>]) -> Vec<f32> {
             }
         }
         breaks.push(n);
+        let longest = breaks.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
         for w in breaks.windows(2) {
             let (a, b) = (w[0], w[1]);
+            // 不是最長的那段（主體的主線），又短於全批的兩成：可疑的小島
+            if b - a < longest && (b - a) * 5 < n {
+                island[a..b].fill(true);
+            }
             if b - a < 3 {
                 continue; // 太短的段落看不出快慢
             }
@@ -490,7 +520,14 @@ pub fn path_scores(cands: &[Vec<Found>], picked: &[Option<usize>]) -> Vec<f32> {
 
     for i in 0..n {
         let Some(k) = picked[i] else { continue };
-        let base = cands[i][k].score * if still[i] { 0.3 } else { 1.0 };
+        let doubt = if still[i] {
+            0.3
+        } else if island[i] {
+            0.4
+        } else {
+            1.0
+        };
+        let base = cands[i][k].score * doubt;
         // 前後都在才算得出「接不接得上」；在邊界就只看那一團自己的分數
         let dev = match (i.checked_sub(1).and_then(|j| pos[j]), pos[i], pos.get(i + 1).copied().flatten())
         {
@@ -607,6 +644,9 @@ const SIG_N: usize = 8;
 pub struct Found {
     pub rect: [f32; 4],
     pub score: f32,
+    /// 補償相機位移之後，這一團比補償之前亮了幾倍。相機沒動時恆為 1；
+    /// 釘在畫面上的浮水印會遠大於 1（見 [`drop_overlays`]）
+    pub shift_gain: f32,
     /// 框裡那一塊縮成 8×8、扣掉平均並正規化的樣子。
     /// 拿它跟別張的比對就知道「還是同一個東西嗎」——差值圖只認得出
     /// 「有沒有在動」，認不出「動的是誰」
@@ -663,6 +703,9 @@ pub fn detect_candidates(
 ) -> Vec<Found> {
     let cp = cur.pyramid(DET_SHIFT);
     let mut maps: Vec<Frame> = Vec::new();
+    // 同樣兩張、但**不補償**相機位移的差值：拿來認出「釘在畫面上」的東西
+    // （浮水印、日期戳記、相框），見下面的 overlay 判斷
+    let mut raws: Vec<Frame> = Vec::new();
     for other in [prev, next].into_iter().flatten() {
         if other.w != cur.w || other.h != cur.h {
             continue; // 尺寸不同的照片沒得逐點相減
@@ -673,20 +716,27 @@ pub fn detect_candidates(
         let s = best_shift(&cp[DET_SHIFT], &op[DET_SHIFT], DET_SHIFT_R);
         let k = 1 << (DET_SHIFT - DET_DIFF);
         maps.push(diff_at(&cp[DET_DIFF], &op[DET_DIFF], (s.0 * k, s.1 * k)));
+        raws.push(diff_at(&cp[DET_DIFF], &op[DET_DIFF], (0, 0)));
     }
-    let mut m = match maps.len() {
-        0 => return Vec::new(),
-        1 => maps.pop().unwrap(),
-        _ => {
-            // 逐點取小值：只有「前後兩張都覺得這裡不一樣」的地方留得下來
-            let (a, b) = (&maps[0], &maps[1]);
-            let px = a.px.iter().zip(&b.px).map(|(x, y)| x.min(*y)).collect();
-            Frame::new(a.w, a.h, px)
-        }
+    // 兩份差值圖用同一種方式合併（逐點取小值、再糊一下），才比得起來
+    let combine = |mut v: Vec<Frame>| -> Option<Frame> {
+        let mut f = match v.len() {
+            0 => return None,
+            1 => v.pop().unwrap(),
+            _ => {
+                // 逐點取小值：只有「前後兩張都覺得這裡不一樣」的地方留得下來
+                let (a, b) = (&v[0], &v[1]);
+                let px = a.px.iter().zip(&b.px).map(|(x, y)| x.min(*y)).collect();
+                Frame::new(a.w, a.h, px)
+            }
+        };
+        blur3(&mut f);
+        Some(f)
     };
     // 單邊（頭尾兩張）少了一層把關，門檻抬高一點免得框到雜訊
     let strict = if maps.len() < 2 { 1.6 } else { 1.0 };
-    blur3(&mut m);
+    let Some(m) = combine(maps) else { return Vec::new() };
+    let raw = combine(raws).unwrap_or_else(|| m.clone());
 
     // 「典型差值」用中位數：會動的東西只佔一小塊，中位數代表的就是背景的殘差
     let mut sorted: Vec<f32> = m.px.clone();
@@ -715,6 +765,7 @@ pub fn detect_candidates(
         let Some(blob) = grow(&m, at, limit, level, &mut used) else {
             continue; // 長太大＝整片都在變（曝光跳動之類），換下一個峰值
         };
+        let gain = shift_gain(&blob, &m, &raw);
         let (x0, y0, x1, y1) = blob.bbox;
         // 位置用**差值加權的重心**而不是外接框的中心：同一隻鳥的外接框會
         // 隨著翅膀張合忽胖忽瘦，中心跟著左右跳；重心穩得多
@@ -750,9 +801,84 @@ pub fn detect_candidates(
             rect,
             score: (contrast * 0.65 + compact * 0.35).clamp(0.0, 1.0),
             sig,
+            shift_gain: gain,
         });
     }
     out
+}
+
+/// 這一團「補償相機位移之後比補償之前亮了幾倍」（見 [`Found::shift_gain`]）
+fn shift_gain(blob: &Blob, comp: &Frame, raw: &Frame) -> f32 {
+    let n = blob.cells.len().max(1) as f32;
+    let comp_mean = blob.cells.iter().map(|&i| comp.px[i]).sum::<f32>() / n;
+    let raw_mean = blob.cells.iter().map(|&i| raw.px[i]).sum::<f32>() / n;
+    comp_mean / raw_mean.max(0.5)
+}
+
+/// 同一個位置（佔畫面的比例）以內就算「同一個地方」
+const OVERLAY_RADIUS: f32 = 0.04;
+
+/// 在整批裡有這麼大比例的照片、同一個位置都出現候選，才可能是釘在畫面上的
+const OVERLAY_SHARE: f32 = 0.10;
+
+/// 那些候選「補償後放大」的倍數中位數要到這裡（相機沒動時恆為 1）
+const OVERLAY_GAIN: f32 = 2.5;
+
+/// 剔除**釘在畫面上**的東西（浮水印、日期戳記、相框）。
+///
+/// 相機一移動，程式會把整張的位移補掉，好讓背景對齊、只剩真正在動的主體。
+/// 但浮水印是跟著畫面走的——背景對齊了，它反而錯開了，於是變成整張最亮的
+/// 「移動物體」。實測一批 164 張的連拍，鳥飛出畫面後最後 10 張整段黏在
+/// 攝影師的簽名上，而且分數都很高。
+///
+/// 單看一張分不出來：半透明的浮水印疊在變動的背景上，補償前的差值也不是 0
+/// （實測 0.9～16），而相機在移動時，真正的鳥補償後也會放大個三到七倍。
+/// 但浮水印有一個鳥絕對沒有的特徵——**每一張都在畫面上同一個位置**。所以
+/// 整批一起看：在固定位置反覆出現（超過一成的照片）、而且那些候選多半是
+/// 靠補償相機位移才亮起來的，就是釘在畫面上的東西。
+///
+/// 相機沒動的連拍（鳥在巢洞口、同一處動了幾十張）放大倍數都是 1，不會被誤殺
+pub fn drop_overlays(cands: &mut [Vec<Found>]) {
+    let n = cands.len();
+    let need = ((n as f32 * OVERLAY_SHARE).ceil() as usize).max(4);
+    let centre = |f: &Found| ((f.rect[0] + f.rect[2]) / 2.0, (f.rect[1] + f.rect[3]) / 2.0);
+    let mut kill: Vec<Vec<bool>> = cands.iter().map(|c| vec![false; c.len()]).collect();
+    for i in 0..n {
+        for (k, c) in cands[i].iter().enumerate() {
+            let (cx, cy) = centre(c);
+            // 其他照片在同一個位置的候選：數有幾張照片有、收集它們的放大倍數
+            let mut frames = 0usize;
+            let mut gains = vec![c.shift_gain];
+            for (j, other) in cands.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                let near: Vec<f32> = other
+                    .iter()
+                    .filter(|o| {
+                        let (ox, oy) = centre(o);
+                        (ox - cx).abs() < OVERLAY_RADIUS && (oy - cy).abs() < OVERLAY_RADIUS
+                    })
+                    .map(|o| o.shift_gain)
+                    .collect();
+                if !near.is_empty() {
+                    frames += 1;
+                    gains.extend(near);
+                }
+            }
+            if frames + 1 < need {
+                continue;
+            }
+            gains.sort_by(f32::total_cmp);
+            if gains[gains.len() / 2] >= OVERLAY_GAIN {
+                kill[i][k] = true;
+            }
+        }
+    }
+    for (c, k) in cands.iter_mut().zip(kill) {
+        let mut it = k.into_iter();
+        c.retain(|_| !it.next().unwrap_or(false));
+    }
 }
 
 /// 只要最強的那一個候選（單張使用時的簡便版）
@@ -1196,7 +1322,7 @@ mod tests {
         for v in sig.iter_mut() {
             *v = (*v - mean) / norm;
         }
-        Found { rect: [cx - 0.04, cy - 0.04, cx + 0.04, cy + 0.04], score, sig }
+        Found { rect: [cx - 0.04, cy - 0.04, cx + 0.04, cy + 0.04], score, sig, shift_gain: 1.0 }
     }
 
     /// 畫面裡不只主體在動：整批一起挑路徑時，要挑那條**連貫**的，
@@ -1278,6 +1404,89 @@ mod tests {
         assert_eq!(pts[0], (0.10, 0.5));
         assert_eq!(pts[4], (0.30, 0.5));
         assert!((pts[1].0 - 0.15).abs() < 1e-6);
+    }
+
+    /// 浮水印：相機在移動時，固定在畫面同一處、靠補償相機位移才亮起來的
+    /// 東西要整批剔除；真正在飛的鳥留著。相機沒動的連拍（鳥在巢洞口同一處
+    /// 動了幾十張，放大倍數恆為 1）不能被誤殺
+    #[test]
+    fn overlays_fixed_on_the_frame_are_dropped() {
+        let with_gain = |cx: f32, cy: f32, g: f32| {
+            let mut f = cand(cx, cy, 0.95, 0.0);
+            f.shift_gain = g;
+            f
+        };
+        let mut cands: Vec<Vec<Found>> = (0..20)
+            .map(|i| {
+                vec![
+                    with_gain(0.90, 0.95, 6.0),                     // 右下角的簽名
+                    with_gain(0.10 + 0.03 * i as f32, 0.50, 1.5), // 飛過去的鳥
+                ]
+            })
+            .collect();
+        drop_overlays(&mut cands);
+        for (i, c) in cands.iter().enumerate() {
+            assert_eq!(c.len(), 1, "第 {i} 張還留著浮水印：{c:?}");
+            assert!((c[0].rect[1] + c[0].rect[3]) / 2.0 < 0.6, "第 {i} 張把鳥剔掉了");
+        }
+
+        // 相機沒動：同一處反覆出現、但放大倍數是 1——那是停在巢洞口的鳥
+        let mut nest: Vec<Vec<Found>> = (0..20).map(|_| vec![with_gain(0.80, 0.48, 1.0)]).collect();
+        drop_overlays(&mut nest);
+        assert!(nest.iter().all(|c| c.len() == 1), "相機沒動時不該剔除任何東西");
+    }
+
+    /// 被兩次「瞬移」夾在中間的小段要被標成沒把握：主體不會一下子跳到畫面
+    /// 另一頭、過幾張又跳回來（實測：鳥飛出畫面後路徑跳到一片葉子上跟了七張）
+    #[test]
+    fn a_short_stretch_between_two_jumps_is_doubted() {
+        let cands: Vec<Vec<Found>> = (0..60)
+            .map(|i| {
+                let t = i as f32;
+                let (x, y) = if (30..36).contains(&i) {
+                    (0.10 + 0.03 * (t - 30.0), 0.15) // 跳到左上角的葉子
+                } else {
+                    (0.30 + 0.008 * t, 0.50 + 0.003 * t) // 主體的主線
+                };
+                vec![cand(x, y, 0.99, 0.0)]
+            })
+            .collect();
+        let picked: Vec<Option<usize>> = (0..60).map(|_| Some(0)).collect();
+        let s = path_scores(&cands, &picked);
+        for i in 30..36 {
+            assert!(s[i] < 0.45, "第 {i} 張在兩次瞬移之間，卻還很有把握（{}）", s[i]);
+        }
+        for i in [5usize, 15, 45, 55] {
+            assert!(s[i] > 0.6, "第 {i} 張是主線上的，不該被壓分（{}）", s[i]);
+        }
+    }
+
+    /// 追蹤器的 `same` 永遠拿**出發時的樣子**來比：主體不見了、換成別的
+    /// 東西時，不管樣板一路混成什麼樣子，`same` 都要說「不像」
+    #[test]
+    fn same_compares_against_the_original_look() {
+        let (w, h) = (320usize, 240usize);
+        let first = scene(w, h, 120.0, 120.0, 14.0);
+        let rect = [106.0 / 320.0, 106.0 / 240.0, 134.0 / 320.0, 134.0 / 240.0];
+        let mut t = Tracker::new(&first, rect).unwrap();
+        let hit = t.find(&scene(w, h, 125.0, 120.0, 14.0));
+        assert!(hit.same > 0.9, "同一個東西應該很像（{}）", hit.same);
+        // 主體離開，原地換成一塊花紋完全不同的東西，連續好幾張
+        let other = |cx: f32| {
+            let mut px = vec![90.0f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    if (x as f32 - cx).abs() <= 14.0 && (y as f32 - 120.0).abs() <= 14.0 {
+                        px[y * w + x] = if (x / 7 + y / 9) % 2 == 0 { 30.0 } else { 220.0 };
+                    }
+                }
+            }
+            Frame::new(w, h, px)
+        };
+        for k in 0..6 {
+            let hit = t.find(&other(130.0 + k as f32));
+            assert!(hit.same < 0.6, "換成別的東西了，same 卻說很像（第 {k} 張 {}）", hit.same);
+        }
     }
 
     #[test]
