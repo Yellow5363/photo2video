@@ -4129,9 +4129,15 @@ fn run_auto_boxes(
     // 交給使用者的框搬到頭上（大小不變）。但補洞那一趟的樣板仍取**身體**
     // 那一團：頭只有二三十個像素見方，在雜亂的樹叢裡幾乎到處都「很像」，
     // 實測拿頭當樣板，追蹤器會沿著葉子一路滑過去還自認很有把握
+    // 十字最後擺的位置：頭附近找得到五色鳥嘴基兩側的紅點，就移到紅點上——
+    // 正面時兩點的重心正好在兩眼之間，側面時那一點緊貼著眼睛（使用者提供
+    // 的辨識特徵）。只在這裡用：挑頭、驗證、要不要檢查都照原本的頭判斷
+    let aim: Vec<Option<(f32, f32)>> = (0..n)
+        .map(|i| head[i].map(|(hx, hy)| track::red_of(&cands[i], hx, hy).unwrap_or((hx, hy))))
+        .collect();
     let shown = |i: usize, k: usize| -> [f32; 4] {
         let r = cands[i][k].rect;
-        match head[i] {
+        match aim[i] {
             Some((hx, hy)) => {
                 let (w, h) = (r[2] - r[0], r[3] - r[1]);
                 [hx - w / 2.0, hy - h / 2.0, hx + w / 2.0, hy + h / 2.0]
@@ -4172,10 +4178,12 @@ fn run_auto_boxes(
         }
     }
     marks.sort_by_key(|(i, _)| *i);
-    // 補框不能自認有把握的那幾張：找頭失敗的；以及這一批是看頭的模式時，
-    // 連一點動態都沒偵測到的——鳥已經飛出畫面，補框只是在空畫面裡找到一塊
-    // 長得有點像的東西（實測一批連拍的最後兩張，框到右邊的樹葉還自認有把握）
-    let fill_doubt: Vec<bool> = (0..n).map(|i| headless[i] || (head_mode && picked[i].is_none())).collect();
+    // 補框不能自認有把握的那幾張：找頭失敗的；以及這一批是看頭的模式時的
+    // **每一張**。補框追的是身體那一團的樣子，再像也只證明「那一團在這裡」，
+    // 證明不了頭在框裡——實測兩批：鳥飛出畫面後的最後兩張，補框框到右邊的
+    // 樹葉；鳥停在空中的十四張，樣板裡大半是散景，補框黏在鳥旁邊的背景上，
+    // 全都自認有把握。看頭的模式下補框只負責先放一個框，請使用者過目
+    let fill_doubt: Vec<bool> = (0..n).map(|i| headless[i] || head_mode).collect();
     let missing = need.iter().filter(|x| **x).count();
     let mut found = n - missing - keep.iter().filter(|k| **k).count();
     if missing > 0 && !marks.is_empty() {
@@ -4190,7 +4198,7 @@ fn run_auto_boxes(
                     seeds.push(f);
                     ok.push((*i, *rect));
                     let (bx, by) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
-                    ok_off.push(head[*i].map_or((0.0, 0.0), |(hx, hy)| (hx - bx, hy - by)));
+                    ok_off.push(aim[*i].map_or((0.0, 0.0), |(hx, hy)| (hx - bx, hy - by)));
                 }
             }
         }

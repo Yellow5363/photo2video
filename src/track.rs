@@ -67,6 +67,21 @@ pub struct Chroma {
     h: usize,
     rg: Vec<f32>,
     yb: Vec<f32>,
+    /// 原解析度（長寬是 `w`、`h` 的兩倍）每一點有多「純紅」（見 [`redness`]）。
+    /// 五色鳥嘴基兩側那對紅點只有幾個像素大，縮一半就跟旁邊的黃、黑混掉了
+    red: Vec<f32>,
+}
+
+/// 一個像素有多「純紅」：紅要同時明顯高過綠與藍，綠與藍又要差不多，而且要夠亮。
+/// 正紅（200, 40, 40）約 160；橘（230, 140, 30）只剩 35；黃、綠、褐都在 0 以下。
+///
+/// 夠亮這一條擋的是鳥嘴裡叼的果子：實測一批連拍，果子是暗紅褐色（115, 34, 40），
+/// 純度跟紅點差不多，十字被拉到果子上；紅點則亮得多（244, 74, 5）
+fn redness(r: f32, g: f32, b: f32) -> f32 {
+    if r < RED_BRIGHT {
+        return -1.0;
+    }
+    (r - g).min(r - b) - 0.5 * (g - b).abs()
 }
 
 impl Chroma {
@@ -93,7 +108,14 @@ impl Chroma {
                 yb.push((r + g) / 2.0 - b);
             }
         }
-        Chroma { w, h, rg, yb }
+        let mut red = Vec::with_capacity(4 * w * h);
+        for y in 0..2 * h {
+            for x in 0..2 * w {
+                let p = img.get_pixel(x.min(iw - 1) as u32, y.min(ih - 1) as u32);
+                red.push(redness(p[0] as f32, p[1] as f32, p[2] as f32));
+            }
+        }
+        Chroma { w, h, rg, yb, red }
     }
 }
 
@@ -548,6 +570,33 @@ pub fn path_scores(
     // 跟了七張之後鳥回來、又瞬間跳回右邊。位置一路平順、差值也很亮，只有
     // 「兩頭都是瞬移」露了餡
     let mut island = vec![false; n];
+    // 頭的版本：只拿通過驗證的頭來量，沒有頭的那幾張跳過；而且只認**真正
+    // 的瞬移**（一步跳超過畫面的 HEAD_TELEPORT）。飛得快的鳥頭偶爾一步跳
+    // 0.06～0.07，拿一般的標準量會把前面一大段誤判成小島（實測一批連拍前
+    // 52 張全被標要檢查）；但鳥停在空中、動態偵測看不見牠的那十幾張，路徑
+    // 會一下跳到畫面最左邊一團緩緩飄的白色光點（跳了三分之一個畫面），
+    // 那裡也湊得出夠強的「頭」，只有兩頭的瞬移露得出馬腳
+    let mut head_island = vec![false; n];
+    if let Some(f) = fit_pos {
+        let seen: Vec<usize> = (0..n).filter(|&i| f[i].is_some()).collect();
+        let mut breaks: Vec<usize> = vec![0];
+        for t in 1..seen.len() {
+            let (a, b) = (f[seen[t - 1]].unwrap(), f[seen[t]].unwrap());
+            let gap = (seen[t] - seen[t - 1]) as f32;
+            if (b.0 - a.0).hypot(b.1 - a.1) / gap > (fit_typical * 4.0).max(HEAD_TELEPORT) {
+                breaks.push(t);
+            }
+        }
+        breaks.push(seen.len());
+        let longest = breaks.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+        for w in breaks.windows(2) {
+            if w[1] - w[0] < longest && (w[1] - w[0]) * 5 < seen.len() {
+                for &i in &seen[w[0]..w[1]] {
+                    head_island[i] = true;
+                }
+            }
+        }
+    }
     {
         let mut breaks: Vec<usize> = vec![0];
         for i in 1..n {
@@ -608,12 +657,9 @@ pub fn path_scores(
         let look = (look * 1.6).min(1.0);
         out[i] = if verified {
             // 頭已經通過前後驗證：那是最直接的證據。「接不接得上」「長得像
-            // 不像」「被兩次瞬移夾住」都是拿動態框猜的間接分數，鳥從遠拍飛到
-            // 特寫、外觀變很多、頭偶爾一步跳得遠時會亂扣分（實測一批飛得快
-            // 的連拍，前 52 張頭明明在十字上卻全被標要檢查）。路徑跳到葉子
-            // 上的那種，葉子上湊出來的「頭」不夠清楚、強度也不到一般水準，
-            // 在 run_auto_boxes 驗證頭的那一步就被擋掉了，到不了這裡
-            cands[i][k].score
+            // 不像」是拿動態框猜的間接分數，鳥從遠拍飛到特寫、外觀變很多時
+            // 會亂扣分。只留「被兩次真正的瞬移夾住」（見 head_island）
+            cands[i][k].score * if head_island[i] { 0.4 } else { 1.0 }
         } else {
             base * fit * look
         }
@@ -726,6 +772,10 @@ pub struct Found {
     /// 不足的是 0 分（見 [`HeadMaps::find`]）。動態偵測找到的常是拍動的
     /// 翅膀，鏡頭要對的是頭；要挑哪一處見 [`choose_heads`]
     pub heads: [(f32, f32, f32); HEAD_PEAKS],
+    /// `heads` 每一處附近的紅點（相對座標），找不到是 None（見 [`red_spot`]）。
+    /// 只用來決定十字最後擺哪：挑頭、驗證、判斷要不要檢查一律照 `heads`，
+    /// 免得紅點把「這一批的頭清不清楚」之類的判斷帶偏
+    pub reds: [Option<(f32, f32)>; HEAD_PEAKS],
     /// 這張照片最清晰那一塊有多清晰（整張共用，見 HeadMaps::sharp_ref）。
     /// 跟整批比低很多＝這張整個糊掉了（失焦或晃動），交給使用者處理
     pub sharp: f32,
@@ -883,12 +933,17 @@ pub fn detect_candidates(
         // 指紋取自**照片本身**（不是差值圖）：要認的是這一塊長什麼樣子。
         // cp 是 cur 的金字塔，第 DET_DIFF 層正是差值圖那一層的灰階原圖
         let sig = signature(&cp[DET_DIFF], rect[0] * fw, rect[1] * fh, rect[2] * fw, rect[3] * fh);
+        let found_heads = heads.as_ref().map_or([(0.0, 0.0, 0.0); HEAD_PEAKS], |hm| hm.find(rect, bird_motion));
         out.push(Found {
             rect,
             score: (contrast * 0.65 + compact * 0.35).clamp(0.0, 1.0),
             sig,
             shift_gain: gain,
-            heads: heads.as_ref().map_or([(0.0, 0.0, 0.0); HEAD_PEAKS], |hm| hm.find(rect, bird_motion)),
+            heads: found_heads,
+            reds: match cur.colour.as_deref() {
+                Some(c) => found_heads.map(|(x, y, s)| (s > 0.0).then(|| red_spot(c, x, y)).flatten()),
+                None => [None; HEAD_PEAKS],
+            },
             sharp: heads.as_ref().map_or(0.0, |hm| hm.sharp_ref),
         });
     }
@@ -1158,6 +1213,134 @@ impl HeadMaps {
     }
 }
 
+/// 第 i 張挑中的頭 (x, y)（[`choose_heads`] 回傳的那一處）附近的紅點
+pub fn red_of(cands: &[Found], x: f32, y: f32) -> Option<(f32, f32)> {
+    cands.iter().find_map(|c| {
+        c.heads
+            .iter()
+            .zip(c.reds.iter())
+            .find(|(h, _)| h.2 > 0.0 && (h.0 - x).abs() < 1e-6 && (h.1 - y).abs() < 1e-6)
+            .and_then(|(_, r)| *r)
+    })
+}
+
+/// 紅點的紅色值至少要這麼亮（0 到 255，見 [`redness`]）
+const RED_BRIGHT: f32 = 150.0;
+
+/// 紅點要多紅才算（見 [`redness`]）
+const RED_MIN: f32 = 60.0;
+
+/// 在頭附近多遠的範圍裡找紅點（[`HEAD_RADIUS`] 的幾倍）
+const RED_SEARCH: f32 = 4.0;
+
+/// 一塊紅至少要有幾個像素（原解析度）才算紅點
+const RED_PIXELS: usize = 4;
+
+/// 成對的兩塊紅點，面積最多差幾倍
+const RED_PAIR_AREA: f32 = 4.0;
+
+/// 成對的兩塊紅點，高低差最多是左右距離的幾倍（頭歪一點也認得）
+const RED_PAIR_TILT: f32 = 0.6;
+
+/// 成對的兩塊紅點，左右距離最多是一塊寬度的幾倍（中間夾著的是嘴基）
+const RED_PAIR_GAP: f32 = 6.0;
+
+/// 在找到的頭 (x, y)（相對座標）附近找五色鳥嘴基兩側的那對紅點，回傳兩點的
+/// 中點（相對座標）；找不到是 None。
+///
+/// 「顏色最雜的一小塊」只說得出頭大概在哪：近拍時常落在喉嚨的紅黃色塊、或
+/// 頭頂與背景的交界。那對紅點的位置是固定的——正面看兩點夾著嘴基、兩眼就在
+/// 它們外側，中點正好在兩眼之間（使用者提供的辨識特徵）。
+///
+/// 一定要**成對**才算：五色鳥脖子兩側還有一塊較大的紅斑，側面時只看得到
+/// 一邊，那時只找單一一塊紅，十字會被拉到脖子上、離眼睛一大段（實測一批
+/// 側飛的連拍，二十幾張都這樣）。成對＝兩塊大小相近、高度相近、左右排開；
+/// 胸口那一圈紅是一整條，湊不成一對
+fn red_spot(c: &Chroma, x: f32, y: f32) -> Option<(f32, f32)> {
+    let (rw, rh) = (2 * c.w, 2 * c.h);
+    if c.red.len() != rw * rh || rw < 8 || rh < 8 {
+        return None;
+    }
+    let r = (rw.max(rh) as f32 * HEAD_RADIUS).max(2.0);
+    let rad = r * RED_SEARCH;
+    let (cx, cy) = (x * rw as f32, y * rh as f32);
+    let x0 = (cx - rad).max(0.0) as usize;
+    let x1 = ((cx + rad) as usize).min(rw - 1);
+    let y0 = (cy - rad).max(0.0) as usize;
+    let y1 = ((cy + rad) as usize).min(rh - 1);
+    let (ww, wh) = (x1 - x0 + 1, y1 - y0 + 1);
+    // 搜尋範圍裡的紅色像素連成一塊一塊（四鄰接）
+    let mut label = vec![0u32; ww * wh];
+    // 每一塊：(像素數, x 總和, y 總和, 最左, 最右)
+    let mut blobs: Vec<(usize, f32, f32, usize, usize)> = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for sy in 0..wh {
+        for sx in 0..ww {
+            if label[sy * ww + sx] != 0 || c.red[(y0 + sy) * rw + x0 + sx] <= RED_MIN {
+                continue;
+            }
+            let id = blobs.len() as u32 + 1;
+            let mut b = (0usize, 0.0f32, 0.0f32, usize::MAX, 0usize);
+            label[sy * ww + sx] = id;
+            stack.push((sx, sy));
+            while let Some((px, py)) = stack.pop() {
+                b.0 += 1;
+                b.1 += px as f32 + 0.5;
+                b.2 += py as f32 + 0.5;
+                b.3 = b.3.min(px);
+                b.4 = b.4.max(px);
+                let mut visit = |qx: usize, qy: usize| {
+                    let k = qy * ww + qx;
+                    if label[k] == 0 && c.red[(y0 + qy) * rw + x0 + qx] > RED_MIN {
+                        label[k] = id;
+                        stack.push((qx, qy));
+                    }
+                };
+                if px > 0 {
+                    visit(px - 1, py);
+                }
+                if px + 1 < ww {
+                    visit(px + 1, py);
+                }
+                if py > 0 {
+                    visit(px, py - 1);
+                }
+                if py + 1 < wh {
+                    visit(px, py + 1);
+                }
+            }
+            blobs.push(b);
+        }
+    }
+    let spots: Vec<(f32, f32, f32, f32)> = blobs
+        .iter()
+        .filter(|b| b.0 >= RED_PIXELS)
+        .map(|b| (b.1 / b.0 as f32, b.2 / b.0 as f32, b.0 as f32, (b.4 - b.3 + 1) as f32))
+        .collect();
+    // 挑最像一對、中點又離頭最近的
+    let mut best: Option<(f32, (f32, f32))> = None;
+    for i in 0..spots.len() {
+        for j in i + 1..spots.len() {
+            let (a, b) = (spots[i], spots[j]);
+            let (dx, dy) = ((a.0 - b.0).abs(), (a.1 - b.1).abs());
+            let size = a.3.max(b.3);
+            let pair = a.2.max(b.2) <= a.2.min(b.2) * RED_PAIR_AREA
+                && dy <= dx * RED_PAIR_TILT
+                && dx >= size
+                && dx <= size * RED_PAIR_GAP;
+            if !pair {
+                continue;
+            }
+            let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+            let d = (mid.0 + x0 as f32 - cx).hypot(mid.1 + y0 as f32 - cy);
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, mid));
+            }
+        }
+    }
+    best.map(|(_, (mx, my))| ((mx + x0 as f32) / rw as f32, (my + y0 as f32) / rh as f32))
+}
+
 /// 這一團「補償相機位移之後比補償之前亮了幾倍」（見 [`Found::shift_gain`]）
 fn shift_gain(blob: &Blob, comp: &Frame, raw: &Frame) -> f32 {
     let n = blob.cells.len().max(1) as f32;
@@ -1240,6 +1423,9 @@ pub fn detect(prev: Option<&Frame>, cur: &Frame, next: Option<&Frame>) -> Option
 /// 候選本身的不確定度在總代價裡佔多少。位置的單位是「畫面的幾分之幾」，
 /// 所以 0.15 代表「分數差一整級」約等於「位置差 15% 畫面」
 const PATH_SCORE_W: f32 = 0.15;
+
+/// 頭一步跳超過畫面的這個比例，才算「瞬移」（見 [`path_scores`] 的頭版小島）
+const HEAD_TELEPORT: f32 = 0.15;
 
 /// 單一步加速度最多算到這裡（佔畫面的比例）。
 ///
@@ -1792,7 +1978,7 @@ mod tests {
         for v in sig.iter_mut() {
             *v = (*v - mean) / norm;
         }
-        Found { rect: [cx - 0.04, cy - 0.04, cx + 0.04, cy + 0.04], score, sig, shift_gain: 1.0, heads: [(0.0, 0.0, 0.0); HEAD_PEAKS], sharp: 0.0 }
+        Found { rect: [cx - 0.04, cy - 0.04, cx + 0.04, cy + 0.04], score, sig, shift_gain: 1.0, heads: [(0.0, 0.0, 0.0); HEAD_PEAKS], reds: [None; HEAD_PEAKS], sharp: 0.0 }
     }
 
     /// 畫面裡不只主體在動：整批一起挑路徑時，要挑那條**連貫**的，
@@ -1996,6 +2182,41 @@ mod tests {
     /// 顏色單一的翅膀（動得再兇也不是頭）、顏色很雜但只是微微晃的葉子
     /// （樹叢裡透光的那種）都不能被當成頭
     #[test]
+    fn red_spots_beside_the_beak_pull_the_head_to_between_the_eyes() {
+        // 原解析度 1000×500：正面的鳥，嘴基兩側各一個紅點；下方遠一點有一圈
+        // 紅色的胸口，不能被它帶走
+        let (rw, rh) = (1000usize, 500usize);
+        let mut img = RgbImage::from_pixel(rw as u32, rh as u32, image::Rgb([60, 140, 40]));
+        for (sx, sy) in [(480u32, 200u32), (510, 200)] {
+            for dy in 0..6 {
+                for dx in 0..6 {
+                    img.put_pixel(sx + dx, sy + dy, image::Rgb([210, 40, 40]));
+                }
+            }
+        }
+        for x in 460..540u32 {
+            for y in 290..300u32 {
+                img.put_pixel(x, y, image::Rgb([200, 50, 45]));
+            }
+        }
+        let c = Chroma::from_rgb(&img);
+        // 「顏色最雜」找到的頭偏在右上方一點
+        let (x, y) = red_spot(&c, 515.0 / rw as f32, 185.0 / rh as f32).expect("應該找得到紅點");
+        let (px, py) = (x * rw as f32, y * rh as f32);
+        assert!((px - 498.0).abs() < 5.0 && (py - 203.0).abs() < 5.0, "紅點重心 ({px}, {py})");
+        // 附近沒有紅點：不動
+        assert!(red_spot(&c, 100.0 / rw as f32, 100.0 / rh as f32).is_none());
+        // 側面：只有脖子上一塊紅斑，湊不成一對，不動
+        let mut side = RgbImage::from_pixel(rw as u32, rh as u32, image::Rgb([60, 140, 40]));
+        for x in 300..330u32 {
+            for y in 300..315u32 {
+                side.put_pixel(x, y, image::Rgb([220, 40, 40]));
+            }
+        }
+        assert!(red_spot(&Chroma::from_rgb(&side), 320.0 / rw as f32, 280.0 / rh as f32).is_none());
+    }
+
+    #[test]
     fn head_is_the_colourful_spot_that_moves_with_the_bird() {
         let (w, h) = (96usize, 64usize);
         let mut rg = vec![0.0f32; w * h];
@@ -2051,7 +2272,7 @@ mod tests {
                 coarse[y * w + x] = 200.0;
             }
         }
-        let c = Chroma { w, h, rg, yb };
+        let c = Chroma { w, h, rg, yb, red: Vec::new() };
         let m = Frame::new(w, h, motion);
         let maps = HeadMaps::new(&c, &m, &Frame::new(w, h, sharp), &Frame::new(w, h, coarse));
         // 動態框落在翅膀上，鳥身的平均移動量 40
