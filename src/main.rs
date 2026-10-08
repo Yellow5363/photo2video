@@ -5899,8 +5899,6 @@ const TRACK_ZOOM_MAX: f32 = 8.0;
 struct TrackTool {
     /// 正在預覽上檢查／拖曳修改主體框
     picking: bool,
-    /// 這一段拖曳中已經框到東西了（放開手時要據此跳到下一張要檢查的）
-    framed_during_drag: bool,
     /// 進入檢查模式後「還有東西要檢查」。等它歸零就代表全部檢查完了，
     /// 那一刻自動退出檢查模式（見 [`App::track_review_done`]）
     was_reviewing: bool,
@@ -8950,9 +8948,19 @@ impl App {
     /// 使用者在某一張上自己框了主體（自動框選找不到、或找錯了的那幾張）。
     /// 手動框優先權最高，之後重跑自動框選或追蹤都不會蓋掉它
     fn track_set_subject(&mut self, photo: PathBuf, rect: [f32; 4]) {
-        let next = Subject::manual(rect);
-        if self.track.box_of(&photo).is_some_and(|s| s.src == BoxSrc::Manual && s.rect == next.rect)
-        {
+        let mut next = Subject::manual(rect);
+        let old = self.track.box_of(&photo);
+        // 中心沒動（只拉把手改了大小）就不算「手動框過」：主體位置還是原本
+        // 自動找的那一個，來源與把握程度照舊——要檢查的照樣留在要檢查裡
+        if let Some(o) = old {
+            let centre = |r: [f32; 4]| ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
+            let ((ax, ay), (bx, by)) = (centre(o.rect), centre(next.rect));
+            if (ax - bx).abs() < 1e-4 && (ay - by).abs() < 1e-4 {
+                next.src = o.src;
+                next.score = o.score;
+            }
+        }
+        if old.is_some_and(|s| s.src == next.src && s.rect == next.rect) {
             return;
         }
         // 背景還在跑的話，它算出來的框會蓋掉使用者剛畫的，先叫停
@@ -13146,30 +13154,6 @@ impl App {
                 );
                 if let Some(r) = next {
                     self.track_set_subject(photo, r);
-                }
-                // 逐一處理模式（只顯示要檢查的）下，框好放開手就自動跳到下一張
-                // 要檢查的——不然畫面停在剛修好的那張，還要自己去找下一張。
-                //
-                // 「有框到東西」與「放開手」**不會在同一幀發生**：拖曳中
-                // dragged() 為真、drag_stopped() 為假；放開的那一幀反過來。
-                // 所以得先記一筆，等放開手再跳（拖到一半就跳走等於框被搶走）
-                if next.is_some() {
-                    self.track.framed_during_drag = true;
-                }
-                if bg_resp.drag_stopped()
-                    && std::mem::take(&mut self.track.framed_during_drag)
-                    && self.track.only_unsure
-                {
-                    let left = self.track_unsure();
-                    let cur = self.preview_selected.unwrap_or(0);
-                    // 先找後面的，沒有就回頭找前面的（剩最後幾張時常在前面）
-                    if let Some(i) = left.iter().copied().find(|&i| i > cur).or(left.first().copied())
-                    {
-                        self.multi_sel.clear();
-                        self.select_photo(Some(i));
-                        self.scroll_to_selected = true;
-                        self.mark_preview_dirty();
-                    }
                 }
                 if done {
                     self.track.picking = false;
@@ -30799,19 +30783,21 @@ fn track_overlay(
                     let y0 = (c[1] + dy).clamp(0.0, 1.0 - h);
                     [x0, y0, x0 + w, y0 + h]
                 }
-                // 拉把手：只改它負責的那一邊（或那個角）
-                (g, Some(mut c)) if g >= 0 => {
-                    match g {
-                        0 => { c[0] = ux; c[1] = uy; }
-                        1 => { c[2] = ux; c[1] = uy; }
-                        2 => { c[2] = ux; c[3] = uy; }
-                        3 => { c[0] = ux; c[3] = uy; }
-                        4 => c[1] = uy,
-                        5 => c[2] = ux,
-                        6 => c[3] = uy,
-                        _ => c[0] = ux,
+                // 拉把手：只改大小，**中心不動**（以中心為準對稱放大縮小）。
+                // 十字就是鏡頭要對的那一點，調大小時跟著跑掉的話，使用者
+                // 只是想把框放大好抓，卻等於把主體位置改了
+                (g, Some(c)) if g >= 0 => {
+                    let (cx, cy) = ((c[0] + c[2]) / 2.0, (c[1] + c[3]) / 2.0);
+                    let (mut hw, mut hh) = ((c[2] - c[0]) / 2.0, (c[3] - c[1]) / 2.0);
+                    if g != 4 && g != 6 {
+                        hw = (ux - cx).abs();
                     }
-                    clamp_rect(c)
+                    if g != 5 && g != 7 {
+                        hh = (uy - cy).abs();
+                    }
+                    let hw = hw.min(cx).min(1.0 - cx);
+                    let hh = hh.min(cy).min(1.0 - cy);
+                    [cx - hw, cy - hh, cx + hw, cy + hh]
                 }
                 // 框外（或本來就沒有框）：從按下去的那一點拉出一個新的框
                 _ => {
@@ -30828,8 +30814,10 @@ fn track_overlay(
             out = Some(clamp_rect([cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0]));
         }
     }
-    // 拖曳中畫的一律是「正在畫的手動框」；否則照這張現有的框標它的來源
-    let tag = match (out.is_some() || resp.dragged(), src) {
+    // 搬家或重畫時畫的是「正在畫的手動框」；只拉把手改大小的話中心沒動，
+    // 還是原本的來源（見 App::track_set_subject）
+    let moving = (out.is_some() || resp.dragged()) && grabbed.is_none_or(|g| g < 0);
+    let tag = match (moving, src) {
         (true, _) | (_, Some(BoxSrc::Manual)) => "✋ 主體（手動）",
         (_, Some(BoxSrc::Auto)) => "⚡ 主體（自動）",
         (_, Some(BoxSrc::Tracked)) => "🔗 主體（追蹤）",
