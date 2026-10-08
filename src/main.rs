@@ -3796,7 +3796,7 @@ fn run_track(
     }
     let photos = Arc::new(photos.to_vec());
     let need = vec![true; photos.len()];
-    let (locked, total) = follow_fill(&photos, marks, &seeds, &need, &vec![false; need.len()], None, None, crop, true, send);
+    let (locked, total) = follow_fill(&photos, marks, &seeds, &need, &vec![false; need.len()], &vec![false; need.len()], None, None, crop, true, send);
     send(TrackMsg::Done(locked + marks.len(), total + marks.len()));
 }
 
@@ -3815,6 +3815,7 @@ fn follow_fill(
     seeds: &[track::Frame],
     need: &[bool],
     keep_own: &[bool],
+    doubt: &[bool],
     cands: Option<&[Vec<track::Found>]>,
     offsets: Option<&[(f32, f32)]>,
     crop: Crop,
@@ -3870,9 +3871,12 @@ fn follow_fill(
                 })
             })
         };
+        // 那一張找頭失敗（頭飛出畫面、只剩翅膀、整張糊掉）：補框追的是身體，
+        // 再像也只證明「身體在這裡」，證明不了頭在框裡
         let sure_fill = |i: usize, h: &track::Hit| -> bool {
-            h.same >= TRACK_FILL_ALONE
-                || (h.same >= TRACK_FILL_SURE && seen_moving(i, h.cx, h.cy))
+            !doubt[i]
+                && (h.same >= TRACK_FILL_ALONE
+                    || (h.same >= TRACK_FILL_SURE && seen_moving(i, h.cx, h.cy)))
         };
         let to_boxes = |got: &[(usize, Option<track::Hit>)]| -> Vec<(usize, Option<Subject>)> {
             got.iter()
@@ -4046,25 +4050,29 @@ fn run_auto_boxes(
     // 這一批大多數張都找得到頭（顏色鮮明的鳥），就以頭為中心、而且找不到頭
     // 的那幾張算「沒抓到」；大多找不到（主體本身沒有顯眼的頭），就照原本的
     // 動態框，不拿這條規矩去刁難
+    // 每張挑一處當鳥頭：整批挑一條最平順、又最像頭的路徑（見 track::choose_heads）
+    let found_head = track::choose_heads(&cands, &picked);
     let chosen = picked.iter().filter(|k| k.is_some()).count();
-    let with_head = (0..n)
-        .filter(|&i| picked[i].is_some_and(|k| cands[i][k].head.is_some()))
-        .count();
+    let with_head = found_head.iter().filter(|h| h.is_some()).count();
     let head_mode = chosen > 0 && with_head * 2 >= chosen;
-    // 每張選中的那一團找到的頭（貼在畫面邊緣的不算：多半被切掉一半，例如鳥
-    // 飛過鏡頭上方時，畫面頂端只剩紅色的喉嚨）
-    let raw_head: Vec<Option<(f32, f32)>> = (0..n)
-        .map(|i| {
-            let k = picked[i]?;
-            let (hx, hy) = cands[i][k].head?;
-            (hx > HEAD_EDGE && hx < 1.0 - HEAD_EDGE && hy > HEAD_EDGE && hy < 1.0 - HEAD_EDGE)
-                .then_some((hx, hy))
-        })
+    // 這一批頭的一般強度（中位數）。遠不如它的「頭」多半是假的：頭已經飛出
+    // 畫面時，剩下的胸口、尾巴也湊得出一點顏色變化
+    let typical_head = {
+        let mut s: Vec<f32> = found_head.iter().filter_map(|h| h.map(|(_, _, s)| s)).collect();
+        s.sort_by(f32::total_cmp);
+        s.get(s.len() / 2).copied().unwrap_or(0.0)
+    };
+    let raw_head: Vec<Option<(f32, f32)>> = found_head
+        .iter()
+        .map(|h| h.filter(|(_, _, s)| *s >= typical_head * HEAD_WEAK).map(|(x, y, _)| (x, y)))
         .collect();
     // 再拿前後張驗證：真的鳥頭跟著鳥平順移動，前一張或後一張的頭就在附近；
     // 樹叢裡顏色雜、又被風吹著晃的葉子也會被當成「頭」，但那種假頭東一個
     // 西一個，接不上前後（實測一批背景雜亂的連拍，不驗證的話有二十幾張的
-    // 框被搬到葉子上）。附近＝兩個框寬以內
+    // 框被搬到葉子上）。附近＝兩個框寬以內。
+    // 前後兩張都有頭時再看「有沒有急轉彎」：頭應該落在前後兩張的中點附近，
+    // 一下跳出去、下一張又跳回來的是翅膀上的亮點，或鳥已經飛出畫面、
+    // 剩下的殘影裡隨便湊出來的
     let head: Vec<Option<(f32, f32)>> = (0..n)
         .map(|i| {
             let (hx, hy) = raw_head[i]?;
@@ -4074,13 +4082,37 @@ fn run_auto_boxes(
             let near = |j: usize| {
                 raw_head[j].is_some_and(|(x, y)| (x - hx).hypot(y - hy) < reach)
             };
-            (i.checked_sub(1).is_some_and(near) || (i + 1 < n && near(i + 1))).then_some((hx, hy))
+            let side = |j: Option<usize>| j.and_then(|j| raw_head.get(j).copied().flatten());
+            let jerk = match (side(i.checked_sub(1)), side(Some(i + 1))) {
+                (Some(a), Some(b)) => (hx - (a.0 + b.0) / 2.0).hypot(hy - (a.1 + b.1) / 2.0),
+                _ => 0.0,
+            };
+            ((i.checked_sub(1).is_some_and(near) || (i + 1 < n && near(i + 1))) && jerk <= HEAD_JERK)
+                .then_some((hx, hy))
         })
         .collect();
+    // 整張糊掉的照片（失焦、晃動）：最清晰的那一塊也遠不如這一批的一般水準。
+    // 那種照片連人都要瞇著眼找頭，程式不硬猜，交給使用者處理
+    let blurry: Vec<bool> = {
+        let mut s: Vec<f32> = (0..n)
+            .filter_map(|i| picked[i].map(|k| cands[i][k].sharp))
+            .filter(|v| *v > 0.0)
+            .collect();
+        s.sort_by(f32::total_cmp);
+        let typical = s.get(s.len() / 2).copied().unwrap_or(0.0);
+        (0..n)
+            .map(|i| {
+                picked[i].is_some_and(|k| {
+                    let v = cands[i][k].sharp;
+                    typical > 0.0 && v > 0.0 && v < typical * BLUR_RATIO
+                })
+            })
+            .collect()
+    };
     // 沒抓到頭（找不到、被切掉、或接不上前後）：這一批大多抓得到頭時，
-    // 只框到翅膀或身體就不算抓到
+    // 只框到翅膀或身體就不算抓到；整張糊掉的也一樣
     let headless: Vec<bool> = (0..n)
-        .map(|i| head_mode && picked[i].is_some() && head[i].is_none())
+        .map(|i| picked[i].is_some() && ((head_mode && head[i].is_none()) || blurry[i]))
         .collect();
     // 把握程度：「是不是同一個東西」照動態框判斷，「接不接得上前後」照頭的
     // 位置算——動態框在翅膀與身體之間跳來跳去，拿它算會把明明框到頭的照片
@@ -4091,13 +4123,7 @@ fn run_auto_boxes(
     // 到 0.11、葉子上的假頭最高到 0.22，大幅重疊）。整批來看就分得出來：
     // 六批連拍的頭強度中位數，清楚的 0.27～0.32，陰暗雜亂的那批只有 0.22。
     // 頭不清楚的批次照樣把鏡頭對到頭上，但把握程度照原本保守的方式判斷
-    let strong_heads = {
-        let mut s: Vec<f32> = (0..n)
-            .filter_map(|i| picked[i].filter(|_| raw_head[i].is_some()).map(|k| cands[i][k].head_score))
-            .collect();
-        s.sort_by(f32::total_cmp);
-        s.get(s.len() / 2).is_some_and(|m| *m >= HEAD_TRUST)
-    };
+    let strong_heads = typical_head >= HEAD_TRUST;
     let fit_pos: Option<Vec<Option<(f32, f32)>>> = (head_mode && strong_heads).then(|| head.clone());
     let conf = track::path_scores(&cands, &picked, fit_pos.as_deref());
     // 交給使用者的框搬到頭上（大小不變）。但補洞那一趟的樣板仍取**身體**
@@ -4165,7 +4191,7 @@ fn run_auto_boxes(
             }
         }
         if !ok.is_empty() {
-            let (filled, _) = follow_fill(&photos, &ok, &seeds, &need, &has_auto, Some(&cands), Some(&ok_off), crop, false, send);
+            let (filled, _) = follow_fill(&photos, &ok, &seeds, &need, &has_auto, &headless, Some(&cands), Some(&ok_off), crop, false, send);
             found += filled;
         }
     }
@@ -5799,8 +5825,19 @@ const TRACK_FILL_SURE: f32 = 0.55;
 /// 的樣子比只有 0.65——所以一定要用 `same` 判斷，門檻比錯的最高值留 0.05 餘裕
 const TRACK_FILL_ALONE: f32 = 0.78;
 
-/// 找到的鳥頭離畫面邊緣不到這個比例，就當作頭被切掉了（不算抓到）
-const HEAD_EDGE: f32 = 0.04;
+/// 頭離「前後兩張的頭的中點」超過這個比例（佔畫面），就算急轉彎、不算抓到。
+/// 實測一批 152 張的連拍：真的頭最多偏 0.025，翅膀上的假頭與鳥飛出畫面時
+/// 湊出來的都在 0.04 以上
+const HEAD_JERK: f32 = 0.035;
+
+/// 頭的強度不到這一批一般水準（中位數）的這個比例，就不算頭。實測兩批：
+/// 背景乾淨的那批真的頭在 0.25～0.33，頭飛出畫面後在胸口、尾巴湊出來的只有
+/// 0.11；停在樹幹上吃東西的那批（中位數 0.31），真的頭最低 0.248，頭轉到
+/// 樹幹後面時框在翅膀、腳、尾巴上的「頭」都在 0.16～0.21
+const HEAD_WEAK: f32 = 0.7;
+
+/// 一張照片最清晰的那一塊，不到這一批一般水準的這個比例，就算整張糊掉了
+const BLUR_RATIO: f32 = 0.4;
 
 /// 整批鳥頭的強度中位數到這裡，才把「找到頭」當成確實抓到的直接證據
 /// （實測六批：清楚的 0.268～0.316、陰暗雜亂的 0.221）

@@ -728,11 +728,13 @@ pub struct Found {
     /// 補償相機位移之後，這一團比補償之前亮了幾倍。相機沒動時恆為 1；
     /// 釘在畫面上的浮水印會遠大於 1（見 [`drop_overlays`]）
     pub shift_gain: f32,
-    /// 在這一團附近找到的鳥頭（相對座標），找不到是 None（見 [`HeadMaps::find`]）。
-    /// 動態偵測找到的常是拍動的翅膀，鏡頭要對的是頭
-    pub head: Option<(f32, f32)>,
-    /// 找到的頭有多明顯（色彩變化量 × 移動量，0~1），找不到是 0
-    pub head_score: f32,
+    /// 在這一團附近最像鳥頭的幾處：(x, y, 有多像)，相對座標，最像的在前，
+    /// 不足的是 0 分（見 [`HeadMaps::find`]）。動態偵測找到的常是拍動的
+    /// 翅膀，鏡頭要對的是頭；要挑哪一處見 [`choose_heads`]
+    pub heads: [(f32, f32, f32); HEAD_PEAKS],
+    /// 這張照片最清晰那一塊有多清晰（整張共用，見 HeadMaps::sharp_ref）。
+    /// 跟整批比低很多＝這張整個糊掉了（失焦或晃動），交給使用者處理
+    pub sharp: f32,
     /// 框裡那一塊縮成 8×8、扣掉平均並正規化的樣子。
     /// 拿它跟別張的比對就知道「還是同一個東西嗎」——差值圖只認得出
     /// 「有沒有在動」，認不出「動的是誰」
@@ -832,7 +834,7 @@ pub fn detect_candidates(
     let level = (m.px.len() as f32 * DET_MAX_AREA) as usize;
     let (fw, fh) = (m.w as f32, m.h as f32);
     // 找鳥頭用的累加表：整張算一次，每個候選共用（沒有色彩的照片就不找）
-    let heads = cur.colour.as_ref().map(|c| HeadMaps::new(c, &m));
+    let heads = cur.colour.as_ref().map(|c| HeadMaps::new(c, &m, &sharpness(&cp[0], &m)));
 
     let mut used = vec![false; m.px.len()];
     let mut out: Vec<Found> = Vec::new();
@@ -892,8 +894,8 @@ pub fn detect_candidates(
             score: (contrast * 0.65 + compact * 0.35).clamp(0.0, 1.0),
             sig,
             shift_gain: gain,
-            head: heads.as_ref().and_then(|hm| hm.find(rect, bird_motion)).map(|(x, y, _)| (x, y)),
-            head_score: heads.as_ref().and_then(|hm| hm.find(rect, bird_motion)).map_or(0.0, |(_, _, s)| s),
+            heads: heads.as_ref().map_or([(0.0, 0.0, 0.0); HEAD_PEAKS], |hm| hm.find(rect, bird_motion)),
+            sharp: heads.as_ref().map_or(0.0, |hm| hm.sharp_ref),
         });
     }
     out
@@ -920,7 +922,37 @@ const HEAD_GATE: f32 = 0.5;
 /// 色彩變化量（0~1）至少要到這裡才算找到頭
 const HEAD_MIN: f32 = 0.06;
 
-/// 找鳥頭用的累加表（整張的對手色與移動量），一張照片算一次、所有候選共用
+/// 頭所在的那一塊要有「整張最清晰那一塊」的幾成清晰度（滿分）
+const HEAD_SHARP: f32 = 0.5;
+
+/// 清晰度圖：每一點的拉普拉斯絕對值（細節越銳利越大），在最細的那層算、
+/// 再 2×2 取平均縮到 `to` 那一層的大小（與差值圖、色彩對齊）。
+///
+/// 要在最細的那層算：散景與對焦清楚的地方，差別全在最細的那些邊緣上，
+/// 先縮小再算就都一樣糊了
+fn sharpness(fine: &Frame, to: &Frame) -> Frame {
+    let (w, h) = (fine.w, fine.h);
+    let mut lap = vec![0.0f32; w * h];
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            let c = fine.at(x, y);
+            let v = 4.0 * c - fine.at(x - 1, y) - fine.at(x + 1, y) - fine.at(x, y - 1) - fine.at(x, y + 1);
+            lap[y * w + x] = v.abs();
+        }
+    }
+    let mut px = Vec::with_capacity(to.w * to.h);
+    for y in 0..to.h {
+        for x in 0..to.w {
+            let (x0, y0) = ((2 * x).min(w - 1), (2 * y).min(h - 1));
+            let (x1, y1) = ((2 * x + 1).min(w - 1), (2 * y + 1).min(h - 1));
+            px.push((lap[y0 * w + x0] + lap[y0 * w + x1] + lap[y1 * w + x0] + lap[y1 * w + x1]) * 0.25);
+        }
+    }
+    Frame::new(to.w, to.h, px)
+}
+
+/// 找鳥頭用的累加表（整張的對手色、移動量與清晰度），一張照片算一次、
+/// 所有候選共用
 struct HeadMaps {
     w: usize,
     h: usize,
@@ -929,11 +961,15 @@ struct HeadMaps {
     q_rg: Vec<f64>,
     q_yb: Vec<f64>,
     s_m: Vec<f64>,
+    s_sharp: Vec<f64>,
+    /// 這張照片「最清晰的那一塊」有多清晰（頭那麼大一塊的平均，取全張的
+    /// 前 1%）。找頭時拿它當尺；整張都糊的照片它也就很低
+    sharp_ref: f32,
 }
 
 impl HeadMaps {
-    fn new(c: &Chroma, m: &Frame) -> HeadMaps {
-        let (w, h) = (c.w.min(m.w), c.h.min(m.h));
+    fn new(c: &Chroma, m: &Frame, sharp: &Frame) -> HeadMaps {
+        let (w, h) = (c.w.min(m.w).min(sharp.w), c.h.min(m.h).min(sharp.h));
         let n = (w + 1) * (h + 1);
         let mut maps = HeadMaps {
             w,
@@ -943,9 +979,12 @@ impl HeadMaps {
             q_rg: vec![0.0; n],
             q_yb: vec![0.0; n],
             s_m: vec![0.0; n],
+            s_sharp: vec![0.0; n],
+            sharp_ref: 0.0,
         };
         for y in 0..h {
             let (mut a, mut b, mut qa, mut qb, mut mm) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let mut ss = 0.0f64;
             for x in 0..w {
                 let rg = c.rg[y * c.w + x] as f64;
                 let yb = c.yb[y * c.w + x] as f64;
@@ -954,6 +993,7 @@ impl HeadMaps {
                 qa += rg * rg;
                 qb += yb * yb;
                 mm += m.px[y * m.w + x] as f64;
+                ss += sharp.px[y * sharp.w + x] as f64;
                 let k = (y + 1) * (w + 1) + x + 1;
                 let up = y * (w + 1) + x + 1;
                 maps.s_rg[k] = maps.s_rg[up] + a;
@@ -961,7 +1001,26 @@ impl HeadMaps {
                 maps.q_rg[k] = maps.q_rg[up] + qa;
                 maps.q_yb[k] = maps.q_yb[up] + qb;
                 maps.s_m[k] = maps.s_m[up] + mm;
+                maps.s_sharp[k] = maps.s_sharp[up] + ss;
             }
+        }
+        // 最清晰的那一塊：以頭的大小為窗，掃一遍取前 1%（取最大值會被
+        // 單一顆亮點或雜訊帶走）
+        let r = ((w.max(h) as f32 * HEAD_RADIUS).round() as usize).max(2);
+        if w > 2 * r + 1 && h > 2 * r + 1 {
+            let mut v: Vec<f32> = Vec::new();
+            let mut y = r;
+            while y + r + 1 < h {
+                let mut x = r;
+                while x + r + 1 < w {
+                    let n = ((2 * r + 1) * (2 * r + 1)) as f64;
+                    v.push((maps.sum(&maps.s_sharp, x - r, y - r, x + r + 1, y + r + 1) / n) as f32);
+                    x += 2;
+                }
+                y += 2;
+            }
+            v.sort_by(f32::total_cmp);
+            maps.sharp_ref = v.get(v.len() * 99 / 100).copied().unwrap_or(0.0);
         }
         maps
     }
@@ -977,11 +1036,16 @@ impl HeadMaps {
     /// 鳥頭的特徵是「**很小的範圍裡擠了很多種顏色**」——五色鳥的藍頭頂、黃臉、
     /// 紅喉、黑嘴全在一起；翅膀與背景的顏色則單一。但光看顏色會被散景騙：
     /// 藍天從綠葉縫透出來，同樣是一小塊裡有兩種顏色。所以再乘上「那裡有沒有
-    /// 在動」——頭跟著鳥一起移動，散景不會
-    fn find(&self, rect: [f32; 4], bird_motion: f32) -> Option<(f32, f32, f32)> {
+    /// 在動」——頭跟著鳥一起移動，散景不會。
+    ///
+    /// 回傳最像頭的前幾處（彼此至少隔一個頭寬，最像的在前，不足的補 0 分）。
+    /// 單張最像的不一定是頭：五色鳥的翅膀也泛著藍綠光，張開又清楚時會贏過
+    /// 頭。留幾個備選，交給整批的連貫性來挑（見 [`choose_heads`]）
+    fn find(&self, rect: [f32; 4], bird_motion: f32) -> [(f32, f32, f32); HEAD_PEAKS] {
+        let mut out = [(0.0, 0.0, 0.0); HEAD_PEAKS];
         let (w, h) = (self.w, self.h);
         if w < 8 || h < 8 {
-            return None;
+            return out;
         }
         let (cx, cy) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
         let ww = ((rect[2] - rect[0]) * HEAD_WIN).max(HEAD_WIN_MIN);
@@ -991,7 +1055,8 @@ impl HeadMaps {
         let (x0, x1) = (px(cx - ww / 2.0, w).max(r), px(cx + ww / 2.0, w).min(w - r));
         let (y0, y1) = (px(cy - wh / 2.0, h).max(r), px(cy + wh / 2.0, h).min(h - r));
         let gate_full = (bird_motion * HEAD_GATE).max(1.0) as f64;
-        let (mut best, mut at) = (0.0f64, None);
+        let sharp_full = (self.sharp_ref * HEAD_SHARP).max(1e-3) as f64;
+        let mut all: Vec<(f32, usize, usize)> = Vec::new();
         let mut y = y0;
         while y < y1 {
             let mut x = x0;
@@ -1003,17 +1068,35 @@ impl HeadMaps {
                 let var = (self.sum(&self.q_rg, a0, b0, a1, b1) / n - mean_rg * mean_rg)
                     + (self.sum(&self.q_yb, a0, b0, a1, b1) / n - mean_yb * mean_yb);
                 let motion = self.sum(&self.s_m, a0, b0, a1, b1) / n;
-                let score = var.max(0.0).sqrt() / 255.0 * (motion / gate_full).min(1.0);
-                if score > best {
-                    best = score;
-                    at = Some((x, y));
+                // 頭幾乎都在整張最清晰的地方：攝影師對焦的就是頭與眼。
+                // 散景裡的葉縫透光、拍動中糊掉的翅膀都過不了這一關
+                let sharp = self.sum(&self.s_sharp, a0, b0, a1, b1) / n;
+                let score = var.max(0.0).sqrt() / 255.0
+                    * (motion / gate_full).min(1.0)
+                    * (sharp / sharp_full).min(1.0);
+                if score as f32 >= HEAD_MIN {
+                    all.push((score as f32, x, y));
                 }
                 x += 2;
             }
             y += 2;
         }
-        let (x, y) = at?;
-        (best as f32 >= HEAD_MIN).then(|| ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, best as f32))
+        all.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let apart = (3 * r) as f32;
+        let mut got = 0;
+        for (s, x, y) in all {
+            let far = out[..got].iter().all(|&(u, v, _)| {
+                (u * w as f32 - x as f32 - 0.5).hypot(v * h as f32 - y as f32 - 0.5) >= apart
+            });
+            if far {
+                out[got] = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, s);
+                got += 1;
+                if got == HEAD_PEAKS {
+                    break;
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1153,46 +1236,72 @@ pub fn choose_path(cands: &[Vec<Found>]) -> Vec<Option<usize>> {
         ((r[2] - r[0]) * (r[3] - r[1])).max(1e-6)
     };
     let unc = |i: usize, k: usize| (1.0 - cands[i][k].score) * PATH_SCORE_W;
+    let pick = viterbi2(&live, |i| cands[i].len(), unc, |(ip, a), (iq, b), (ir, c)| {
+        let (pa, pb, pc) = (centre(ip, a), centre(iq, b), centre(ir, c));
+        let d2 = (ir - iq) as f32;
+        // 有在移動的給折扣（否則原地顫動的葉子最便宜），
+        // 大小忽大忽小的要罰（多半是換到別的東西上了）
+        let speed = ((pc.0 - pb.0).hypot(pc.1 - pb.1) / d2).min(PATH_MOVE_CAP);
+        let grow = (area(ir, c) / area(iq, b)).ln().abs().min(3.0);
+        accel(pa, pb, pc, (iq - ip) as f32, d2) + unc(ir, c) + grow * PATH_SIZE_W
+            - speed * PATH_MOVE_W
+    });
+    for (t, &i) in live.iter().enumerate() {
+        out[i] = Some(pick[t]);
+    }
+    out
+}
 
+/// 依序在 pa、pb、pc 的三張（間隔 d1、d2 張）：照前兩張等速外推出來的位置，
+/// 與實際位置差多少＝這一步的加速度。間距不等時（中間有空著的張數）按比例外推
+fn accel(pa: (f32, f32), pb: (f32, f32), pc: (f32, f32), d1: f32, d2: f32) -> f32 {
+    let v = ((pb.0 - pa.0) / d1, (pb.1 - pa.1) / d1);
+    let pred = (pb.0 + v.0 * d2, pb.1 + v.1 * d2);
+    (pc.0 - pred.0).hypot(pc.1 - pred.1)
+}
+
+/// 二階的維特比：`live` 裡的每一張各有 `count(i)` 個選項，挑總代價最低的一條，
+/// 回傳每張選了第幾個（與 `live` 一一對應）。
+///
+/// `own(i, k)` 是選項本身的代價（只用在頭兩張），`step` 是連著三張選
+/// (ip, a)、(iq, b)、(ir, c) 時最後這一步要付的代價（含 c 本身的）。
+/// 狀態帶著「前一張選了哪個」才算得出加速度
+fn viterbi2(
+    live: &[usize],
+    count: impl Fn(usize) -> usize,
+    own: impl Fn(usize, usize) -> f32,
+    step: impl Fn((usize, usize), (usize, usize), (usize, usize)) -> f32,
+) -> Vec<usize> {
+    if live.len() <= 2 {
+        return live
+            .iter()
+            .map(|&i| (0..count(i)).min_by(|&a, &b| own(i, a).total_cmp(&own(i, b))).unwrap_or(0))
+            .collect();
+    }
     // best[(a, b)]＝「上上張選 a、上一張選 b」這條路走到這裡的最低總代價
-    let (n0, n1) = (cands[live[0]].len(), cands[live[1]].len());
+    let (n0, n1) = (count(live[0]), count(live[1]));
     let mut best: Vec<f32> = Vec::with_capacity(n0 * n1);
     for a in 0..n0 {
         for b in 0..n1 {
-            best.push(unc(live[0], a) + unc(live[1], b));
+            best.push(own(live[0], a) + own(live[1], b));
         }
     }
     let mut width = n1;
     let mut back: Vec<Vec<usize>> = Vec::with_capacity(live.len());
     for t in 2..live.len() {
         let (ip, iq, ir) = (live[t - 2], live[t - 1], live[t]);
-        let (np, nq, nr) = (cands[ip].len(), cands[iq].len(), cands[ir].len());
-        // 間距不等時（中間有沒候選的張數）按比例外推
-        let (d1, d2) = ((iq - ip) as f32, (ir - iq) as f32);
+        let (np, nq, nr) = (count(ip), count(iq), count(ir));
         let mut next = vec![f32::MAX; nq * nr];
         let mut from = vec![0usize; nq * nr];
         for b in 0..nq {
-            let pb = centre(iq, b);
             for c in 0..nr {
-                let pc = centre(ir, c);
-                let cost_c = unc(ir, c);
                 let slot = b * nr + c;
                 for a in 0..np {
                     let prev = best[a * width + b];
                     if prev == f32::MAX {
                         continue;
                     }
-                    let pa = centre(ip, a);
-                    // 等速外推出來的位置與實際位置差多少＝這一步的加速度
-                    let v = ((pb.0 - pa.0) / d1, (pb.1 - pa.1) / d1);
-                    let pred = (pb.0 + v.0 * d2, pb.1 + v.1 * d2);
-                    let acc = (pc.0 - pred.0).hypot(pc.1 - pred.1);
-                    // 有在移動的給折扣（否則原地顫動的葉子最便宜），
-                    // 大小忽大忽小的要罰（多半是換到別的東西上了）
-                    let speed = ((pc.0 - pb.0).hypot(pc.1 - pb.1) / d2).min(PATH_MOVE_CAP);
-                    let grow = (area(ir, c) / area(iq, b)).ln().abs().min(3.0);
-                    let total =
-                        prev + acc + cost_c + grow * PATH_SIZE_W - speed * PATH_MOVE_W;
+                    let total = prev + step((ip, a), (iq, b), (ir, c));
                     if total < next[slot] {
                         next[slot] = total;
                         from[slot] = a;
@@ -1212,16 +1321,79 @@ pub fn choose_path(cands: &[Vec<Found>]) -> Vec<Option<usize>> {
             bi = i;
         }
     }
+    let mut out = vec![0usize; live.len()];
     let (mut b, mut c) = (bi / width, bi % width);
-    out[live[live.len() - 1]] = Some(c);
-    out[live[live.len() - 2]] = Some(b);
+    out[live.len() - 1] = c;
+    out[live.len() - 2] = b;
     for t in (2..live.len()).rev() {
-        let from = &back[t - 2];
-        let nr = cands[live[t]].len();
-        let a = from[b * nr + c];
-        out[live[t - 2]] = Some(a);
+        let a = back[t - 2][b * count(live[t]) + c];
+        out[t - 2] = a;
         c = b;
         b = a;
+    }
+    out
+}
+
+/// 每一團附近留幾處「像頭」的地方當備選（見 [`HeadMaps::find`]）
+pub const HEAD_PEAKS: usize = 3;
+
+/// 找到的鳥頭離畫面邊緣不到這個比例，就當作頭被切掉了（不算抓到）
+pub const HEAD_EDGE: f32 = 0.04;
+
+/// 每張最多拿幾處備選去挑路徑
+const HEAD_POOL: usize = 6;
+
+/// 不同團找到的頭相距這麼近（佔畫面的比例）就算同一處
+const HEAD_SAME: f32 = 0.02;
+
+/// 頭的強度到這裡就算十足像頭（挑路徑時的不確定度歸零）
+const HEAD_FULL: f32 = 0.4;
+
+/// 每張挑一處當鳥頭：回傳 (x, y, 有多像)，選中的那一團附近找不到頭就是 None。
+///
+/// 單張各挑最像的不夠：五色鳥張開的翅膀泛著藍綠光，對焦又清楚時會贏過頭
+/// （實測一批連拍，就有一張的「頭」從前一張的位置跳出去、下一張又跳回來，
+/// 落在翅膀上）；動態框挑中的那一團也不一定離頭最近，旁邊那一團找到的才是
+/// 真的頭。所以把「選中那一團的搜尋範圍裡、所有候選找到的頭」都當備選，
+/// 跟 [`choose_path`] 一樣整批挑一條加速度最小、又最像頭的路徑——真的頭
+/// 跟著鳥平順移動，翅膀上的亮點忽左忽右
+pub fn choose_heads(cands: &[Vec<Found>], picked: &[Option<usize>]) -> Vec<Option<(f32, f32, f32)>> {
+    let n = cands.len();
+    let edge = |v: f32| v > HEAD_EDGE && v < 1.0 - HEAD_EDGE;
+    let pool: Vec<Vec<(f32, f32, f32)>> = (0..n)
+        .map(|i| {
+            let Some(k) = picked.get(i).copied().flatten() else { return Vec::new() };
+            let r = cands[i][k].rect;
+            let (cx, cy) = ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
+            let ww = ((r[2] - r[0]) * HEAD_WIN).max(HEAD_WIN_MIN) / 2.0;
+            let wh = ((r[3] - r[1]) * HEAD_WIN).max(HEAD_WIN_MIN) / 2.0;
+            let mut v: Vec<(f32, f32, f32)> = Vec::new();
+            for &(x, y, s) in cands[i].iter().flat_map(|c| c.heads.iter()) {
+                // 貼在畫面邊緣的不算：多半被切掉一半（例如鳥飛過鏡頭上方時，
+                // 畫面頂端只剩紅色的喉嚨）
+                if s <= 0.0 || (x - cx).abs() > ww || (y - cy).abs() > wh || !edge(x) || !edge(y) {
+                    continue;
+                }
+                match v.iter_mut().find(|h| (h.0 - x).hypot(h.1 - y) < HEAD_SAME) {
+                    Some(h) if s > h.2 => *h = (x, y, s),
+                    Some(_) => {}
+                    None => v.push((x, y, s)),
+                }
+            }
+            v.sort_by(|a, b| b.2.total_cmp(&a.2));
+            v.truncate(HEAD_POOL);
+            v
+        })
+        .collect();
+    let live: Vec<usize> = (0..n).filter(|&i| !pool[i].is_empty()).collect();
+    let pos = |i: usize, k: usize| (pool[i][k].0, pool[i][k].1);
+    let own = |i: usize, k: usize| (1.0 - (pool[i][k].2 / HEAD_FULL).min(1.0)) * PATH_SCORE_W;
+    let pick = viterbi2(&live, |i| pool[i].len(), own, |(ip, a), (iq, b), (ir, c)| {
+        accel(pos(ip, a), pos(iq, b), pos(ir, c), (iq - ip) as f32, (ir - iq) as f32) + own(ir, c)
+    });
+    let mut out = vec![None; n];
+    for (t, &i) in live.iter().enumerate() {
+        out[i] = Some(pool[i][pick[t]]);
     }
     out
 }
@@ -1532,7 +1704,7 @@ mod tests {
         for v in sig.iter_mut() {
             *v = (*v - mean) / norm;
         }
-        Found { rect: [cx - 0.04, cy - 0.04, cx + 0.04, cy + 0.04], score, sig, shift_gain: 1.0, head: None, head_score: 0.0 }
+        Found { rect: [cx - 0.04, cy - 0.04, cx + 0.04, cy + 0.04], score, sig, shift_gain: 1.0, heads: [(0.0, 0.0, 0.0); HEAD_PEAKS], sharp: 0.0 }
     }
 
     /// 畫面裡不只主體在動：整批一起挑路徑時，要挑那條**連貫**的，
@@ -1646,6 +1818,39 @@ mod tests {
         assert!(nest.iter().all(|c| c.len() == 1), "相機沒動時不該剔除任何東西");
     }
 
+    /// 單張最像頭的不一定是頭：中間那張翅膀上的亮點比頭還強，但它一下跳出去、
+    /// 下一張又跳回來；頭跟著鳥平順移動，整批挑的時候要挑頭。
+    /// 另一團（不是路徑選中的那一團）找到的頭也要拿來當備選
+    #[test]
+    fn heads_follow_the_smooth_path_not_the_brightest_spot() {
+        let n = 7;
+        let mut cands: Vec<Vec<Found>> = Vec::new();
+        for i in 0..n {
+            let hx = 0.3 + 0.02 * i as f32;
+            let mut body = cand(hx + 0.05, 0.5, 0.9, 0.0);
+            body.heads[0] = (hx, 0.45, 0.30);
+            if i == 3 {
+                // 翅膀上的亮點比頭強，頭只排第二
+                body.heads[0] = (hx + 0.09, 0.53, 0.40);
+                body.heads[1] = (hx, 0.45, 0.25);
+            }
+            let mut wing = cand(hx + 0.07, 0.55, 0.5, 1.0);
+            if i == 5 {
+                // 選中那一團這張沒找到頭，旁邊那一團找到了
+                body.heads[0] = (0.0, 0.0, 0.0);
+                wing.heads[0] = (hx, 0.45, 0.28);
+            }
+            cands.push(vec![body, wing]);
+        }
+        let picked = vec![Some(0); n];
+        let heads = choose_heads(&cands, &picked);
+        for (i, h) in heads.iter().enumerate() {
+            let (x, y, _) = h.expect("每張都該找得到頭");
+            let hx = 0.3 + 0.02 * i as f32;
+            assert!((x - hx).abs() < 1e-4 && (y - 0.45).abs() < 1e-4, "第 {i} 張挑到 ({x}, {y})");
+        }
+    }
+
     /// 被兩次「瞬移」夾在中間的小段要被標成沒把握：主體不會一下子跳到畫面
     /// 另一頭、過幾張又跳回來（實測：鳥飛出畫面後路徑跳到一片葉子上跟了七張）
     #[test]
@@ -1736,12 +1941,27 @@ mod tests {
             yb[k] = if (x / 2 + y) % 2 == 0 { 80.0 } else { -90.0 };
             motion[k] = 6.0;
         });
+        // 糊掉的「頭」：顏色雜、也在動，但沒對焦（散景、或拍動中糊掉的那一塊）
+        put(20, 42, &mut |x, y| {
+            let k = y * w + x;
+            rg[k] = if (x + y) % 2 == 0 { 90.0 } else { -60.0 };
+            yb[k] = if (x / 2 + y) % 2 == 0 { 80.0 } else { -90.0 };
+            motion[k] = 40.0;
+        });
+        // 清晰度：只有真的鳥頭那一塊對焦清楚
+        let mut sharp = vec![2.0f32; w * h];
+        for y in 20..30 {
+            for x in 20..30 {
+                sharp[y * w + x] = 20.0;
+            }
+        }
         let c = Chroma { w, h, rg, yb };
         let m = Frame::new(w, h, motion);
-        let maps = HeadMaps::new(&c, &m);
+        let maps = HeadMaps::new(&c, &m, &Frame::new(w, h, sharp));
         // 動態框落在翅膀上，鳥身的平均移動量 40
         let rect = [45.0 / 96.0, 20.0 / 64.0, 55.0 / 96.0, 30.0 / 64.0];
-        let (hx, hy, _) = maps.find(rect, 40.0).expect("應該找得到頭");
+        let (hx, hy, s) = maps.find(rect, 40.0)[0];
+        assert!(s > 0.0, "應該找得到頭");
         let (px, py) = (hx * w as f32, hy * h as f32);
         assert!(
             (20.0..30.0).contains(&px) && (20.0..30.0).contains(&py),
