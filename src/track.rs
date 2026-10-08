@@ -54,23 +54,65 @@ pub struct Frame {
     pub w: usize,
     pub h: usize,
     px: Vec<f32>,
+    /// 這張照片的色彩（只有解碼來的原圖有；金字塔縮出來的各層、切出來的
+    /// 樣板都沒有）。找鳥頭要用顏色，見 [`find_head`]
+    colour: Option<std::sync::Arc<Chroma>>,
+}
+
+/// 照片的色彩，存成兩個「對手色」平面：紅綠（R−G）與黃藍（(R+G)/2−B）。
+/// 解析度是灰階原圖的一半，正好與差值圖（[`DET_DIFF`] 層）一樣大，
+/// 兩者可以逐點對照
+pub struct Chroma {
+    w: usize,
+    h: usize,
+    rg: Vec<f32>,
+    yb: Vec<f32>,
+}
+
+impl Chroma {
+    /// 從彩色影像縮一半（2×2 取平均）算出對手色
+    fn from_rgb(img: &RgbImage) -> Chroma {
+        let (iw, ih) = (img.width() as usize, img.height() as usize);
+        let (w, h) = ((iw / 2).max(1), (ih / 2).max(1));
+        let mut rg = Vec::with_capacity(w * h);
+        let mut yb = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let p = img.get_pixel(
+                        ((2 * x + dx).min(iw - 1)) as u32,
+                        ((2 * y + dy).min(ih - 1)) as u32,
+                    );
+                    r += p[0] as f32;
+                    g += p[1] as f32;
+                    b += p[2] as f32;
+                }
+                let (r, g, b) = (r / 4.0, g / 4.0, b / 4.0);
+                rg.push(r - g);
+                yb.push((r + g) / 2.0 - b);
+            }
+        }
+        Chroma { w, h, rg, yb }
+    }
 }
 
 impl Frame {
-    /// 從彩色影像轉灰階（BT.601，與 ffmpeg 在 yuv420p 上用的同一組係數）
+    /// 從彩色影像轉灰階（BT.601，與 ffmpeg 在 yuv420p 上用的同一組係數），
+    /// 順便留一份色彩（找鳥頭用）
     pub fn from_rgb(img: &RgbImage) -> Frame {
         let (w, h) = (img.width() as usize, img.height() as usize);
         let px = img
             .pixels()
             .map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
             .collect();
-        Frame { w, h, px }
+        Frame { w, h, px, colour: Some(std::sync::Arc::new(Chroma::from_rgb(img))) }
     }
 
     /// 直接以灰階像素建一張（切塊與測試用）
     fn new(w: usize, h: usize, px: Vec<f32>) -> Frame {
         debug_assert_eq!(px.len(), w * h);
-        Frame { w, h, px }
+        Frame { w, h, px, colour: None }
     }
 
     fn at(&self, x: usize, y: usize) -> f32 {
@@ -402,7 +444,16 @@ impl Tracker {
 /// 用前後兩張等速外推出來的位置，與這張選中的位置差多少，除以整段的典型
 /// 步幅。接得上的照原本的分數，接不上的往下壓，於是「該檢查的那幾張」就
 /// 自己浮出來了（也正是自動補框要優先處理的那些）
-pub fn path_scores(cands: &[Vec<Found>], picked: &[Option<usize>]) -> Vec<f32> {
+///
+/// `fit_pos` 有給的話，「接不接得上前後」改用這組位置來算（鏡頭實際要對的
+/// 位置，例如鳥頭）。動態框會在翅膀與身體之間跳來跳去，拿它算接不接得上，
+/// 明明框到頭的照片也會被當成沒把握。其他幾條（換人、整段不動、被瞬移夾住）
+/// 判斷的是「追的是不是同一個東西」，照樣用動態框——那幾條不能省
+pub fn path_scores(
+    cands: &[Vec<Found>],
+    picked: &[Option<usize>],
+    fit_pos: Option<&[Option<(f32, f32)>]>,
+) -> Vec<f32> {
     let n = picked.len();
     let mut out = vec![0.0f32; n];
     let pos: Vec<Option<(f32, f32)>> = (0..n)
@@ -422,6 +473,20 @@ pub fn path_scores(cands: &[Vec<Found>], picked: &[Option<usize>]) -> Vec<f32> {
     }
     steps.sort_by(f32::total_cmp);
     let typical = steps.get(steps.len() / 2).copied().unwrap_or(0.02).max(0.01);
+    // 「接不接得上」那一項用的位置有自己的典型步幅（頭與動態框走的距離不同）
+    let fit_typical = match fit_pos {
+        None => typical,
+        Some(f) => {
+            let mut s: Vec<f32> = (1..n)
+                .filter_map(|i| match (f[i - 1].or(pos[i - 1]), f[i].or(pos[i])) {
+                    (Some(a), Some(b)) => Some((b.0 - a.0).hypot(b.1 - a.1)),
+                    _ => None,
+                })
+                .collect();
+            s.sort_by(f32::total_cmp);
+            s.get(s.len() / 2).copied().unwrap_or(0.02).max(0.01)
+        }
+    };
 
     // 再問一次「這一路上還是同一個東西嗎」：把路徑照外觀指紋切成幾段
     // （相鄰兩張長得完全不像＝中途換人了），拿**最長的那一段**當作主體的樣子，
@@ -520,6 +585,11 @@ pub fn path_scores(cands: &[Vec<Found>], picked: &[Option<usize>]) -> Vec<f32> {
 
     for i in 0..n {
         let Some(k) = picked[i] else { continue };
+        // 「整段不動」「被瞬移夾住」是**不知道框的是不是主體時**的間接懷疑。
+        // 那一張若已經找到通過前後驗證的鳥頭（fit_pos 有值），就有了更直接的
+        // 證據，不再套這兩條——停在枝頭吃東西的鳥，頭本來就幾乎不動，實測
+        // 一批這樣的連拍，套了會把三十幾張明明框到頭的照片標成要檢查
+        let verified = fit_pos.is_some_and(|f| f[i].is_some());
         let doubt = if still[i] {
             0.3
         } else if island[i] {
@@ -529,7 +599,8 @@ pub fn path_scores(cands: &[Vec<Found>], picked: &[Option<usize>]) -> Vec<f32> {
         };
         let base = cands[i][k].score * doubt;
         // 前後都在才算得出「接不接得上」；在邊界就只看那一團自己的分數
-        let dev = match (i.checked_sub(1).and_then(|j| pos[j]), pos[i], pos.get(i + 1).copied().flatten())
+        let fp = |j: usize| fit_pos.map_or(pos[j], |f| f[j].or(pos[j]));
+        let dev = match (i.checked_sub(1).map(fp).flatten(), fp(i), (i + 1 < n).then(|| fp(i + 1)).flatten())
         {
             (Some(a), Some(b), Some(c)) => {
                 let mid = ((a.0 + c.0) / 2.0, (a.1 + c.1) / 2.0);
@@ -538,11 +609,21 @@ pub fn path_scores(cands: &[Vec<Found>], picked: &[Option<usize>]) -> Vec<f32> {
             _ => 0.0,
         };
         // 差一個典型步幅還算正常，差三四個就幾乎不可信了
-        let fit = 1.0 / (1.0 + (dev / (typical * 1.5)).powi(2));
+        let fit = 1.0 / (1.0 + (dev / (fit_typical * 1.5)).powi(2));
         // 與「主體的樣子」像不像：完全不像的直接壓到要檢查的程度
         let look = ((sig_corr(&cands[i][k].sig, &refsig) + 1.0) / 2.0).clamp(0.0, 1.0);
         let look = (look * 1.6).min(1.0);
-        out[i] = (base * fit * look).clamp(0.0, 1.0);
+        out[i] = if verified {
+            // 頭已經通過前後驗證：那是最直接的證據。「接不接得上」「長得像
+            // 不像」這兩項是拿動態框猜的間接分數，鳥從遠拍飛到特寫、外觀
+            // 變很多時會亂扣分（實測一批連拍有十幾張頭明明在十字上卻被標
+            // 要檢查）。只留「被兩次瞬移夾住」這一條：路徑跳到葉子上又跳
+            // 回來那種，葉子上也找得到顏色雜的「頭」，靠這條才擋得住
+            cands[i][k].score * if island[i] { 0.4 } else { 1.0 }
+        } else {
+            base * fit * look
+        }
+        .clamp(0.0, 1.0);
     }
     out
 }
@@ -647,6 +728,11 @@ pub struct Found {
     /// 補償相機位移之後，這一團比補償之前亮了幾倍。相機沒動時恆為 1；
     /// 釘在畫面上的浮水印會遠大於 1（見 [`drop_overlays`]）
     pub shift_gain: f32,
+    /// 在這一團附近找到的鳥頭（相對座標），找不到是 None（見 [`HeadMaps::find`]）。
+    /// 動態偵測找到的常是拍動的翅膀，鏡頭要對的是頭
+    pub head: Option<(f32, f32)>,
+    /// 找到的頭有多明顯（色彩變化量 × 移動量，0~1），找不到是 0
+    pub head_score: f32,
     /// 框裡那一塊縮成 8×8、扣掉平均並正規化的樣子。
     /// 拿它跟別張的比對就知道「還是同一個東西嗎」——差值圖只認得出
     /// 「有沒有在動」，認不出「動的是誰」
@@ -745,6 +831,8 @@ pub fn detect_candidates(
     let floor = (DET_PEAK_MIN * strict).max(typical * DET_PEAK_OVER * strict);
     let level = (m.px.len() as f32 * DET_MAX_AREA) as usize;
     let (fw, fh) = (m.w as f32, m.h as f32);
+    // 找鳥頭用的累加表：整張算一次，每個候選共用（沒有色彩的照片就不找）
+    let heads = cur.colour.as_ref().map(|c| HeadMaps::new(c, &m));
 
     let mut used = vec![false; m.px.len()];
     let mut out: Vec<Found> = Vec::new();
@@ -766,6 +854,8 @@ pub fn detect_candidates(
             continue; // 長太大＝整片都在變（曝光跳動之類），換下一個峰值
         };
         let gain = shift_gain(&blob, &m, &raw);
+        // 這一團（鳥身）自己的平均移動量：找頭時拿它當尺（見 HEAD_GATE）
+        let bird_motion = blob.cells.iter().map(|&j| m.px[j]).sum::<f32>() / blob.cells.len().max(1) as f32;
         let (x0, y0, x1, y1) = blob.bbox;
         // 位置用**差值加權的重心**而不是外接框的中心：同一隻鳥的外接框會
         // 隨著翅膀張合忽胖忽瘦，中心跟著左右跳；重心穩得多
@@ -802,9 +892,129 @@ pub fn detect_candidates(
             score: (contrast * 0.65 + compact * 0.35).clamp(0.0, 1.0),
             sig,
             shift_gain: gain,
+            head: heads.as_ref().and_then(|hm| hm.find(rect, bird_motion)).map(|(x, y, _)| (x, y)),
+            head_score: heads.as_ref().and_then(|hm| hm.find(rect, bird_motion)).map_or(0.0, |(_, _, s)| s),
         });
     }
     out
+}
+
+/// 找鳥頭時搜尋的範圍：動態框的幾倍大（至少畫面的 [`HEAD_WIN_MIN`]）。
+///
+/// 動態框常常落在拍動的翅膀上，頭在旁邊；鳥飛近時翅膀很大，頭可以離框中心
+/// 好幾個框寬，範圍開小了就找不到
+const HEAD_WIN: f32 = 5.0;
+const HEAD_WIN_MIN: f32 = 0.15;
+
+/// 頭的大小（佔長邊的比例）：算「這一小塊有多少種顏色」用的半徑
+const HEAD_RADIUS: f32 = 0.012;
+
+/// 附近的移動量要到「這隻鳥自己的移動量」的幾成，才算跟著鳥一起在動（滿分）。
+///
+/// 不能拿背景的典型殘差當尺：實測一批背景雜亂的連拍，黃色葉子挨著深色
+/// 樹枝，「一小塊裡顏色很多樣」這點跟鳥頭一樣，被風吹得微微晃動也早就超過
+/// 背景殘差的好幾倍——框就被搬到葉子上。鳥頭是跟著鳥整隻一起移動的，
+/// 移動量跟鳥身差不多；葉子只是晃，遠不到鳥身的一半
+const HEAD_GATE: f32 = 0.5;
+
+/// 色彩變化量（0~1）至少要到這裡才算找到頭
+const HEAD_MIN: f32 = 0.06;
+
+/// 找鳥頭用的累加表（整張的對手色與移動量），一張照片算一次、所有候選共用
+struct HeadMaps {
+    w: usize,
+    h: usize,
+    s_rg: Vec<f64>,
+    s_yb: Vec<f64>,
+    q_rg: Vec<f64>,
+    q_yb: Vec<f64>,
+    s_m: Vec<f64>,
+}
+
+impl HeadMaps {
+    fn new(c: &Chroma, m: &Frame) -> HeadMaps {
+        let (w, h) = (c.w.min(m.w), c.h.min(m.h));
+        let n = (w + 1) * (h + 1);
+        let mut maps = HeadMaps {
+            w,
+            h,
+            s_rg: vec![0.0; n],
+            s_yb: vec![0.0; n],
+            q_rg: vec![0.0; n],
+            q_yb: vec![0.0; n],
+            s_m: vec![0.0; n],
+        };
+        for y in 0..h {
+            let (mut a, mut b, mut qa, mut qb, mut mm) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for x in 0..w {
+                let rg = c.rg[y * c.w + x] as f64;
+                let yb = c.yb[y * c.w + x] as f64;
+                a += rg;
+                b += yb;
+                qa += rg * rg;
+                qb += yb * yb;
+                mm += m.px[y * m.w + x] as f64;
+                let k = (y + 1) * (w + 1) + x + 1;
+                let up = y * (w + 1) + x + 1;
+                maps.s_rg[k] = maps.s_rg[up] + a;
+                maps.s_yb[k] = maps.s_yb[up] + b;
+                maps.q_rg[k] = maps.q_rg[up] + qa;
+                maps.q_yb[k] = maps.q_yb[up] + qb;
+                maps.s_m[k] = maps.s_m[up] + mm;
+            }
+        }
+        maps
+    }
+
+    /// [x0, x1) × [y0, y1) 的總和
+    fn sum(&self, v: &[f64], x0: usize, y0: usize, x1: usize, y1: usize) -> f64 {
+        let w1 = self.w + 1;
+        v[y1 * w1 + x1] + v[y0 * w1 + x0] - v[y0 * w1 + x1] - v[y1 * w1 + x0]
+    }
+
+    /// 在動態框 `rect` 附近找鳥頭，回傳頭的中心（相對座標）。
+    ///
+    /// 鳥頭的特徵是「**很小的範圍裡擠了很多種顏色**」——五色鳥的藍頭頂、黃臉、
+    /// 紅喉、黑嘴全在一起；翅膀與背景的顏色則單一。但光看顏色會被散景騙：
+    /// 藍天從綠葉縫透出來，同樣是一小塊裡有兩種顏色。所以再乘上「那裡有沒有
+    /// 在動」——頭跟著鳥一起移動，散景不會
+    fn find(&self, rect: [f32; 4], bird_motion: f32) -> Option<(f32, f32, f32)> {
+        let (w, h) = (self.w, self.h);
+        if w < 8 || h < 8 {
+            return None;
+        }
+        let (cx, cy) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
+        let ww = ((rect[2] - rect[0]) * HEAD_WIN).max(HEAD_WIN_MIN);
+        let wh = ((rect[3] - rect[1]) * HEAD_WIN).max(HEAD_WIN_MIN);
+        let r = ((w.max(h) as f32 * HEAD_RADIUS).round() as usize).max(2);
+        let px = |u: f32, n: usize| ((u.clamp(0.0, 1.0) * n as f32) as usize).min(n);
+        let (x0, x1) = (px(cx - ww / 2.0, w).max(r), px(cx + ww / 2.0, w).min(w - r));
+        let (y0, y1) = (px(cy - wh / 2.0, h).max(r), px(cy + wh / 2.0, h).min(h - r));
+        let gate_full = (bird_motion * HEAD_GATE).max(1.0) as f64;
+        let (mut best, mut at) = (0.0f64, None);
+        let mut y = y0;
+        while y < y1 {
+            let mut x = x0;
+            while x < x1 {
+                let (a0, b0, a1, b1) = (x - r, y - r, x + r + 1, y + r + 1);
+                let n = ((a1 - a0) * (b1 - b0)) as f64;
+                let mean_rg = self.sum(&self.s_rg, a0, b0, a1, b1) / n;
+                let mean_yb = self.sum(&self.s_yb, a0, b0, a1, b1) / n;
+                let var = (self.sum(&self.q_rg, a0, b0, a1, b1) / n - mean_rg * mean_rg)
+                    + (self.sum(&self.q_yb, a0, b0, a1, b1) / n - mean_yb * mean_yb);
+                let motion = self.sum(&self.s_m, a0, b0, a1, b1) / n;
+                let score = var.max(0.0).sqrt() / 255.0 * (motion / gate_full).min(1.0);
+                if score > best {
+                    best = score;
+                    at = Some((x, y));
+                }
+                x += 2;
+            }
+            y += 2;
+        }
+        let (x, y) = at?;
+        (best as f32 >= HEAD_MIN).then(|| ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, best as f32))
+    }
 }
 
 /// 這一團「補償相機位移之後比補償之前亮了幾倍」（見 [`Found::shift_gain`]）
@@ -1322,7 +1532,7 @@ mod tests {
         for v in sig.iter_mut() {
             *v = (*v - mean) / norm;
         }
-        Found { rect: [cx - 0.04, cy - 0.04, cx + 0.04, cy + 0.04], score, sig, shift_gain: 1.0 }
+        Found { rect: [cx - 0.04, cy - 0.04, cx + 0.04, cy + 0.04], score, sig, shift_gain: 1.0, head: None, head_score: 0.0 }
     }
 
     /// 畫面裡不只主體在動：整批一起挑路徑時，要挑那條**連貫**的，
@@ -1379,7 +1589,7 @@ mod tests {
             })
             .collect();
         let picked: Vec<Option<usize>> = (0..16).map(|_| Some(0)).collect();
-        let s = path_scores(&cands, &picked);
+        let s = path_scores(&cands, &picked, None);
         for i in 6..10 {
             assert!(s[i] < 0.4, "第 {i} 張換了東西卻還很有把握（{}）", s[i]);
         }
@@ -1452,7 +1662,7 @@ mod tests {
             })
             .collect();
         let picked: Vec<Option<usize>> = (0..60).map(|_| Some(0)).collect();
-        let s = path_scores(&cands, &picked);
+        let s = path_scores(&cands, &picked, None);
         for i in 30..36 {
             assert!(s[i] < 0.45, "第 {i} 張在兩次瞬移之間，卻還很有把握（{}）", s[i]);
         }
@@ -1487,6 +1697,56 @@ mod tests {
             let hit = t.find(&other(130.0 + k as f32));
             assert!(hit.same < 0.6, "換成別的東西了，same 卻說很像（第 {k} 張 {}）", hit.same);
         }
+    }
+
+    /// 找鳥頭：要挑「顏色很多樣、又跟著鳥一起在動」的那一塊。
+    /// 顏色單一的翅膀（動得再兇也不是頭）、顏色很雜但只是微微晃的葉子
+    /// （樹叢裡透光的那種）都不能被當成頭
+    #[test]
+    fn head_is_the_colourful_spot_that_moves_with_the_bird() {
+        let (w, h) = (96usize, 64usize);
+        let mut rg = vec![0.0f32; w * h];
+        let mut yb = vec![0.0f32; w * h];
+        let mut motion = vec![1.0f32; w * h];
+        let put = |x0: usize, y0: usize, f: &mut dyn FnMut(usize, usize)| {
+            for y in y0..y0 + 10 {
+                for x in x0..x0 + 10 {
+                    f(x, y);
+                }
+            }
+        };
+        // 鳥頭：藍、黃、紅、黑擠在一起，跟著鳥移動
+        put(20, 20, &mut |x, y| {
+            let k = y * w + x;
+            rg[k] = if (x + y) % 2 == 0 { 90.0 } else { -60.0 };
+            yb[k] = if (x / 2 + y) % 2 == 0 { 80.0 } else { -90.0 };
+            motion[k] = 40.0;
+        });
+        // 翅膀：顏色單一，但拍得比頭還兇
+        put(45, 20, &mut |x, y| {
+            let k = y * w + x;
+            rg[k] = -30.0;
+            yb[k] = -10.0;
+            motion[k] = 70.0;
+        });
+        // 葉子縫透光：顏色一樣雜，但只是微微晃
+        put(70, 20, &mut |x, y| {
+            let k = y * w + x;
+            rg[k] = if (x + y) % 2 == 0 { 90.0 } else { -60.0 };
+            yb[k] = if (x / 2 + y) % 2 == 0 { 80.0 } else { -90.0 };
+            motion[k] = 6.0;
+        });
+        let c = Chroma { w, h, rg, yb };
+        let m = Frame::new(w, h, motion);
+        let maps = HeadMaps::new(&c, &m);
+        // 動態框落在翅膀上，鳥身的平均移動量 40
+        let rect = [45.0 / 96.0, 20.0 / 64.0, 55.0 / 96.0, 30.0 / 64.0];
+        let (hx, hy, _) = maps.find(rect, 40.0).expect("應該找得到頭");
+        let (px, py) = (hx * w as f32, hy * h as f32);
+        assert!(
+            (20.0..30.0).contains(&px) && (20.0..30.0).contains(&py),
+            "頭找錯地方了：({px:.1}, {py:.1})"
+        );
     }
 
     #[test]

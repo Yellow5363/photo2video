@@ -3796,7 +3796,7 @@ fn run_track(
     }
     let photos = Arc::new(photos.to_vec());
     let need = vec![true; photos.len()];
-    let (locked, total) = follow_fill(&photos, marks, &seeds, &need, &vec![false; need.len()], None, crop, true, send);
+    let (locked, total) = follow_fill(&photos, marks, &seeds, &need, &vec![false; need.len()], None, None, crop, true, send);
     send(TrackMsg::Done(locked + marks.len(), total + marks.len()));
 }
 
@@ -3816,6 +3816,7 @@ fn follow_fill(
     need: &[bool],
     keep_own: &[bool],
     cands: Option<&[Vec<track::Found>]>,
+    offsets: Option<&[(f32, f32)]>,
     crop: Crop,
     step: bool,
     send: &dyn Fn(TrackMsg),
@@ -3852,6 +3853,8 @@ fn follow_fill(
         // 這一段的框都跟著出發那一張的大小走（追蹤只找位置、不量大小）
         let seed_rect = marks[seed].1;
         let (sw, sh) = (seed_rect[2] - seed_rect[0], seed_rect[3] - seed_rect[1]);
+        // 起點那一張「頭在身體哪裡」的偏移（見下面 to_boxes）
+        let off = offsets.map_or((0.0, 0.0), |o| o[seed]);
         // 這一張的動態偵測有沒有在差不多的位置也看到東西：兩種獨立的方法
         // 指向同一處，才敢說「這裡就是主體」
         let seen_moving = |i: usize, cx: f32, cy: f32| -> bool {
@@ -3882,12 +3885,17 @@ fn follow_fill(
                 .map(|(i, h)| {
                     (
                         *i,
-                        h.map(|h| Subject {
+                        h.map(|h| {
+                            // 追的是身體那一團；鏡頭要對的是頭。連拍相鄰幾張之間，
+                            // 頭相對身體的位置幾乎不變，所以照起點那一張「頭在身體
+                            // 哪裡」的偏移搬過去（起點沒找到頭的偏移是 0）
+                            let (cx, cy) = (h.cx + off.0, h.cy + off.1);
+                            Subject {
                             rect: clamp_rect([
-                                h.cx - sw / 2.0,
-                                h.cy - sh / 2.0,
-                                h.cx + sw / 2.0,
-                                h.cy + sh / 2.0,
+                                cx - sw / 2.0,
+                                cy - sh / 2.0,
+                                cx + sw / 2.0,
+                                cy + sh / 2.0,
                             ]),
                             src: BoxSrc::Tracked,
                             // 樣板比對的分數單獨拿來判斷並不可靠：實測一批
@@ -3902,6 +3910,7 @@ fn follow_fill(
                             } else {
                                 0.2
                             },
+                        }
                         }),
                     )
                 })
@@ -4033,7 +4042,77 @@ fn run_auto_boxes(
     // 整批一起挑出最連貫的那一條軌跡，再按「與鄰張接不接得上」重估把握程度
     // （見 track::choose_path / track::path_scores）
     let picked = track::choose_path(&cands);
-    let conf = track::path_scores(&cands, &picked);
+    // 鏡頭要對的是**鳥頭**，不是動得最兇的翅膀（見 track::HeadMaps::find）。
+    // 這一批大多數張都找得到頭（顏色鮮明的鳥），就以頭為中心、而且找不到頭
+    // 的那幾張算「沒抓到」；大多找不到（主體本身沒有顯眼的頭），就照原本的
+    // 動態框，不拿這條規矩去刁難
+    let chosen = picked.iter().filter(|k| k.is_some()).count();
+    let with_head = (0..n)
+        .filter(|&i| picked[i].is_some_and(|k| cands[i][k].head.is_some()))
+        .count();
+    let head_mode = chosen > 0 && with_head * 2 >= chosen;
+    // 每張選中的那一團找到的頭（貼在畫面邊緣的不算：多半被切掉一半，例如鳥
+    // 飛過鏡頭上方時，畫面頂端只剩紅色的喉嚨）
+    let raw_head: Vec<Option<(f32, f32)>> = (0..n)
+        .map(|i| {
+            let k = picked[i]?;
+            let (hx, hy) = cands[i][k].head?;
+            (hx > HEAD_EDGE && hx < 1.0 - HEAD_EDGE && hy > HEAD_EDGE && hy < 1.0 - HEAD_EDGE)
+                .then_some((hx, hy))
+        })
+        .collect();
+    // 再拿前後張驗證：真的鳥頭跟著鳥平順移動，前一張或後一張的頭就在附近；
+    // 樹叢裡顏色雜、又被風吹著晃的葉子也會被當成「頭」，但那種假頭東一個
+    // 西一個，接不上前後（實測一批背景雜亂的連拍，不驗證的話有二十幾張的
+    // 框被搬到葉子上）。附近＝兩個框寬以內
+    let head: Vec<Option<(f32, f32)>> = (0..n)
+        .map(|i| {
+            let (hx, hy) = raw_head[i]?;
+            let k = picked[i]?;
+            let r = cands[i][k].rect;
+            let reach = ((r[2] - r[0]).max(r[3] - r[1]) * 2.0).max(0.04);
+            let near = |j: usize| {
+                raw_head[j].is_some_and(|(x, y)| (x - hx).hypot(y - hy) < reach)
+            };
+            (i.checked_sub(1).is_some_and(near) || (i + 1 < n && near(i + 1))).then_some((hx, hy))
+        })
+        .collect();
+    // 沒抓到頭（找不到、被切掉、或接不上前後）：這一批大多抓得到頭時，
+    // 只框到翅膀或身體就不算抓到
+    let headless: Vec<bool> = (0..n)
+        .map(|i| head_mode && picked[i].is_some() && head[i].is_none())
+        .collect();
+    // 把握程度：「是不是同一個東西」照動態框判斷，「接不接得上前後」照頭的
+    // 位置算——動態框在翅膀與身體之間跳來跳去，拿它算會把明明框到頭的照片
+    // 誤判成沒把握
+    // 頭能不能當成「確實抓到」的直接證據，要看這一批的頭清不清楚：
+    // 光線好、背景乾淨時鳥頭的顏色對比很強，找到的幾乎都是真的；陰暗雜亂
+    // 的樹叢裡，葉子縫透光也長得像「頭」，單看一張分不出真假（實測真頭最低
+    // 到 0.11、葉子上的假頭最高到 0.22，大幅重疊）。整批來看就分得出來：
+    // 六批連拍的頭強度中位數，清楚的 0.27～0.32，陰暗雜亂的那批只有 0.22。
+    // 頭不清楚的批次照樣把鏡頭對到頭上，但把握程度照原本保守的方式判斷
+    let strong_heads = {
+        let mut s: Vec<f32> = (0..n)
+            .filter_map(|i| picked[i].filter(|_| raw_head[i].is_some()).map(|k| cands[i][k].head_score))
+            .collect();
+        s.sort_by(f32::total_cmp);
+        s.get(s.len() / 2).is_some_and(|m| *m >= HEAD_TRUST)
+    };
+    let fit_pos: Option<Vec<Option<(f32, f32)>>> = (head_mode && strong_heads).then(|| head.clone());
+    let conf = track::path_scores(&cands, &picked, fit_pos.as_deref());
+    // 交給使用者的框搬到頭上（大小不變）。但補洞那一趟的樣板仍取**身體**
+    // 那一團：頭只有二三十個像素見方，在雜亂的樹叢裡幾乎到處都「很像」，
+    // 實測拿頭當樣板，追蹤器會沿著葉子一路滑過去還自認很有把握
+    let shown = |i: usize, k: usize| -> [f32; 4] {
+        let r = cands[i][k].rect;
+        match head[i] {
+            Some((hx, hy)) => {
+                let (w, h) = (r[2] - r[0], r[3] - r[1]);
+                [hx - w / 2.0, hy - h / 2.0, hx + w / 2.0, hy + h / 2.0]
+            }
+            None => r,
+        }
+    };
     let mut boxes: Vec<(usize, Option<Subject>)> = Vec::with_capacity(n);
     let mut marks: Vec<(usize, [f32; 4])> = Vec::new();
     let mut need = vec![false; n];
@@ -4043,14 +4122,15 @@ fn run_auto_boxes(
         if keep[i] {
             continue;
         }
-        let s = picked[i].map(|k| Subject {
-            rect: clamp_rect(cands[i][k].rect),
-            src: BoxSrc::Auto,
-            score: conf[i],
+        let s = picked[i].map(|k| {
+            // 只框到翅膀、身體或背景：不算抓到，請使用者過目
+            let score = if headless[i] { conf[i].min(0.4) } else { conf[i] };
+            Subject { rect: clamp_rect(shown(i, k)), src: BoxSrc::Auto, score }
         });
-        // 有把握的那幾張當作接下來補洞的起點；其餘的等著被補
-        match s {
-            Some(s) if s.sure() => marks.push((i, s.rect)),
+        // 有把握的那幾張當作接下來補洞的起點（樣板取身體那一團，見上面）；
+        // 其餘的等著被補
+        match (s, picked[i]) {
+            (Some(s), Some(k)) if s.sure() => marks.push((i, clamp_rect(cands[i][k].rect))),
             _ => need[i] = true,
         }
         boxes.push((i, s));
@@ -4072,16 +4152,20 @@ fn run_auto_boxes(
         send(TrackMsg::Phase(format!("補上動態偵測看不見的 {missing} 張…")));
         let mut seeds: Vec<track::Frame> = Vec::with_capacity(marks.len());
         let mut ok: Vec<(usize, [f32; 4])> = Vec::with_capacity(marks.len());
+        // 每個起點「頭在身體哪裡」的偏移：補出來的身體位置加上它就是頭
+        let mut ok_off: Vec<(f32, f32)> = Vec::with_capacity(marks.len());
         for (i, rect) in &marks {
             if let Some(f) = decode_for_track(&photos[*i], crop) {
                 if track::Tracker::new(&f, *rect).is_some() {
                     seeds.push(f);
                     ok.push((*i, *rect));
+                    let (bx, by) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
+                    ok_off.push(head[*i].map_or((0.0, 0.0), |(hx, hy)| (hx - bx, hy - by)));
                 }
             }
         }
         if !ok.is_empty() {
-            let (filled, _) = follow_fill(&photos, &ok, &seeds, &need, &has_auto, Some(&cands), crop, false, send);
+            let (filled, _) = follow_fill(&photos, &ok, &seeds, &need, &has_auto, Some(&cands), Some(&ok_off), crop, false, send);
             found += filled;
         }
     }
@@ -5714,6 +5798,13 @@ const TRACK_FILL_SURE: f32 = 0.55;
 /// 鳥飛出畫面後樣板漂移到葉子上的那幾張，跟漂移後的樣板比高達 0.97，跟出發時
 /// 的樣子比只有 0.65——所以一定要用 `same` 判斷，門檻比錯的最高值留 0.05 餘裕
 const TRACK_FILL_ALONE: f32 = 0.78;
+
+/// 找到的鳥頭離畫面邊緣不到這個比例，就當作頭被切掉了（不算抓到）
+const HEAD_EDGE: f32 = 0.04;
+
+/// 整批鳥頭的強度中位數到這裡，才把「找到頭」當成確實抓到的直接證據
+/// （實測六批：清楚的 0.268～0.316、陰暗雜亂的 0.221）
+const HEAD_TRUST: f32 = 0.25;
 
 impl Subject {
     fn manual(rect: [f32; 4]) -> Subject {
