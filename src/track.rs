@@ -456,14 +456,7 @@ pub fn path_scores(
 ) -> Vec<f32> {
     let n = picked.len();
     let mut out = vec![0.0f32; n];
-    let pos: Vec<Option<(f32, f32)>> = (0..n)
-        .map(|i| {
-            picked[i].map(|k| {
-                let r = cands[i][k].rect;
-                ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0)
-            })
-        })
-        .collect();
+    let pos: Vec<Option<(f32, f32)>> = (0..n).map(|i| picked[i].map(|k| track_pos(&cands[i][k]))).collect();
     // 整段的典型步幅：拿它當尺，快飛的連拍與慢慢晃的連拍才用同一套標準
     let mut steps: Vec<f32> = Vec::new();
     for i in 1..n {
@@ -615,11 +608,12 @@ pub fn path_scores(
         let look = (look * 1.6).min(1.0);
         out[i] = if verified {
             // 頭已經通過前後驗證：那是最直接的證據。「接不接得上」「長得像
-            // 不像」這兩項是拿動態框猜的間接分數，鳥從遠拍飛到特寫、外觀
-            // 變很多時會亂扣分（實測一批連拍有十幾張頭明明在十字上卻被標
-            // 要檢查）。只留「被兩次瞬移夾住」這一條：路徑跳到葉子上又跳
-            // 回來那種，葉子上也找得到顏色雜的「頭」，靠這條才擋得住
-            cands[i][k].score * if island[i] { 0.4 } else { 1.0 }
+            // 不像」「被兩次瞬移夾住」都是拿動態框猜的間接分數，鳥從遠拍飛到
+            // 特寫、外觀變很多、頭偶爾一步跳得遠時會亂扣分（實測一批飛得快
+            // 的連拍，前 52 張頭明明在十字上卻全被標要檢查）。路徑跳到葉子
+            // 上的那種，葉子上湊出來的「頭」不夠清楚、強度也不到一般水準，
+            // 在 run_auto_boxes 驗證頭的那一步就被擋掉了，到不了這裡
+            cands[i][k].score
         } else {
             base * fit * look
         }
@@ -834,7 +828,7 @@ pub fn detect_candidates(
     let level = (m.px.len() as f32 * DET_MAX_AREA) as usize;
     let (fw, fh) = (m.w as f32, m.h as f32);
     // 找鳥頭用的累加表：整張算一次，每個候選共用（沒有色彩的照片就不找）
-    let heads = cur.colour.as_ref().map(|c| HeadMaps::new(c, &m, &sharpness(&cp[0], &m)));
+    let heads = cur.colour.as_ref().map(|c| HeadMaps::new(c, &m, &sharpness(&cp[0], &m), &coarse_detail(&cp[DET_DIFF + 1], &m)));
 
     let mut used = vec![false; m.px.len()];
     let mut out: Vec<Found> = Vec::new();
@@ -925,6 +919,13 @@ const HEAD_MIN: f32 = 0.06;
 /// 頭所在的那一塊要有「整張最清晰那一塊」的幾成清晰度（滿分）
 const HEAD_SHARP: f32 = 0.5;
 
+/// 頭所在的那一塊，「細節 ÷ 輪廓」要有整張最高的幾成才算滿分（見
+/// [`HeadMaps::crisp_at`]）。門檻刻意放低：只淘汰真的糊掉的。攝影師對焦的
+/// 就是鳥，常常整張只有鳥是清楚的；散景裡天空透過樹葉的白色亮邊，邊緣強度
+/// 跟鳥一樣高（光看 [`HEAD_SHARP`] 那一關擋不住，實測一批連拍連續十幾張框在
+/// 左邊的散景裡），但細節遠不如輪廓，這一關擋得住
+const HEAD_CRISP: f32 = 0.2;
+
 /// 清晰度圖：每一點的拉普拉斯絕對值（細節越銳利越大），在最細的那層算、
 /// 再 2×2 取平均縮到 `to` 那一層的大小（與差值圖、色彩對齊）。
 ///
@@ -932,20 +933,45 @@ const HEAD_SHARP: f32 = 0.5;
 /// 先縮小再算就都一樣糊了
 fn sharpness(fine: &Frame, to: &Frame) -> Frame {
     let (w, h) = (fine.w, fine.h);
-    let mut lap = vec![0.0f32; w * h];
-    for y in 1..h.saturating_sub(1) {
-        for x in 1..w.saturating_sub(1) {
-            let c = fine.at(x, y);
-            let v = 4.0 * c - fine.at(x - 1, y) - fine.at(x + 1, y) - fine.at(x, y - 1) - fine.at(x, y + 1);
-            lap[y * w + x] = v.abs();
-        }
-    }
+    let lap = lap_abs(fine);
     let mut px = Vec::with_capacity(to.w * to.h);
     for y in 0..to.h {
         for x in 0..to.w {
             let (x0, y0) = ((2 * x).min(w - 1), (2 * y).min(h - 1));
             let (x1, y1) = ((2 * x + 1).min(w - 1), (2 * y + 1).min(h - 1));
             px.push((lap[y0 * w + x0] + lap[y0 * w + x1] + lap[y1 * w + x0] + lap[y1 * w + x1]) * 0.25);
+        }
+    }
+    Frame::new(to.w, to.h, px)
+}
+
+/// 每一點拉普拉斯的絕對值（邊上一圈是 0）
+fn lap_abs(f: &Frame) -> Vec<f32> {
+    let (w, h) = (f.w, f.h);
+    let mut lap = vec![0.0f32; w * h];
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            let c = f.at(x, y);
+            let v = 4.0 * c - f.at(x - 1, y) - f.at(x + 1, y) - f.at(x, y - 1) - f.at(x, y + 1);
+            lap[y * w + x] = v.abs();
+        }
+    }
+    lap
+}
+
+/// 粗一級的輪廓圖：在比 `to` 再小一半的那層算拉普拉斯，放大回 `to` 的大小。
+///
+/// 拿來當 [`sharpness`] 的分母：光看最細的邊緣有多強會被**對比**騙——散景裡
+/// 白色天空透過樹葉的亮邊，糊歸糊，邊緣強度照樣比鳥頭高（實測一批連拍，
+/// 左邊散景的「清晰度」跟整張最清晰的鳥一樣）。糊掉的邊緣只剩粗輪廓、沒有
+/// 細節；對焦清楚的地方兩者都有。兩者相除，就只剩「銳不銳利」，與亮暗對比無關
+fn coarse_detail(coarse: &Frame, to: &Frame) -> Frame {
+    let (w, h) = (coarse.w, coarse.h);
+    let lap = lap_abs(coarse);
+    let mut px = Vec::with_capacity(to.w * to.h);
+    for y in 0..to.h {
+        for x in 0..to.w {
+            px.push(lap[(y / 2).min(h.saturating_sub(1)) * w + (x / 2).min(w.saturating_sub(1))]);
         }
     }
     Frame::new(to.w, to.h, px)
@@ -962,14 +988,21 @@ struct HeadMaps {
     q_yb: Vec<f64>,
     s_m: Vec<f64>,
     s_sharp: Vec<f64>,
+    /// 粗一級輪廓的累加表（清晰度的分母，見 [`coarse_detail`]）
+    s_coarse: Vec<f64>,
+    /// 分母的底：平坦的天空、散景裡只有雜訊，細節與輪廓都接近 0，相除會亂跳。
+    /// 每一點的輪廓至少算這麼多（整張輪廓的中位數）
+    floor: f64,
     /// 這張照片「最清晰的那一塊」有多清晰（頭那麼大一塊的平均，取全張的
     /// 前 1%）。找頭時拿它當尺；整張都糊的照片它也就很低
     sharp_ref: f32,
+    /// 「細節 ÷ 輪廓」的前 1%（見 [`HeadMaps::crisp_at`]）
+    crisp_ref: f32,
 }
 
 impl HeadMaps {
-    fn new(c: &Chroma, m: &Frame, sharp: &Frame) -> HeadMaps {
-        let (w, h) = (c.w.min(m.w).min(sharp.w), c.h.min(m.h).min(sharp.h));
+    fn new(c: &Chroma, m: &Frame, sharp: &Frame, coarse: &Frame) -> HeadMaps {
+        let (w, h) = (c.w.min(m.w).min(sharp.w).min(coarse.w), c.h.min(m.h).min(sharp.h).min(coarse.h));
         let n = (w + 1) * (h + 1);
         let mut maps = HeadMaps {
             w,
@@ -980,11 +1013,14 @@ impl HeadMaps {
             q_yb: vec![0.0; n],
             s_m: vec![0.0; n],
             s_sharp: vec![0.0; n],
+            s_coarse: vec![0.0; n],
+            floor: 0.0,
             sharp_ref: 0.0,
+            crisp_ref: 0.0,
         };
         for y in 0..h {
             let (mut a, mut b, mut qa, mut qb, mut mm) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
-            let mut ss = 0.0f64;
+            let (mut ss, mut sc) = (0.0f64, 0.0f64);
             for x in 0..w {
                 let rg = c.rg[y * c.w + x] as f64;
                 let yb = c.yb[y * c.w + x] as f64;
@@ -994,6 +1030,7 @@ impl HeadMaps {
                 qb += yb * yb;
                 mm += m.px[y * m.w + x] as f64;
                 ss += sharp.px[y * sharp.w + x] as f64;
+                sc += coarse.px[y * coarse.w + x] as f64;
                 let k = (y + 1) * (w + 1) + x + 1;
                 let up = y * (w + 1) + x + 1;
                 maps.s_rg[k] = maps.s_rg[up] + a;
@@ -1002,27 +1039,45 @@ impl HeadMaps {
                 maps.q_yb[k] = maps.q_yb[up] + qb;
                 maps.s_m[k] = maps.s_m[up] + mm;
                 maps.s_sharp[k] = maps.s_sharp[up] + ss;
+                maps.s_coarse[k] = maps.s_coarse[up] + sc;
             }
         }
+        let mut cs: Vec<f32> = coarse.px.clone();
+        cs.sort_by(f32::total_cmp);
+        maps.floor = cs.get(cs.len() / 2).copied().unwrap_or(0.0).max(1.0) as f64;
         // 最清晰的那一塊：以頭的大小為窗，掃一遍取前 1%（取最大值會被
         // 單一顆亮點或雜訊帶走）
         let r = ((w.max(h) as f32 * HEAD_RADIUS).round() as usize).max(2);
         if w > 2 * r + 1 && h > 2 * r + 1 {
-            let mut v: Vec<f32> = Vec::new();
+            let (mut v, mut q): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
+            let n = ((2 * r + 1) * (2 * r + 1)) as f64;
             let mut y = r;
             while y + r + 1 < h {
                 let mut x = r;
                 while x + r + 1 < w {
-                    let n = ((2 * r + 1) * (2 * r + 1)) as f64;
                     v.push((maps.sum(&maps.s_sharp, x - r, y - r, x + r + 1, y + r + 1) / n) as f32);
+                    q.push(maps.crisp_at(x - r, y - r, x + r + 1, y + r + 1) as f32);
                     x += 2;
                 }
                 y += 2;
             }
             v.sort_by(f32::total_cmp);
+            q.sort_by(f32::total_cmp);
             maps.sharp_ref = v.get(v.len() * 99 / 100).copied().unwrap_or(0.0);
+            maps.crisp_ref = q.get(q.len() * 99 / 100).copied().unwrap_or(0.0);
         }
         maps
+    }
+
+    /// [x0, x1) × [y0, y1) 這一塊是不是糊的：最細的細節 ÷ 粗一級的輪廓
+    /// （見 [`coarse_detail`]）。與亮暗對比無關，對焦清楚的地方遠高於散景。
+    ///
+    /// 只拿來**否決糊掉的**，不拿來比誰比較清楚：鳥頭是大塊的藍、黃、紅，
+    /// 粗輪廓本來就強，這個比例反而常輸給細碎的羽毛與樹枝（實測一批近距離
+    /// 的連拍，拿它打分，十幾張的十字被拉到頭旁邊的翅膀上）
+    fn crisp_at(&self, x0: usize, y0: usize, x1: usize, y1: usize) -> f64 {
+        let n = ((x1 - x0) * (y1 - y0)) as f64;
+        self.sum(&self.s_sharp, x0, y0, x1, y1) / (self.sum(&self.s_coarse, x0, y0, x1, y1) + self.floor * n)
     }
 
     /// [x0, x1) × [y0, y1) 的總和
@@ -1056,6 +1111,7 @@ impl HeadMaps {
         let (y0, y1) = (px(cy - wh / 2.0, h).max(r), px(cy + wh / 2.0, h).min(h - r));
         let gate_full = (bird_motion * HEAD_GATE).max(1.0) as f64;
         let sharp_full = (self.sharp_ref * HEAD_SHARP).max(1e-3) as f64;
+        let crisp_full = (self.crisp_ref * HEAD_CRISP).max(1e-6) as f64;
         let mut all: Vec<(f32, usize, usize)> = Vec::new();
         let mut y = y0;
         while y < y1 {
@@ -1071,9 +1127,11 @@ impl HeadMaps {
                 // 頭幾乎都在整張最清晰的地方：攝影師對焦的就是頭與眼。
                 // 散景裡的葉縫透光、拍動中糊掉的翅膀都過不了這一關
                 let sharp = self.sum(&self.s_sharp, a0, b0, a1, b1) / n;
+                let crisp = self.crisp_at(a0, b0, a1, b1);
                 let score = var.max(0.0).sqrt() / 255.0
                     * (motion / gate_full).min(1.0)
-                    * (sharp / sharp_full).min(1.0);
+                    * (sharp / sharp_full).min(1.0)
+                    * (crisp / crisp_full).min(1.0);
                 if score as f32 >= HEAD_MIN {
                     all.push((score as f32, x, y));
                 }
@@ -1183,6 +1241,23 @@ pub fn detect(prev: Option<&Frame>, cur: &Frame, next: Option<&Frame>) -> Option
 /// 所以 0.15 代表「分數差一整級」約等於「位置差 15% 畫面」
 const PATH_SCORE_W: f32 = 0.15;
 
+/// 單一步加速度最多算到這裡（佔畫面的比例）。
+///
+/// 偶爾一兩張偵測不到主體時，路徑只能暫時跳到別的東西上再跳回來；不設上限
+/// 的話一進一出代價太大，整段乾脆都留在旁邊那團樹葉上更「便宜」（實測一批
+/// 連拍，鳥在 14 張裡只有 3 張沒偵測到，整段 14 張就全被拉走）。跳出去的那
+/// 一兩張之後會被頭的前後檢查抓出來，標成要檢查
+const PATH_ACC_CAP: f32 = 0.12;
+
+/// 「附近找不到清楚的頭」要罰多少（與 [`PATH_SCORE_W`] 同一把尺）。
+///
+/// 只看軌跡平不平順會被騙：鳥迎面振翅時，每張偵測到的那一團在翅膀與身體
+/// 之間跳來跳去，旁邊一團被風吹著緩緩飄的樹葉反而平順得多，整段路徑就被
+/// 拉到樹葉上（實測一批連拍，連續十幾張框在左邊的散景裡）。附近有沒有
+/// 清楚的頭是另一條獨立的證據；主體不是鳥（全都找不到頭）時每個候選罰得
+/// 一樣，不影響挑選
+const PATH_HEAD_W: f32 = 0.15;
+
 /// 「有在移動」這件事值多少折扣。
 ///
 /// 沒有這一項的話，光看軌跡平不平順會**偏好原地不動的東西**：被風吹得
@@ -1227,15 +1302,15 @@ pub fn choose_path(cands: &[Vec<Found>]) -> Vec<Option<usize>> {
         }
         return out;
     }
-    let centre = |i: usize, k: usize| -> (f32, f32) {
-        let r = cands[i][k].rect;
-        ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0)
-    };
+    let centre = |i: usize, k: usize| track_pos(&cands[i][k]);
     let area = |i: usize, k: usize| -> f32 {
         let r = cands[i][k].rect;
         ((r[2] - r[0]) * (r[3] - r[1])).max(1e-6)
     };
-    let unc = |i: usize, k: usize| (1.0 - cands[i][k].score) * PATH_SCORE_W;
+    let unc = |i: usize, k: usize| {
+        let c = &cands[i][k];
+        (1.0 - c.score) * PATH_SCORE_W + (1.0 - (c.heads[0].2 / HEAD_FULL).min(1.0)) * PATH_HEAD_W
+    };
     let pick = viterbi2(&live, |i| cands[i].len(), unc, |(ip, a), (iq, b), (ir, c)| {
         let (pa, pb, pc) = (centre(ip, a), centre(iq, b), centre(ir, c));
         let d2 = (ir - iq) as f32;
@@ -1243,7 +1318,7 @@ pub fn choose_path(cands: &[Vec<Found>]) -> Vec<Option<usize>> {
         // 大小忽大忽小的要罰（多半是換到別的東西上了）
         let speed = ((pc.0 - pb.0).hypot(pc.1 - pb.1) / d2).min(PATH_MOVE_CAP);
         let grow = (area(ir, c) / area(iq, b)).ln().abs().min(3.0);
-        accel(pa, pb, pc, (iq - ip) as f32, d2) + unc(ir, c) + grow * PATH_SIZE_W
+        accel(pa, pb, pc, (iq - ip) as f32, d2).min(PATH_ACC_CAP) + unc(ir, c) + grow * PATH_SIZE_W
             - speed * PATH_MOVE_W
     });
     for (t, &i) in live.iter().enumerate() {
@@ -1396,6 +1471,19 @@ pub fn choose_heads(cands: &[Vec<Found>], picked: &[Option<usize>]) -> Vec<Optio
         out[i] = Some(pool[i][pick[t]]);
     }
     out
+}
+
+/// 量軌跡用的位置：附近找得到頭就用頭，否則用那一團的中心。
+///
+/// 鳥迎面振翅時，偵測到的那一團在翅膀與身體之間跳來跳去，但每一團找到的頭
+/// 都在同一處——拿那一團的中心量，真的鳥反而顯得亂跳，輸給旁邊一團緩緩飄的
+/// 樹葉（實測一批連拍，連續十幾張框在左邊的散景裡）
+fn track_pos(c: &Found) -> (f32, f32) {
+    if c.heads[0].2 > 0.0 {
+        return (c.heads[0].0, c.heads[0].1);
+    }
+    let r = c.rect;
+    ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0)
 }
 
 /// 估「b 要平移多少才會對上 a」（回傳的是 a 的座標系裡的位移，該層的像素）。
@@ -1948,16 +2036,24 @@ mod tests {
             yb[k] = if (x / 2 + y) % 2 == 0 { 80.0 } else { -90.0 };
             motion[k] = 40.0;
         });
-        // 清晰度：只有真的鳥頭那一塊對焦清楚
+        // 清晰度：只有真的鳥頭那一塊對焦清楚。糊掉的那塊對比很強（散景裡
+        // 天空透過樹葉的亮邊），最細的邊緣強度跟頭一樣，但粗輪廓強得多
         let mut sharp = vec![2.0f32; w * h];
+        let mut coarse = vec![10.0f32; w * h];
         for y in 20..30 {
             for x in 20..30 {
                 sharp[y * w + x] = 20.0;
             }
         }
+        for y in 42..52 {
+            for x in 20..30 {
+                sharp[y * w + x] = 20.0;
+                coarse[y * w + x] = 200.0;
+            }
+        }
         let c = Chroma { w, h, rg, yb };
         let m = Frame::new(w, h, motion);
-        let maps = HeadMaps::new(&c, &m, &Frame::new(w, h, sharp));
+        let maps = HeadMaps::new(&c, &m, &Frame::new(w, h, sharp), &Frame::new(w, h, coarse));
         // 動態框落在翅膀上，鳥身的平均移動量 40
         let rect = [45.0 / 96.0, 20.0 / 64.0, 55.0 / 96.0, 30.0 / 64.0];
         let (hx, hy, s) = maps.find(rect, 40.0)[0];

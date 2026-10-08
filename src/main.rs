@@ -4172,6 +4172,10 @@ fn run_auto_boxes(
         }
     }
     marks.sort_by_key(|(i, _)| *i);
+    // 補框不能自認有把握的那幾張：找頭失敗的；以及這一批是看頭的模式時，
+    // 連一點動態都沒偵測到的——鳥已經飛出畫面，補框只是在空畫面裡找到一塊
+    // 長得有點像的東西（實測一批連拍的最後兩張，框到右邊的樹葉還自認有把握）
+    let fill_doubt: Vec<bool> = (0..n).map(|i| headless[i] || (head_mode && picked[i].is_none())).collect();
     let missing = need.iter().filter(|x| **x).count();
     let mut found = n - missing - keep.iter().filter(|k| **k).count();
     if missing > 0 && !marks.is_empty() {
@@ -4191,7 +4195,7 @@ fn run_auto_boxes(
             }
         }
         if !ok.is_empty() {
-            let (filled, _) = follow_fill(&photos, &ok, &seeds, &need, &has_auto, &headless, Some(&cands), Some(&ok_off), crop, false, send);
+            let (filled, _) = follow_fill(&photos, &ok, &seeds, &need, &has_auto, &fill_doubt, Some(&cands), Some(&ok_off), crop, false, send);
             found += filled;
         }
     }
