@@ -962,7 +962,7 @@ impl Default for ProjectFile {
             sub_boxed: style.boxed,
             track_boxes: Vec::new(),
             track_prev: Vec::new(),
-            track_zoom: 3.0,
+            track_zoom: TRACK_ZOOM_DEFAULT,
             track_smooth: 20,
             transition: "none".into(),
             ken_burns: false,
@@ -5890,6 +5890,9 @@ static TRACK_CANCEL: AtomicBool = AtomicBool::new(false);
 const TRACK_ZOOM_MIN: f32 = 1.5;
 const TRACK_ZOOM_MAX: f32 = 8.0;
 
+/// 鏡頭範圍的預設值。3 倍時輸出影片裡的鳥太大隻（使用者實測），放寬一倍
+const TRACK_ZOOM_DEFAULT: f32 = 6.0;
+
 /// 「主體追蹤」的狀態：每張照片的主體框、鏡頭怎麼跟。
 ///
 /// 找主體與擺鏡頭是**兩件事**：框一次算好存著，之後拖動「鏡頭範圍」與
@@ -5945,7 +5948,7 @@ impl Default for TrackJob {
 
 impl TrackTool {
     fn new() -> Self {
-        Self { zoom: 3.0, smooth: 20, ..Default::default() }
+        Self { zoom: TRACK_ZOOM_DEFAULT, smooth: 20, ..Default::default() }
     }
 
     /// 這張照片的主體框（沒有就是 None）
@@ -5967,8 +5970,17 @@ impl TrackTool {
     ///
     /// 有手動框就以**手動框裡最大的那個**為準——那是使用者親自指定的大小；
     /// 全是自動／追蹤來的框則取**中位數**，個別框歪掉、框到一大片的那幾張
-    /// 才不會把整支影片的鏡頭撐大
+    /// 才不會把整支影片的鏡頭撐大。
+    ///
+    /// 框比主體大 [`TRACK_BOX_UNIFORM_GROW`] 倍（那是為了好抓），這裡除回去，
+    /// 鏡頭範圍才仍以主體本身的大小為準，不會因為框放大而跟著拉遠
     fn base_size(&self) -> (f32, f32) {
+        let (w, h) = self.box_size();
+        (w / TRACK_BOX_UNIFORM_GROW, h / TRACK_BOX_UNIFORM_GROW)
+    }
+
+    /// 框的代表大小（見 [`TrackTool::base_size`]）
+    fn box_size(&self) -> (f32, f32) {
         let manual: Vec<&Subject> =
             self.boxes.values().filter(|s| s.src == BoxSrc::Manual).collect();
         if !manual.is_empty() {
@@ -8820,9 +8832,19 @@ impl App {
         let mut pts = fill_gaps(&known);
         track::despike(&mut pts);
         track::smooth(&mut pts, self.track.smooth as f32 / 100.0);
+        // 只看有把握的那幾張（理由同 apply_track 數貼邊張數那段）；
+        // 全都沒把握時退回全部
+        let sure: Vec<bool> = self
+            .photos
+            .iter()
+            .map(|p| self.track.box_of(p).is_some_and(|s| s.sure()))
+            .collect();
+        let any_sure = sure.iter().any(|s| *s);
         let mut room: Vec<f32> = pts
             .iter()
-            .map(|(cx, cy)| {
+            .enumerate()
+            .filter(|(i, _)| !any_sure || sure[*i])
+            .map(|(_, (cx, cy))| {
                 let x = 2.0 * cx.min(1.0 - cx) / unit.0;
                 let y = 2.0 * cy.min(1.0 - cy) / unit.1;
                 x.min(y)
@@ -8882,7 +8904,14 @@ impl App {
         // 主體貼近照片邊緣、鏡頭再往外就會切到照片外面的那幾張：
         // 那時鏡頭只能停在邊界上，主體就不在正中央了。數出來讓使用者知道
         // （想讓那幾張也置中，就把「鏡頭範圍」調小一點）
+        // 只數有把握的那幾張：要檢查的（例如鳥飛出畫面時頭貼在邊緣）多半會被
+        // 刪掉，拿它們來數會讓程式誤以為鏡頭範圍開太大、把它一路壓到最小
         self.track.off_centre = 0;
+        let sure: Vec<bool> = self
+            .photos
+            .iter()
+            .map(|p| self.track.box_of(p).is_some_and(|s| s.sure()))
+            .collect();
         for (i, (cx, cy)) in pts.iter().copied().enumerate() {
             let photo = self.photos[i].clone();
             // 第一次動到這張時記下它原本的樣子（清除追蹤要還原回去）
@@ -8894,7 +8923,7 @@ impl App {
             let want = (cx - cw / 2.0, cy - ch / 2.0);
             let x0 = want.0.clamp(0.0, 1.0 - cw);
             let y0 = want.1.clamp(0.0, 1.0 - ch);
-            if (x0 - want.0).abs() > 1e-4 || (y0 - want.1).abs() > 1e-4 {
+            if sure[i] && ((x0 - want.0).abs() > 1e-4 || (y0 - want.1).abs() > 1e-4) {
                 self.track.off_centre += 1;
             }
             a.crop = Crop { x0, y0, x1: x0 + cw, y1: y0 + ch, ..a.crop }.clamped();
@@ -9107,11 +9136,14 @@ impl App {
         }
         if finished {
             self.track.rx = None;
+            // 只有自動框選剛找出來的框是原始大小，要放大；從手動框追蹤出來的
+            // 沿用使用者的框大小，再放大一次就越追越大
+            let grow = self.track.job == TrackJob::Auto;
             self.track.job = TrackJob::None;
             // 跑完就直接把鏡頭擺上去：使用者等的就是看到結果。
             // 先把框統一成同一個大小，等一下要手動微調時才好抓
             if self.track.has_boxes() {
-                self.track_uniform_boxes();
+                self.track_uniform_boxes(grow);
                 self.apply_track();
                 // 鏡頭範圍太大會讓主體一直頂在邊界（那正是「主體在抖」的元凶），
                 // 貼邊超過四分之一就自動改成「幾乎每張都置中」的那個範圍，
@@ -9148,9 +9180,9 @@ impl App {
     /// 偵測到的框是「這一團在動的像素」的外接框：翅膀張開時大、收起來時小，
     /// 每張都不一樣。鏡頭本來就只看框的**中心**（切多大是「鏡頭範圍」決定的），
     /// 所以大小不統一對成品沒影響——但要手動微調時，小到只有幾個像素的框
-    /// 連抓都抓不到。統一成中位數大小、並保證不會小於 [`TRACK_BOX_UNIFORM_MIN`]，
+    /// 連抓都抓不到。統一成中位數大小（剛跑完自動框選時再放大 [`TRACK_BOX_UNIFORM_GROW`] 倍）、並保證不會小於 [`TRACK_BOX_UNIFORM_MIN`]，
     /// 每一張就都一樣好抓
-    fn track_uniform_boxes(&mut self) {
+    fn track_uniform_boxes(&mut self, grow: bool) {
         let (mut ws, mut hs): (Vec<f32>, Vec<f32>) = self
             .track
             .boxes
@@ -9163,8 +9195,9 @@ impl App {
         }
         ws.sort_by(f32::total_cmp);
         hs.sort_by(f32::total_cmp);
-        let w = ws[ws.len() / 2].clamp(TRACK_BOX_UNIFORM_MIN, 0.5);
-        let h = hs[hs.len() / 2].clamp(TRACK_BOX_UNIFORM_MIN, 0.5);
+        let k = if grow { TRACK_BOX_UNIFORM_GROW } else { 1.0 };
+        let w = (ws[ws.len() / 2] * k).clamp(TRACK_BOX_UNIFORM_MIN, 0.5);
+        let h = (hs[hs.len() / 2] * k).clamp(TRACK_BOX_UNIFORM_MIN, 0.5);
         for s in self.track.boxes.values_mut() {
             if s.src == BoxSrc::Manual {
                 continue;
@@ -12194,12 +12227,12 @@ impl App {
                 )
                 .on_hover_text(
                     "裁切框是主體框的幾倍。倍數小＝主體大、鏡頭跟得明顯，\n\
-                     倍數大＝留下較多環境、鏡頭移動較少（連點兩下回到 3 倍）",
+                     倍數大＝留下較多環境、鏡頭移動較少（連點兩下回到預設 6 倍）",
                 );
                 ui.spacing_mut().slider_width = (ui.available_width() - NUM_BOX_ROOM - 6.0).max(60.0);
                 let mut z = self.track.zoom;
                 if drop_slider(ui, &mut z, TRACK_ZOOM_MIN, TRACK_ZOOM_MAX).double_clicked() {
-                    z = 3.0;
+                    z = TRACK_ZOOM_DEFAULT;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
@@ -12216,7 +12249,7 @@ impl App {
             // 頂在邊界，看起來就像在抖
             if self.track.has_boxes()
                 && ui
-                    .small_button("⤢ 自動選範圍（讓主體都置中）")
+                    .small_button("自動選範圍（讓主體都置中）")
                     .on_hover_text(
                         "反算每一張「主體要落在正中央的話，鏡頭最大能開多大」，\n\
                          取幾乎每張都滿足的那個值",
@@ -12237,7 +12270,7 @@ impl App {
             }
             if self.track.has_boxes()
                 && ui
-                    .small_button("⤢ 自動選平滑度（置中與穩定的平衡點）")
+                    .small_button("自動選平滑度（置中與穩定的平衡點）")
                     .on_hover_text(
                         "把「主體偏離中央多少」與「鏡頭自己晃多少」換算成同一把尺\n\
                          （都以成品畫面為單位），取兩者相加最小的那個值",
@@ -30702,6 +30735,10 @@ const TRACK_BOX_MIN: f32 = 0.006;
 /// 自動框選完把框統一成同一個大小時，至少要有這麼大（佔畫面的比例）。
 /// 太小的框在預覽上只有幾個像素，抓不到也搬不動（見 [`App::track_uniform_boxes`]）
 const TRACK_BOX_UNIFORM_MIN: f32 = 0.05;
+
+/// 統一大小時再放大幾倍。中位數大小的框只剛好圈住鳥頭，使用者覺得小、
+/// 要再拉大才好抓（實測一批：0.058×0.076 拉到 0.077×0.10，約 1.3 倍）
+const TRACK_BOX_UNIFORM_GROW: f32 = 1.3;
 
 /// 在預覽上檢查／重畫「要跟的主體」。
 /// 回傳（拖出來的框（沒拖到就是 None）, 是否收工）。
