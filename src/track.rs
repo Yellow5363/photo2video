@@ -1213,6 +1213,112 @@ impl HeadMaps {
     }
 }
 
+/// 圖庫比對的取樣格數（每邊）
+const LIB_GRID: usize = 12;
+
+/// 一塊鳥頭的「長相」：以某一點為中心、邊長 `size` 的方塊縮成 12×12，
+/// 灰階扣平均再正規化（只看明暗花紋），兩個對手色保留原值（五色鳥頭上的藍、
+/// 黃、紅本身就是線索）
+#[derive(Clone)]
+pub struct HeadLook {
+    v: Vec<f32>,
+}
+
+/// 色彩在比對裡的份量（灰階已正規化成長度 1）
+const LIB_COLOUR_W: f32 = 1.0 / 400.0;
+
+impl Frame {
+    /// 雙線性取樣（超出邊界的取邊界）
+    fn sample(&self, x: f32, y: f32) -> f32 {
+        let x = x.clamp(0.0, (self.w - 1) as f32);
+        let y = y.clamp(0.0, (self.h - 1) as f32);
+        let (x0, y0) = (x as usize, y as usize);
+        let (x1, y1) = ((x0 + 1).min(self.w - 1), (y0 + 1).min(self.h - 1));
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let a = self.px[y0 * self.w + x0] * (1.0 - fx) + self.px[y0 * self.w + x1] * fx;
+        let b = self.px[y1 * self.w + x0] * (1.0 - fx) + self.px[y1 * self.w + x1] * fx;
+        a * (1.0 - fy) + b * fy
+    }
+
+    /// 以 (cx, cy)（工作圖像素）為中心、邊長 `size` 的那一塊長什麼樣子
+    pub fn head_look(&self, cx: f32, cy: f32, size: f32) -> Option<HeadLook> {
+        self.head_look_m(cx, cy, size, false)
+    }
+
+    /// 同 [`Frame::head_look`]，`mirror` 為真時左右翻轉（朝左飛的範本也能拿來
+    /// 比朝右飛的鳥；標記點在正中央，翻過來還是在正中央）
+    pub fn head_look_m(&self, cx: f32, cy: f32, size: f32, mirror: bool) -> Option<HeadLook> {
+        let c = self.colour.as_deref()?;
+        let g = LIB_GRID;
+        let step = size / g as f32;
+        let mut lum = Vec::with_capacity(g * g);
+        let mut col = Vec::with_capacity(2 * g * g);
+        for j in 0..g {
+            for i in 0..g {
+                let ii = if mirror { g - 1 - i } else { i };
+                let x = cx - size / 2.0 + (ii as f32 + 0.5) * step;
+                let y = cy - size / 2.0 + (j as f32 + 0.5) * step;
+                lum.push(self.sample(x, y));
+                let (qx, qy) = (((x / 2.0) as usize).min(c.w - 1), ((y / 2.0) as usize).min(c.h - 1));
+                col.push(c.rg[qy * c.w + qx] * LIB_COLOUR_W);
+                col.push(c.yb[qy * c.w + qx] * LIB_COLOUR_W);
+            }
+        }
+        let m = lum.iter().sum::<f32>() / lum.len() as f32;
+        let norm = lum.iter().map(|v| (v - m) * (v - m)).sum::<f32>().sqrt().max(1e-3);
+        let mut v: Vec<f32> = lum.iter().map(|x| (x - m) / norm).collect();
+        v.extend(col);
+        Some(HeadLook { v })
+    }
+}
+
+impl HeadLook {
+    /// 兩塊長相差多遠（越小越像）
+    pub fn dist(&self, o: &HeadLook) -> f32 {
+        self.v.iter().zip(o.v.iter()).map(|(a, b)| (a - b) * (a - b)).sum()
+    }
+}
+
+/// 拿圖庫裡標好的鳥頭，在工作圖 `f` 的 (cx, cy) 附近找最像的那一處，回傳
+/// (x, y, 距離, 用了第幾張範本)；x, y 是範本標記點對應的位置（工作圖像素）。
+///
+/// 範本是「以使用者標的那一點為中心」切下來的，所以找到最像的那一塊，它的
+/// 中心就是使用者會標的位置：側面時是眼睛，正面時是兩眼之間——不必再分
+/// 正面側面。鳥遠近不同，所以範本大小從 `sizes` 裡逐一試
+pub fn match_library(
+    f: &Frame,
+    cx: f32,
+    cy: f32,
+    sizes: &[f32],
+    lib: &[HeadLook],
+    skip: &dyn Fn(usize) -> bool,
+) -> Option<(f32, f32, f32, usize)> {
+    let mut best: Option<(f32, f32, f32, usize)> = None;
+    for &s in sizes {
+        let reach = s * 1.5;
+        let step = (s / 8.0).max(1.0);
+        let n = (reach / step) as i32;
+        for j in -n..=n {
+            for i in -n..=n {
+                let (x, y) = (cx + i as f32 * step, cy + j as f32 * step);
+                if x < 0.0 || y < 0.0 || x >= f.w as f32 || y >= f.h as f32 {
+                    continue;
+                }
+                let Some(look) = f.head_look(x, y, s) else { return None };
+                for (k, t) in lib.iter().enumerate() {
+                    if skip(k) {
+                        continue;
+                    }
+                    let d = look.dist(t);
+                    if best.is_none_or(|b| d < b.2) {
+                        best = Some((x, y, d, k));
+                    }
+                }
+            }
+        }
+    }
+    best
+}
 /// 第 i 張挑中的頭 (x, y)（[`choose_heads`] 回傳的那一處）附近的紅點
 pub fn red_of(cands: &[Found], x: f32, y: f32) -> Option<(f32, f32)> {
     cands.iter().find_map(|c| {
@@ -2181,6 +2287,36 @@ mod tests {
     /// 找鳥頭：要挑「顏色很多樣、又跟著鳥一起在動」的那一塊。
     /// 顏色單一的翅膀（動得再兇也不是頭）、顏色很雜但只是微微晃的葉子
     /// （樹叢裡透光的那種）都不能被當成頭
+    /// 範本取自一張照片的鳥頭，換到下一張（鳥移了位置、左右翻了面）也要找得到，
+    /// 而且回傳的是範本標記點（正中央）對應的位置
+    #[test]
+    fn library_match_finds_the_marked_spot_in_another_photo() {
+        let head = |img: &mut RgbImage, x0: i64, y0: i64, flip: bool| {
+            for dy in 0..30i64 {
+                for dx in 0..30i64 {
+                    let ex = if flip { 29 - dx } else { dx };
+                    let c = match (ex / 10, dy / 10) {
+                        (0, _) => [40, 90, 200],
+                        (1, 0) => [230, 200, 40],
+                        (1, _) => [220, 40, 40],
+                        _ => [20, 20, 20],
+                    };
+                    img.put_pixel((x0 + dx) as u32, (y0 + dy) as u32, image::Rgb(c));
+                }
+            }
+        };
+        let mut a = RgbImage::from_pixel(200, 150, image::Rgb([70, 130, 60]));
+        head(&mut a, 40, 40, false);
+        let mut b = RgbImage::from_pixel(200, 150, image::Rgb([70, 130, 60]));
+        head(&mut b, 110, 70, true);
+        let (fa, fb) = (Frame::from_rgb(&a), Frame::from_rgb(&b));
+        // 標記點在頭的正中央 (55, 55)
+        let lib: Vec<HeadLook> = [false, true].iter().filter_map(|&m| fa.head_look_m(55.0, 55.0, 30.0, m)).collect();
+        // 從偏了一段的地方出發
+        let (x, y, _, _) = match_library(&fb, 115.0, 95.0, &[24.0, 30.0, 36.0], &lib, &|_| false).expect("應該找得到");
+        assert!((x - 125.0).abs() <= 3.0 && (y - 85.0).abs() <= 3.0, "找到 ({x}, {y})");
+    }
+
     #[test]
     fn red_spots_beside_the_beak_pull_the_head_to_between_the_eyes() {
         // 原解析度 1000×500：正面的鳥，嘴基兩側各一個紅點；下方遠一點有一圈

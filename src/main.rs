@@ -3998,6 +3998,20 @@ fn run_auto_boxes(
     send: &dyn Fn(TrackMsg),
 ) {
     let n = photos.len();
+    // 記下每張最後送出去的框：最後一趟「照手動框校正」要從它們出發
+    let latest = std::sync::Mutex::new(vec![None::<Subject>; n]);
+    let record = |m: TrackMsg| {
+        if let TrackMsg::Boxes(list) = &m {
+            let mut l = latest.lock().unwrap();
+            for (i, s) in list {
+                if let Some(s) = s {
+                    l[*i] = Some(*s);
+                }
+            }
+        }
+        send(m)
+    };
+    let send: &dyn Fn(TrackMsg) = &record;
     let keep: Vec<bool> = manual.iter().map(|m| m.is_some()).collect();
     let photos = Arc::new(photos.to_vec());
     let order: Vec<usize> = (0..n).collect();
@@ -4207,7 +4221,92 @@ fn run_auto_boxes(
             found += filled;
         }
     }
+    let latest = latest.lock().unwrap().clone();
+    refine_by_manual(&photos, manual, &latest, crop, send);
     send(TrackMsg::Done(found + keep.iter().filter(|k| **k).count(), n));
+}
+
+/// 最後一趟：照使用者**在這一批裡手動框的那幾張**，校正其他張的框位置。
+///
+/// 使用者手動框的位置就是他要的「主體中心」（側面時是眼睛、正面時是兩眼
+/// 之間），程式自己找的頭常落在喉嚨、臉頰或頭頂。拿手動框的那幾張當範本
+/// （以框中心為準切下鳥頭、另做一份左右翻轉），在每一張現有框的附近找最像
+/// 的那一處，框就搬到那裡。
+///
+/// 只用同一批的手動框：同一天、同樣光線與背景，鳥的大小也差不多。實測兩批
+/// 使用者標好的連拍，每 10 張只框 1 張，其餘張落在使用者會標的位置（差不到
+/// 四分之一個框寬）的比例從 11～25% 提高到 70～90%；拿別天的照片當範本則
+/// 反而更差（背景、光線不同就認錯）。
+///
+/// 只搬位置：大小、來源、有沒有把握都照舊
+fn refine_by_manual(
+    photos: &Arc<Vec<PathBuf>>,
+    manual: &[Option<[f32; 4]>],
+    latest: &[Option<Subject>],
+    crop: Crop,
+    send: &dyn Fn(TrackMsg),
+) {
+    let n = photos.len();
+    let marked: Vec<usize> = (0..n).filter(|&i| manual[i].is_some()).collect();
+    let todo: Vec<usize> = (0..n).filter(|&i| manual[i].is_none() && latest[i].is_some()).collect();
+    if marked.is_empty() || todo.is_empty() {
+        return;
+    }
+    send(TrackMsg::Phase(format!("照你框的 {} 張校正其他 {} 張…", marked.len(), todo.len())));
+    let mut lib: Vec<track::HeadLook> = Vec::new();
+    let mut sizes: Vec<f32> = Vec::new();
+    for &i in &marked {
+        if TRACK_CANCEL.load(Ordering::Relaxed) {
+            return;
+        }
+        let (Some(r), Some(f)) = (manual[i], decode_for_track(&photos[i], crop)) else { continue };
+        let (fw, fh) = (f.w as f32, f.h as f32);
+        let (cx, cy) = ((r[0] + r[2]) / 2.0 * fw, (r[1] + r[3]) / 2.0 * fh);
+        let size = (r[2] - r[0]) * fw * TRACK_LIB_SIZE;
+        if size < TRACK_LIB_MIN_PX {
+            continue;
+        }
+        for mirror in [false, true] {
+            if let Some(look) = f.head_look_m(cx, cy, size, mirror) {
+                lib.push(look);
+            }
+        }
+        sizes.push(size);
+    }
+    if lib.is_empty() {
+        return;
+    }
+    // 同一批的鳥大小差不多：只試範本大小附近幾個尺寸，又快又不容易認錯
+    sizes.sort_by(f32::total_cmp);
+    let mid = sizes[sizes.len() / 2];
+    let (lo, hi) = (sizes[0], sizes[sizes.len() - 1]);
+    let mut try_sizes: Vec<f32> = Vec::new();
+    let mut s = (lo * 0.8).max(TRACK_LIB_MIN_PX);
+    while s <= hi * 1.25 {
+        try_sizes.push(s);
+        s *= 1.2;
+    }
+    if try_sizes.is_empty() {
+        try_sizes.push(mid);
+    }
+    let rxs = spawn_decoders(&todo, photos, crop);
+    for (k, &i) in todo.iter().enumerate() {
+        if TRACK_CANCEL.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok((j, frame)) = rxs[k % TRACK_DECODERS].recv() else { break };
+        debug_assert_eq!(i, j);
+        let (Some(f), Some(old)) = (frame, latest[i]) else { continue };
+        let (fw, fh) = (f.w as f32, f.h as f32);
+        let (ox, oy) = old.centre();
+        let Some((x, y, _, _)) = track::match_library(&f, ox * fw, oy * fh, &try_sizes, &lib, &|_| false) else {
+            continue;
+        };
+        let (w, h) = old.size();
+        let (nx, ny) = (x / fw, y / fh);
+        let rect = clamp_rect([nx - w / 2.0, ny - h / 2.0, nx + w / 2.0, ny + h / 2.0]);
+        send(TrackMsg::Boxes(vec![(i, Some(Subject { rect, ..old }))]));
+    }
 }
 
 /// 去煙工具背景執行緒的回報
@@ -30751,6 +30850,13 @@ const TRACK_BOX_UNIFORM_MIN: f32 = 0.05;
 /// 統一大小時再放大幾倍。中位數大小的框只剛好圈住鳥頭，使用者覺得小、
 /// 要再拉大才好抓（實測一批：0.058×0.076 拉到 0.077×0.10，約 1.3 倍）
 const TRACK_BOX_UNIFORM_GROW: f32 = 1.3;
+
+/// 照手動框校正時，範本切多大：手動框寬的幾倍（見 [`refine_by_manual`]）。
+/// 只切鳥頭本身：切大了會把背景也包進去，實測 1.5 倍時常被背景帶走，0.8 最準
+const TRACK_LIB_SIZE: f32 = 0.8;
+
+/// 範本小於這麼多像素（工作圖）就不用：只剩幾個像素，什麼都像
+const TRACK_LIB_MIN_PX: f32 = 10.0;
 
 /// 在預覽上檢查／重畫「要跟的主體」。
 /// 回傳（拖出來的框（沒拖到就是 None）, 是否收工）。
