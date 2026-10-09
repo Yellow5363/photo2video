@@ -4221,8 +4221,11 @@ fn run_auto_boxes(
             found += filled;
         }
     }
-    let latest = latest.lock().unwrap().clone();
-    refine_by_manual(&photos, manual, &latest, crop, send);
+    let mut latest = latest.lock().unwrap().clone();
+    refine_by_manual(&photos, manual, &mut latest, crop, send);
+    if head_mode {
+        refine_by_neighbours(&photos, &keep, &latest, crop, send);
+    }
     send(TrackMsg::Done(found + keep.iter().filter(|k| **k).count(), n));
 }
 
@@ -4242,7 +4245,7 @@ fn run_auto_boxes(
 fn refine_by_manual(
     photos: &Arc<Vec<PathBuf>>,
     manual: &[Option<[f32; 4]>],
-    latest: &[Option<Subject>],
+    latest: &mut [Option<Subject>],
     crop: Crop,
     send: &dyn Fn(TrackMsg),
 ) {
@@ -4305,7 +4308,103 @@ fn refine_by_manual(
         let (w, h) = old.size();
         let (nx, ny) = (x / fw, y / fh);
         let rect = clamp_rect([nx - w / 2.0, ny - h / 2.0, nx + w / 2.0, ny + h / 2.0]);
-        send(TrackMsg::Boxes(vec![(i, Some(Subject { rect, ..old }))]));
+        latest[i] = Some(Subject { rect, ..old });
+        send(TrackMsg::Boxes(vec![(i, latest[i])]));
+    }
+}
+
+/// 最後一趟：拿**前後幾張框得有把握的照片**當範本，檢查每一張的框。
+///
+/// 動態偵測偶爾會框到拍動的翅膀尖、旁邊的樹幹——那幾張自己找不到頭，但前後
+/// 幾張多半框得好好的。相鄰幾張的鳥大小、光線、姿態幾乎一樣，拿它們框到的
+/// 那塊鳥頭當範本，在兩張之間內插的位置附近找最像的地方：
+/// - 這張原本沒把握：框搬過去（仍標要檢查，請使用者過目）；
+/// - 這張原本自認有把握，但最像的地方離框很遠：框搬過去，改標要檢查——
+///   多半是框到了別的東西卻沒被發現（實測一批連拍，框在翅膀尖上卻放行）。
+///
+/// 前後兩邊都要在 [`TRACK_NB_GAP`] 張以內有好框才做：隔太遠鳥的姿態、位置都
+/// 變了，內插不準、範本也不像（實測鳥在空中停了十幾張的那段，這樣找反而認錯）。
+/// 跟使用者手動框的範本不同，這裡用同一批自己框的結果，所以不用使用者先做事
+fn refine_by_neighbours(
+    photos: &Arc<Vec<PathBuf>>,
+    keep: &[bool],
+    latest: &[Option<Subject>],
+    crop: Crop,
+    send: &dyn Fn(TrackMsg),
+) {
+    let n = photos.len();
+    let sure: Vec<bool> = (0..n).map(|i| keep[i] || latest[i].is_some_and(|s| s.sure())).collect();
+    // 每一張：前後最近的好框
+    let plan: Vec<(usize, usize, usize)> = (0..n)
+        .filter(|&i| !keep[i] && latest[i].is_some())
+        .filter_map(|i| {
+            let a = (i.saturating_sub(TRACK_NB_GAP)..i).rev().find(|&j| sure[j])?;
+            let c = (i + 1..(i + 1 + TRACK_NB_GAP).min(n)).find(|&j| sure[j])?;
+            Some((i, a, c))
+        })
+        .collect();
+    if plan.is_empty() {
+        return;
+    }
+    send(TrackMsg::Phase("拿前後框好的照片核對每一張…".into()));
+    // 依序解碼，只留還用得到的那幾張（照片很多時一次全留會吃掉好幾 GB）
+    let order: Vec<usize> = (0..n).collect();
+    let rxs = spawn_decoders(&order, photos, crop);
+    let mut cache: std::collections::BTreeMap<usize, Option<track::Frame>> = Default::default();
+    let mut pulled = 0usize;
+    let mut moved: Vec<(usize, Option<Subject>)> = Vec::new();
+    for &(i, a, c) in &plan {
+        if TRACK_CANCEL.load(Ordering::Relaxed) {
+            return;
+        }
+        while pulled <= c {
+            let Ok((j, f)) = rxs[pulled % TRACK_DECODERS].recv() else { return };
+            cache.insert(j, f);
+            pulled += 1;
+        }
+        cache.retain(|&j, _| j >= a);
+        let (Some(Some(f)), Some(Some(fa)), Some(Some(fc))) = (cache.get(&i), cache.get(&a), cache.get(&c)) else {
+            continue;
+        };
+        let (Some(old), Some(sa), Some(sc)) = (latest[i], latest[a], latest[c]) else { continue };
+        let (fw, fh) = (f.w as f32, f.h as f32);
+        let size = TRACK_NB_SIZE * fw;
+        let ((xa, ya), (xc, yc)) = (sa.centre(), sc.centre());
+        let lib: Vec<track::HeadLook> = [(fa, xa, ya), (fc, xc, yc)]
+            .iter()
+            .filter_map(|(g, x, y)| g.head_look(x * g.w as f32, y * g.h as f32, size))
+            .collect();
+        let t = (i - a) as f32 / (c - a) as f32;
+        let (px, py) = (xa + (xc - xa) * t, ya + (yc - ya) * t);
+        let reach = (TRACK_NB_REACH * (c - a) as f32 * fw).clamp(0.05 * fw, 0.2 * fw);
+        let sizes = [size * 0.8, size, size * 1.25];
+        // 前後兩張的範本各找一次，兩邊要找到同一個地方才算數：其中一張自己就
+        // 框錯了（框到翅膀上卻自認有把握）時，兩邊會各說各話
+        let found: Vec<(f32, f32, f32, f32)> = lib
+            .iter()
+            .filter_map(|t| track::match_library_wide(f, px * fw, py * fh, reach, &sizes, std::slice::from_ref(t)))
+            .collect();
+        let [p, q] = found.as_slice() else { continue };
+        if (p.0 - q.0).hypot(p.1 - q.1) > TRACK_NB_AGREE * fw {
+            continue;
+        }
+        let (x, y, d, _) = if p.2 <= q.2 { *p } else { *q };
+        if d > TRACK_NB_MAX_D {
+            continue;
+        }
+        let (nx, ny) = (x / fw, y / fh);
+        let (ox, oy) = old.centre();
+        let far = (nx - ox).hypot(ny - oy) > TRACK_NB_TOL;
+        if old.sure() && !far {
+            continue;
+        }
+        let (w, h) = old.size();
+        let rect = clamp_rect([nx - w / 2.0, ny - h / 2.0, nx + w / 2.0, ny + h / 2.0]);
+        let score = if old.sure() { TRACK_NB_DOUBT } else { old.score };
+        moved.push((i, Some(Subject { rect, score, ..old })));
+    }
+    if !moved.is_empty() {
+        send(TrackMsg::Boxes(moved));
     }
 }
 
@@ -30857,6 +30956,29 @@ const TRACK_LIB_SIZE: f32 = 0.8;
 
 /// 範本小於這麼多像素（工作圖）就不用：只剩幾個像素，什麼都像
 const TRACK_LIB_MIN_PX: f32 = 10.0;
+
+/// 拿前後框好的照片核對時（見 [`refine_by_neighbours`]），前後各最多隔幾張
+const TRACK_NB_GAP: usize = 3;
+
+/// 範本切多大：畫面寬的這個比例（約一個鳥頭）
+const TRACK_NB_SIZE: f32 = 0.03;
+
+/// 搜尋範圍：兩張好框之間每隔一張，放寬畫面寬的這個比例
+const TRACK_NB_REACH: f32 = 0.04;
+
+/// 比對距離超過這個就不算找到（實測認對的在 2.8 以下，認錯的 3.2 以上）
+const TRACK_NB_MAX_D: f32 = 3.0;
+
+/// 前後兩張的範本各自找到的位置，相差不到畫面寬的這個比例才算一致
+const TRACK_NB_AGREE: f32 = 0.02;
+
+/// 原本自認有把握的框，離找到的位置超過畫面寬的這個比例才算框錯了、搬過去。
+/// 只抓明顯的錯（框到翅膀尖、旁邊的樹幹，實測都在 0.09 以上）：門檻設小了，
+/// 前後幾張自己框在胸口時會把框對的那張也拉過去（實測 0.02、0.04 都發生過）
+const TRACK_NB_TOL: f32 = 0.07;
+
+/// 原本自認有把握、核對後被搬走的框，改成這個把握程度（要檢查）
+const TRACK_NB_DOUBT: f32 = 0.4;
 
 /// 在預覽上檢查／重畫「要跟的主體」。
 /// 回傳（拖出來的框（沒拖到就是 None）, 是否收工）。

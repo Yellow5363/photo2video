@@ -1222,10 +1222,16 @@ const LIB_GRID: usize = 12;
 #[derive(Clone)]
 pub struct HeadLook {
     v: Vec<f32>,
+    /// 明暗的起伏（灰階標準差）：散景太平、樹皮太粗，花紋再像也不是鳥頭
+    sd: f32,
 }
 
 /// 色彩在比對裡的份量（灰階已正規化成長度 1）
 const LIB_COLOUR_W: f32 = 1.0 / 400.0;
+
+/// 明暗起伏差幾倍要罰多少（取對數的平方）。不罰的話，平平的散景、粗糙的樹皮
+/// 縮成小格之後花紋也能「很像」，實測範本常被它們搶走
+const LIB_SD_W: f32 = 2.0;
 
 impl Frame {
     /// 雙線性取樣（超出邊界的取邊界）
@@ -1268,14 +1274,16 @@ impl Frame {
         let norm = lum.iter().map(|v| (v - m) * (v - m)).sum::<f32>().sqrt().max(1e-3);
         let mut v: Vec<f32> = lum.iter().map(|x| (x - m) / norm).collect();
         v.extend(col);
-        Some(HeadLook { v })
+        Some(HeadLook { v, sd: norm / (lum.len() as f32).sqrt() })
     }
 }
 
 impl HeadLook {
     /// 兩塊長相差多遠（越小越像）
     pub fn dist(&self, o: &HeadLook) -> f32 {
-        self.v.iter().zip(o.v.iter()).map(|(a, b)| (a - b) * (a - b)).sum()
+        let shape: f32 = self.v.iter().zip(o.v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+        let k = LIB_SD_W;
+        shape + k * (self.sd.max(1.0) / o.sd.max(1.0)).ln().powi(2)
     }
 }
 
@@ -1319,6 +1327,43 @@ pub fn match_library(
     }
     best
 }
+
+/// 同 [`match_library`]，但搜尋範圍由 `reach`（工作圖像素）決定，而且先粗後細：
+/// 先以 1/4 範本的步距掃一遍，再在最好的那一處附近以 1/8 步距補找。
+/// 框離鳥頭很遠（框到翅膀尖、旁邊的樹幹）時才搆得到
+pub fn match_library_wide(f: &Frame, cx: f32, cy: f32, reach: f32, sizes: &[f32], lib: &[HeadLook]) -> Option<(f32, f32, f32, f32)> {
+    let mut best: Option<(f32, f32, f32, f32)> = None;
+    let mut eval = |x: f32, y: f32, s: f32, best: &mut Option<(f32, f32, f32, f32)>| {
+        if x < 0.0 || y < 0.0 || x >= f.w as f32 || y >= f.h as f32 {
+            return;
+        }
+        let Some(look) = f.head_look(x, y, s) else { return };
+        for t in lib {
+            let d = look.dist(t);
+            if best.is_none_or(|b| d < b.2) {
+                *best = Some((x, y, d, s));
+            }
+        }
+    };
+    for &s in sizes {
+        let step = (s / 4.0).max(1.0);
+        let n = (reach / step) as i32;
+        for j in -n..=n {
+            for i in -n..=n {
+                eval(cx + i as f32 * step, cy + j as f32 * step, s, &mut best);
+            }
+        }
+    }
+    let (bx, by, _, bs) = best?;
+    let step = (bs / 8.0).max(1.0);
+    for j in -3..=3 {
+        for i in -3..=3 {
+            eval(bx + i as f32 * step, by + j as f32 * step, bs, &mut best);
+        }
+    }
+    best
+}
+
 /// 第 i 張挑中的頭 (x, y)（[`choose_heads`] 回傳的那一處）附近的紅點
 pub fn red_of(cands: &[Found], x: f32, y: f32) -> Option<(f32, f32)> {
     cands.iter().find_map(|c| {
