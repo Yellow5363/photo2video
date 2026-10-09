@@ -5899,8 +5899,8 @@ static TRACK_CANCEL: AtomicBool = AtomicBool::new(false);
 
 /// 鏡頭範圍的上下限（主體框的幾倍）。1 倍＝剛好貼著主體（看不出環境），
 /// 太大則等於沒裁到什麼、鏡頭幾乎不動
-const TRACK_ZOOM_MIN: f32 = 1.5;
-const TRACK_ZOOM_MAX: f32 = 8.0;
+const TRACK_ZOOM_MIN: f32 = 1.0;
+const TRACK_ZOOM_MAX: f32 = 10.0;
 
 /// 鏡頭範圍的預設值。3 倍時輸出影片裡的鳥太大隻（使用者實測），放寬一倍
 const TRACK_ZOOM_DEFAULT: f32 = 6.0;
