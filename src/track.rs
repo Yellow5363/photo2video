@@ -583,7 +583,9 @@ pub fn path_scores(
         for t in 1..seen.len() {
             let (a, b) = (f[seen[t - 1]].unwrap(), f[seen[t]].unwrap());
             let gap = (seen[t] - seen[t - 1]) as f32;
-            if (b.0 - a.0).hypot(b.1 - a.1) / gap > (fit_typical * 4.0).max(HEAD_TELEPORT) {
+            // 中間隔了幾張沒頭的：門檻照張數放寬（最多算 3 張），但位移不平均掉——鳥停在空中、
+            // 隔三張一下跳到畫面另一頭的那種，平均下來每張就不到門檻了
+            if (b.0 - a.0).hypot(b.1 - a.1) > (fit_typical * 4.0 * gap.min(3.0)).max(HEAD_TELEPORT) {
                 breaks.push(t);
             }
         }

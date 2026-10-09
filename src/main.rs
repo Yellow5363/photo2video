@@ -4293,6 +4293,8 @@ fn refine_by_manual(
         try_sizes.push(mid);
     }
     let rxs = spawn_decoders(&todo, photos, crop);
+    // 先每張都找一次，等整批都找完再決定要不要搬（要看整批配得好不好）
+    let mut found: Vec<(usize, f32, f32, f32)> = Vec::with_capacity(todo.len());
     for (k, &i) in todo.iter().enumerate() {
         if TRACK_CANCEL.load(Ordering::Relaxed) {
             return;
@@ -4302,14 +4304,34 @@ fn refine_by_manual(
         let (Some(f), Some(old)) = (frame, latest[i]) else { continue };
         let (fw, fh) = (f.w as f32, f.h as f32);
         let (ox, oy) = old.centre();
-        let Some((x, y, _, _)) = track::match_library(&f, ox * fw, oy * fh, &try_sizes, &lib, &|_| false) else {
+        if let Some((x, y, d, _)) = track::match_library(&f, ox * fw, oy * fh, &try_sizes, &lib, &|_| false) {
+            found.push((i, x / fw, y / fh, d));
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    // 整批配得好不好：範本的姿態跟這一批大多數張差太多時（例如手動框的幾張
+    // 都是正面、其他張多是背影或側面），每一張「最像的地方」其實都不像，往往
+    // 是旁邊一團散景。實測：手動框的姿態涵蓋得夠的兩批，比對距離中位數 1.8、
+    // 2.1；一批只框 6 張、姿態差很多的，中位數 3.2，照搬的話幾乎每張都被搬到
+    // 散景上。那種批次只搬非常像的那幾張
+    let mut ds: Vec<f32> = found.iter().map(|f| f.3).collect();
+    ds.sort_by(f32::total_cmp);
+    let limit = if ds[ds.len() / 2] > TRACK_LIB_POOR { TRACK_LIB_STRICT } else { f32::MAX };
+    let mut moved: Vec<(usize, Option<Subject>)> = Vec::new();
+    for (i, nx, ny, d) in found {
+        if d > limit {
             continue;
-        };
+        }
+        let Some(old) = latest[i] else { continue };
         let (w, h) = old.size();
-        let (nx, ny) = (x / fw, y / fh);
         let rect = clamp_rect([nx - w / 2.0, ny - h / 2.0, nx + w / 2.0, ny + h / 2.0]);
         latest[i] = Some(Subject { rect, ..old });
-        send(TrackMsg::Boxes(vec![(i, latest[i])]));
+        moved.push((i, latest[i]));
+    }
+    if !moved.is_empty() {
+        send(TrackMsg::Boxes(moved));
     }
 }
 
@@ -30956,6 +30978,11 @@ const TRACK_LIB_SIZE: f32 = 0.8;
 
 /// 範本小於這麼多像素（工作圖）就不用：只剩幾個像素，什麼都像
 const TRACK_LIB_MIN_PX: f32 = 10.0;
+
+/// 照手動框校正時（見 [`refine_by_manual`]），整批比對距離的中位數超過這個，
+/// 就當作手動框的姿態涵蓋不到這一批，只搬比對距離在 [`TRACK_LIB_STRICT`] 以內的
+const TRACK_LIB_POOR: f32 = 2.7;
+const TRACK_LIB_STRICT: f32 = 2.0;
 
 /// 拿前後框好的照片核對時（見 [`refine_by_neighbours`]），前後各最多隔幾張
 const TRACK_NB_GAP: usize = 3;
