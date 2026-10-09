@@ -4241,7 +4241,9 @@ fn run_auto_boxes(
 /// 四分之一個框寬）的比例從 11～25% 提高到 70～90%；拿別天的照片當範本則
 /// 反而更差（背景、光線不同就認錯）。
 ///
-/// 只搬位置：大小、來源、有沒有把握都照舊
+/// 只改**還沒框得有把握**、而且跟手動框的姿態一樣的照片（見 [`TRACK_LIB_MATCH`]），
+/// 其他張不動；已經框得有把握的照片一律不碰（使用者定的規矩）。只搬位置：大小、
+/// 來源、有沒有把握都照舊
 fn refine_by_manual(
     photos: &Arc<Vec<PathBuf>>,
     manual: &[Option<[f32; 4]>],
@@ -4251,7 +4253,11 @@ fn refine_by_manual(
 ) {
     let n = photos.len();
     let marked: Vec<usize> = (0..n).filter(|&i| manual[i].is_some()).collect();
-    let todo: Vec<usize> = (0..n).filter(|&i| manual[i].is_none() && latest[i].is_some()).collect();
+    // 已經框得有把握的照片一律不動（使用者定的規矩）：只校正還沒框到、或框得
+    // 沒把握的那幾張
+    let todo: Vec<usize> = (0..n)
+        .filter(|&i| manual[i].is_none() && latest[i].is_some_and(|s| !s.sure()))
+        .collect();
     if marked.is_empty() || todo.is_empty() {
         return;
     }
@@ -4311,14 +4317,11 @@ fn refine_by_manual(
     if found.is_empty() {
         return;
     }
-    // 整批配得好不好：範本的姿態跟這一批大多數張差太多時（例如手動框的幾張
-    // 都是正面、其他張多是背影或側面），每一張「最像的地方」其實都不像，往往
-    // 是旁邊一團散景。實測：手動框的姿態涵蓋得夠的兩批，比對距離中位數 1.8、
-    // 2.1；一批只框 6 張、姿態差很多的，中位數 3.2，照搬的話幾乎每張都被搬到
-    // 散景上。那種批次只搬非常像的那幾張
-    let mut ds: Vec<f32> = found.iter().map(|f| f.3).collect();
-    ds.sort_by(f32::total_cmp);
-    let limit = if ds[ds.len() / 2] > TRACK_LIB_POOR { TRACK_LIB_STRICT } else { f32::MAX };
+    // 只改「跟手動框的那幾張姿態一樣」的照片：比對距離在 TRACK_LIB_MATCH 以內
+    // 才搬，其他張不動。姿態不一樣時（例如手動框的幾張是正面、這張是背影），
+    // 每一張「最像的地方」其實都不像，往往是旁邊一團散景——實測一批只框 6 張的
+    // 連拍，不設門檻時原本框對的照片幾乎全被搬到散景上
+    let limit = TRACK_LIB_MATCH;
     let mut moved: Vec<(usize, Option<Subject>)> = Vec::new();
     for (i, nx, ny, d) in found {
         if d > limit {
@@ -30979,10 +30982,10 @@ const TRACK_LIB_SIZE: f32 = 0.8;
 /// 範本小於這麼多像素（工作圖）就不用：只剩幾個像素，什麼都像
 const TRACK_LIB_MIN_PX: f32 = 10.0;
 
-/// 照手動框校正時（見 [`refine_by_manual`]），整批比對距離的中位數超過這個，
-/// 就當作手動框的姿態涵蓋不到這一批，只搬比對距離在 [`TRACK_LIB_STRICT`] 以內的
-const TRACK_LIB_POOR: f32 = 2.7;
-const TRACK_LIB_STRICT: f32 = 2.0;
+/// 照手動框校正時（見 [`refine_by_manual`]），比對距離在這以內才算「姿態一樣」、
+/// 才搬。實測兩批使用者標好的連拍（每 10 張框 1 張）：2.5 時其餘張落在標的位置
+/// 64/87、53/60；不設門檻 78/87、55/60，但姿態涵蓋不到的批次會被搬壞
+const TRACK_LIB_MATCH: f32 = 2.5;
 
 /// 拿前後框好的照片核對時（見 [`refine_by_neighbours`]），前後各最多隔幾張
 const TRACK_NB_GAP: usize = 3;
