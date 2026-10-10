@@ -4224,7 +4224,8 @@ fn run_auto_boxes(
     let mut latest = latest.lock().unwrap().clone();
     refine_by_manual(&photos, manual, &mut latest, crop, send);
     if head_mode {
-        refine_by_neighbours(&photos, &keep, &latest, crop, send);
+        refine_by_neighbours(&photos, &keep, &mut latest, crop, send);
+        refine_by_chain(&photos, &keep, &latest, crop, send);
     }
     send(TrackMsg::Done(found + keep.iter().filter(|k| **k).count(), n));
 }
@@ -4353,7 +4354,7 @@ fn refine_by_manual(
 fn refine_by_neighbours(
     photos: &Arc<Vec<PathBuf>>,
     keep: &[bool],
-    latest: &[Option<Subject>],
+    latest: &mut [Option<Subject>],
     crop: Crop,
     send: &dyn Fn(TrackMsg),
 ) {
@@ -4428,9 +4429,125 @@ fn refine_by_neighbours(
         let score = if old.sure() { TRACK_NB_DOUBT } else { old.score };
         moved.push((i, Some(Subject { rect, score, ..old })));
     }
+    for (i, s) in &moved {
+        latest[*i] = *s;
+    }
     if !moved.is_empty() {
         send(TrackMsg::Boxes(moved));
     }
+}
+
+/// 最後一趟：一整段連續沒框好的照片，從段落兩頭框好的那張「一路接過去」。
+///
+/// 鳥停在空中拍翅膀時，逐張比差異看不見牠，連續十幾張的框都跳到旁邊的散景
+/// 上（實測一批連拍第 36～51 張）；前後核對（[`refine_by_neighbours`]）只管得到
+/// 前後 3 張內有好框的，這種長段落管不到。但段落前一張框得好好的，停在空中的
+/// 鳥位置變化又小：拿那一張框到的鳥頭當範本，在下一張「上一張找到的位置」
+/// 附近找最像的地方，再拿找到的位置當下一張的起點，一張接一張往下找；段落
+/// 後一張有好框的話也反方向接一次。
+///
+/// - 兩個方向都接到、而且位置一致：框搬過去，算有把握；
+/// - 只有一個方向接得到（段落在頭尾）、或兩邊不一致：框搬過去，仍標要檢查；
+/// - 一路上比對距離超過門檻（鳥飛走、被擋住）就停，後面的不動。
+///
+/// 範本一律用段落兩頭那張的原樣、不跟著換：換了的話每一步的小誤差會累積，
+/// 最後漂到背景上
+fn refine_by_chain(
+    photos: &Arc<Vec<PathBuf>>,
+    keep: &[bool],
+    latest: &[Option<Subject>],
+    crop: Crop,
+    send: &dyn Fn(TrackMsg),
+) {
+    let n = photos.len();
+    let good: Vec<bool> = (0..n).map(|i| keep[i] || latest[i].is_some_and(|s| s.sure())).collect();
+    // 連續沒框好的段落 [s, e]，長度超過前後核對管得到的才處理
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if good[i] {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < n && !good[i] {
+            i += 1;
+        }
+        let e = i - 1;
+        if e - s + 1 > TRACK_NB_GAP && e - s < TRACK_CHAIN_MAX {
+            runs.push((s, e));
+        }
+    }
+    if runs.is_empty() {
+        return;
+    }
+    send(TrackMsg::Phase("從框好的那張一路接過去…".into()));
+    let mut moved: Vec<(usize, Option<Subject>)> = Vec::new();
+    for (s, e) in runs {
+        // 往後接（從 s-1）與往前接（從 e+1）
+        let fwd = (s > 0).then(|| chain_one(photos, latest, s - 1, (s..=e).collect(), crop)).flatten();
+        let bwd = (e + 1 < n).then(|| chain_one(photos, latest, e + 1, (s..=e).rev().collect(), crop)).flatten();
+        if TRACK_CANCEL.load(Ordering::Relaxed) {
+            return;
+        }
+        for i in s..=e {
+            let Some(old) = latest[i] else { continue };
+            let f = fwd.as_ref().and_then(|v| v.get(&i).copied());
+            let b = bwd.as_ref().and_then(|v| v.get(&i).copied());
+            let (pos, agree) = match (f, b) {
+                (Some(p), Some(q)) => {
+                    let agree = (p.0 - q.0).hypot(p.1 - q.1) <= TRACK_CHAIN_AGREE;
+                    ((((p.0 + q.0) / 2.0), ((p.1 + q.1) / 2.0)), agree)
+                }
+                (Some(p), None) | (None, Some(p)) => (p, false),
+                (None, None) => continue,
+            };
+            let (w, h) = old.size();
+            let rect = clamp_rect([pos.0 - w / 2.0, pos.1 - h / 2.0, pos.0 + w / 2.0, pos.1 + h / 2.0]);
+            let score = if agree { TRACK_CHAIN_SURE } else { old.score.min(TRACK_NB_DOUBT) };
+            moved.push((i, Some(Subject { rect, score, ..old })));
+        }
+    }
+    if !moved.is_empty() {
+        send(TrackMsg::Boxes(moved));
+    }
+}
+
+/// 從第 `from` 張框好的位置出發，依 `order` 的順序一張接一張找，回傳每張找到
+/// 的位置（相對座標）；中途比對不上就停，後面的不回傳
+fn chain_one(
+    photos: &Arc<Vec<PathBuf>>,
+    latest: &[Option<Subject>],
+    from: usize,
+    order: Vec<usize>,
+    crop: Crop,
+) -> Option<std::collections::HashMap<usize, (f32, f32)>> {
+    let start = latest[from]?;
+    let f0 = decode_for_track(&photos[from], crop)?;
+    let (fw, fh) = (f0.w as f32, f0.h as f32);
+    let size = TRACK_CHAIN_SIZE * fw;
+    let (sx, sy) = start.centre();
+    let lib = vec![f0.head_look(sx * fw, sy * fh, size)?];
+    drop(f0);
+    let sizes = [size * 0.9, size, size * 1.1];
+    let mut at = (sx * fw, sy * fh);
+    let mut out = std::collections::HashMap::new();
+    let rxs = spawn_decoders(&order, photos, crop);
+    for (k, &i) in order.iter().enumerate() {
+        if TRACK_CANCEL.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Ok((_, Some(f))) = rxs[k % TRACK_DECODERS].recv() else { break };
+        let Some((x, y, d, _)) = track::match_library_wide(&f, at.0, at.1, TRACK_CHAIN_REACH * fw, &sizes, &lib) else {
+            break;
+        };
+        if d > TRACK_CHAIN_MAX_D {
+            break;
+        }
+        at = (x, y);
+        out.insert(i, (x / fw, y / fh));
+    }
+    Some(out)
 }
 
 /// 去煙工具背景執行緒的回報
@@ -31012,6 +31129,27 @@ const TRACK_NB_TOL: f32 = 0.07;
 
 /// 原本自認有把握、核對後被搬走的框，改成這個把握程度（要檢查）
 const TRACK_NB_DOUBT: f32 = 0.4;
+
+/// 一路接過去時（見 [`refine_by_chain`]），段落最長幾張：再長鳥多半已經飛走了
+const TRACK_CHAIN_MAX: usize = 40;
+
+/// 每一步在上一張找到的位置附近多遠找（畫面寬的比例）。停在空中的鳥每張只
+/// 挪一點點；設大了容易接到旁邊長得有點像的東西
+const TRACK_CHAIN_REACH: f32 = 0.03;
+
+/// 一路接過去時的範本大小（畫面寬的比例）。比前後核對的小一點：只取鳥頭本身，
+/// 不把旁邊的散景包進來——停在空中時翅膀一直在動，包進來就接不下去
+const TRACK_CHAIN_SIZE: f32 = 0.018;
+
+/// 一路接過去時，比對距離超過這個就停。比前後核對寬鬆一點：範本固定用段落頭
+/// 那張，鳥的角度慢慢轉，十幾張後就沒那麼像了（實測一批，接對的最高 3.2）
+const TRACK_CHAIN_MAX_D: f32 = 3.5;
+
+/// 兩個方向接到的位置相差不到畫面寬的這個比例，才算一致、算有把握
+const TRACK_CHAIN_AGREE: f32 = 0.02;
+
+/// 兩個方向一致時給的把握程度（與補框有把握時一樣）
+const TRACK_CHAIN_SURE: f32 = 0.9;
 
 /// 在預覽上檢查／重畫「要跟的主體」。
 /// 回傳（拖出來的框（沒拖到就是 None）, 是否收工）。
