@@ -7361,7 +7361,7 @@ impl MovieTool {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        video_file_stem(&name, "去煙", w, h)
+        video_file_stem(&name, None, "去煙", w, h)
     }
 
     /// 預覽需不需要重算（參數或時間點與畫面上那張不同）
@@ -10618,7 +10618,7 @@ impl App {
 
     fn start_convert(&mut self, ctx: &egui::Context) {
         let ext = self.format.ext();
-        // 預設檔名「連拍影片_<照片資料夾名>_<解析度>」（見 video_file_stem）。
+        // 預設檔名「<照片資料夾名>-<日期時間>_<解析度>」（見 video_file_stem）。
         // 解析度要用**實際會輸出的**那一組：選「原始像素」時得先解析成
         // 具體尺寸，否則檔名上會寫成 0x0
         let res = self.resolved_resolution();
@@ -10629,7 +10629,10 @@ impl App {
             .first()
             .and_then(|p| folder_name(p))
             .unwrap_or_default();
-        let default_name = format!("{}.{ext}", video_file_stem(&folder, "", res.w, res.h));
+        let default_name = format!(
+            "{}.{ext}",
+            video_file_stem(&folder, date_stamp().as_deref(), "", res.w, res.h)
+        );
         // 先指到這批照片自己的資料夾，沒有才用上次存到哪（見 output_start_dir）
         let start = output_start_dir(LastDir::VideoOutput, self.photos.first().map(|p| p.as_path()));
         let dialog = match start {
@@ -34118,13 +34121,18 @@ fn size_tag(w: u32, h: u32) -> String {
 ///   是哪一支處理出來的，標記則分得出這是處理過的還是原始檔。
 ///
 /// `source` 是空的（照片放在磁碟根目錄下，沒有資料夾名可用）時退回「影片」，
-/// 免得檔名變成只有一個解析度
-fn video_file_stem(source: &str, mark: &str, w: u32, h: u32) -> String {
+/// 免得檔名變成只有一個解析度。
+///
+/// `stamp` 是接在來源名稱後面的日期時間，寫法與「專案儲存」的檔名一樣
+/// （`連拍4-20261010-0941_1080p`）：同一批照片轉好幾次才不會互相蓋掉，
+/// 也看得出是哪一次轉的。照片轉影片給現在的時間；None＝不加
+fn video_file_stem(source: &str, stamp: Option<&str>, mark: &str, w: u32, h: u32) -> String {
     let tag = size_tag(w, h);
     let head = match source.trim() {
         "" => "影片",
         s => s,
     };
+    let head = project::with_stamp(head, stamp);
     match mark.trim() {
         "" => format!("{head}_{tag}"),
         m => format!("{head}_{m}_{tag}"),
@@ -36926,16 +36934,16 @@ mod tests {
         assert_eq!(folder, "20260718連拍1");
         // 照片轉影片：資料夾名 ＋ 常用尺寸的短標籤，沒有額外的標記
         assert_eq!(
-            video_file_stem(&folder, "", 3840, 2160),
+            video_file_stem(&folder, None, "", 3840, 2160),
             "20260718連拍1_4k"
         );
         assert_eq!(
-            video_file_stem(&folder, "", 1920, 1080),
+            video_file_stem(&folder, None, "", 1920, 1080),
             "20260718連拍1_1080p"
         );
         // 「原始像素」那種不是常用尺寸的，寫實際的寬x高
         assert_eq!(
-            video_file_stem(&folder, "", 8640, 5760),
+            video_file_stem(&folder, None, "", 8640, 5760),
             "20260718連拍1_8640x5760"
         );
         // 影片去煙：換成**來源影片的檔名**（不是資料夾），並標「去煙」
@@ -36946,7 +36954,7 @@ mod tests {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         assert_eq!(
-            video_file_stem(&name, "去煙", 1920, 1080),
+            video_file_stem(&name, None, "去煙", 1920, 1080),
             "20260802將軍吼_4k_1分33_去煙_1080p"
         );
         // 短邊認尺寸：直拍的影片也要認得出是 1080p
@@ -36954,8 +36962,17 @@ mod tests {
         assert_eq!(size_tag(2160, 3840), "4k");
         assert_eq!(size_tag(854, 480), "480p");
         // 來源名稱取不到時退回「影片」，檔名不會變成只有一個解析度
-        assert_eq!(video_file_stem("", "", 1280, 720), "影片_720p");
-        assert_eq!(video_file_stem("  ", "去煙", 1280, 720), "影片_去煙_720p");
+        assert_eq!(video_file_stem("", None, "", 1280, 720), "影片_720p");
+        assert_eq!(video_file_stem("  ", None, "去煙", 1280, 720), "影片_去煙_720p");
+        // 照片轉影片在資料夾名後面接上日期時間（與專案儲存的檔名同一個寫法）
+        assert_eq!(
+            video_file_stem("連拍4", Some("20261010-0941"), "", 1920, 1080),
+            "連拍4-20261010-0941_1080p"
+        );
+        assert_eq!(
+            video_file_stem("", Some("20261010-0941"), "", 1280, 720),
+            "影片-20261010-0941_720p"
+        );
         // 根目錄下的照片沒有資料夾名可用（就是上面那條退路）
         assert_eq!(folder_name(Path::new(r"F:\a.jpg")), None);
     }
@@ -37053,7 +37070,7 @@ mod tests {
                 res.label()
             );
             assert_eq!(
-                video_file_stem(&folder, "", res.w, res.h),
+                video_file_stem(&folder, None, "", res.w, res.h),
                 want,
                 "{} 算出來的檔名不對",
                 res.label()
