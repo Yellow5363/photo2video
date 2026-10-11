@@ -188,8 +188,7 @@ impl Module {
         })
     }
 
-    /// 專案檔名開頭的起始值。使用者存過一次之後改用他自己取的名字
-    /// （見 [`project::saved_name`]）
+    /// 專案檔名開頭的名字（後面接日期時間，見 [`project::file_stem`]）
     fn project_prefix(self) -> &'static str {
         match self {
             Module::Video => "轉影片",
@@ -10486,16 +10485,17 @@ impl App {
     /// 「專案儲存」：把這一次編輯的每一項設定寫成一個 .p2v，下次開回來接著做。
     ///
     /// 預設存在那批照片（或影片）資料夾底下的「專案」裡，檔名是
-    /// 「名字－日期－時間」（如 去煙霧-20260914-1300）。使用者在對話框裡把
-    /// 名字改成自己的就記著，下次預帶他那一個，時間的部分照樣換成新的
+    /// 「模組名－日期－時間」（如 去煙霧-20260914-1300）
     fn save_module_project(&mut self, m: Module) {
-        let (Some(kind), Some(which)) = (m.project_kind(), LastDir::project_of(m)) else {
+        let (Some(_), Some(which)) = (m.project_kind(), LastDir::project_of(m)) else {
             return;
         };
-        // 預設檔名**每次都帶現在的時間**，即使已經開著某個 .p2v 也一樣：
-        // 規則就是「名字＋當天日期＋時間」，預帶舊檔名等於預設要蓋掉上一份
-        // （想蓋掉的人用 Ctrl+S，那條路本來就直接覆寫、不開對話框）
-        let stem = project::file_stem(&project::saved_name(kind, m.project_prefix()));
+        // 預設檔名**每次都是「模組名＋現在的日期時間」**，即使已經開著某個 .p2v、
+        // 或上次在對話框裡改過名字也一樣：預帶舊檔名等於預設要蓋掉上一份
+        // （想蓋掉的人用 Ctrl+S，那條路本來就直接覆寫、不開對話框）；
+        // 記著上次取的名字則會讓換了一批照片之後，預設檔名還是上一批的
+        // （實際回報過：疊圖預帶了上一批地景的檔名）
+        let stem = project::file_stem(m.project_prefix());
         let default_name = format!("{stem}.{PROJECT_EXT}");
         // 有照片就存到它旁邊的「專案／<模組>」資料夾（沒有就建一個）；
         // 還沒選照片就退回目前這個專案檔自己的資料夾，再不行才用上次的位置
@@ -10539,10 +10539,6 @@ impl App {
             }
         }
         remember_dir(which, &path);
-        // 記下使用者這次取的名字（把程式加的日期時間拆掉），下次預帶它
-        if let Some(s) = path.file_stem().and_then(|s| s.to_str()) {
-            project::remember_name(kind, project::strip_stamp(s));
-        }
         // 內容要等路徑定了才能產生：存放位置也寫進檔案裡（見 project_json）
         let json = match self.project_json(m, &path) {
             Ok(j) => j,
@@ -20701,59 +20697,27 @@ impl App {
     }
 
     /// 回到「選擇照片」的起始狀態
+    ///
+    /// 「清除」是回到起始狀態，**這一批調過的每一樣都要跟著不見**：
+    /// 簡易／專業、混合方式、遮色片與它的羽化與濃度、每一層的擺法與調色、
+    /// 成品的調色與裁切、兩個開關——整份換回 [`StackTool::default`]。
+    ///
+    /// 逐張的設定是以「檔案路徑」為鍵存的，留著的話——下一批只要有同名檔案
+    /// （同一場煙火再選一次是常事）——上一批畫的遮色片、搬過的位置就會
+    /// 悄悄套回去；整批的那幾項（例如停在專業模式）留著，重新選同一批照片
+    /// 也會莫名其妙地接著上一趟（實際回報過的狀況）。
+    /// 想留著設定就別按「清除」，直接用「選擇照片」重選：那條路才會
+    /// 保留仍在清單裡那幾張的設定（見 [`App::stack_set_photos`]）
     fn stack_clear_photos(&mut self) {
+        // 背景還在跑的載入與對齊叫它們收工（執行緒手上拿的是同一支旗標）
         self.stack.load_cancel.store(true, Ordering::Relaxed);
-        self.stack.load_rx = None;
-        self.stack.load_left = 0;
         self.stack.align_cancel.store(true, Ordering::Relaxed);
-        self.stack.align_rx = None;
-        self.stack.align_left = 0;
-        self.stack.auto_offsets.clear();
-        self.stack.photos.clear();
-        self.stack.ground = 0;
-        self.stack.cur = 0;
-        // 「清除」是回到起始狀態，**這一批調過的每一樣都要跟著不見**：
-        // 遮色片、每一層的擺法與調色、成品的調色與裁切。
-        //
-        // 這些是逐張以「檔案路徑」為鍵存的，留著的話——下一批只要有同名檔案
-        // （同一場煙火再選一次是常事）——上一批畫的遮色片、搬過的位置就會
-        // 悄悄套回去，畫面上只看得到縮圖角落一個小記號，根本不知道哪來的。
-        // 想留著設定就別按「清除」，直接用「選擇照片」重選：那條路才會
-        // 保留仍在清單裡那幾張的設定（見 [`App::stack_set_photos`]）
-        self.stack.masks.clear();
-        self.stack.mask_polarity.clear();
-        self.stack.xforms.clear();
-        self.stack.grades.clear();
-        self.stack.grade = Adjustments::default();
-        self.stack.grade_target = GradeTarget::Output;
-        self.stack.crop_editing = false;
-        // 底圖與縮圖都是純快取，留著只是白佔記憶體
-        self.stack.bases.clear();
-        self.stack.drop_fine();
-        self.stack.layer_previews.clear();
-        self.stack.base_scale = 0.0;
-        self.stack.src_dims.clear();
-        self.stack.thumbs.clear();
-        self.stack.vis_range = None;
-        self.stack.stacked = None;
-        self.stack.applied = None;
-        self.stack.graded = None;
-        self.stack.tex_out = None;
-        self.stack.tex_raw = None;
-        self.stack.tex_raw_of = None;
-        self.stack.draft = None;
-        self.stack.moving = None;
-        self.stack.rx = None;
-        self.stack.busy = StackBusy::Idle;
-        self.stack.error = None;
-        self.stack.saved = None;
-        self.stack.saved_path = None;
-        self.stack.view_layer = false;
-        self.stack.tool = None;
-        self.stack.zoom = None;
-        self.stack.zoom_back = None;
-        self.stack.pan = egui::pos2(0.5, 0.5);
-        self.stack.dirty = false;
+        let old = std::mem::take(&mut self.stack);
+        // 只留版面量測與使用者拖過的預覽高度：那是視窗怎麼擺，不是這一批的編輯
+        self.stack.settings_h = old.settings_h;
+        self.stack.save_h = old.save_h;
+        self.stack.zoom_h = old.zoom_h;
+        self.stack.img_extra = old.img_extra;
     }
 
     /// 在背景把每張照片解成預覽底圖。疊圖要同時看到全部的層，所以不像
@@ -37021,18 +36985,9 @@ mod tests {
         assert_eq!(project::parse(&bom).unwrap().module(), Module::Stack);
     }
 
-    /// 檔名是「名字-日期-時間」。下次存檔要換上新的時間，所以得拆得回
-    /// 使用者自己取的那一段
+    /// 檔名是「模組名-日期-時間」
     #[test]
-    fn 專案檔名帶日期時間且拆得回使用者取的名字() {
-        assert_eq!(project::strip_stamp("去煙霧-20260914-1300"), "去煙霧");
-        assert_eq!(
-            project::strip_stamp("漁人碼頭 煙火-20260914-1300"),
-            "漁人碼頭 煙火"
-        );
-        // 整個改掉的（尾巴沒有那一段）原樣留著，不要砍掉人家的名字
-        assert_eq!(project::strip_stamp("我的專案"), "我的專案");
-        assert_eq!(project::strip_stamp("2026-09-14 的煙火"), "2026-09-14 的煙火");
+    fn 專案檔名帶日期時間() {
         // 少了名字或少了時間都不該拼出多餘的「-」
         assert!(!project::file_stem("疊圖").ends_with('-'));
         assert!(!project::file_stem("").starts_with('-'));
@@ -37047,10 +37002,8 @@ mod tests {
                 "{stamp}"
             );
             let stem = project::file_stem("優化");
-            // 剛好跨過一分鐘時兩次取到的時間會差一格，拆得回名字才是重點
             assert!(stem.starts_with("優化-"), "{stem}");
             assert_eq!(stem.len(), "優化-".len() + 13, "{stem}");
-            assert_eq!(project::strip_stamp(&stem), "優化");
         }
         // 換算本身對不對：2026-09-14 13:00:00 UTC 在任何時區都還是 2026 年 9 月
         #[cfg(any(windows, unix))]
