@@ -2367,6 +2367,18 @@ impl LastDir {
             Module::Home | Module::Files => return None,
         })
     }
+
+    /// 這個模組上次從哪個資料夾選照片（影片去煙是選影片）
+    fn source_of(m: Module) -> Option<LastDir> {
+        Some(match m {
+            Module::Video => LastDir::VideoPhotos,
+            Module::Dehaze => LastDir::DehazePhotos,
+            Module::Stack => LastDir::StackPhotos,
+            Module::Movie => LastDir::MovieSource,
+            Module::Enhance => LastDir::EnhancePhotos,
+            Module::Home | Module::Files => return None,
+        })
+    }
 }
 
 /// 讀出這個用途上次用的資料夾。資料夾已被刪除、改名或在拔掉的隨身碟上時
@@ -10606,10 +10618,25 @@ impl App {
     /// 開始找——檔案裡記著它自己是哪個模組的，開起來會切過去
     fn open_module_project(&mut self, m: Module, ctx: &egui::Context) {
         let which = LastDir::project_of(m).unwrap_or(LastDir::VideoProject);
+        let sub = m.project_prefix();
         // 手上有照片就先看它旁邊的「專案／<模組>」資料夾（多半就存在那裡），
-        // 那裡沒有才用上次開／存專案的位置
-        let start = project::project_dir(self.project_src(m), m.project_prefix(), false)
-            .or_else(|| load_last_dir(which));
+        // 那裡沒有才用上次開／存專案的位置。
+        //
+        // 那個位置也不在了（例如在拔掉的隨身碟上）時**一定要自己挑一個**：
+        // 什麼都不給的話 Windows 會開在這支程式上一次用過的資料夾，常常是
+        // 剛才別的模組存專案的那一格（實際回報過：去煙霧開到疊圖那一格）。
+        // 依序改用最近那份專案隔壁屬於這個模組的那一格、再來是這個模組
+        // 上次選照片的資料夾
+        let start = project::project_dir(self.project_src(m), sub, false)
+            .or_else(|| load_last_dir(which))
+            .or_else(|| {
+                let recent = self.recent_projects.first()?.parent()?;
+                project::sibling_dir(recent, sub)
+            })
+            .or_else(|| {
+                let photos = load_last_dir(LastDir::source_of(m)?)?;
+                project::project_dir_in(&photos, sub, false).or(Some(photos))
+            });
         let mut dialog = file_dialog();
         if let Some(dir) = start {
             dialog = dialog.set_directory(dir);
@@ -37266,6 +37293,18 @@ mod tests {
         );
         // 沒有照片就沒有「旁邊」可言
         assert_eq!(project::project_dir(None, "疊圖", true), None);
+
+        // 開檔時從別的模組最近那一格換到自己那一格（剛在疊圖存過、切到
+        // 去煙霧按「開啟專案」，不能開在疊圖那一格）
+        assert_eq!(project::sibling_dir(&stack, "去煙霧"), Some(dehaze.clone()));
+        // 「專案」那一層本身也算
+        assert_eq!(project::sibling_dir(&root, "去煙霧"), Some(dehaze.clone()));
+        // 自己那一格還沒有就停在「專案」那一層，不要停在別人那一格
+        assert_eq!(project::sibling_dir(&stack, "轉影片"), Some(root.clone()));
+        // 不在任何「專案」底下的資料夾推不出來
+        assert_eq!(project::sibling_dir(&base, "去煙霧"), None);
+        // 只知道照片所在的資料夾時（上次選照片的位置）也找得到
+        assert_eq!(project::project_dir_in(&base, "疊圖", false), Some(stack.clone()));
         let _ = std::fs::remove_dir_all(&base);
     }
 

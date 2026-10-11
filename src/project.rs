@@ -541,6 +541,12 @@ pub fn parse(txt: &str) -> Result<AnyProject, String> {
 /// 改用上次的位置
 pub fn project_dir(src: Option<&Path>, sub: &str, create: bool) -> Option<PathBuf> {
     let parent = src?.parent().filter(|p| !p.as_os_str().is_empty())?;
+    project_dir_in(parent, sub, create)
+}
+
+/// 與 [`project_dir`] 相同，只是給的是照片所在的**資料夾**而不是其中一個檔案
+/// （例如「上次從哪裡選照片」記下來的那個資料夾）
+pub fn project_dir_in(parent: &Path, sub: &str, create: bool) -> Option<PathBuf> {
     let root = parent.join(PROJECT_DIR);
     let dir = if sub.is_empty() {
         root.clone()
@@ -556,6 +562,26 @@ pub fn project_dir(src: Option<&Path>, sub: &str, create: bool) -> Option<PathBu
     match std::fs::create_dir_all(&dir) {
         Ok(()) => Some(dir),
         Err(_) => Some(parent.to_path_buf()),
+    }
+}
+
+/// 從**別的模組**的專案資料夾換到這個模組的：「…\專案\疊圖」→「…\專案\去煙霧」。
+///
+/// 同一批照片常常是幾個模組輪流做，剛在疊圖存過專案、切到去煙霧按「開啟專案」，
+/// 要找的多半就在隔壁那一格。這一格還沒有就停在「專案」那一層（看得到底下
+/// 分了哪幾格，也看得到還沒分層之前存的舊檔）；`dir` 根本不在某個「專案」
+/// 底下就回 None
+pub fn sibling_dir(dir: &Path, sub: &str) -> Option<PathBuf> {
+    let root = if dir.file_name()? == PROJECT_DIR {
+        dir
+    } else {
+        dir.parent().filter(|p| p.file_name().is_some_and(|n| n == PROJECT_DIR))?
+    };
+    let mine = root.join(sub);
+    if mine.is_dir() {
+        Some(mine)
+    } else {
+        root.is_dir().then(|| root.to_path_buf())
     }
 }
 
