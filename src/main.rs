@@ -8525,8 +8525,14 @@ enum BackupMsg {
     Planned(usize, Result<backup::Plan, String>),
     /// 每一組都比對完了（中途被中止也會送這一則）
     PlannedAll,
-    /// 搬檔進度：全部組加起來已處理幾件、現在做到第幾組
-    Progress { done: usize, group: usize },
+    /// 搬檔進度：全部組加起來已處理幾件、現在做到第幾組、已經拷了幾個位元組
+    /// （做到一半的那個檔案也算進去）、正在拷哪一個檔案
+    Progress {
+        done: usize,
+        group: usize,
+        bytes: u64,
+        name: String,
+    },
     /// 整批做完：成功幾件、失敗的訊息、丟進資源回收筒的檔案
     /// （看得見的／一起收掉的雜檔分開放，見 [`BackupTool::last_deleted`]）
     Done {
@@ -8585,9 +8591,45 @@ const BACKUP_RESULT_MIN: f32 = 320.0;
 /// 「來源資料夾 ［📂 選擇］ G:\20250124日本四國遊_精選_last」那一列的長度
 const BACKUP_LEFT_MIN: f32 = 470.0;
 
-/// 每做幾件回報一次進度。一件一報的話，一批幾萬個小檔會讓 UI 執行緒
-/// 光是收訊息就忙不完（畫面也不需要一件一件跳）
-const BACKUP_PROGRESS_EVERY: usize = 16;
+/// 進度最多隔多久回報一次。一件一報的話，一批幾萬個小檔會讓 UI 執行緒
+/// 光是收訊息就忙不完；只數件數（以前是每 16 件報一次）又會讓一批十幾支
+/// 影片從頭到尾停在 0——照時間報，兩種都顧得到
+const BACKUP_PROGRESS_GAP: Duration = Duration::from_millis(150);
+
+/// 估剩餘時間看最近多久的速度。太短會跟著每個小檔跳來跳去，太長又跟不上
+/// 換到慢的那顆碟（檔案總管的估法也是看近況，不是從頭平均）
+const BACKUP_SPEED_WINDOW: Duration = Duration::from_secs(10);
+
+/// 這一件要拷多少位元組（剩餘時間照這個算）。刪多餘檔案是 0：丟回收筒
+/// 一下就好，算進去的話剩餘時間會被一堆不佔時間的大檔撐大
+fn backup_copy_bytes(act: &backup::Action) -> u64 {
+    match act.kind {
+        backup::Kind::Copy | backup::Kind::Update | backup::Kind::Overwrite => act.bytes,
+        backup::Kind::Extra => 0,
+    }
+}
+
+/// 剩餘時間的人話，寫法照檔案總管：「20 秒」「3 分 10 秒」「12 分鐘」
+/// 「1 小時 5 分」。十分鐘以上就不報秒數——那麼久的估計跳來跳去，
+/// 秒數只是雜訊
+fn fmt_eta(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    match s {
+        0..=59 => format!("{} 秒", s.max(1)),
+        60..=599 => match s % 60 {
+            0 => format!("{} 分鐘", s / 60),
+            r => format!("{} 分 {r} 秒", s / 60),
+        },
+        600..=3599 => format!("{} 分鐘", (s + 30) / 60),
+        _ => {
+            let m = (s + 30) / 60;
+            match m % 60 {
+                0 => format!("{} 小時", m / 60),
+                r => format!("{} 小時 {r} 分", m / 60),
+            }
+        }
+    }
+}
 
 /// 資料備份的一組資料夾：來源 → 目的。畫面上可以列好幾組，比對與備份
 /// 會照順序把每一組都跑過（「含子資料夾」那些開關與進度是全部共用的，
@@ -8673,6 +8715,18 @@ struct BackupTool {
     /// 搬檔進度（全部組加起來已處理幾件）與這一批總共幾件
     done: usize,
     total: usize,
+    /// 已經拷了幾個位元組（做到一半的檔案也算）與這一批要拷的總量。
+    /// 刪除多餘檔案不算位元組（丟回收筒一下就好，不佔時間）
+    bytes_done: u64,
+    bytes_total: u64,
+    /// 正在拷的檔案名（只有檔名，與檔案總管的「名稱：」一樣）
+    current: String,
+    /// 最近一段時間的（時間, 已拷位元組），估速度與剩餘時間用
+    /// （見 [`BackupTool::speed`]）
+    samples: VecDeque<(Instant, u64)>,
+    /// 進度框上一次捲進畫面時的（在做什麼, 框的高度）。兩者一變就再捲一次，
+    /// 沒變就不動，使用者才能自己往上捲（見 [`App::ui_backup_body`]）
+    scrolled_for: Option<(BackupBusy, i32)>,
     /// 正在比對／搬第幾組（畫面上那行字用）
     at: usize,
     /// 比對結果那一欄佔視窗寬的幾成。使用者拖過就記他拖的比例，
@@ -8711,6 +8765,38 @@ impl BackupTool {
             result_frac: 0.5,
             ..Default::default()
         }
+    }
+
+    /// 記一筆進度，丟掉比 [`BACKUP_SPEED_WINDOW`] 還舊的（最舊那筆留著，
+    /// 才量得到整段窗口）
+    fn push_sample(&mut self, at: Instant, bytes: u64) {
+        self.samples.push_back((at, bytes));
+        while self.samples.len() > 2
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|&(t, _)| at.duration_since(t) >= BACKUP_SPEED_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// 最近這段時間每秒拷幾個位元組。量到的時間還不到一秒就不算
+    /// （剛開始那一下的數字沒有意義），回 None 讓畫面寫「估算中」
+    fn speed(&self) -> Option<f64> {
+        let (&(t0, b0), &(t1, b1)) = (self.samples.front()?, self.samples.back()?);
+        let secs = t1.duration_since(t0).as_secs_f64();
+        (secs >= 1.0).then(|| b1.saturating_sub(b0) as f64 / secs)
+    }
+
+    /// 還要多久：剩下的位元組 ÷ 最近的速度
+    fn eta_secs(&self) -> Option<f64> {
+        let left = self.bytes_total.saturating_sub(self.bytes_done);
+        if left == 0 {
+            return Some(0.0);
+        }
+        let v = self.speed().filter(|v| *v > 0.0)?;
+        Some(left as f64 / v)
     }
 
     /// 畫面上永遠要看得到一組：全部刪光就補一組空的回來。
@@ -9075,9 +9161,11 @@ impl App {
             music_fade: true,
             // 起始畫面只展開「調色」，其餘三區收合：側欄一眼看得完，
             // 要用哪一區點它的標題就展開（收合狀態不進專案檔，每次啟動都一樣）
-            sec_adjust_open: true,
+            // 預設展開主體追蹤、收起調色（使用者定的：連拍轉影片最常先做的是
+            // 框主體）。收起追蹤時調色會打開（見 adjust_open_before_track）
+            sec_adjust_open: false,
             sec_sub_open: false,
-            sec_track_open: false,
+            sec_track_open: true,
             sec_fx_open: false,
             adjust_open_before_track: true,
             track: TrackTool::new(),
@@ -12189,6 +12277,14 @@ impl App {
                         if primary_button(ui, "▶  開始轉換", can_convert).clicked() {
                             self.start_convert(ctx);
                         }
+                        ui.add_space(8.0);
+                        if ui
+                            .add_enabled(can_convert, egui::Button::new("💾  儲存專案"))
+                            .on_hover_text("選擇位置儲存（另存新檔）；Ctrl+S 可直接覆寫目前專案")
+                            .clicked()
+                        {
+                            self.save_project_dialog();
+                        }
                     });
                 });
 
@@ -13361,8 +13457,9 @@ impl App {
     fn ui_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let working = self.is_working();
 
-        // 工具列：只留跟「這批照片」有關的常用動作。
-        // 專案的開新／開啟／儲存都收進上面的「檔案」功能表，不再重複一份
+        // 工具列：跟「這批照片」有關的常用動作，加上開啟專案——它也是一種
+        // 「把東西叫進來」（與另外三個模組同一個位置）。儲存專案在底下的
+        // 「開始轉換」旁邊：存的是調好的這一支，跟輸出擺在一起
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!working, |ui| {
                 if ui.button("📁  加入資料夾").clicked() {
@@ -13375,12 +13472,8 @@ impl App {
                     self.clear_photos();
                 }
                 ui.separator();
-                if ui
-                    .button("💾  儲存專案")
-                    .on_hover_text("選擇位置儲存（另存新檔）；Ctrl+S 可直接覆寫目前專案")
-                    .clicked()
-                {
-                    self.save_project_dialog();
+                if project_open_button(ui, true) {
+                    self.open_module_project(Module::Video, ctx);
                 }
             });
             // 與煙火影片去煙霧同一套：來源名稱放大一點，完整路徑用滑鼠停著看。
@@ -28860,79 +28953,80 @@ impl App {
         // 好幾組時每一組標「第 n 組」、多一顆移除鈕；只有一組就跟以前一樣
         let multi = self.backup.pairs.len() > 1;
 
+        // 每一組自己一個框：好幾組排在一起時才分得出哪個來源配哪個目的
         for i in 0..self.backup.pairs.len() {
-            if multi {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("第 {} 組", i + 1))
-                            .size(12.5)
-                            .strong()
+            backup_card(ui, |ui| {
+                if multi {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("第 {} 組", i + 1))
+                                .size(12.5)
+                                .strong()
+                                .color(theme::TEXT_WEAK),
+                        );
+                        if ui
+                            .add_enabled(idle, egui::Button::new("✖").small())
+                            .tip("移除這一組")
+                            .clicked()
+                        {
+                            clicks.remove = Some(i);
+                        }
+                    });
+                }
+                let pair = &self.backup.pairs[i];
+                if backup_dir_row(
+                    ui,
+                    "來源",
+                    pair.src.as_deref(),
+                    idle,
+                    "要備份出去的資料夾。\n\
+                     對話框裡可以按住 Ctrl 或 Shift 一次選好幾個，一個資料夾各成一組",
+                ) {
+                    clicks.pick = Some((i, true));
+                }
+                ui.add_space(4.0);
+                if backup_dir_row(
+                    ui,
+                    "目的",
+                    pair.dst.as_deref(),
+                    idle,
+                    "備份要放進去的資料夾。\n\
+                     挑上一層就好（例如 O:\\），底下會自動套一層與來源同名的資料夾",
+                ) {
+                    clicks.pick = Some((i, false));
+                }
+                // 挑的目的資料夾底下還會再套一層與來源同名的資料夾時，把真正
+                // 寫入的位置寫出來——光看上面兩列看不出多了一層。挑的那個自己
+                // 就是目標時（[`backup::target`]）不多這一行，說了也是廢話
+                let target = pair.target();
+                if let Some(t) = target.filter(|t| Some(t.as_path()) != pair.dst.as_deref()) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "→ 實際寫入 {}{}",
+                                t.to_string_lossy(),
+                                if t.is_dir() {
+                                    ""
+                                } else {
+                                    "（還不存在，備份時自動建立）"
+                                }
+                            ))
+                            .size(12.0)
                             .color(theme::TEXT_WEAK),
-                    );
-                    if ui
-                        .add_enabled(idle, egui::Button::new("✖").small())
-                        .tip("移除這一組")
-                        .clicked()
-                    {
-                        clicks.remove = Some(i);
-                    }
-                });
-            }
-            let pair = &self.backup.pairs[i];
-            if backup_dir_row(
-                ui,
-                "來源",
-                pair.src.as_deref(),
-                idle,
-                "要備份出去的資料夾。\n\
-                 對話框裡可以按住 Ctrl 或 Shift 一次選好幾個，一個資料夾各成一組",
-            ) {
-                clicks.pick = Some((i, true));
-            }
-            ui.add_space(4.0);
-            if backup_dir_row(
-                ui,
-                "目的",
-                pair.dst.as_deref(),
-                idle,
-                "備份要放進去的資料夾。\n\
-                 挑上一層就好（例如 O:\\），底下會自動套一層與來源同名的資料夾",
-            ) {
-                clicks.pick = Some((i, false));
-            }
-            // 挑的目的資料夾底下還會再套一層與來源同名的資料夾時，把真正
-            // 寫入的位置寫出來——光看上面兩列看不出多了一層。挑的那個自己
-            // 就是目標時（[`backup::target`]）不多這一行，說了也是廢話
-            let target = pair.target();
-            if let Some(t) = target.filter(|t| Some(t.as_path()) != pair.dst.as_deref()) {
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
+                        );
+                    });
+                }
+                // 這一組自己的問題：只有它被跳過，別組照做
+                if let Some(e) = &pair.error {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "→ 實際寫入 {}{}",
-                            t.to_string_lossy(),
-                            if t.is_dir() {
-                                ""
-                            } else {
-                                "（還不存在，備份時自動建立）"
-                            }
-                        ))
-                        .size(12.0)
-                        .color(theme::TEXT_WEAK),
+                        egui::RichText::new(format!("✖ {e}（這一組跳過）"))
+                            .size(12.0)
+                            .color(theme::ERROR),
                     );
-                });
-            }
-            // 這一組自己的問題：只有它被跳過，別組照做
-            if let Some(e) = &pair.error {
-                ui.label(
-                    egui::RichText::new(format!("✖ {e}（這一組跳過）"))
-                        .size(12.0)
-                        .color(theme::ERROR),
-                );
-            }
-            if multi {
-                ui.add_space(8.0);
-            }
+                }
+            });
+            ui.add_space(8.0);
         }
         if ui
             .add_enabled(idle, egui::Button::new("＋  加入一組"))
@@ -29117,7 +29211,13 @@ impl App {
         } else {
             String::new()
         };
-        match busy {
+        // 進度自己一個框，與上面的設定分開（閒著時整個不畫）
+        if idle {
+            self.backup.scrolled_for = None;
+            return;
+        }
+        ui.add_space(4.0);
+        let card = ui.scope(|ui| backup_card(ui, |ui| match busy {
             BackupBusy::Scanning => {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -29129,25 +29229,55 @@ impl App {
                 });
             }
             BackupBusy::Running => {
-                let (done, total) = (self.backup.done, self.backup.total);
-                let frac = if total > 0 {
+                let b = &self.backup;
+                let (done, total) = (b.done, b.total);
+                // 進度條照位元組走（與檔案總管一樣）：十幾支影片的話，照件數
+                // 會在 0 停到第一支拷完；只有刪檔、沒東西要拷時才照件數
+                let frac = if b.bytes_total > 0 {
+                    b.bytes_done as f32 / b.bytes_total as f32
+                } else if total > 0 {
                     done as f32 / total as f32
                 } else {
                     0.0
                 };
                 ui.add(
-                    egui::ProgressBar::new(frac)
+                    egui::ProgressBar::new(frac.min(1.0))
                         .desired_height(10.0)
                         .fill(theme::ACCENT),
                 );
                 ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{at}已處理 {done} / {total} 項目（{:.0}%）",
-                        frac * 100.0
-                    ))
-                    .size(12.0)
-                    .color(theme::TEXT),
+                let mut head = format!("{at}已處理 {done} / {total} 項目（{:.0}%）", frac * 100.0);
+                if let Some(v) = b.speed().filter(|_| b.bytes_total > 0) {
+                    head.push_str(&format!(" · 速度 {}/秒", backup::fmt_size(v as u64)));
+                }
+                ui.label(egui::RichText::new(head).size(12.0).color(theme::TEXT));
+                // 底下三行照檔案總管複製視窗的「詳細資料」
+                let line = |ui: &mut egui::Ui, k: &str, v: String| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(k).size(12.0).color(theme::TEXT_WEAK));
+                        ui.label(egui::RichText::new(v).size(12.0).color(theme::TEXT));
+                    });
+                };
+                if !b.current.is_empty() {
+                    line(ui, "名稱：", b.current.clone());
+                }
+                if b.bytes_total > 0 {
+                    let eta = match b.eta_secs() {
+                        Some(s) => format!("大約 {}", fmt_eta(s)),
+                        None => "估算中…".into(),
+                    };
+                    line(ui, "剩餘時間：", eta);
+                }
+                let left = total.saturating_sub(done);
+                let left_bytes = b.bytes_total.saturating_sub(b.bytes_done);
+                line(
+                    ui,
+                    "剩餘的項目：",
+                    if b.bytes_total > 0 {
+                        format!("{left}（{}）", backup::fmt_size(left_bytes))
+                    } else {
+                        left.to_string()
+                    },
                 );
             }
             BackupBusy::Restoring => {
@@ -29161,8 +29291,16 @@ impl App {
                 });
             }
             BackupBusy::Idle => {}
+        }))
+        .response;
+        // 組數一多，進度框就排到視窗外面去了：一出現（或換成比較高的樣子，
+        // 例如比對完開始搬檔）就捲到看得見它。只在那一下捲——每一幀都捲
+        // 的話，備份途中想往上看設定也會被拉回來
+        let key = (busy, card.rect.height().round() as i32);
+        if self.backup.scrolled_for != Some(key) {
+            card.scroll_to_me(Some(egui::Align::Max));
+            self.backup.scrolled_for = Some(key);
         }
-
     }
 
     /// 比對結果那一區（畫在右邊的獨立面板，見 [`App::ui_files_module`]）。
@@ -29185,12 +29323,16 @@ impl App {
         // 實際回報過看不出到底在比對還是在備份。進度（第幾組、幾 % ）在
         // 左邊那欄，這裡不重複講
         if let Some(busy) = self.backup.busy_text() {
-            ui.label(
-                egui::RichText::new(busy)
-                    .size(13.0)
-                    .strong()
-                    .color(theme::TEXT),
-            );
+            // 旁邊一個轉圈圈：一個大檔要拷好幾分鐘時，只有字的話看不出程式還在動
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(busy)
+                        .size(13.0)
+                        .strong()
+                        .color(theme::TEXT),
+                );
+                ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT));
+            });
             return;
         }
         ui.label(
@@ -29636,6 +29778,15 @@ impl App {
         self.backup.result = None;
         self.backup.done = 0;
         self.backup.total = jobs.iter().map(|j| j.actions.len()).sum();
+        self.backup.bytes_done = 0;
+        self.backup.bytes_total = jobs
+            .iter()
+            .flat_map(|j| j.actions.iter())
+            .map(backup_copy_bytes)
+            .sum();
+        self.backup.current.clear();
+        self.backup.samples.clear();
+        self.backup.push_sample(Instant::now(), 0);
         self.backup.at = jobs[0].group;
         // 「還原」只認最近一次：舊的那批還在回收筒，要撈得從 Windows 那邊撈
         self.backup.last_deleted.clear();
@@ -29649,14 +29800,51 @@ impl App {
             let mut deleted: Vec<backup::Trashed> = Vec::new();
             // 收資料夾時順手丟掉的 ._ 附屬檔那些：還原要放回去，但不計數
             let mut deleted_junk: Vec<backup::Trashed> = Vec::new();
-            // 全部組加起來做到第幾件（進度條看的是這個）
+            // 全部組加起來做到第幾件、拷完的檔案共幾個位元組
             let mut done = 0usize;
+            let mut bytes = 0u64;
+            // 上一次回報的時間（None＝還沒報過，第一件一開始就報，名稱才馬上有）
+            let mut last_sent: Option<Instant> = None;
+            let due = |last: &mut Option<Instant>| {
+                let now = Instant::now();
+                if last.is_some_and(|t| now.duration_since(t) < BACKUP_PROGRESS_GAP) {
+                    return false;
+                }
+                *last = Some(now);
+                true
+            };
             'all: for job in &jobs {
                 for (k, act) in job.actions.iter().enumerate() {
                     if cancel.load(Ordering::Relaxed) {
                         break 'all;
                     }
-                    match backup::apply(act, &job.src, &job.dst, keep_extra) {
+                    let name = act
+                        .rel
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let size = backup_copy_bytes(act);
+                    // 拷到一半也回報（一支好幾 GB 的影片才看得出在動），
+                    // 封頂在這個檔案的大小：Windows 連附屬資料流一起算，會多一點
+                    let mut on_bytes = |b: u64| {
+                        if due(&mut last_sent) {
+                            let _ = tx.send(BackupMsg::Progress {
+                                done,
+                                group: job.group,
+                                bytes: bytes + b.min(size),
+                                name: name.clone(),
+                            });
+                            ctx.request_repaint();
+                        }
+                    };
+                    on_bytes(0);
+                    match backup::apply_with_progress(
+                        act,
+                        &job.src,
+                        &job.dst,
+                        keep_extra,
+                        &mut on_bytes,
+                    ) {
                         Ok(trashed) => {
                             ok += 1;
                             if let Some(t) = trashed {
@@ -29666,12 +29854,16 @@ impl App {
                         Err(e) => errs.push(e),
                     }
                     done += 1;
+                    // 失敗的也算處理過了：剩下的量要照實減下去，剩餘時間才不會卡住
+                    bytes += size;
                     // 一批動輒好幾萬個小檔，每件都送一次訊息只是在洗畫面；
                     // 隔一段送一次，每一組的最後一件一定送得到
-                    if done % BACKUP_PROGRESS_EVERY == 0 || k + 1 == job.actions.len() {
+                    if due(&mut last_sent) || k + 1 == job.actions.len() {
                         let _ = tx.send(BackupMsg::Progress {
                             done,
                             group: job.group,
+                            bytes,
+                            name,
                         });
                         ctx.request_repaint();
                     }
@@ -29790,9 +29982,17 @@ impl App {
                     self.backup.show_ignored = None;
                 }
                 // 搬檔中：只更新進度，通道要留著繼續收
-                Ok(BackupMsg::Progress { done, group }) => {
+                Ok(BackupMsg::Progress {
+                    done,
+                    group,
+                    bytes,
+                    name,
+                }) => {
                     self.backup.done = done;
                     self.backup.at = group;
+                    self.backup.bytes_done = bytes;
+                    self.backup.current = name;
+                    self.backup.push_sample(Instant::now(), bytes);
                 }
                 Ok(BackupMsg::Done {
                     ok,
@@ -32439,6 +32639,22 @@ fn files_tab(ui: &mut egui::Ui, tab: FilesTab, active: bool) -> bool {
     // 看不出那是「另外跳出來的一句說明」。與模組列同一個顏色（見 [`module_tab`]）
     resp.on_hover_text(egui::RichText::new(tab.hint()).color(theme::LINK))
         .clicked()
+}
+
+/// 資料備份畫面上的一個框（每一組資料夾、進度各一個）：比底色亮一階、
+/// 細邊、圓角，撐滿整欄寬——寬度跟著內容走的話，路徑長短不一的幾組
+/// 框會參差不齊
+fn backup_card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::default()
+        .fill(theme::PANEL)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add(ui)
+        })
+        .inner
 }
 
 /// 資料備份的一列資料夾：標題、選擇鈕、現在選到哪裡。
@@ -37156,6 +37372,36 @@ mod tests {
         );
         // 根目錄下的照片沒有資料夾名可用（就是上面那條退路）
         assert_eq!(folder_name(Path::new(r"F:\a.jpg")), None);
+    }
+
+    /// 資料備份的剩餘時間：寫法照檔案總管，速度看最近十秒
+    #[test]
+    fn 備份剩餘時間照最近的速度估() {
+        assert_eq!(fmt_eta(0.2), "1 秒");
+        assert_eq!(fmt_eta(20.4), "20 秒");
+        assert_eq!(fmt_eta(180.0), "3 分鐘");
+        assert_eq!(fmt_eta(190.0), "3 分 10 秒");
+        assert_eq!(fmt_eta(725.0), "12 分鐘");
+        assert_eq!(fmt_eta(3600.0), "1 小時");
+        assert_eq!(fmt_eta(3900.0), "1 小時 5 分");
+
+        let mut b = BackupTool::new();
+        b.bytes_total = 1000 * MB;
+        let t0 = Instant::now();
+        b.push_sample(t0, 0);
+        // 量不到一秒：還估不出來
+        b.push_sample(t0 + Duration::from_millis(500), 10 * MB);
+        assert_eq!(b.eta_secs(), None);
+        // 前面慢（每秒 10MB），後來快（每秒 50MB）：只看最近十秒
+        for s in 1..=20u64 {
+            let bytes = if s <= 10 { s * 10 } else { 100 + (s - 10) * 50 };
+            b.push_sample(t0 + Duration::from_secs(s), bytes * MB);
+        }
+        b.bytes_done = 600 * MB;
+        let v = b.speed().unwrap();
+        assert!((v - 50.0 * MB as f64).abs() < 1.0, "速度要是最近的 50MB/秒：{v}");
+        assert!((b.eta_secs().unwrap() - 8.0).abs() < 0.01);
+        const MB: u64 = 1024 * 1024;
     }
 
     /// 上次的資料夾不在了（J 碟拔掉）時，對話框不能交給 Windows——它會開在

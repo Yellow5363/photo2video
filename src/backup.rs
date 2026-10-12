@@ -579,19 +579,39 @@ fn trash_delete(p: &Path) -> Result<(), trash::Error> {
 /// 寫的一律是目的那一邊——`src_root` 只拿來讀。
 ///
 /// 回傳真的丟進資源回收筒的那個檔案（只有多餘檔案、而且沒勾保留時才有），
-/// 「還原」靠這筆紀錄放回去
+/// 「還原」靠這筆紀錄放回去。
+///
+/// 程式本身走 [`apply_with_progress`]（要顯示剩餘時間），這個不帶進度的
+/// 版本留給測試用
+#[cfg(test)]
 pub fn apply(
     act: &Action,
     src_root: &Path,
     dst_root: &Path,
     keep_extra: bool,
 ) -> Result<Option<Trashed>, String> {
+    apply_with_progress(act, src_root, dst_root, keep_extra, &mut |_| {})
+}
+
+/// 與 [`apply`] 相同，複製的途中會一直回報「這個檔案已經拷了幾個位元組」。
+///
+/// 一批只有十幾支影片時，只數「做完幾件」的進度會在 0 停好幾分鐘；
+/// 照位元組算才估得出剩餘時間（與檔案總管的複製視窗同一個算法）。
+/// 回報的數字可能略大於 [`Action::bytes`]（Windows 連附屬的資料流一起算），
+/// 呼叫端自己封頂
+pub fn apply_with_progress(
+    act: &Action,
+    src_root: &Path,
+    dst_root: &Path,
+    keep_extra: bool,
+    on_bytes: &mut dyn FnMut(u64),
+) -> Result<Option<Trashed>, String> {
     let in_src = src_root.join(&act.rel);
     let in_dst = dst_root.join(&act.rel);
     match act.kind {
         Kind::Copy | Kind::Update | Kind::Overwrite => {
             create_dirs_for(src_root, dst_root, &act.rel)?;
-            copy_file(&in_src, &in_dst, &act.rel)?;
+            copy_file(&in_src, &in_dst, &act.rel, on_bytes)?;
             Ok(None)
         }
         Kind::Extra => {
@@ -844,7 +864,12 @@ fn create_dirs_for(src_root: &Path, dst_root: &Path, rel: &Path) -> Result<(), S
     Ok(())
 }
 
-fn copy_file(from: &Path, to: &Path, rel: &Path) -> Result<(), String> {
+fn copy_file(
+    from: &Path,
+    to: &Path,
+    rel: &Path,
+    on_bytes: &mut dyn FnMut(u64),
+) -> Result<(), String> {
     // 舊檔帶唯讀屬性時 fs::copy 會失敗（從光碟或記憶卡拷出來的照片常帶著）。
     // 要覆蓋的既然是舊的那一份，先把旗標拿掉再蓋
     if let Ok(md) = fs::metadata(to) {
@@ -854,7 +879,8 @@ fn copy_file(from: &Path, to: &Path, rel: &Path) -> Result<(), String> {
             let _ = fs::set_permissions(to, perm);
         }
     }
-    fs::copy(from, to).map_err(|e| format!("{}：複製失敗（{e}）", rel.display()))?;
+    copy_with_progress(from, to, on_bytes)
+        .map_err(|e| format!("{}：複製失敗（{e}）", rel.display()))?;
     // 修改時間一起帶過去，下次比對才認得出這兩份是同一個——不帶的話新拷的
     // 那份永遠比較新，每次備份都要再抄一遍。Windows
     // 的 CopyFileEx 本來就會帶，其他平台不會，統一補一次。補不成不算失敗，
@@ -864,6 +890,118 @@ fn copy_file(from: &Path, to: &Path, rel: &Path) -> Result<(), String> {
             let _ = f.set_modified(t);
         }
     }
+    Ok(())
+}
+
+/// 拷一個檔案，途中回報已經拷了幾個位元組。
+///
+/// 直接叫 `CopyFileExW`：`fs::copy` 在 Windows 上底下也是它（旗標同樣是 0），
+/// 屬性、修改時間、附屬資料流的處理都一樣，只是多接一個進度回呼。
+/// **不在途中中止**：中止會讓 Windows 把目的檔刪掉，而「更新」那幾件的目的檔
+/// 是舊版本——拷到一半按中止，舊的那份也沒了。中止照舊在檔案與檔案之間生效
+#[cfg(windows)]
+fn copy_with_progress(
+    from: &Path,
+    to: &Path,
+    on_bytes: &mut dyn FnMut(u64),
+) -> std::io::Result<()> {
+    use std::ffi::c_void;
+    type Routine = unsafe extern "system" fn(
+        i64,
+        i64,
+        i64,
+        i64,
+        u32,
+        u32,
+        isize,
+        isize,
+        *mut c_void,
+    ) -> u32;
+    extern "system" {
+        fn CopyFileExW(
+            from: *const u16,
+            to: *const u16,
+            progress: Option<Routine>,
+            data: *mut c_void,
+            cancel: *mut i32,
+            flags: u32,
+        ) -> i32;
+    }
+    /// 每拷完一塊（約 1MB）Windows 就叫一次；`data` 是下面那個回呼
+    unsafe extern "system" fn routine(
+        _total: i64,
+        done: i64,
+        _stream_size: i64,
+        _stream_done: i64,
+        _stream: u32,
+        _reason: u32,
+        _src: isize,
+        _dst: isize,
+        data: *mut c_void,
+    ) -> u32 {
+        let cb = &mut *(data as *mut &mut dyn FnMut(u64));
+        cb(done.max(0) as u64);
+        0 // PROGRESS_CONTINUE
+    }
+    let (f, t) = (wide_path(from), wide_path(to));
+    let mut cb: &mut dyn FnMut(u64) = on_bytes;
+    let ok = unsafe {
+        CopyFileExW(
+            f.as_ptr(),
+            t.as_ptr(),
+            Some(routine),
+            &mut cb as *mut &mut dyn FnMut(u64) as *mut c_void,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// 路徑轉成 Windows API 吃的寬字元（結尾補 0）。
+///
+/// 超過 MAX_PATH 的長路徑要加 `\\?\` 才拷得動——`fs::copy` 自己會補，
+/// 改成直接叫 API 之後得自己來，不然資料夾層數一深就「找不到路徑」。
+/// 短路徑原樣送，不去改它
+#[cfg(windows)]
+fn wide_path(p: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let raw: Vec<u16> = p.as_os_str().encode_wide().collect();
+    let bs = b'\\' as u16;
+    let mut out: Vec<u16> = Vec::with_capacity(raw.len() + 9);
+    if raw.len() >= 248 && p.is_absolute() {
+        let already = raw.starts_with(&[bs, bs, b'?' as u16, bs]);
+        if already {
+            // 本來就是 \\?\ 開頭
+        } else if raw.starts_with(&[bs, bs]) {
+            // 網路路徑 \\server\share → \\?\UNC\server\share
+            out.extend(r"\\?\UNC".encode_utf16());
+            out.extend_from_slice(&raw[1..]);
+            out.push(0);
+            return out;
+        } else {
+            out.extend(r"\\?\".encode_utf16());
+        }
+    }
+    out.extend_from_slice(&raw);
+    out.push(0);
+    out
+}
+
+/// 其他平台照舊用 `fs::copy`（macOS 底下是 clonefile／fcopyfile，會把延伸
+/// 屬性一起帶過去，自己一塊一塊拷就沒了），拷完一次報整個檔案
+#[cfg(not(windows))]
+fn copy_with_progress(
+    from: &Path,
+    to: &Path,
+    on_bytes: &mut dyn FnMut(u64),
+) -> std::io::Result<()> {
+    let n = fs::copy(from, to)?;
+    on_bytes(n);
     Ok(())
 }
 
@@ -960,6 +1098,46 @@ mod tests {
             .iter()
             .map(|a| (a.rel.to_string_lossy().replace('\\', "/"), a.kind))
             .collect()
+    }
+
+    /// 拷的途中要一直回報位元組（剩餘時間靠它），內容、修改時間照舊；
+    /// 改成直接叫 CopyFileExW 之後，超過 260 字的長路徑也要拷得動
+    #[test]
+    fn copy_reports_bytes_and_handles_long_paths() {
+        let root = tmp("progress");
+        let src = root.join("src");
+        let deep: PathBuf = (0..12).map(|i| format!("很深的一層資料夾_{i:02}_abcdefghij")).collect();
+        let rel = deep.join("影片.mp4");
+        let body: Vec<u8> = (0..3_500_000u32).map(|i| (i % 251) as u8).collect();
+        fs::create_dir_all(src.join(&deep)).unwrap();
+        fs::write(src.join(&rel), &body).unwrap();
+        let t = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(src.join(&rel))
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        let dst = root.join("dst");
+        assert!(dst.join(&rel).as_os_str().len() > 300, "要真的超過 MAX_PATH");
+        let act = Action {
+            rel: rel.clone(),
+            kind: Kind::Copy,
+            bytes: body.len() as u64,
+        };
+        let mut seen: Vec<u64> = Vec::new();
+        apply_with_progress(&act, &src, &dst, true, &mut |b| seen.push(b)).unwrap();
+        assert_eq!(fs::read(dst.join(&rel)).unwrap(), body);
+        assert_eq!(seen.last().copied(), Some(body.len() as u64), "最後要報到整個檔案");
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "回報的數字只會往上");
+        #[cfg(windows)]
+        assert!(seen.len() > 2, "Windows 上大檔要在途中回報，不是拷完才報：{seen:?}");
+        let got = fs::metadata(dst.join(&rel)).unwrap().modified().unwrap();
+        let diff = got
+            .duration_since(t)
+            .unwrap_or_else(|e| e.duration());
+        assert!(diff < Duration::from_secs(2), "修改時間要帶過去");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
