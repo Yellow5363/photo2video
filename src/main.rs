@@ -37770,6 +37770,40 @@ mod tests {
         }
     }
 
+    /// Mac 上開著存檔／開檔對話框時偶爾整個程式中止，是 winit 的問題：AppKit 在
+    /// 對話框裡用 default mode 跑巢狀 run loop，winit 排在佇列裡的事件被提早執行，
+    /// 撞上「正在處理另一個事件」而 panic。修在 vendor/winit 裡（見 Cargo.toml 的
+    /// [patch.crates-io]）。這條守住兩件事：補丁真的接上了，而且排隊的地方都走
+    /// 會再檢查一次的 queue_when_idle——升級 eframe／winit 時重新拷一份原版進來，
+    /// 這裡就會紅，提醒補丁要搬過去
+    #[test]
+    fn mac_winit_patch_for_dialog_crash_is_in_place() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cargo = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("[patch.crates-io]") && cargo.contains("vendor/winit"),
+            "Cargo.toml 沒有把 winit 換成 vendor/winit 裡打過補丁的版本"
+        );
+        let mac = root.join("vendor/winit/src/platform_impl/macos");
+        let app_state = std::fs::read_to_string(mac.join("app_state.rs")).unwrap();
+        assert!(
+            app_state.contains("pub fn queue_when_idle")
+                && app_state.contains("self.queue_when_idle(move || this.handle_event(event))"),
+            "vendor/winit 的 app_state.rs 少了 queue_when_idle 補丁"
+        );
+        // 排進佇列、最後會走到事件處理的工作，一個都不能直接用 queue_closure
+        let delegate = std::fs::read_to_string(mac.join("window_delegate.rs")).unwrap();
+        assert!(
+            !delegate.contains(".queue_closure("),
+            "window_delegate.rs 又有直接 queue_closure 的地方，要改走 queue_when_idle"
+        );
+        assert_eq!(
+            app_state.matches(".queue_closure(").count(),
+            1,
+            "app_state.rs 只該在 queue_when_idle 裡面呼叫 queue_closure"
+        );
+    }
+
     #[test]
     fn last_dir_keys_are_unique_per_purpose() {
         // 每個模組、每種用途各記一份資料夾。兩個用途不小心共用同一個

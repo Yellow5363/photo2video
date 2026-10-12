@@ -41,6 +41,19 @@ rust_xlsxwriter = "0.99.1"
 # 一份六列的 PDF 就 13MB
 printpdf = { version = "0.12.8", default-features = false, features = ["text_layout"] }
 
+# winit 換成 vendor/winit 裡打過補丁的同一版（0.30.13，只改 macOS 的
+# app_state.rs 一處，見檔案裡的「photo2video patch」）。
+#
+# 原版在事件處理途中開著檔案／訊息對話框時，AppKit 的手勢辨識會用 default mode
+# 跑一圈巢狀 run loop，把 winit 排在佇列裡的事件提早執行，撞上「正在處理另一個
+# 事件」而 panic，整個程式中止——Mac 上存檔、開檔對話框偶爾閃退就是這個。
+# 程式裡有將近三十個對話框都是開著等結果的寫法，修在 winit 這一處最小。
+#
+# eframe 升級、改用別版 winit 時這裡要跟著看：補丁沒對上版本 cargo 會警告
+# 「Patch `winit` was not used」，那時要確認新版修了沒有，沒修就把補丁搬過去
+[patch.crates-io]
+winit = { path = "vendor/winit" }
+
 [build-dependencies]
 winresource = "0.1"
 
