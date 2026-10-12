@@ -2255,7 +2255,7 @@ fn save_recent_projects(list: &[PathBuf]) {
 /// 開檔與存檔分開、模組之間也不共用——去煙霧的照片來源不會把影片的輸出
 /// 位置蓋掉，選完音樂再去存專案也不會被丟到音樂資料夾。加新模組時在這裡
 /// 補上它自己的欄位即可，彼此不會互相干擾
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum LastDir {
     /// 影片模組：加入照片／選擇資料夾
     VideoPhotos,
@@ -2355,6 +2355,28 @@ impl LastDir {
         }
     }
 
+    /// 同一個模組記著的幾個位置（照片、成品、專案），自己這個位置不在了時
+    /// 拿來當退路（見 [`start_dir`]）。背景音樂、疊上去的圖片不在裡面：
+    /// 那些通常不跟照片放一起，拿來指照片的對話框反而更遠
+    fn module_mates(self) -> &'static [LastDir] {
+        use LastDir::*;
+        match self {
+            VideoPhotos | VideoOutput | VideoProject | VideoMusic => {
+                &[VideoPhotos, VideoOutput, VideoProject]
+            }
+            DehazePhotos | DehazeOutput | DehazeProject | DehazeOverlay => {
+                &[DehazePhotos, DehazeOutput, DehazeProject]
+            }
+            StackPhotos | StackOutput | StackProject => &[StackPhotos, StackOutput, StackProject],
+            MovieSource | MovieOutput | MovieProject => &[MovieSource, MovieOutput, MovieProject],
+            EnhancePhotos | EnhanceOutput | EnhanceProject => {
+                &[EnhancePhotos, EnhanceOutput, EnhanceProject]
+            }
+            BackupSource | BackupDest => &[BackupSource, BackupDest],
+            DiskTable => &[],
+        }
+    }
+
     /// 這個模組的專案檔上次停在哪個資料夾；硬碟管理沒有專案
     fn project_of(m: Module) -> Option<LastDir> {
         Some(match m {
@@ -2405,14 +2427,68 @@ fn remember_dir(which: LastDir, picked: &Path) {
     update_config(which.key(), serde_json::json!(dir.to_string_lossy()));
 }
 
-/// 從「這個用途上次停的資料夾」開始的**選檔**對話框。沒有記錄時不指定
-/// 起始位置，交給作業系統決定（通常是最近用過的地方）
-fn dir_dialog(which: LastDir) -> FileDialog {
-    let d = file_dialog();
-    match load_last_dir(which) {
-        Some(dir) => d.set_directory(dir),
-        None => d,
+/// 對話框該從哪個資料夾開始：**一定給一個**，不交給作業系統。
+///
+/// 什麼都不給的話 Windows 會開在這支程式上一次用過的資料夾——那是全程式
+/// 共用的，常常是剛才別的模組用過的那一格（實際回報過：J 碟拔掉之後，
+/// 去煙霧與煙火疊圖選照片都開到了影片去煙的專案資料夾）。所以依序：
+///
+/// 1. 這個用途上次停的資料夾；
+/// 2. 它被刪掉或改名了：往上找還在的那一層（磁碟根目錄不算，太遠了）；
+/// 3. 整顆碟不在了：同一個模組記著的其他位置（專案資料夾換回它旁邊的
+///    照片資料夾，見 [`photos_dir_of`]）；
+/// 4. 都沒有：「圖片」資料夾
+fn start_dir(which: LastDir) -> PathBuf {
+    start_dir_from(which, &|w| {
+        load_config()
+            .get(w.key())
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+    })
+}
+
+/// [`start_dir`] 的本體；記錄從 `stored` 拿，測試才不必動到真的設定檔
+fn start_dir_from(which: LastDir, stored: &dyn Fn(LastDir) -> Option<PathBuf>) -> PathBuf {
+    let own = stored(which);
+    if let Some(d) = own.as_ref().filter(|d| d.is_dir()) {
+        return d.clone();
     }
+    let ancestor = own.as_deref().and_then(|d| {
+        d.ancestors()
+            .skip(1)
+            .find(|a| a.parent().is_some() && a.is_dir())
+            .map(Path::to_path_buf)
+    });
+    ancestor
+        .or_else(|| {
+            which
+                .module_mates()
+                .iter()
+                .filter(|&&w| w != which)
+                .filter_map(|&w| stored(w))
+                .map(|d| photos_dir_of(&d))
+                .find(|d| d.is_dir())
+        })
+        .unwrap_or_else(pictures_dir)
+}
+
+/// 「<照片>／專案／<模組>」或「<照片>／專案」換回 `<照片>`；不是專案資料夾就原樣
+fn photos_dir_of(dir: &Path) -> PathBuf {
+    let is_proj = |p: &Path| p.file_name().is_some_and(|n| n == project::PROJECT_DIR);
+    let up = |p: &Path| p.parent().map(Path::to_path_buf);
+    if is_proj(dir) {
+        return up(dir).unwrap_or_else(|| dir.to_path_buf());
+    }
+    match dir.parent() {
+        Some(p) if is_proj(p) => up(p).unwrap_or_else(|| dir.to_path_buf()),
+        _ => dir.to_path_buf(),
+    }
+}
+
+/// 從「這個用途上次停的資料夾」開始的**選檔**對話框；那裡不在了的退路
+/// 見 [`start_dir`]
+fn dir_dialog(which: LastDir) -> FileDialog {
+    file_dialog().set_directory(start_dir(which))
 }
 
 /// 自己叫 Windows 的「選資料夾」對話框，為的是**把上次那個資料夾的名字預填進
@@ -2992,7 +3068,7 @@ fn pick_folder_remembering(which: LastDir, title: &str, start: Option<&Path>) ->
     let start = start
         .filter(|d| d.is_dir())
         .map(|p| p.to_path_buf())
-        .or_else(|| load_last_dir(which));
+        .or_else(|| Some(start_dir(which)));
     // 對話框開著時 UI 執行緒就停在這一行，畫面不會更新。看門狗要知道這是
     // 「在等對話框」而不是當掉，否則 15 秒就寫下一筆假的停止回應紀錄，
     // 而且不會被撤銷（撤銷只給對話框狀態，見 [`hang_action`]）——下次開程式
@@ -10520,12 +10596,9 @@ impl App {
                     .filter(|d| d.is_dir())
                     .map(Path::to_path_buf)
             })
-            .or_else(|| load_last_dir(which));
-        let mut dialog = file_dialog();
-        if let Some(dir) = start {
-            dialog = dialog.set_directory(dir);
-        }
-        let Some(mut path) = dialog
+            .unwrap_or_else(|| start_dir(which));
+        let Some(mut path) = file_dialog()
+            .set_directory(start)
             .set_title("專案儲存")
             .add_filter("Photo2Video 專案", &[PROJECT_EXT])
             .set_file_name(default_name)
@@ -10636,12 +10709,10 @@ impl App {
             .or_else(|| {
                 let photos = load_last_dir(LastDir::source_of(m)?)?;
                 project::project_dir_in(&photos, sub, false).or(Some(photos))
-            });
-        let mut dialog = file_dialog();
-        if let Some(dir) = start {
-            dialog = dialog.set_directory(dir);
-        }
-        if let Some(path) = dialog
+            })
+            .unwrap_or_else(|| start_dir(which));
+        if let Some(path) = file_dialog()
+            .set_directory(start)
             .set_title("開啟專案")
             .add_filter("Photo2Video 專案", &[PROJECT_EXT])
             .pick_file()
@@ -10775,10 +10846,7 @@ impl App {
         );
         // 先指到這批照片自己的資料夾，沒有才用上次存到哪（見 output_start_dir）
         let start = output_start_dir(LastDir::VideoOutput, self.photos.first().map(|p| p.as_path()));
-        let dialog = match start {
-            Some(d) => file_dialog().set_directory(d),
-            None => file_dialog(),
-        };
+        let dialog = file_dialog().set_directory(start);
         let Some(output) = dialog
             .set_title("選擇影片儲存位置")
             .add_filter(format!("{} 影片", ext.to_uppercase()), &[ext])
@@ -17221,10 +17289,8 @@ impl App {
                 .collect()
         } else {
             // 先指到來源影片自己的資料夾（見 output_start_dir）
-            let dialog = match output_start_dir(LastDir::MovieOutput, Some(src.as_path())) {
-                Some(d) => file_dialog().set_directory(d),
-                None => file_dialog(),
-            };
+            let dialog = file_dialog()
+                .set_directory(output_start_dir(LastDir::MovieOutput, Some(src.as_path())));
             let Some(mut out) = dialog
                 .add_filter("MP4 影片", &["mp4"])
                 // 合併與單支都是輸出一支影片，用同一套檔名；是不是合併
@@ -21201,11 +21267,8 @@ impl App {
             // 「另存新檔…」：檔名交給存檔對話框，使用者可以自己改；
             // 檔案已存在時系統的存檔對話框會先問要不要覆蓋。
             // 先指到地景那張自己的資料夾（見 output_start_dir）
-            let start_dir = output_start_dir(LastDir::StackOutput, Some(ground.as_path()));
-            let dialog = match start_dir {
-                Some(d) => file_dialog().set_directory(d),
-                None => file_dialog(),
-            };
+            let start = output_start_dir(LastDir::StackOutput, Some(ground.as_path()));
+            let dialog = file_dialog().set_directory(start);
             let Some(out) = dialog
                 .set_title("儲存疊圖成品")
                 .set_file_name(format!("{stem}_疊圖.jpg"))
@@ -34215,12 +34278,12 @@ fn write_project_atomic(path: &Path, json: &str) -> std::io::Result<()> {
 ///
 /// 反過來（先看上次存到哪）會讓人存錯地方：這一輪換了一批照片，對話框卻還停在
 /// 上一輪的輸出資料夾，檔名又是照新這批取的，一按存檔就散到別的資料夾去。
-/// `src` 給的是那批的第一個檔案
-fn output_start_dir(which: LastDir, src: Option<&Path>) -> Option<PathBuf> {
+/// `src` 給的是那批的第一個檔案；上次那個也不在了的退路見 [`start_dir`]
+fn output_start_dir(which: LastDir, src: Option<&Path>) -> PathBuf {
     src.and_then(|p| p.parent())
         .filter(|d| !d.as_os_str().is_empty() && d.is_dir())
         .map(|d| d.to_path_buf())
-        .or_else(|| load_last_dir(which))
+        .unwrap_or_else(|| start_dir(which))
 }
 
 /// 輸出尺寸寫進檔名的短標籤：`4k`、`1440p`、`1080p`、`720p`、`480p`。
@@ -37095,6 +37158,40 @@ mod tests {
         assert_eq!(folder_name(Path::new(r"F:\a.jpg")), None);
     }
 
+    /// 上次的資料夾不在了（J 碟拔掉）時，對話框不能交給 Windows——它會開在
+    /// 全程式共用的「上次用過的地方」，也就是別的模組的資料夾
+    #[test]
+    fn 上次的資料夾不在了要退回同模組的位置() {
+        let base = std::env::temp_dir().join(format!("p2v_startdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let photos = base.join("20260830漁人碼頭煙火 - test");
+        let proj = photos.join(project::PROJECT_DIR).join("疊圖");
+        std::fs::create_dir_all(&proj).unwrap();
+        let movie = base.join("20260830漁人碼頭煙火_video_去煙");
+        std::fs::create_dir_all(&movie).unwrap();
+        let gone = PathBuf::from(r"Q:\不存在的碟\20261010_101_煙火_a12");
+        let stored = |w: LastDir| match w {
+            LastDir::StackPhotos | LastDir::StackOutput => Some(gone.clone()),
+            LastDir::StackProject => Some(proj.clone()),
+            LastDir::MovieSource => Some(movie.clone()),
+            _ => None,
+        };
+        // 自己的位置還在：就是它
+        assert_eq!(start_dir_from(LastDir::StackProject, &stored), proj);
+        // 整顆碟不在：改用同模組的專案資料夾，換回它旁邊的照片資料夾，
+        // 不會跑到影片去煙的那一格
+        assert_eq!(start_dir_from(LastDir::StackPhotos, &stored), photos);
+        // 只是那一層被刪掉：往上找還在的那層
+        let deleted = photos.join("刪掉的");
+        let stored2 = |w: LastDir| (w == LastDir::DehazePhotos).then(|| deleted.clone());
+        assert_eq!(start_dir_from(LastDir::DehazePhotos, &stored2), photos);
+        // 什麼都沒記：圖片資料夾
+        assert_eq!(start_dir_from(LastDir::DehazePhotos, &|_| None), pictures_dir());
+        assert_eq!(photos_dir_of(&photos.join(project::PROJECT_DIR)), photos);
+        assert_eq!(photos_dir_of(&movie), movie);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// 存成品的對話框要開在**手上這批東西自己的資料夾**，不是上次存到哪。
     /// 反過來的話換一批照片之後對話框還停在上一輪的位置，一按存檔就散出去
     #[test]
@@ -37107,11 +37204,11 @@ mod tests {
         std::fs::write(&photo, b"x").unwrap();
         // 「上次存到哪」不在這裡設——那會寫進使用者真正的設定檔。
         // 拿它現在記著的值當對照就夠了
-        let last = load_last_dir(LastDir::VideoOutput);
+        let last = start_dir(LastDir::VideoOutput);
         // 手上有照片：照片自己的資料夾贏過上次那個
         assert_eq!(
             output_start_dir(LastDir::VideoOutput, Some(&photo)),
-            Some(here.clone()),
+            here.clone(),
             "應該開在這批照片所在的資料夾"
         );
         // 還沒選照片：才退回上次存到哪
