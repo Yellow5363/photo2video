@@ -3834,9 +3834,10 @@ fn spread_drift(hits: &mut [(usize, Option<track::Hit>)], target: (f32, f32)) {
 
 /// 追蹤整批照片。
 ///
-/// `marks` 是使用者框過的照片（照片順序，至少一個）。整批切成幾段各自追：
+/// `marks` 是使用者框過的照片（照片順序，至少一個），`need` 是要補的那幾張
+/// （呼叫端決定：第一個手動框之後、還沒框好的）。整批切成幾段各自追，只往後追：
 ///
-/// * 第一個框**往前**倒著追到第一張
+/// * 第一個框之前的照片不動（不往回追）
 /// * 相鄰兩個框之間往後追，追到下一個框時把「追到的位置」與「使用者框的
 ///   位置」之差當成這一段累積的漂移，沿路按比例攤掉——兩端都釘在使用者
 ///   框的地方，中間就不會愈跑愈偏
@@ -3850,6 +3851,7 @@ fn spread_drift(hits: &mut [(usize, Option<track::Hit>)], target: (f32, f32)) {
 fn run_track(
     photos: &[PathBuf],
     marks: &[(usize, [f32; 4])],
+    need: &[bool],
     crop: Crop,
     send: &dyn Fn(TrackMsg),
 ) {
@@ -3882,8 +3884,7 @@ fn run_track(
         send(TrackMsg::Step);
     }
     let photos = Arc::new(photos.to_vec());
-    let need = vec![true; photos.len()];
-    let (locked, total) = follow_fill(&photos, marks, &seeds, &need, &vec![false; need.len()], &vec![false; need.len()], None, None, crop, true, send);
+    let (locked, total) = follow_fill(&photos, marks, &seeds, need, &vec![false; need.len()], &vec![false; need.len()], None, None, crop, true, send);
     send(TrackMsg::Done(locked + marks.len(), total + marks.len()));
 }
 
@@ -4329,8 +4330,8 @@ fn run_auto_boxes(
 /// 四分之一個框寬）的比例從 11～25% 提高到 70～90%；拿別天的照片當範本則
 /// 反而更差（背景、光線不同就認錯）。
 ///
-/// 只改**還沒框得有把握**、而且跟手動框的姿態一樣的照片（見 [`TRACK_LIB_MATCH`]），
-/// 其他張不動；已經框得有把握的照片一律不碰（使用者定的規矩）。只搬位置：大小、
+/// 只改跟手動框的姿態一樣的照片（見 [`TRACK_LIB_MATCH`]），其他張不動；已經框得
+/// 有把握的照片只准在一個框寬以內微調（見 [`TRACK_LIB_NUDGE`]）。只搬位置：大小、
 /// 來源、有沒有把握都照舊
 fn refine_by_manual(
     photos: &Arc<Vec<PathBuf>>,
@@ -4341,11 +4342,8 @@ fn refine_by_manual(
 ) {
     let n = photos.len();
     let marked: Vec<usize> = (0..n).filter(|&i| manual[i].is_some()).collect();
-    // 已經框得有把握的照片一律不動（使用者定的規矩）：只校正還沒框到、或框得
-    // 沒把握的那幾張
-    let todo: Vec<usize> = (0..n)
-        .filter(|&i| manual[i].is_none() && latest[i].is_some_and(|s| !s.sure()))
-        .collect();
+    // 已經框得有把握的照片也一起看，但只在鳥頭範圍內微調（見下面搬的那段）
+    let todo: Vec<usize> = (0..n).filter(|&i| manual[i].is_none() && latest[i].is_some()).collect();
     if marked.is_empty() || todo.is_empty() {
         return;
     }
@@ -4417,6 +4415,14 @@ fn refine_by_manual(
         }
         let Some(old) = latest[i] else { continue };
         let (w, h) = old.size();
+        // 已經框得有把握的照片：只准在鳥頭範圍內微調（一個框寬以內，例如從臉頰
+        // 移到眼睛），要搬更遠的不動——那多半是認錯了東西（使用者定的規矩）。
+        // 實測一批大特寫的連拍，程式自認有把握的十字多落在眼睛下方的臉頰：
+        // 有把握的完全不動時，每 10 張框 1 張其餘只有 0/54 對準；允許微調 48/54
+        let (ox, oy) = old.centre();
+        if old.sure() && ((nx - ox) / w).hypot((ny - oy) / h) > TRACK_LIB_NUDGE {
+            continue;
+        }
         let rect = clamp_rect([nx - w / 2.0, ny - h / 2.0, nx + w / 2.0, ny + h / 2.0]);
         latest[i] = Some(Subject { rect, ..old });
         moved.push((i, latest[i]));
@@ -9611,10 +9617,23 @@ impl App {
         self.track_cancel();
         TRACK_CANCEL.store(false, Ordering::Relaxed);
         self.track.error = None;
-        self.track.clear_derived();
+        // 只往後追、不回頭：第一個手動框之前的照片不動；沿途已經框得有把握的
+        // 照片也不動（使用者定的規矩：追蹤不能把原本框對的位置移開），只補
+        // 還沒框到、或框得沒把握的
+        let first = marks[0].0;
+        let need: Vec<bool> = self
+            .photos
+            .iter()
+            .enumerate()
+            .map(|(i, p)| i > first && !self.track.box_of(p).is_some_and(|s| s.src == BoxSrc::Manual || s.sure()))
+            .collect();
+        if !need.iter().any(|x| *x) {
+            self.track.error = Some("手動框之後的照片都已經框好了，沒有要追的".into());
+            return;
+        }
         self.track.job = TrackJob::Follow;
         self.track.phase = None;
-        self.track.total = self.photos.len();
+        self.track.total = self.photos.len() - first;
         self.track.done = 0;
         let photos = self.photos.clone();
         let crop = self.effective_adj(&photos[marks[0].0]).crop;
@@ -9622,7 +9641,7 @@ impl App {
         self.track.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            run_track(&photos, &marks, crop, &|m| {
+            run_track(&photos, &marks, &need, crop, &|m| {
                 let _ = tx.send(m);
                 ctx.request_repaint();
             });
@@ -12629,6 +12648,15 @@ impl App {
                     .clicked()
                 {
                     self.track.picking = !self.track.picking;
+                    // 打開時從第一張看起：逐張檢查要從頭開始，停在中間某張
+                    // 還得自己捲回去
+                    // （只顯示要檢查的開著時，從第一張要檢查的看起）
+                    let first = if self.track.only_unsure { self.track_unsure().first().copied().unwrap_or(0) } else { 0 };
+                    if self.track.picking && !self.photos.is_empty() {
+                        self.multi_sel.clear();
+                        self.select_photo(Some(first));
+                        self.scroll_to_selected = true;
+                    }
                     self.mark_preview_dirty();
                 }
                 // 只留要檢查的那幾張在縮圖列上，逐一處理不必大海撈針。
@@ -13671,10 +13699,11 @@ impl App {
         // 不屬於照片，裁切的相對座標是對著轉完的畫布算的
         if self.crop_editing {
             if let Some(ir) = img_rect_opt {
+                // 尺寸一定要讀到（理由同主體框那段）
                 let src = self
                     .preview_selected
-                    .and_then(|i| self.photos.get(i))
-                    .and_then(|p| self.dims_cache.get(p).copied().flatten());
+                    .and_then(|i| self.photos.get(i).cloned())
+                    .and_then(|p| self.photo_dims(&p));
                 // 與調色面板同一個範圍：多選時改的是那批照片的覆寫
                 let cur = if self.multi_sel.is_empty() {
                     self.adj
@@ -13709,7 +13738,9 @@ impl App {
             // 拖出來的框才對得上
             if let (Some(ir), Some(idx)) = (img_rect_opt, self.preview_selected) {
                 let photo = self.photos[idx].clone();
-                let src = self.dims_cache.get(&photo).copied().flatten();
+                // 照片尺寸一定要讀到：沒讀到時框會照預覽區（輸出解析度的長寬比）去畫，
+                // 3:2 的照片配 16:9 的區域，越靠左右兩邊的框偏得越多
+                let src = self.photo_dims(&photo);
                 let cur = self.effective_adj(&photo).crop;
                 let photo_rect = match src.map(|(w, h)| cur.canvas(w as f32, h as f32)) {
                     Some((w, h)) if w > 0.0 && h > 0.0 => fit_rect(egui::vec2(w, h), ir),
@@ -31360,6 +31391,9 @@ const TRACK_LIB_MIN_PX: f32 = 10.0;
 /// 才搬。實測兩批使用者標好的連拍（每 10 張框 1 張）：2.5 時其餘張落在標的位置
 /// 64/87、53/60；不設門檻 78/87、55/60，但姿態涵蓋不到的批次會被搬壞
 const TRACK_LIB_MATCH: f32 = 2.5;
+
+/// 照手動框校正時，原本已經框得有把握的照片最多只能移幾個框寬
+const TRACK_LIB_NUDGE: f32 = 1.0;
 
 /// 拿前後框好的照片核對時（見 [`refine_by_neighbours`]），前後各最多隔幾張
 const TRACK_NB_GAP: usize = 3;
