@@ -6353,6 +6353,9 @@ struct TrackTool {
     /// 縮圖列只顯示「要檢查」的那幾張（沒框到或沒把握），逐一處理時
     /// 不必在上百張裡找它們
     only_unsure: bool,
+    /// 縮圖列只顯示使用者自己框的那幾張（回頭檢查手動框時用）。與
+    /// `only_unsure` 互斥：打開其中一個就關掉另一個
+    only_manual: bool,
     /// 每張照片的主體框。三種來源共用這一份（見 [`BoxSrc`]）：
     /// 自動框選填滿它，使用者拖曳覆蓋其中幾張，追蹤則把手動框之間補起來
     boxes: HashMap<PathBuf, Subject>,
@@ -12651,7 +12654,13 @@ impl App {
                     // 打開時從第一張看起：逐張檢查要從頭開始，停在中間某張
                     // 還得自己捲回去
                     // （只顯示要檢查的開著時，從第一張要檢查的看起）
-                    let first = if self.track.only_unsure { self.track_unsure().first().copied().unwrap_or(0) } else { 0 };
+                    let first = if self.track.only_unsure {
+                        self.track_unsure().first().copied().unwrap_or(0)
+                    } else if self.track.only_manual {
+                        self.track_manual_idx().first().map_or(0, |m| m.0)
+                    } else {
+                        0
+                    };
                     if self.track.picking && !self.photos.is_empty() {
                         self.multi_sel.clear();
                         self.select_photo(Some(first));
@@ -12659,6 +12668,9 @@ impl App {
                     }
                     self.mark_preview_dirty();
                 }
+                // 兩個過濾勾選自成一行、並排：跟上面的按鈕擠在一起時會被折成兩行
+                ui.end_row();
+                ui.horizontal(|ui| {
                 // 只留要檢查的那幾張在縮圖列上，逐一處理不必大海撈針。
                 //
                 // 這顆**只要在用追蹤就一直顯示**：把它藏在「還有要檢查的」條件裡
@@ -12679,21 +12691,61 @@ impl App {
                         .clicked()
                     {
                         self.track.only_unsure = !self.track.only_unsure;
+                        if self.track.only_unsure {
+                            self.track.only_manual = false;
+                        }
                         self.scroll_to_selected = true;
                     }
                 }
-                if !unsure.is_empty() {
+                // 只留使用者自己框的那幾張：回頭檢查、修正手動框時不必一張張找
+                let manual_n = self.track.manual_count();
+                if manual_n > 0 || self.track.only_manual {
+                    let label = format!("✋ 只顯示手動（{manual_n}）");
+                    if check_label(ui, self.track.only_manual, label)
+                        .on_hover_text("下面的縮圖列只排你自己框的照片，方便回頭檢查、修正手動框")
+                        .clicked()
+                    {
+                        self.track.only_manual = !self.track.only_manual;
+                        if self.track.only_manual {
+                            self.track.only_unsure = false;
+                            // 目前這張不是手動框的就跳到第一張手動框的
+                            let manual: Vec<usize> = self.track_manual_idx().iter().map(|m| m.0).collect();
+                            if !self.preview_selected.is_some_and(|i| manual.contains(&i)) {
+                                if let Some(&i) = manual.first() {
+                                    self.multi_sel.clear();
+                                    self.select_photo(Some(i));
+                                    self.mark_preview_dirty();
+                                }
+                            }
+                        }
+                        self.scroll_to_selected = true;
+                    }
+                }
+                });
+                ui.end_row();
+                // 「只顯示手動框選的」開著時，這顆改成在手動框的照片之間跳：
+                // 縮圖列只排手動框的，跳到要檢查的那張預覽會對不上縮圖列
+                let manual_view = self.track.only_manual;
+                let (targets, label, hover) = if manual_view {
+                    let m: Vec<usize> = self.track_manual_idx().iter().map(|m| m.0).collect();
+                    let label = format!("⏭ 下一張手動框選的（{}）", m.len());
+                    (m, label, "跳到下一張你自己框的照片")
+                } else {
+                    let label = format!("⏭ 下一張要檢查的（{}）", unsure.len());
+                    (unsure.clone(), label, "跳到下一張沒框到、或框得沒把握的照片")
+                };
+                if !targets.is_empty() {
                     if ui
-                        .button(format!("⏭ 下一張要檢查的（{}）", unsure.len()))
-                        .on_hover_text("跳到下一張沒框到、或框得沒把握的照片")
+                        .button(label)
+                        .on_hover_text(hover)
                         .clicked()
                     {
                         let cur = self.preview_selected.unwrap_or(0);
-                        let next = unsure
+                        let next = targets
                             .iter()
                             .copied()
                             .find(|&i| i > cur)
-                            .or_else(|| unsure.first().copied());
+                            .or_else(|| targets.first().copied());
                         if let Some(i) = next {
                             self.multi_sel.clear();
                             self.select_photo(Some(i));
@@ -13819,7 +13871,11 @@ impl App {
         // 「只顯示要檢查的」：膠卷改成只排那幾張，逐一處理時不必在上百張裡
         // 大海撈針。view[slot] 是那一格對應的照片編號（沒過濾時就是它自己）
         let all: Vec<usize> = (0..self.photos.len()).collect();
-        let unsure_view = (self.track.only_unsure && track_on).then(|| self.track_unsure());
+        let unsure_view = if self.track.only_manual && track_on {
+            Some(self.track_manual_idx().iter().map(|m| m.0).collect::<Vec<usize>>())
+        } else {
+            (self.track.only_unsure && track_on).then(|| self.track_unsure())
+        };
         // 沒有要檢查的了就自動回到「全部照片、原來的順序」——留一排空白在那裡
         // 只會讓人以為照片不見了（過濾的勾選維持原狀，之後再有要檢查的會自己排出來）
         let nothing_left = unsure_view.as_ref().is_some_and(|v| v.is_empty());
@@ -13828,7 +13884,7 @@ impl App {
             _ => all,
         };
         let n = view.len();
-        if nothing_left && !self.photos.is_empty() {
+        if nothing_left && !self.track.only_manual && !self.photos.is_empty() {
             ui.label(
                 egui::RichText::new("✔ 每一張都框好了，沒有要檢查的——下面照原來的順序顯示全部照片")
                     .size(11.0)
@@ -33223,9 +33279,15 @@ fn check_label(ui: &mut egui::Ui, on: bool, text: impl Into<egui::WidgetText>) -
     let padding = ui.spacing().button_padding;
     let lead = MARK_W + MARK_GAP;
     let wrap_w = ui.available_width() - padding.x * 2.0 - lead;
-    let galley = text
-        .into()
-        .into_galley(ui, None, wrap_w, egui::TextStyle::Button);
+    // 先試不折行：放得下就照文字本身的寬度，才能跟同一行的其他勾選並排
+    // （折行排版的寬度是整個可用寬，會把一行佔滿，後面的被擠到下一行）
+    let text = text.into();
+    let one_line = text.clone().into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button);
+    let galley = if one_line.size().x <= wrap_w {
+        one_line
+    } else {
+        text.into_galley(ui, None, wrap_w, egui::TextStyle::Button)
+    };
 
     let mut size = padding * 2.0 + galley.size() + egui::vec2(lead, 0.0);
     size.y = size.y.max(ui.spacing().interact_size.y);
