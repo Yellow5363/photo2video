@@ -3855,6 +3855,7 @@ fn run_track(
     photos: &[PathBuf],
     marks: &[(usize, [f32; 4])],
     need: &[bool],
+    keep_own: &[bool],
     crop: Crop,
     send: &dyn Fn(TrackMsg),
 ) {
@@ -3887,7 +3888,7 @@ fn run_track(
         send(TrackMsg::Step);
     }
     let photos = Arc::new(photos.to_vec());
-    let (locked, total) = follow_fill(&photos, marks, &seeds, need, &vec![false; need.len()], &vec![false; need.len()], None, None, crop, true, send);
+    let (locked, total) = follow_fill(&photos, marks, &seeds, need, keep_own, &vec![false; need.len()], None, None, crop, true, send);
     send(TrackMsg::Done(locked + marks.len(), total + marks.len()));
 }
 
@@ -4141,7 +4142,7 @@ fn run_auto_boxes(
                 (i, n) if i + 1 == n => (at(i - 1), at(i - 2)),
                 (i, _) => (at(i - 1), at(i + 1)),
             };
-            cands[i] = track::detect_candidates(a, cur, b, track::DET_CANDIDATES);
+            cands[i] = track::detect_candidates(a, cur, b, track::DET_CANDIDATES, bird.head_style());
         }
         send(TrackMsg::Step);
     }
@@ -6286,10 +6287,19 @@ impl BirdKind {
         BirdKind::ALL.into_iter().find(|b| b.id() == s).unwrap_or_default()
     }
 
-    /// 這種鳥頭上有沒有「嘴基兩側一對紅點」可以拿來對準兩眼之間
-    /// （五色鳥才有；八色鳥的紅色在腹部，拿來找會把十字拉到肚子上）
+    /// 找到頭之後，有沒有更準的「眼睛在哪」的線索可以把十字移過去：五色鳥看嘴基
+    /// 兩側的紅點，八色鳥看黑色過眼帶（見 track::red_spot、track::dark_spot）。
+    /// 其他鳥種還沒有，十字就留在找到的頭上
     fn red_spots(self) -> bool {
-        self == BirdKind::Barbet
+        matches!(self, BirdKind::Barbet | BirdKind::Pitta)
+    }
+
+    /// 找頭時看顏色多樣還是明暗變化（見 [`track::HeadStyle`]）
+    fn head_style(self) -> track::HeadStyle {
+        match self {
+            BirdKind::Pitta => track::HeadStyle::Masked,
+            _ => track::HeadStyle::Colourful,
+        }
     }
 }
 
@@ -9758,6 +9768,14 @@ impl App {
             self.track.error = Some("手動框之後的照片都已經框好了，沒有要追的".into());
             return;
         }
+        // 上一次追蹤補上、但沒把握的框：這次只在比對得更有把握時才換掉。
+        // 沒把握不代表錯——實測一批八色鳥，多框一張再追蹤一次，有一張原本
+        // 對的（沒把握）被重算成錯的直接蓋掉（使用者回報「把對的改成不對」）
+        let keep_own: Vec<bool> = self
+            .photos
+            .iter()
+            .map(|p| self.track.box_of(p).is_some_and(|s| s.src == BoxSrc::Tracked))
+            .collect();
         self.track.job = TrackJob::Follow;
         self.track.phase = None;
         self.track.total = self.photos.len() - first;
@@ -9768,7 +9786,7 @@ impl App {
         self.track.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            run_track(&photos, &marks, &need, crop, &|m| {
+            run_track(&photos, &marks, &need, &keep_own, crop, &|m| {
                 let _ = tx.send(m);
                 ctx.request_repaint();
             });

@@ -67,6 +67,9 @@ pub struct Chroma {
     h: usize,
     rg: Vec<f32>,
     yb: Vec<f32>,
+    /// 與 rg、yb 同解析度的亮度（八色鳥那種頭部是黑白褐、沒什麼彩度的鳥，
+    /// 要看明暗的變化，見 [`HeadStyle::Masked`]）
+    lum: Vec<f32>,
     /// 原解析度（長寬是 `w`、`h` 的兩倍）每一點有多「純紅」（見 [`redness`]）。
     /// 五色鳥嘴基兩側那對紅點只有幾個像素大，縮一半就跟旁邊的黃、黑混掉了
     red: Vec<f32>,
@@ -91,6 +94,7 @@ impl Chroma {
         let (w, h) = ((iw / 2).max(1), (ih / 2).max(1));
         let mut rg = Vec::with_capacity(w * h);
         let mut yb = Vec::with_capacity(w * h);
+        let mut lum = Vec::with_capacity(w * h);
         for y in 0..h {
             for x in 0..w {
                 let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
@@ -106,6 +110,7 @@ impl Chroma {
                 let (r, g, b) = (r / 4.0, g / 4.0, b / 4.0);
                 rg.push(r - g);
                 yb.push((r + g) / 2.0 - b);
+                lum.push(0.299 * r + 0.587 * g + 0.114 * b);
             }
         }
         let mut red = Vec::with_capacity(4 * w * h);
@@ -115,7 +120,7 @@ impl Chroma {
                 red.push(redness(p[0] as f32, p[1] as f32, p[2] as f32));
             }
         }
-        Chroma { w, h, rg, yb, red }
+        Chroma { w, h, rg, yb, lum, red }
     }
 }
 
@@ -834,6 +839,7 @@ pub fn detect_candidates(
     cur: &Frame,
     next: Option<&Frame>,
     max: usize,
+    style: HeadStyle,
 ) -> Vec<Found> {
     let cp = cur.pyramid(DET_SHIFT);
     let mut maps: Vec<Frame> = Vec::new();
@@ -880,7 +886,7 @@ pub fn detect_candidates(
     let level = (m.px.len() as f32 * DET_MAX_AREA) as usize;
     let (fw, fh) = (m.w as f32, m.h as f32);
     // 找鳥頭用的累加表：整張算一次，每個候選共用（沒有色彩的照片就不找）
-    let heads = cur.colour.as_ref().map(|c| HeadMaps::new(c, &m, &sharpness(&cp[0], &m), &coarse_detail(&cp[DET_DIFF + 1], &m)));
+    let heads = cur.colour.as_ref().map(|c| HeadMaps::new(c, &m, &sharpness(&cp[0], &m), &coarse_detail(&cp[DET_DIFF + 1], &m), style));
 
     let mut used = vec![false; m.px.len()];
     let mut out: Vec<Found> = Vec::new();
@@ -943,7 +949,14 @@ pub fn detect_candidates(
             shift_gain: gain,
             heads: found_heads,
             reds: match cur.colour.as_deref() {
-                Some(c) => found_heads.map(|(x, y, s)| (s > 0.0).then(|| red_spot(c, x, y)).flatten()),
+                Some(c) => found_heads.map(|(x, y, s)| {
+                    (s > 0.0)
+                        .then(|| match style {
+                            HeadStyle::Colourful => red_spot(c, x, y),
+                            HeadStyle::Masked => dark_spot(c, x, y),
+                        })
+                        .flatten()
+                }),
                 None => [None; HEAD_PEAKS],
             },
             sharp: heads.as_ref().map_or(0.0, |hm| hm.sharp_ref),
@@ -1034,11 +1047,46 @@ fn coarse_detail(coarse: &Frame, to: &Frame) -> Frame {
     Frame::new(to.w, to.h, px)
 }
 
+/// 鳥頭長什麼樣子：決定找頭時看哪一種「一小塊裡很雜」
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HeadStyle {
+    /// 頭上擠滿鮮豔的顏色（五色鳥：藍頭頂、黃臉、紅喉、黑嘴）：看顏色多樣
+    #[default]
+    Colourful,
+    /// 頭部是黑白褐、幾乎不帶彩度，身上反而有鮮豔的色塊（八色鳥：黑色過眼帶、
+    /// 白喉、褐頭頂；紅色在尾下、藍綠在翅膀）：看明暗的變化，鮮豔的地方扣分。
+    /// 用 Colourful 去找，十字會落在紅色尾下與藍綠翅膀上（實測一批 186 張的
+    /// 連拍幾乎每張都這樣）
+    Masked,
+}
+
+/// 八色鳥頭頂的褐色（R＞G＞B、中等亮度、彩度不高）。翅膀的黑、白、藍綠，
+/// 腹部的米白與紅都不算
+fn is_brown(rg: f32, yb: f32, lum: f32) -> bool {
+    (15.0..90.0).contains(&rg) && (25.0..110.0).contains(&yb) && (50.0..170.0).contains(&lum)
+}
+
+/// Masked 時，頭那麼大一塊裡褐色佔這個比例就算滿分
+const MASK_BROWN: f32 = 0.15;
+
+/// Masked 時，褐色在分數裡的份量（0＝不看褐色）。實測一批 111 張標好的八色鳥連拍：
+/// 0 時落在標的位置半個框寬以內 56 張、偏超過一個框寬 36 張（27 張沒標要檢查）；
+/// 0.7 時 73 張、22 張（只 2 張沒標）
+const MASK_BROWN_W: f32 = 0.7;
+
+/// Masked 時，一塊的平均彩度（|R−G|＋|(R+G)/2−B|）到這裡就完全不像頭
+const MASK_SAT: f32 = 90.0;
+
 /// 找鳥頭用的累加表（整張的對手色、移動量與清晰度），一張照片算一次、
 /// 所有候選共用
 struct HeadMaps {
     w: usize,
     h: usize,
+    style: HeadStyle,
+    /// 彩度的累加表（Masked 才用）
+    s_sat: Vec<f64>,
+    /// 「褐色」像素的累加表（Masked 才用，見 [`is_brown`]）
+    s_brown: Vec<f64>,
     s_rg: Vec<f64>,
     s_yb: Vec<f64>,
     q_rg: Vec<f64>,
@@ -1058,12 +1106,15 @@ struct HeadMaps {
 }
 
 impl HeadMaps {
-    fn new(c: &Chroma, m: &Frame, sharp: &Frame, coarse: &Frame) -> HeadMaps {
+    fn new(c: &Chroma, m: &Frame, sharp: &Frame, coarse: &Frame, style: HeadStyle) -> HeadMaps {
         let (w, h) = (c.w.min(m.w).min(sharp.w).min(coarse.w), c.h.min(m.h).min(sharp.h).min(coarse.h));
         let n = (w + 1) * (h + 1);
         let mut maps = HeadMaps {
             w,
             h,
+            style,
+            s_sat: vec![0.0; n],
+            s_brown: vec![0.0; n],
             s_rg: vec![0.0; n],
             s_yb: vec![0.0; n],
             q_rg: vec![0.0; n],
@@ -1077,10 +1128,18 @@ impl HeadMaps {
         };
         for y in 0..h {
             let (mut a, mut b, mut qa, mut qb, mut mm) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
-            let (mut ss, mut sc) = (0.0f64, 0.0f64);
+            let (mut ss, mut sc, mut st, mut sb) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
             for x in 0..w {
-                let rg = c.rg[y * c.w + x] as f64;
-                let yb = c.yb[y * c.w + x] as f64;
+                let (crg, cyb) = (c.rg[y * c.w + x] as f64, c.yb[y * c.w + x] as f64);
+                st += crg.abs() + cyb.abs();
+                if is_brown(crg as f32, cyb as f32, c.lum.get(y * c.w + x).copied().unwrap_or(0.0)) {
+                    sb += 1.0;
+                }
+                // Masked：第一個通道改放亮度、第二個通道不用（變異數只剩明暗）
+                let (rg, yb) = match style {
+                    HeadStyle::Colourful => (crg, cyb),
+                    HeadStyle::Masked => (c.lum.get(y * c.w + x).copied().unwrap_or(0.0) as f64, 0.0),
+                };
                 a += rg;
                 b += yb;
                 qa += rg * rg;
@@ -1097,6 +1156,8 @@ impl HeadMaps {
                 maps.s_m[k] = maps.s_m[up] + mm;
                 maps.s_sharp[k] = maps.s_sharp[up] + ss;
                 maps.s_coarse[k] = maps.s_coarse[up] + sc;
+                maps.s_sat[k] = maps.s_sat[up] + st;
+                maps.s_brown[k] = maps.s_brown[up] + sb;
             }
         }
         let mut cs: Vec<f32> = coarse.px.clone();
@@ -1185,7 +1246,17 @@ impl HeadMaps {
                 // 散景裡的葉縫透光、拍動中糊掉的翅膀都過不了這一關
                 let sharp = self.sum(&self.s_sharp, a0, b0, a1, b1) / n;
                 let crisp = self.crisp_at(a0, b0, a1, b1);
+                let plain = match self.style {
+                    HeadStyle::Colourful => 1.0,
+                    HeadStyle::Masked => {
+                        // 鮮豔的扣分；頭頂那一撮褐色加分（翅膀是黑白藍綠，沒有褐色）
+                        let calm = (1.0 - self.sum(&self.s_sat, a0, b0, a1, b1) / n / MASK_SAT as f64).max(0.0);
+                        let brown = (self.sum(&self.s_brown, a0, b0, a1, b1) / n / MASK_BROWN as f64).min(1.0);
+                        calm * (1.0 - MASK_BROWN_W as f64 + MASK_BROWN_W as f64 * brown)
+                    }
+                };
                 let score = var.max(0.0).sqrt() / 255.0
+                    * plain
                     * (motion / gate_full).min(1.0)
                     * (sharp / sharp_full).min(1.0)
                     * (crisp / crisp_full).min(1.0);
@@ -1398,6 +1469,60 @@ const RED_PAIR_TILT: f32 = 0.6;
 /// 成對的兩塊紅點，左右距離最多是一塊寬度的幾倍（中間夾著的是嘴基）
 const RED_PAIR_GAP: f32 = 6.0;
 
+/// 八色鳥（[`HeadStyle::Masked`]）：在找到的頭 (x, y) 附近找黑色過眼帶的中心，
+/// 回傳相對座標；找不到是 None。
+///
+/// 明暗變化最大的地方是過眼帶與白色喉嚨的交界，比眼睛低一截；眼睛就在
+/// 那條黑帶裡。取附近「又暗、又不帶顏色」那幾點的重心：側面時落在眼睛上，
+/// 正面時左右兩塊黑一起算，重心正好在兩眼之間
+fn dark_spot(c: &Chroma, x: f32, y: f32) -> Option<(f32, f32)> {
+    let (w, h) = (c.w, c.h);
+    if c.lum.len() != w * h || w < 8 || h < 8 {
+        return None;
+    }
+    let r = (w.max(h) as f32 * HEAD_RADIUS * DARK_SEARCH).max(2.0);
+    let (cx, cy) = (x * w as f32, y * h as f32);
+    let x0 = (cx - r).max(0.0) as usize;
+    let x1 = ((cx + r) as usize).min(w - 1);
+    let y0 = (cy - r).max(0.0) as usize;
+    let y1 = ((cy + r) as usize).min(h - 1);
+    let mut v: Vec<f32> = Vec::new();
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            v.push(c.lum[py * w + px]);
+        }
+    }
+    if v.len() < 9 {
+        return None;
+    }
+    v.sort_by(f32::total_cmp);
+    let (lo, mid) = (v[0], v[v.len() / 2]);
+    let cut = lo + (mid - lo) * DARK_CUT;
+    let (mut sw, mut sx, mut sy, mut n) = (0.0f32, 0.0f32, 0.0f32, 0usize);
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let k = py * w + px;
+            let (l, sat) = (c.lum[k], c.rg[k].abs() + c.yb[k].abs());
+            if l > cut || sat > MASK_SAT * 0.5 {
+                continue;
+            }
+            let wgt = cut - l + 1.0;
+            sw += wgt;
+            sx += wgt * (px as f32 + 0.5);
+            sy += wgt * (py as f32 + 0.5);
+            n += 1;
+        }
+    }
+    (n >= 4 && sw > 0.0).then(|| (sx / sw / w as f32, sy / sw / h as f32))
+}
+
+/// 找黑色過眼帶時的搜尋半徑（[`HEAD_RADIUS`] 的幾倍）。設大了會被飛行時同樣
+/// 又黑又不帶顏色的翅膀拉過去（實測 2.0 比 1.0 差）
+const DARK_SEARCH: f32 = 1.0;
+
+/// 比「最暗」亮多少還算黑：最暗到中位數之間的這個比例
+const DARK_CUT: f32 = 0.3;
+
 /// 在找到的頭 (x, y)（相對座標）附近找五色鳥嘴基兩側的那對紅點，回傳兩點的
 /// 中點（相對座標）；找不到是 None。
 ///
@@ -1570,7 +1695,7 @@ pub fn drop_overlays(cands: &mut [Vec<Found>]) {
 
 /// 只要最強的那一個候選（單張使用時的簡便版）
 pub fn detect(prev: Option<&Frame>, cur: &Frame, next: Option<&Frame>) -> Option<Found> {
-    detect_candidates(prev, cur, next, 1).into_iter().next()
+    detect_candidates(prev, cur, next, 1, HeadStyle::Colourful).into_iter().next()
 }
 
 /// 候選本身的不確定度在總代價裡佔多少。位置的單位是「畫面的幾分之幾」，
@@ -2364,6 +2489,28 @@ mod tests {
         assert!((x - 125.0).abs() <= 3.0 && (y - 85.0).abs() <= 3.0, "找到 ({x}, {y})");
     }
 
+    /// 八色鳥：明暗交界（黑色過眼帶下緣接白喉）附近，十字要移到黑帶的中心
+    #[test]
+    fn dark_spot_moves_to_the_middle_of_the_black_mask() {
+        let mut img = RgbImage::from_pixel(1000, 500, image::Rgb([70, 130, 60]));
+        for y in 180..220u32 {
+            for x in 480..540u32 {
+                img.put_pixel(x, y, image::Rgb([20, 20, 22]));
+            }
+        }
+        for y in 220..260u32 {
+            for x in 480..540u32 {
+                img.put_pixel(x, y, image::Rgb([235, 235, 228]));
+            }
+        }
+        let c = Chroma::from_rgb(&img);
+        // 從交界出發
+        let (x, y) = dark_spot(&c, 510.0 / 1000.0, 220.0 / 500.0).expect("應該找得到黑帶");
+        let (px, py) = (x * 1000.0, y * 500.0);
+        // 往上移進黑帶裡（不在白喉上），左右不跑掉
+        assert!((px - 510.0).abs() < 8.0 && py > 180.0 && py < 216.0, "黑帶中心 ({px}, {py})");
+    }
+
     #[test]
     fn red_spots_beside_the_beak_pull_the_head_to_between_the_eyes() {
         // 原解析度 1000×500：正面的鳥，嘴基兩側各一個紅點；下方遠一點有一圈
@@ -2455,9 +2602,9 @@ mod tests {
                 coarse[y * w + x] = 200.0;
             }
         }
-        let c = Chroma { w, h, rg, yb, red: Vec::new() };
+        let c = Chroma { w, h, rg, yb, lum: Vec::new(), red: Vec::new() };
         let m = Frame::new(w, h, motion);
-        let maps = HeadMaps::new(&c, &m, &Frame::new(w, h, sharp), &Frame::new(w, h, coarse));
+        let maps = HeadMaps::new(&c, &m, &Frame::new(w, h, sharp), &Frame::new(w, h, coarse), HeadStyle::Colourful);
         // 動態框落在翅膀上，鳥身的平均移動量 40
         let rect = [45.0 / 96.0, 20.0 / 64.0, 55.0 / 96.0, 30.0 / 64.0];
         let (hx, hy, s) = maps.find(rect, 40.0)[0];
