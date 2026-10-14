@@ -7,11 +7,12 @@
 //!
 //! 兩個規矩決定了這張表長什麼樣，兩個都是使用者定的：
 //!
-//! 1. **大小只算那個資料夾自己的檔案**，不含子資料夾。`照片_ok\_縮小` 那一列
-//!    的數字，就是點進 `_縮小` 看到的那幾個檔案加起來——不是整棵子樹。
-//!    （整棵子樹的總和在這裡沒有用：要找的是「東西放在哪一層」。）
-//! 2. **掃描停在指定的層數**，不是「只列到那一層」。第 5 層底下還有東西也
-//!    不走進去，所以掃一顆碟的時間是可預期的。
+//! 1. **大小含所有子資料夾**，與檔案總管「內容」裡的大小同一個數字。
+//!    （2026-10-14 改的：原本只算那個資料夾自己的檔案，檔案全放在子資料夾
+//!    裡的上層資料夾就變成 0 GB，跟檔案總管對不起來，使用者以為算錯了。）
+//!    隱藏的、程式自己的工作資料夾、超過層數的雖然不列，大小一樣算進上一層。
+//! 2. **清單停在指定的層數**：第 5 層底下的資料夾不列出來。但為了算大小，
+//!    底下還是要走到底——掃一顆碟的時間取決於整顆碟有多少檔案。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -51,7 +52,8 @@ pub struct Row {
     /// 資料夾名稱（路徑的最後一段）
     #[serde(rename = "n")]
     pub name: String,
-    /// 資料夾大小：**這個資料夾裡的檔案**加總，不含子資料夾
+    /// 資料夾大小：**這個資料夾底下所有檔案**加總，含每一層子資料夾
+    /// （與檔案總管的「內容」一致）
     #[serde(rename = "b")]
     pub bytes: u64,
     /// 資料夾修改時間（unix 秒）
@@ -84,6 +86,15 @@ pub fn fmt_time(unix: u64) -> String {
         Some((y, mo, d, h, mi, s)) => {
             format!("{y:04}/{mo:02}/{d:02} {h:02}:{mi:02}:{s:02}")
         }
+        None => String::new(),
+    }
+}
+
+/// 只要日期的寫法：`2026/10/14`（本機時間）。「這個號是哪一天建的」
+/// 問的是哪一天，時分秒只會讓那一欄變寬
+pub fn fmt_date(unix: u64) -> String {
+    match crate::local_parts(unix) {
+        Some((y, mo, d, ..)) => format!("{y:04}/{mo:02}/{d:02}"),
         None => String::new(),
     }
 }
@@ -182,8 +193,8 @@ pub struct Scanned {
 
 /// 掃一顆硬碟（或任何一個資料夾）底下的資料夾。
 ///
-/// `depth`＝最多往下幾層，**根底下的第一層算第 1 層**；掃描本身就停在那一層，
-/// 更深的資料夾不走進去、也不算進任何人的大小。
+/// `depth`＝清單最多列到第幾層，**根底下的第一層算第 1 層**。更深的資料夾
+/// 不列，但還是會走進去算大小（每一列都是含子資料夾的總和）。
 ///
 /// `report(已掃到幾個, 現在在哪)` 每掃完一個資料夾叫一次，給畫面更新進度用；
 /// 叫得很頻繁，節流由呼叫端決定（見 `App::disk_scan`）。
@@ -197,22 +208,58 @@ pub fn scan(
     cancel: &AtomicBool,
     report: &mut dyn FnMut(usize, &Path),
 ) -> Result<Scanned, String> {
-    let mut rows: Vec<Row> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-    // 待走的資料夾與它在第幾層（根是第 0 層，不列進清單：那是整顆碟本身）
-    let mut stack: Vec<(PathBuf, u32)> = vec![(root.to_path_buf(), 0)];
-    while let Some((dir, level)) = stack.pop() {
-        if cancel.load(Ordering::Relaxed) {
+    let mut w = Walker {
+        rows: Vec::new(),
+        skipped: Vec::new(),
+        depth,
+        disk,
+        cancel,
+        report,
+    };
+    // 根是第 0 層，不列進清單：那是整顆碟本身
+    w.walk(root, 0, true)?;
+    let mut rows = w.rows;
+    sort_rows(&mut rows);
+    Ok(Scanned {
+        rows,
+        skipped: w.skipped,
+    })
+}
+
+/// [`scan`] 走資料夾時帶著的東西
+struct Walker<'a> {
+    rows: Vec<Row>,
+    skipped: Vec<String>,
+    depth: u32,
+    disk: u32,
+    cancel: &'a AtomicBool,
+    report: &'a mut dyn FnMut(usize, &Path),
+}
+
+impl Walker<'_> {
+    /// 走一個資料夾，回傳**它底下所有檔案**的大小總和（含每一層子資料夾，
+    /// 與檔案總管「內容」裡的大小同一個算法——使用者對照的就是那個數字）。
+    ///
+    /// `listed`＝這個資料夾要不要列進清單。隱藏的、程式自己的工作資料夾、
+    /// 快取、超過指定層數的，**一律不列、但照樣算進上一層的大小**：清單上
+    /// 不想看到它們，可是它們佔的空間是真的，少算的話上一層的數字就跟
+    /// 檔案總管對不起來
+    fn walk(&mut self, dir: &Path, level: u32, listed: bool) -> Result<u64, String> {
+        if self.cancel.load(Ordering::Relaxed) {
             return Err(CANCELLED.into());
         }
-        let rd = match fs::read_dir(&dir) {
+        let rd = match fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(e) => {
                 if level == 0 {
                     return Err(format!("無法讀取「{}」：{e}", dir.display()));
                 }
-                skipped.push(format!("{}（{e}）", dir.display()));
-                continue;
+                // 只有清單上的資料夾讀不進去才值得講（隱藏的系統資料夾
+                // 讀不進去很常見，講了只是一堆雜訊）
+                if listed {
+                    self.skipped.push(format!("{}（{e}）", dir.display()));
+                }
+                return Ok(0);
             }
         };
         // 這個資料夾自己叫什麼（`is_app_data` 要靠它分辨 `release\build`
@@ -222,28 +269,29 @@ pub fn scan(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut bytes: u64 = 0;
-        let mut subs: Vec<PathBuf> = Vec::new();
+        // 子資料夾與它要不要列進清單
+        let mut subs: Vec<(PathBuf, bool)> = Vec::new();
         // 裡面有 CACHEDIR.TAG 就代表「這是快取資料夾」——那是跨工具的
         // 標準標記（cargo 的 target 就有，備份軟體也靠它略過），整棵不列
         let mut cache_tag = false;
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
             // 捷徑（符號連結／junction）不跟進去：它可能指回自己形成無窮迴圈，
-            // 連結後面那份資料也不住在這顆碟的這個位置上
+            // 連結後面那份資料也不住在這顆碟的這個位置上（檔案總管也不算它）
             if ft.is_symlink() {
                 continue;
             }
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if is_junk(&name) {
-                continue;
-            }
             if ft.is_dir() {
-                // 隱藏的、以及程式自己的工作資料夾都不列、也不走進去
-                // （見 [`is_hidden`]、[`is_app_data`]）
-                if !is_hidden(&e) && !is_app_data(&name, Some(&here)) {
-                    subs.push(e.path());
-                }
+                // 隱藏的、程式自己的工作資料夾不列（見 [`is_hidden`]、
+                // [`is_app_data`]），超過層數的也不列——但大小都要算
+                let show = listed
+                    && level < self.depth
+                    && !is_junk(&name)
+                    && !is_hidden(&e)
+                    && !is_app_data(&name, Some(&here));
+                subs.push((e.path(), show));
             } else if ft.is_file() {
                 if name.eq_ignore_ascii_case("CACHEDIR.TAG") {
                     cache_tag = true;
@@ -253,33 +301,23 @@ pub fn scan(
                 }
             }
         }
-        // 快取資料夾：這一列不記，底下也不走
-        if cache_tag {
-            continue;
+        // 快取資料夾：這一列不記，底下的也都不列（大小一樣照算）
+        let listed = listed && !cache_tag;
+        for (s, show) in subs {
+            bytes += self.walk(&s, level + 1, show && listed)?;
         }
-        if level > 0 {
-            rows.push(Row {
-                disk,
+        if listed && level > 0 {
+            self.rows.push(Row {
+                disk: self.disk,
                 path: dir.to_string_lossy().into_owned(),
-                name: dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                name: here,
                 bytes,
-                mtime: dir_mtime(&dir),
+                mtime: dir_mtime(dir),
             });
         }
-        // 停在第 depth 層：這一層的資料夾照樣列出來（連同它自己的檔案大小），
-        // 只是不再往它底下走
-        if level < depth {
-            for s in subs {
-                stack.push((s, level + 1));
-            }
-        }
-        report(rows.len(), &dir);
+        (self.report)(self.rows.len(), dir);
+        Ok(bytes)
     }
-    sort_rows(&mut rows);
-    Ok(Scanned { rows, skipped })
 }
 
 /// 資料夾的修改時間（unix 秒）。讀不到就是 0，對應畫面上的空白
@@ -352,6 +390,25 @@ pub struct DiskNote {
     /// 編號；插回來時不管先認到哪一個磁區，都要能帶出同一個號
     #[serde(rename = "ss", default)]
     pub serials: Vec<u32>,
+    /// 這個編號**第一次建檔**的時間（unix 秒）。之後重掃、加磁區都不會改它，
+    /// 只有整號刪掉再重建才重新算（`at` 是每掃一次就換的那個）。
+    ///
+    /// 0＝這個欄位還不存在時建的號，當時沒記下來；讀的時候退回 `at`
+    /// （見 [`DiskNote::created_at`]）
+    #[serde(rename = "c", default)]
+    pub created: u64,
+}
+
+impl DiskNote {
+    /// 這個編號是什麼時候建的。舊總表沒記建立時間，只好拿上次掃完的時間
+    /// 頂著——那是手上最早的一個日期
+    pub fn created_at(&self) -> u64 {
+        if self.created != 0 {
+            self.created
+        } else {
+            self.at
+        }
+    }
 }
 
 /// 同一個編號再建一次檔時，新掃到的東西要怎麼進表
@@ -427,6 +484,14 @@ impl Table {
         v
     }
 
+    /// 這個編號是哪一天建的（見 [`DiskNote::created`]）。沒有附註就是 None
+    pub fn created_of(&self, disk: u32) -> Option<u64> {
+        self.notes
+            .get(&disk)
+            .map(DiskNote::created_at)
+            .filter(|&c| c != 0)
+    }
+
     /// 這個編號底下有幾列
     pub fn count_of(&self, disk: u32) -> usize {
         self.rows.iter().filter(|r| r.disk == disk).count()
@@ -489,6 +554,15 @@ impl Table {
         note: DiskNote,
         how: Merge,
     ) {
+        // 建立日期跟著編號走：這一號已經有了就沿用原本的，第一次建才是現在
+        // （兩種放法都一樣——重掃同一顆碟，編號還是當初那天建的）
+        let created = self
+            .notes
+            .get(&disk)
+            .map(DiskNote::created_at)
+            .filter(|&c| c != 0)
+            .unwrap_or(note.at);
+        let note = DiskNote { created, ..note };
         let note = match how {
             Merge::Replace => {
                 self.rows.retain(|r| r.disk != disk);
@@ -1133,6 +1207,7 @@ mod tests {
             label: root.into(),
             serial,
             serials: Vec::new(),
+            created: 0,
         };
         // 先掃 K:（這一號還沒有東西）
         t.put_disk(94, "K:\\", vec![row(94, "K:\\一")], note("新碟 (K:)", 11), Merge::Replace);
@@ -1164,6 +1239,32 @@ mod tests {
         // 選「覆蓋」就只剩這次掃到的
         t.put_disk(94, "L:\\", vec![row(94, "L:\\只剩我")], note("新碟 (L:)", 22), Merge::Replace);
         assert_eq!(t.count_of(94), 1);
+    }
+
+    /// 「編號建立日期」是這個號第一次建檔那天：重掃、加磁區都不改，
+    /// 整號刪掉再重建才重算；舊總表沒記的退回上次掃完的時間
+    #[test]
+    fn 編號建立日期跟著編號走() {
+        let mut t = Table::default();
+        let at = |a: u64| DiskNote {
+            at: a,
+            ..DiskNote::default()
+        };
+        t.put_disk(7, "K:\\", Vec::new(), at(1000), Merge::Replace);
+        assert_eq!(t.created_of(7), Some(1000), "第一次建檔就是那天");
+        t.put_disk(7, "K:\\", Vec::new(), at(2000), Merge::Replace);
+        t.put_disk(7, "L:\\", Vec::new(), at(3000), Merge::Append);
+        assert_eq!(t.created_of(7), Some(1000), "重掃、加磁區都不改");
+        assert_eq!(t.notes[&7].at, 3000, "上次掃完的時間照常更新");
+        t.remove_disk(7);
+        t.put_disk(7, "M:\\", Vec::new(), at(4000), Merge::Replace);
+        assert_eq!(t.created_of(7), Some(4000), "刪掉重建就是新的一號");
+        // 舊總表：附註裡沒有建立時間
+        t.notes.insert(8, at(500));
+        assert_eq!(t.created_of(8), Some(500));
+        t.put_disk(8, "N:\\", Vec::new(), at(900), Merge::Replace);
+        assert_eq!(t.created_of(8), Some(500), "舊的號重掃也要留住手上最早的日期");
+        assert_eq!(t.created_of(9), None);
     }
 
     #[test]
@@ -1329,10 +1430,38 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let out = scan(&base, 2, 7, &cancel, &mut |_, _| {}).unwrap();
         let names: Vec<&str> = out.rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["a", "b"], "第 3 層的 c 不該被走到");
+        assert_eq!(names, vec!["a", "b"], "第 3 層的 c 不該列出來");
         assert!(out.rows.iter().all(|r| r.disk == 7));
-        // 每一列的大小只算自己那一層的檔案
-        assert!(out.rows.iter().all(|r| r.bytes == 1));
+        // 大小含子資料夾（與檔案總管一樣）：沒列出來的 c 也要算進去
+        let size = |n: &str| out.rows.iter().find(|r| r.name == n).unwrap().bytes;
+        assert_eq!(size("a"), 3, "a 自己 1 ＋ b 的 1 ＋ c 的 1");
+        assert_eq!(size("b"), 2, "b 自己 1 ＋ c 的 1");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// 檔案全放在子資料夾裡的上層資料夾，大小不能是 0（實際回報過：
+    /// F:\新增資料夾 顯示 0 GB，檔案總管是 50.6 GB）。不列出來的隱藏資料夾、
+    /// 快取，佔的空間也要算進上一層
+    #[test]
+    fn 資料夾大小含子資料夾與不列出來的() {
+        let base = std::env::temp_dir().join(format!("p2v_tree_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let top = base.join("新增資料夾");
+        fs::create_dir_all(top.join("鳥_精選").join("1樹鴨")).unwrap();
+        fs::write(top.join("鳥_精選").join("1樹鴨").join("a.jpg"), [0u8; 100]).unwrap();
+        fs::write(top.join("鳥_精選").join("b.jpg"), [0u8; 10]).unwrap();
+        fs::create_dir_all(top.join(".cache")).unwrap();
+        fs::write(top.join(".cache").join("x"), [0u8; 5]).unwrap();
+        fs::create_dir_all(top.join("target")).unwrap();
+        fs::write(top.join("target").join("CACHEDIR.TAG"), [0u8; 3]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let out = scan(&base, 5, 1, &cancel, &mut |_, _| {}).unwrap();
+        let size = |n: &str| out.rows.iter().find(|r| r.name == n).map(|r| r.bytes);
+        assert_eq!(size("1樹鴨"), Some(100));
+        assert_eq!(size("鳥_精選"), Some(110));
+        assert_eq!(size("新增資料夾"), Some(118), "子資料夾＋隱藏＋快取全部算進來");
+        assert_eq!(size(".cache"), None, "隱藏的照樣不列");
+        assert_eq!(size("target"), None, "快取照樣不列");
         let _ = fs::remove_dir_all(&base);
     }
 }

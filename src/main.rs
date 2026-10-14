@@ -8318,6 +8318,9 @@ struct SearchTool {
     /// 只看這個範圍內的硬碟編號（None＝不指定）
     from: Option<u32>,
     to: Option<u32>,
+    /// 資料夾大小的範圍（GB，使用者打的字；空白＝不限，見 [`SearchTool::size_range`]）
+    size_lo: String,
+    size_hi: String,
     /// 符合條件的那幾列（總表 rows 的索引）。條件變了才重算
     hits: Vec<u32>,
     /// 總表被動過了（建檔、刪除），下一幀重算
@@ -8325,12 +8328,19 @@ struct SearchTool {
     /// 使用者自己拖過的欄寬。None＝照內容自動算（見 [`App::ui_search_table`]）；
     /// 拖過一次就整組記下來，之後只有他自己能再改（視窗變寬也不會被蓋掉——
     /// 「我調成這樣」的意思就是要它保持這樣）
-    cols: Option<[f32; 7]>,
+    cols: Option<[f32; 8]>,
     /// 點了哪一欄的標題要排序（欄位索引，true＝由小到大）。
     /// None＝總表原本的順序（先硬碟編號、再資料夾名稱）
     sort: Option<(usize, bool)>,
     /// 上次算 hits 用的條件，拿來判斷要不要重算
-    last: (String, Option<u32>, Option<u32>, usize, Option<(usize, bool)>),
+    last: (
+        String,
+        Option<u32>,
+        Option<u32>,
+        (Option<u64>, Option<u64>),
+        usize,
+        Option<(usize, bool)>,
+    ),
     /// 一頁一頁翻。**預設關著**：幾萬列直接捲就好（只畫看得見的那幾列），
     /// 翻頁反而多一道手續——要一頁一頁看的人再自己打開
     paged: bool,
@@ -8361,12 +8371,14 @@ impl Default for SearchTool {
             text: String::new(),
             from: None,
             to: None,
+            size_lo: String::new(),
+            size_hi: String::new(),
             hits: Vec::new(),
             dirty: true,
             cols: None,
             sort: None,
             // 一個不可能相等的起始值，確保第一次一定會算
-            last: (String::new(), None, None, usize::MAX, None),
+            last: (String::new(), None, None, (None, None), usize::MAX, None),
             paged: false,
             per_page: 100,
             page: 0,
@@ -8384,6 +8396,25 @@ impl Default for SearchTool {
 }
 
 impl SearchTool {
+    /// 資料夾大小的範圍換成位元組（下限, 上限），沒填或填錯的那一邊是 None（不限）。
+    ///
+    /// 照**畫面上看到的數字**算：表格寫的是四捨五入到 0.01 GB 的值，所以
+    /// 「10 到 20」要包含顯示成 20 GB 的 20.004 GB，兩邊各放寬半格。
+    /// 兩個填反了（大的寫在前面）就自己對調，不要因此一筆都查不到
+    fn size_range(&self) -> (Option<u64>, Option<u64>) {
+        const G: f64 = 1024.0 * 1024.0 * 1024.0;
+        let lo = parse_gb(&self.size_lo);
+        let hi = parse_gb(&self.size_hi);
+        let (lo, hi) = match (lo, hi) {
+            (Some(a), Some(b)) if a > b => (Some(b), Some(a)),
+            other => other,
+        };
+        (
+            lo.map(|g| ((g - 0.005).max(0.0) * G).ceil() as u64),
+            hi.map(|g| ((g + 0.005) * G).floor() as u64),
+        )
+    }
+
     /// 分頁時總共幾頁（至少一頁）
     fn pages(&self) -> usize {
         if !self.paged {
@@ -8412,6 +8443,25 @@ enum SearchScroll {
     /// 就是「換一個畫面」，不是「把選取挪進畫面」。
     /// 超出可捲範圍沒關係，egui 會自己夾住（End 因此剛好到底）
     At(f32),
+}
+
+/// 檔案搜尋「資料夾大小」那兩格打的字：GB 數，可以有小數；順手帶的
+/// 「GB」與全形數字也認得。空白、負數、認不出來的都是 None
+fn parse_gb(s: &str) -> Option<f64> {
+    let t: String = s
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '０'..='９' => char::from_u32(c as u32 - '０' as u32 + '0' as u32).unwrap_or(c),
+            '．' => '.',
+            _ => c,
+        })
+        .collect();
+    let t = t.trim_end_matches(|c: char| c.eq_ignore_ascii_case(&'g') || c.eq_ignore_ascii_case(&'b'));
+    t.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|g| g.is_finite() && *g >= 0.0)
 }
 
 /// 三位一撇的數字。兩萬多筆的清單上，`24996` 與 `249960` 掃過去是一樣的，
@@ -27486,10 +27536,10 @@ impl App {
                     .desired_width(40.0)
                     .char_limit(2),
             )
-            .tip("往下掃幾層資料夾就停（1~20）");
+            .tip("清單列到第幾層資料夾（1~20）");
             ui.label(egui::RichText::new("層").size(13.0).color(theme::TEXT));
             let msg = if self.disk.depth().is_some() {
-                "更深的資料夾不走進去，所以掃一顆碟要多久是可以預期的".to_string()
+                "更深的資料夾不列出來，但大小照樣算進上一層（與檔案總管一樣含子資料夾）".to_string()
             } else {
                 "深度請填 1 到 20 的數字".to_string()
             };
@@ -27938,6 +27988,8 @@ impl App {
                         label: drive.label.clone(),
                         serial: drive.serial,
                         serials: Vec::new(),
+                        // 建立日期由 put_disk 決定（已經有這一號就沿用原本的）
+                        created: 0,
                     },
                     how,
                 );
@@ -28048,6 +28100,7 @@ impl App {
             self.search.text.clone(),
             self.search.from,
             self.search.to,
+            self.search.size_range(),
             self.disk.table.rows.len(),
             self.search.sort,
         );
@@ -28058,6 +28111,7 @@ impl App {
         self.search.last = key;
         let q = disk::Query::parse(&self.search.text);
         let (from, to) = (self.search.from, self.search.to);
+        let (lo, hi) = self.search.size_range();
         self.search.hits = self
             .disk
             .table
@@ -28067,6 +28121,8 @@ impl App {
             .filter(|(_, r)| {
                 from.is_none_or(|f| r.disk >= f)
                     && to.is_none_or(|t| r.disk <= t)
+                    && lo.is_none_or(|l| r.bytes >= l)
+                    && hi.is_none_or(|h| r.bytes <= h)
                     && q.matches(&r.name)
             })
             .map(|(i, _)| i as u32)
@@ -28075,6 +28131,8 @@ impl App {
         // 再資料夾名稱，見 [`disk::Table`]），那也是 Excel 與 PDF 的順序
         if let Some((col, asc)) = self.search.sort {
             let rows = &self.disk.table.rows;
+            let table = &self.disk.table;
+            let created = |d: u32| table.created_of(d).unwrap_or(0);
             let mut hits = std::mem::take(&mut self.search.hits);
             if col == 2 || col == 3 {
                 // 文字那兩欄**先把排序鍵算好再排**：在比較函式裡現算的話，
@@ -28099,6 +28157,10 @@ impl App {
                         // 「資料夾大小」與「資料夾大小(byte)」是同一個數字
                         4 | 6 => x.bytes.cmp(&y.bytes),
                         5 => x.mtime.cmp(&y.mtime),
+                        // 照硬碟編號的建立日期；同一天建的再照編號，同一號的列才排在一起
+                        7 => created(x.disk)
+                            .cmp(&created(y.disk))
+                            .then_with(|| x.disk.cmp(&y.disk)),
                         // 0＝流水號：它本來就是「第幾筆」，照原順序
                         _ => std::cmp::Ordering::Equal,
                     }
@@ -28291,7 +28353,14 @@ impl App {
                     .strong()
                     .color(theme::TEXT),
             );
+            let from_before = self.search.from;
             search_no_combo(ui, "search_from", "全部", &disks, &mut self.search.from);
+            // 選了開始那一號，結束那一號跟著換成同一號（使用者定的）：最常查
+            // 的是「這一顆碟裡有什麼」，要查一段範圍再自己把後面那個改大。
+            // 開始改回「全部」就兩邊一起回到全部
+            if self.search.from != from_before {
+                self.search.to = self.search.from;
+            }
             ui.label(egui::RichText::new("到").size(12.5).color(theme::TEXT_WEAK));
             search_no_combo(ui, "search_to", "全部", &disks, &mut self.search.to);
             ui.add_space(14.0);
@@ -28314,6 +28383,48 @@ impl App {
                 .size(12.0)
                 .color(theme::TEXT_WEAK),
             );
+            ui.add_space(18.0);
+            // 資料夾大小：幾 GB 到幾 GB。一填就照大小由大到小排——用大小找，
+            // 要看的多半是最大的那幾個（使用者定的）；之後點標題照樣能換排法
+            let before = self.search.size_range();
+            ui.label(
+                egui::RichText::new("資料夾大小")
+                    .size(13.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            let box_ = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
+                let bad = !text.trim().is_empty() && parse_gb(text).is_none();
+                ui.add(
+                    egui::TextEdit::singleline(text)
+                        .desired_width(56.0)
+                        .hint_text(hint)
+                        .text_color(if bad { theme::ERROR } else { theme::TEXT }),
+                )
+                .tip(if bad {
+                    "請填數字（GB），例如 0.5、10"
+                } else {
+                    "單位是 GB，可以有小數；空著就是不限"
+                });
+            };
+            box_(ui, &mut self.search.size_lo, "不限");
+            ui.label(egui::RichText::new("GB　到").size(12.5).color(theme::TEXT_WEAK));
+            box_(ui, &mut self.search.size_hi, "不限");
+            ui.label(egui::RichText::new("GB").size(12.5).color(theme::TEXT_WEAK));
+            let after = self.search.size_range();
+            if after != before && after != (None, None) {
+                // 4＝「資料夾大小」那一欄，false＝由大到小
+                self.search.sort = Some((4, false));
+            }
+            if (!self.search.size_lo.is_empty() || !self.search.size_hi.is_empty())
+                && ui
+                    .small_button("✖")
+                    .tip("清掉大小的條件")
+                    .clicked()
+            {
+                self.search.size_lo.clear();
+                self.search.size_hi.clear();
+            }
         });
         ui.add_space(6.0);
 
@@ -28512,16 +28623,18 @@ impl App {
         // 多出來的空間就留在表格右邊，與 Excel 一樣
         const COL_NO: f32 = 64.0;
         const COL_DISK: f32 = 76.0;
-        // 最後三欄（大小、修改時間、byte）**固定寬度、不給拖**。數字照
+        // 後面四欄（大小、修改時間、byte、編號建立日期）**固定寬度、不給拖**。數字照
         // 使用者自己拖出來、說「就要這樣」的那一版量的：原本的 84／136／124
         // 太擠，數字貼著格線，每次開程式都得重拖一次（拖過的寬度不會存）
         const COL_GB: f32 = 112.0;
         const COL_TIME: f32 = 188.0;
         const COL_BYTES: f32 = 170.0;
+        /// 「編號建立日期」：只有日期（2026/10/14），寬度要留得下標題與排序箭頭
+        const COL_CREATED: f32 = 140.0;
         /// 捲軸與右邊留白
         const COL_GAP: f32 = 34.0;
         let rest = (ui.available_width()
-            - (COL_NO + COL_DISK + COL_GB + COL_TIME + COL_BYTES + COL_GAP))
+            - (COL_NO + COL_DISK + COL_GB + COL_TIME + COL_BYTES + COL_CREATED + COL_GAP))
             .max(300.0);
         let text_w = |ui: &egui::Ui, s: &str| {
             ui.fonts(|f| {
@@ -28556,13 +28669,14 @@ impl App {
         } else {
             (path_w, name_w)
         };
-        // 自己拖過就以他拖的為準——只有前四欄；最後三欄一律是固定寬度
+        // 自己拖過就以他拖的為準——只有前四欄；後面四欄一律是固定寬度
         let mut widths = self.search.cols.unwrap_or([
-            COL_NO, COL_DISK, path_w, name_w, COL_GB, COL_TIME, COL_BYTES,
+            COL_NO, COL_DISK, path_w, name_w, COL_GB, COL_TIME, COL_BYTES, COL_CREATED,
         ]);
         widths[4] = COL_GB;
         widths[5] = COL_TIME;
         widths[6] = COL_BYTES;
+        widths[7] = COL_CREATED;
         let titles = [
             "編號",
             "硬碟編號",
@@ -28571,6 +28685,7 @@ impl App {
             "資料夾大小",
             "資料夾修改時間",
             "資料夾大小(byte)",
+            "編號建立日期",
         ];
         // 標題列：**點一下照那一欄排，再點一次反過來**，排序中的那一欄
         // 標一個箭頭。流水號那一欄排的是「總表原本的順序」
@@ -28601,7 +28716,7 @@ impl App {
         let mut gx = head.left();
         for i in 0..widths.len() {
             gx += widths[i];
-            // 大小、修改時間、byte 這三欄固定寬度：右邊界不給拖
+            // 大小、修改時間、byte、建立日期這四欄固定寬度：右邊界不給拖
             // （名稱那一欄的右邊界還是可以拖，它調的是名稱的寬度）
             if i >= 4 {
                 continue;
@@ -28760,6 +28875,12 @@ impl App {
                         disk::fmt_gb(r.bytes),
                         disk::fmt_time(r.mtime),
                         thousands(r.bytes),
+                        // 這一筆所在的那個硬碟編號是哪一天建的（同一號每一列都一樣）
+                        self.disk
+                            .table
+                            .created_of(r.disk)
+                            .map(disk::fmt_date)
+                            .unwrap_or_default(),
                     ];
                     // 名稱那一欄亮一點：找東西時眼睛掃的就是它
                     let colors = [
@@ -28768,6 +28889,7 @@ impl App {
                         theme::TEXT_WEAK,
                         theme::TEXT,
                         theme::TEXT,
+                        theme::TEXT_WEAK,
                         theme::TEXT_WEAK,
                         theme::TEXT_WEAK,
                     ];
@@ -37468,6 +37590,37 @@ mod tests {
         );
         // 根目錄下的照片沒有資料夾名可用（就是上面那條退路）
         assert_eq!(folder_name(Path::new(r"F:\a.jpg")), None);
+    }
+
+    /// 檔案搜尋的資料夾大小範圍：照畫面上四捨五入的數字算，填反了自己對調
+    #[test]
+    fn 資料夾大小範圍照畫面上的數字() {
+        const G: u64 = 1024 * 1024 * 1024;
+        assert_eq!(parse_gb("10"), Some(10.0));
+        assert_eq!(parse_gb(" 0.5 GB "), Some(0.5));
+        assert_eq!(parse_gb("１２．５"), Some(12.5));
+        assert_eq!(parse_gb(""), None);
+        assert_eq!(parse_gb("abc"), None);
+        assert_eq!(parse_gb("-1"), None);
+
+        let mut s = SearchTool::default();
+        s.size_lo = "10".into();
+        s.size_hi = "20".into();
+        let (lo, hi) = s.size_range();
+        let inside = |b: u64| lo.is_none_or(|l| b >= l) && hi.is_none_or(|h| b <= h);
+        // 顯示成 20 GB 的 20.004 GB 要算在內；顯示 20.01 GB 的不算
+        assert!(inside((20.004 * G as f64) as u64));
+        assert!(!inside((20.01 * G as f64) as u64));
+        assert!(inside((9.996 * G as f64) as u64), "顯示成 10 GB 的也算");
+        assert!(!inside(9 * G));
+        // 大的寫在前面：一樣查得到
+        s.size_lo = "20".into();
+        s.size_hi = "10".into();
+        assert_eq!(s.size_range(), (lo, hi));
+        // 只填一邊＝另一邊不限
+        s.size_lo = "10".into();
+        s.size_hi.clear();
+        assert_eq!(s.size_range().1, None);
     }
 
     /// 資料備份的剩餘時間：寫法照檔案總管，速度看最近十秒
