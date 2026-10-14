@@ -6423,6 +6423,9 @@ const TRACK_ZOOM_DEFAULT: f32 = 6.0;
 /// 不必重跑
 #[derive(Default)]
 struct TrackTool {
+    /// 上一次「從手動框追蹤」時用到的手動框（照片 → 框）。下一次只重追
+    /// 手動框有變動的那幾段（見 [`App::spawn_track`]）；清除追蹤時一併忘掉
+    followed: HashMap<PathBuf, [f32; 4]>,
     /// 要找的鳥種（見 [`BirdKind`]），存在專案裡
     bird: BirdKind,
     /// 正在預覽上檢查／拖曳修改主體框
@@ -9429,6 +9432,34 @@ impl App {
         v
     }
 
+    /// 縮圖列被過濾時排的是哪幾張（「只顯示要檢查的」「只顯示手動」）；
+    /// 沒過濾、或追蹤沒在用時是 None
+    fn filtered_view(&self) -> Option<Vec<usize>> {
+        let track_on = self.track.has_boxes() && !self.track.busy();
+        if self.track.only_manual && track_on {
+            Some(self.track_manual_idx().iter().map(|m| m.0).collect())
+        } else {
+            (self.track.only_unsure && track_on).then(|| self.track_unsure())
+        }
+    }
+
+    /// 預覽切到上一張（-1）或下一張（+1）。縮圖列被過濾時只在那幾張之間
+    /// 切——否則滾輪、方向鍵會切到沒列出來的照片，預覽跟縮圖列對不上
+    /// （使用者回報：只顯示手動時，預覽卻停在一張自動框的）
+    fn step_preview(&mut self, dir: i32) {
+        let cur = self.preview_selected.unwrap_or(0);
+        let next = match self.filtered_view().filter(|v| !v.is_empty()) {
+            Some(v) if dir > 0 => v.iter().copied().find(|&i| i > cur),
+            Some(v) => v.iter().rev().copied().find(|&i| i < cur),
+            None if dir > 0 => (cur + 1 < self.photos.len()).then_some(cur + 1),
+            None => cur.checked_sub(1),
+        };
+        if let Some(i) = next {
+            self.select_photo(Some(i));
+            self.scroll_to_selected = true;
+        }
+    }
+
     /// 還沒框到、或框得沒把握的照片（照片順序）。逐一檢查與「整批移除」
     /// 都以這一份為準
     fn track_unsure(&self) -> Vec<usize> {
@@ -9758,16 +9789,50 @@ impl App {
         // 照片也不動（使用者定的規矩：追蹤不能把原本框對的位置移開），只補
         // 還沒框到、或框得沒把握的
         let first = marks[0].0;
+        // 只重追「手動框有變動」的那幾段（使用者定的規矩）：上一趟追蹤時就在、
+        // 位置也沒動過的手動框，它前後那兩段上一趟已經追過了，不再重算——
+        // 重算只會冒著把對的改壞的風險。變動＝新框的、搬過的；拿掉的手動框，
+        // 它原本所在的那一段也算變動（前後兩個框之間變成新的一段）
+        let changed: Vec<bool> = marks
+            .iter()
+            .map(|(i, r)| self.track.followed.get(&self.photos[*i]) != Some(r))
+            .collect();
+        let removed: Vec<usize> = self
+            .photos
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| self.track.followed.contains_key(*p) && !self.track.box_of(p).is_some_and(|s| s.src == BoxSrc::Manual))
+            .map(|(i, _)| i)
+            .collect();
+        let mut affected = vec![false; self.photos.len()];
+        for k in 0..marks.len() {
+            let a = marks[k].0;
+            let b = marks.get(k + 1).map_or(self.photos.len(), |m| m.0);
+            let hit = changed[k]
+                || changed.get(k + 1).copied().unwrap_or(false)
+                || removed.iter().any(|&r| r > a && r < b);
+            if hit {
+                affected[a + 1..b].fill(true);
+            }
+        }
         let need: Vec<bool> = self
             .photos
             .iter()
             .enumerate()
-            .map(|(i, p)| i > first && !self.track.box_of(p).is_some_and(|s| s.src == BoxSrc::Manual || s.sure()))
+            .map(|(i, p)| {
+                i > first && affected[i] && !self.track.box_of(p).is_some_and(|s| s.src == BoxSrc::Manual || s.sure())
+            })
             .collect();
         if !need.iter().any(|x| *x) {
-            self.track.error = Some("手動框之後的照片都已經框好了，沒有要追的".into());
+            self.track.error = Some(if affected.iter().any(|x| *x) {
+                "有變動的手動框附近都已經框好了，沒有要追的".into()
+            } else {
+                "手動框跟上一次追蹤時一樣，沒有要重追的（新框一張或搬動手動框再按）".into()
+            });
             return;
         }
+        // 記下這一趟用到的手動框，下一趟拿來比對哪幾個有變動
+        self.track.followed = marks.iter().map(|(i, r)| (self.photos[*i].clone(), *r)).collect();
         // 上一次追蹤補上、但沒把握的框：這次只在比對得更有把握時才換掉。
         // 沒把握不代表錯——實測一批八色鳥，多框一張再追蹤一次，有一張原本
         // 對的（沒把握）被重算成錯的直接蓋掉（使用者回報「把對的改成不對」）
@@ -9778,7 +9843,7 @@ impl App {
             .collect();
         self.track.job = TrackJob::Follow;
         self.track.phase = None;
-        self.track.total = self.photos.len() - first;
+        self.track.total = affected.iter().filter(|x| **x).count() + marks.len();
         self.track.done = 0;
         let photos = self.photos.clone();
         let crop = self.effective_adj(&photos[marks[0].0]).crop;
@@ -12855,6 +12920,16 @@ impl App {
                         self.track.only_unsure = !self.track.only_unsure;
                         if self.track.only_unsure {
                             self.track.only_manual = false;
+                            // 目前這張不在要檢查的名單裡就跳到第一張要檢查的：
+                            // 縮圖列只排那幾張，預覽停在別張會對不上（使用者回報）
+                            let left = self.track_unsure();
+                            if !self.preview_selected.is_some_and(|i| left.contains(&i)) {
+                                if let Some(&i) = left.first() {
+                                    self.multi_sel.clear();
+                                    self.select_photo(Some(i));
+                                    self.mark_preview_dirty();
+                                }
+                            }
                         }
                         self.scroll_to_selected = true;
                     }
@@ -13997,19 +14072,11 @@ impl App {
             const STEP: f32 = 40.0;
             while self.wheel_accum >= STEP {
                 self.wheel_accum -= STEP;
-                let cur = self.preview_selected.unwrap_or(0);
-                if cur > 0 {
-                    self.select_photo(Some(cur - 1));
-                    self.scroll_to_selected = true;
-                }
+                self.step_preview(-1);
             }
             while self.wheel_accum <= -STEP {
                 self.wheel_accum += STEP;
-                let cur = self.preview_selected.unwrap_or(0);
-                if cur + 1 < self.photos.len() {
-                    self.select_photo(Some(cur + 1));
-                    self.scroll_to_selected = true;
-                }
+                self.step_preview(1);
             }
         } else {
             self.wheel_accum = 0.0;
@@ -14033,11 +14100,7 @@ impl App {
         // 「只顯示要檢查的」：膠卷改成只排那幾張，逐一處理時不必在上百張裡
         // 大海撈針。view[slot] 是那一格對應的照片編號（沒過濾時就是它自己）
         let all: Vec<usize> = (0..self.photos.len()).collect();
-        let unsure_view = if self.track.only_manual && track_on {
-            Some(self.track_manual_idx().iter().map(|m| m.0).collect::<Vec<usize>>())
-        } else {
-            (self.track.only_unsure && track_on).then(|| self.track_unsure())
-        };
+        let unsure_view = self.filtered_view();
         // 沒有要檢查的了就自動回到「全部照片、原來的順序」——留一排空白在那裡
         // 只會讓人以為照片不見了（過濾的勾選維持原狀，之後再有要檢查的會自己排出來）
         let nothing_left = unsure_view.as_ref().is_some_and(|v| v.is_empty());
@@ -31046,15 +31109,11 @@ impl eframe::App for App {
             && !self.photos.is_empty()
             && ctx.memory(|m| m.focused().is_none())
         {
-            let cur = self.preview_selected.unwrap_or(0);
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && cur + 1 < self.photos.len()
-            {
-                self.select_photo(Some(cur + 1));
-                self.scroll_to_selected = true;
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                self.step_preview(1);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && cur > 0 {
-                self.select_photo(Some(cur - 1));
-                self.scroll_to_selected = true;
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                self.step_preview(-1);
             }
         }
 
