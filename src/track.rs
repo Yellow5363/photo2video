@@ -952,7 +952,7 @@ pub fn detect_candidates(
                 Some(c) => found_heads.map(|(x, y, s)| {
                     (s > 0.0)
                         .then(|| match style {
-                            HeadStyle::Colourful => red_spot(c, x, y),
+                            HeadStyle::Colourful => barbet_aim(cur, c, x, y, rect),
                             HeadStyle::Masked => dark_spot(c, x, y),
                         })
                         .flatten()
@@ -1436,6 +1436,96 @@ pub fn match_library_wide(f: &Frame, cx: f32, cy: f32, reach: f32, sizes: &[f32]
     }
     best
 }
+
+/// 五色鳥頭頂那一條黃（到橘）的冠羽：在 (x, y)（工作圖像素）附近 `r` 像素內，
+/// 找最上面那一塊夠大的黃，回傳（重心 x, 重心 y, 高, 寬），工作圖像素。
+///
+/// 喉嚨也有一塊黃，所以取「最上面」那一塊：鳥頭朝上時冠羽在最上面
+pub fn crown_of(f: &Frame, x: f32, y: f32, r: f32) -> Option<(f32, f32, f32, f32)> {
+    let c = f.colour.as_deref()?;
+    let (w, h) = (c.w, c.h);
+    if c.lum.len() != w * h {
+        return None;
+    }
+    // 工作圖 → 色彩圖（縮一半）
+    let (cx, cy, r) = (x / 2.0, y / 2.0, (r / 2.0).max(2.0));
+    let x0 = (cx - r).max(0.0) as usize;
+    let x1 = ((cx + r) as usize).min(w - 1);
+    let y0 = (cy - r).max(0.0) as usize;
+    let y1 = ((cy + r) as usize).min(h - 1);
+    let (ww, wh) = (x1 - x0 + 1, y1 - y0 + 1);
+    let yellow = |k: usize| c.rg[k] > -10.0 && c.rg[k] < 110.0 && c.yb[k] > 80.0 && c.lum[k] > 110.0;
+    let mut label = vec![0u32; ww * wh];
+    let mut best: Option<(f32, f32, f32, f32, usize)> = None; // (cx, cy, h, w, n)
+    let mut stack = Vec::new();
+    let mut id = 0u32;
+    for sy in 0..wh {
+        for sx in 0..ww {
+            let k0 = (y0 + sy) * w + x0 + sx;
+            if label[sy * ww + sx] != 0 || !yellow(k0) {
+                continue;
+            }
+            id += 1;
+            label[sy * ww + sx] = id;
+            stack.push((sx, sy));
+            let (mut n, mut tx, mut ty) = (0usize, 0.0f32, 0.0f32);
+            let (mut minx, mut maxx, mut miny, mut maxy) = (usize::MAX, 0usize, usize::MAX, 0usize);
+            while let Some((px, py)) = stack.pop() {
+                n += 1;
+                tx += px as f32;
+                ty += py as f32;
+                minx = minx.min(px);
+                maxx = maxx.max(px);
+                miny = miny.min(py);
+                maxy = maxy.max(py);
+                for (qx, qy) in [(px.wrapping_sub(1), py), (px + 1, py), (px, py.wrapping_sub(1)), (px, py + 1)] {
+                    if qx < ww && qy < wh && label[qy * ww + qx] == 0 && yellow((y0 + qy) * w + x0 + qx) {
+                        label[qy * ww + qx] = id;
+                        stack.push((qx, qy));
+                    }
+                }
+            }
+            if n < CROWN_MIN_PX {
+                continue;
+            }
+            let (gx, gy) = (tx / n as f32 + x0 as f32, ty / n as f32 + y0 as f32);
+            if best.is_none_or(|b| gy < b.1) {
+                best = Some((gx, gy, (maxy - miny + 1) as f32, (maxx - minx + 1) as f32, n));
+            }
+        }
+    }
+    best.map(|(gx, gy, bh, bw, _)| (gx * 2.0 + 1.0, gy * 2.0 + 1.0, bh * 2.0, bw * 2.0))
+}
+
+/// 五色鳥找到頭之後，十字擺哪：頭頂那條黃色冠羽的下方（眼睛、兩眼之間就在
+/// 那裡）；找不到冠羽才看嘴基兩側的紅點（見 [`red_spot`]）。
+///
+/// 「顏色最雜的一小塊」正面時落在額頭，側面時卻常落在紅色頸帶、藍臉、黃喉
+/// 擠在一起的地方，比眼睛低一個頭寬（使用者回報：鳥轉成側面後十字都往左
+/// 下偏）。冠羽不管正面側面都在眼睛正上方。實測五批使用者標好的五色鳥，
+/// 落在標的位置四分之一框寬內：7/21 圖庫 10→17、8/10 圖庫 44→47、大溪 1→19、
+/// 0712 35→42、大安連拍4 40→36；中位偏離都變小
+fn barbet_aim(f: &Frame, c: &Chroma, x: f32, y: f32, rect: [f32; 4]) -> Option<(f32, f32)> {
+    let (fw, fh) = (f.w as f32, f.h as f32);
+    // 搜尋範圍跟著鳥的大小變：特寫時頭很大，冠羽離「顏色最雜」那點很遠；
+    // 中距離時範圍太大會撿到別的黃（實測固定 4 倍頭寬時中距離三批變差）
+    let blob = ((rect[2] - rect[0]) * fw).max((rect[3] - rect[1]) * fh);
+    let r = (fw.max(fh) * HEAD_RADIUS * CROWN_SEARCH).max(CROWN_BLOB * blob);
+    crown_of(f, x * fw, y * fh, r)
+        .map(|(cx, cy, ch, _)| (cx / fw, (cy + CROWN_DROP * ch) / fh))
+        .or_else(|| red_spot(c, x, y))
+}
+
+/// 找冠羽的範圍：[`HEAD_RADIUS`] 的幾倍，與動態框長邊的幾倍，取大的
+const CROWN_SEARCH: f32 = 2.5;
+const CROWN_BLOB: f32 = 0.5;
+
+/// 十字從冠羽重心往下移冠羽高度的幾倍（眼睛在冠羽下緣附近）
+const CROWN_DROP: f32 = 0.7;
+
+
+/// 冠羽至少要有幾個色彩圖像素（工作圖的四分之一）
+const CROWN_MIN_PX: usize = 6;
 
 /// 第 i 張挑中的頭 (x, y)（[`choose_heads`] 回傳的那一處）附近的紅點
 pub fn red_of(cands: &[Found], x: f32, y: f32) -> Option<(f32, f32)> {
