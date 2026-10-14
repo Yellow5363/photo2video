@@ -929,6 +929,8 @@ struct ProjectFile {
     /// 主體追蹤的鏡頭範圍（主體框的幾倍）與平滑度（0~100）
     track_zoom: f32,
     track_smooth: i32,
+    /// 主體追蹤的鳥種（[`BirdKind::id`]）；舊專案沒有這欄就是五色鳥
+    track_bird: String,
     /// 轉場（none/fade_black）
     transition: String,
     ken_burns: bool,
@@ -963,6 +965,7 @@ impl Default for ProjectFile {
             track_prev: Vec::new(),
             track_zoom: TRACK_ZOOM_DEFAULT,
             track_smooth: 20,
+            track_bird: String::new(),
             transition: "none".into(),
             ken_burns: false,
             fade_out: true,
@@ -4083,6 +4086,7 @@ fn run_auto_boxes(
     photos: &[PathBuf],
     manual: &[Option<[f32; 4]>],
     crop: Crop,
+    bird: BirdKind,
     send: &dyn Fn(TrackMsg),
 ) {
     let n = photos.len();
@@ -4235,7 +4239,9 @@ fn run_auto_boxes(
     // 正面時兩點的重心正好在兩眼之間，側面時那一點緊貼著眼睛（使用者提供
     // 的辨識特徵）。只在這裡用：挑頭、驗證、要不要檢查都照原本的頭判斷
     let aim: Vec<Option<(f32, f32)>> = (0..n)
-        .map(|i| head[i].map(|(hx, hy)| track::red_of(&cands[i], hx, hy).unwrap_or((hx, hy))))
+        .map(|i| head[i].map(|(hx, hy)| {
+            if bird.red_spots() { track::red_of(&cands[i], hx, hy).unwrap_or((hx, hy)) } else { (hx, hy) }
+        }))
         .collect();
     let shown = |i: usize, k: usize| -> [f32; 4] {
         let r = cands[i][k].rect;
@@ -6229,6 +6235,64 @@ enum TrackMsg {
     Failed(String),
 }
 
+/// 主體追蹤要找的鳥種。各鳥種長得不一樣，找頭、對準眼睛的線索也不同；
+/// 目前只有五色鳥調校過（嘴基兩側的紅點），其他鳥種先用通用的找法，
+/// 之後一種一種跟使用者討論後補上各自的特徵
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum BirdKind {
+    #[default]
+    Barbet,
+    Kingfisher,
+    Pitta,
+    Osprey,
+    Harrier,
+    Other,
+}
+
+impl BirdKind {
+    const ALL: [BirdKind; 6] = [
+        BirdKind::Barbet,
+        BirdKind::Kingfisher,
+        BirdKind::Pitta,
+        BirdKind::Osprey,
+        BirdKind::Harrier,
+        BirdKind::Other,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            BirdKind::Barbet => "五色鳥",
+            BirdKind::Kingfisher => "翠鳥",
+            BirdKind::Pitta => "八色鳥",
+            BirdKind::Osprey => "魚鷹",
+            BirdKind::Harrier => "灰澤鵟",
+            BirdKind::Other => "其它",
+        }
+    }
+
+    /// 存進專案檔用的代號（不隨介面文字變動）
+    fn id(self) -> &'static str {
+        match self {
+            BirdKind::Barbet => "barbet",
+            BirdKind::Kingfisher => "kingfisher",
+            BirdKind::Pitta => "pitta",
+            BirdKind::Osprey => "osprey",
+            BirdKind::Harrier => "harrier",
+            BirdKind::Other => "other",
+        }
+    }
+
+    fn from_id(s: &str) -> BirdKind {
+        BirdKind::ALL.into_iter().find(|b| b.id() == s).unwrap_or_default()
+    }
+
+    /// 這種鳥頭上有沒有「嘴基兩側一對紅點」可以拿來對準兩眼之間
+    /// （五色鳥才有；八色鳥的紅色在腹部，拿來找會把十字拉到肚子上）
+    fn red_spots(self) -> bool {
+        self == BirdKind::Barbet
+    }
+}
+
 /// 主體框是怎麼來的。決定誰蓋得過誰：**手動框永遠不會被自動框選或追蹤蓋掉**
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BoxSrc {
@@ -6284,9 +6348,13 @@ const HEAD_WEAK: f32 = 0.7;
 /// 一張照片最清晰的那一塊，不到這一批一般水準的這個比例，就算整張糊掉了
 const BLUR_RATIO: f32 = 0.4;
 
-/// 整批鳥頭的強度中位數到這裡，才把「找到頭」當成確實抓到的直接證據
-/// （實測六批：清楚的 0.268～0.316、陰暗雜亂的 0.221）
-const HEAD_TRUST: f32 = 0.25;
+/// 整批鳥頭的強度中位數到這裡，才把「找到頭」當成確實抓到的直接證據。
+///
+/// 原本訂 0.25，用來擋陰暗雜亂的 0718（當時 0.221）；之後找頭改良，0718 已到
+/// 0.259，九批實測都在 0.26～0.33。逆光拍的那批（鳥是天空前的剪影，顏色對比
+/// 低）只有 0.197：頭明明都找對了，卻因為不到門檻改用保守判斷，130 張標了
+/// 64 張要檢查（使用者回報），降到 0.18 後只剩真的框錯的 47 張
+const HEAD_TRUST: f32 = 0.18;
 
 impl Subject {
     fn manual(rect: [f32; 4]) -> Subject {
@@ -6345,6 +6413,8 @@ const TRACK_ZOOM_DEFAULT: f32 = 6.0;
 /// 不必重跑
 #[derive(Default)]
 struct TrackTool {
+    /// 要找的鳥種（見 [`BirdKind`]），存在專案裡
+    bird: BirdKind,
     /// 正在預覽上檢查／拖曳修改主體框
     picking: bool,
     /// 進入檢查模式後「還有東西要檢查」。等它歸零就代表全部檢查完了，
@@ -9556,7 +9626,10 @@ impl App {
     fn track_clear(&mut self) {
         self.track_cancel();
         self.track_restore_crops();
+        // 鳥種是使用者選的設定，不是框選的結果：清除追蹤時留著
+        let bird = self.track.bird;
         self.track = TrackTool::new();
+        self.track.bird = bird;
         self.mark_preview_dirty();
     }
 
@@ -9634,6 +9707,7 @@ impl App {
         let photos = self.photos.clone();
         // 追蹤的座標與裁切框同一個畫布，所以解出來的圖要先照使用者的旋轉轉正
         let crop = self.effective_adj(&photos[0]).crop;
+        let bird = self.track.bird;
         // 使用者自己框過的那幾張原樣留著，還兼作「補洞」時的可靠起點
         let manual: Vec<Option<[f32; 4]>> = photos
             .iter()
@@ -9648,7 +9722,7 @@ impl App {
         self.track.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            run_auto_boxes(&photos, &manual, crop, &|m| {
+            run_auto_boxes(&photos, &manual, crop, bird, &|m| {
                 let _ = tx.send(m);
                 ctx.request_repaint();
             });
@@ -10382,6 +10456,7 @@ impl App {
                 .collect(),
             track_zoom: self.track.zoom,
             track_smooth: self.track.smooth,
+            track_bird: self.track.bird.id().into(),
             transition: self.transition.id().into(),
             ken_burns: self.ken_burns,
             fade_out: self.fade_out,
@@ -10579,6 +10654,7 @@ impl App {
                 3.0
             },
             smooth: pf.track_smooth.clamp(0, 100),
+            bird: BirdKind::from_id(&pf.track_bird),
             prev: pf
                 .track_prev
                 .into_iter()
@@ -12588,6 +12664,24 @@ impl App {
             // 收起追蹤再把它放回原本的樣子
             let was_open = self.sec_track_open;
             section_toggle(ui, "主體追蹤", &mut self.sec_track_open);
+            // 鳥種：各鳥種找頭、對準眼睛的線索不同（見 BirdKind）。改了要重跑
+            // 自動框選才會套用
+            if self.sec_track_open {
+                ui.label(egui::RichText::new("鳥種類").size(12.5).color(theme::TEXT_WEAK));
+                ui.add_enabled_ui(!self.track.busy(), |ui| {
+                    egui::ComboBox::from_id_salt("track_bird")
+                        .selected_text(egui::RichText::new(self.track.bird.label()).size(12.5))
+                        .width(88.0)
+                        .show_ui(ui, |ui| {
+                            for b in BirdKind::ALL {
+                                ui.selectable_value(&mut self.track.bird, b, b.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text("要找的鳥種。各鳥種的特徵不同；目前五色鳥調校過，
+其他鳥種先用通用的找法。改了之後重按「自動框選主體」才會套用");
+                });
+            }
             if self.sec_track_open != was_open {
                 if self.sec_track_open {
                     self.adjust_open_before_track = self.sec_adjust_open;
