@@ -4230,7 +4230,15 @@ fn run_auto_boxes(
     // 到 0.11、葉子上的假頭最高到 0.22，大幅重疊）。整批來看就分得出來：
     // 六批連拍的頭強度中位數，清楚的 0.27～0.32，陰暗雜亂的那批只有 0.22。
     // 頭不清楚的批次照樣把鏡頭對到頭上，但把握程度照原本保守的方式判斷
-    let strong_heads = typical_head >= HEAD_TRUST;
+    // 八色鳥的找法（明暗變化 × 不鮮豔，見 track::HeadStyle::Masked）分數本來就比
+    // 五色鳥（顏色多樣）低一截：兩批八色鳥中位數 0.151、0.156，五色鳥九批 0.20～0.33。
+    // 共用同一個門檻的話八色鳥永遠被當成「頭不可信」，框對了也一半以上標要檢查
+    //（使用者回報：158 張標了 77 張）
+    let trust = match bird.head_style() {
+        track::HeadStyle::Masked => HEAD_TRUST_MASKED,
+        track::HeadStyle::Colourful => HEAD_TRUST,
+    };
+    let strong_heads = typical_head >= trust;
     let fit_pos: Option<Vec<Option<(f32, f32)>>> = (head_mode && strong_heads).then(|| head.clone());
     let conf = track::path_scores(&cands, &picked, fit_pos.as_deref());
     // 交給使用者的框搬到頭上（大小不變）。但補洞那一趟的樣板仍取**身體**
@@ -6365,6 +6373,9 @@ const BLUR_RATIO: f32 = 0.4;
 /// 低）只有 0.197：頭明明都找對了，卻因為不到門檻改用保守判斷，130 張標了
 /// 64 張要檢查（使用者回報），降到 0.18 後只剩真的框錯的 47 張
 const HEAD_TRUST: f32 = 0.18;
+
+/// 同 [`HEAD_TRUST`]，八色鳥用（找頭的分數尺度不同）
+const HEAD_TRUST_MASKED: f32 = 0.10;
 
 impl Subject {
     fn manual(rect: [f32; 4]) -> Subject {
@@ -13158,13 +13169,17 @@ impl App {
 
         // 結果與提醒
         if let Some((found, total)) = self.track.report {
+            // 「每一張都放了框」不等於「每一張都框對了」：沒把握的也要算進來，
+            // 否則畫面上同時寫著「每一張都框到了」與「24 張要檢查」（使用者回報）
             let missed = total.saturating_sub(found);
-            let text = if missed == 0 {
-                format!("跑完 {total} 張，每一張都框到了")
-            } else {
-                format!("跑完 {total} 張，有 {missed} 張沒框到（可以自己框，或整批移除）")
+            let doubt = if busy { 0 } else { unsure.len().saturating_sub(missed) };
+            let text = match (missed, doubt) {
+                (0, 0) => format!("跑完 {total} 張，每一張都框到了"),
+                (0, d) => format!("跑完 {total} 張，{d} 張沒把握、要檢查"),
+                (m, 0) => format!("跑完 {total} 張，有 {m} 張沒框到（可以自己框，或整批移除）"),
+                (m, d) => format!("跑完 {total} 張，有 {m} 張沒框到、{d} 張沒把握，要檢查"),
             };
-            let color = if missed * 4 > total { theme::ERROR } else { theme::SUCCESS };
+            let color = if (missed + doubt) * 4 > total { theme::ERROR } else if missed + doubt > 0 { theme::TRACK } else { theme::SUCCESS };
             ui.label(egui::RichText::new(text).size(11.0).color(color));
         }
         if self.track.applied {
