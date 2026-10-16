@@ -1027,6 +1027,7 @@ fn temp_path(name: &str) -> PathBuf {
 /// photo2video、其他是 $XDG_CONFIG_HOME（或 ~/.config）/photo2video。
 /// 取不到才退回暫存資料夾——設定會隨系統清暫存消失，但不至於讀寫失敗
 #[cfg(windows)]
+
 fn config_dir() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
@@ -3813,6 +3814,17 @@ fn fit_smooth(raw: &[(f32, f32)], crop: (f32, f32)) -> i32 {
 /// 追對的幾張也一起拉歪
 const TRACK_MAX_DRIFT: f32 = 0.25;
 
+/// 追到下一個手動框時，終點離那個框的中心不到框長邊的這個比例，就算整段追對了
+const TRACK_ARRIVE: f32 = 0.5;
+
+/// 只重新判斷的照片：追到的位置離原本的框中心不到框大小的這個比例，才算對得上
+const TRACK_VERIFY_TOL: f32 = 0.5;
+
+/// 追蹤後重新判斷（見 [`App::track_rejudge_between`]）：一段最多幾張、每張離
+/// 兩頭連線的距離最多是框大小的幾倍
+const TRACK_REJUDGE_MAX: usize = 40;
+const TRACK_REJUDGE_TOL: f32 = 0.5;
+
 /// 把一段追蹤累積的漂移沿路攤掉：最後一張本來就有使用者的框（`target`），
 /// 追到那裡卻差了多少，就是這一段一路累積下來的偏差；照「走了幾張」按比例
 /// 減回去，兩端都釘在使用者框的位置上，中間也不會突然跳一下。
@@ -3970,14 +3982,15 @@ fn follow_fill(
                 && (h.same >= TRACK_FILL_ALONE
                     || (h.same >= TRACK_FILL_SURE && seen_moving(i, h.cx, h.cy)))
         };
-        let to_boxes = |got: &[(usize, Option<track::Hit>)]| -> Vec<(usize, Option<Subject>)> {
+        // landed：這一段一路追到下一個手動框，終點也落在那個框上（見下面）
+        let to_boxes = |got: &[(usize, Option<track::Hit>)], landed: bool| -> Vec<(usize, Option<Subject>)> {
             got.iter()
                 // 已經有可靠框的那幾張不覆蓋（自動框選只補看不見的那些）
                 .filter(|(i, _)| need[*i])
                 // 那一張原本有動態偵測的框（只是沒把握）：補框要有把握才蓋過去，
                 // 否則保留原本那個——兩個都沒把握時，動態偵測看到的至少是
                 // 「真的在動的東西」，補框卻可能是一片長得有點像的散景
-                .filter(|(i, h)| !keep_own[*i] || h.is_some_and(|h| sure_fill(*i, &h)))
+                .filter(|(i, h)| !keep_own[*i] || h.is_some_and(|h| sure_fill(*i, &h) || (landed && h.locked && !doubt[*i])))
                 .map(|(i, h)| {
                     (
                         *i,
@@ -3999,7 +4012,7 @@ fn follow_fill(
                             // 散景上）的落在 0.42～0.80，中間大片重疊。所以要
                             // 嘛分數高到錯的達不到，要嘛動態偵測也在同一處看到
                             // 東西（兩種獨立方法互相印證），否則一律請使用者過目
-                            score: if sure_fill(*i, &h) {
+                            score: if sure_fill(*i, &h) || (landed && h.locked && !doubt[*i]) {
                                 0.9
                             } else if h.locked {
                                 0.4
@@ -4015,7 +4028,7 @@ fn follow_fill(
         let mut got: Vec<(usize, Option<track::Hit>)> = Vec::with_capacity(order.len());
         for n in 0..order.len() {
             if TRACK_CANCEL.load(Ordering::Relaxed) {
-                send(TrackMsg::Boxes(to_boxes(&got)));
+                send(TrackMsg::Boxes(to_boxes(&got, false)));
                 return (locked, total);
             }
             let Ok((i, frame)) = rxs[n % TRACK_DECODERS].recv() else { break };
@@ -4030,6 +4043,15 @@ fn follow_fill(
                 send(TrackMsg::Step);
             }
         }
+        // 這一段一路追到下一個手動框、終點也落在那個框上（差不到半個框）：整段
+        // 都跟著同一隻鳥，就算單張比對分數不高也算有把握。拍翅膀的鳥每張長得
+        // 不太一樣，比對分數常低於門檻，實測一批八色鳥追蹤補上的 54 張有 27 張
+        // 框對了卻標要檢查（使用者回報）
+        let landed = target.is_some_and(|t| {
+            got.last().and_then(|(_, h)| *h).is_some_and(|e| {
+                (e.cx - t.0).hypot(e.cy - t.1) < sw.max(sh) * TRACK_ARRIVE
+            }) && got.iter().all(|(_, h)| h.is_some_and(|h| h.locked))
+        });
         // 這一段的終點有使用者的框：把追到終點時累積的偏差沿路攤掉
         if let Some(t) = target {
             spread_drift(&mut got, t);
@@ -4041,7 +4063,7 @@ fn follow_fill(
             .filter(|(i, h)| need[*i] && h.is_some_and(|h| h.locked))
             .count();
         total += got.iter().filter(|(i, _)| need[*i]).count();
-        send(TrackMsg::Boxes(to_boxes(&got)));
+        send(TrackMsg::Boxes(to_boxes(&got, landed)));
     }
     (locked, total)
 }
@@ -6480,6 +6502,13 @@ struct TrackTool {
     /// 上一次跑完的結果（框到幾張／共幾張），顯示在面板上
     report: Option<(usize, usize)>,
     error: Option<String>,
+    /// 上一次「從手動框追蹤」的結果（要檢查從幾張變幾張），顯示在按鈕下方。
+    /// 追蹤只改要檢查的那幾張、常常看不出有動，沒有這行會以為按鈕沒反應
+    follow_note: Option<String>,
+    /// 開始追蹤時要檢查的張數（算 follow_note 用）
+    unsure_before: usize,
+    /// 這一趟追蹤裡「只重新判斷、不搬框」的照片（手動框沒變的段落裡要檢查的）
+    verify_only: std::collections::HashSet<PathBuf>,
 }
 
 impl Default for TrackJob {
@@ -9713,6 +9742,65 @@ impl App {
         }
     }
 
+    /// 追蹤跑完後再判斷一次：一段連續「沒把握」的框，前後兩頭都是有把握的框
+    /// （或手動框），而且整段每一張都落在兩頭之間的直線上（差不到半個框），
+    /// 就是同一隻鳥一路過去，整段改成有把握。
+    ///
+    /// 最後一個手動框之後那一段沒有「下一個手動框」可對照，追蹤本身判斷不了；
+    /// 但自動框選在後面常有框得有把握的照片，拿它當另一頭。實測一批八色鳥，
+    /// 停在橫木上那十幾張追蹤框都在頭上，卻全標要檢查（使用者回報）
+    fn track_rejudge_between(&mut self) {
+        let n = self.photos.len();
+        let anchor = |s: Option<Subject>| s.is_some_and(|s| s.sure());
+        let boxes: Vec<Option<Subject>> = self.photos.iter().map(|p| self.track.box_of(p)).collect();
+        let mut i = 0;
+        while i < n {
+            if anchor(boxes[i]) || boxes[i].is_none() {
+                i += 1;
+                continue;
+            }
+            let s = i;
+            while i < n && boxes[i].is_some() && !anchor(boxes[i]) {
+                i += 1;
+            }
+            let e = i; // [s, e) 一段沒把握的
+            let (Some(a), Some(b)) = (s.checked_sub(1).and_then(|k| boxes[k]), boxes.get(e).copied().flatten()) else {
+                continue;
+            };
+            if !anchor(Some(a)) || !anchor(Some(b)) || e - s > TRACK_REJUDGE_MAX {
+                continue;
+            }
+            let ((ax, ay), (bx, by)) = (a.centre(), b.centre());
+            let span = (e - s + 1) as f32;
+            let ok = (s..e).all(|k| {
+                let Some(x) = boxes[k] else { return false };
+                let t = (k - s + 1) as f32 / span;
+                let (px, py) = (ax + (bx - ax) * t, ay + (by - ay) * t);
+                let (cx, cy) = x.centre();
+                let (w, h) = x.size();
+                ((cx - px) / w).hypot((cy - py) / h) < TRACK_REJUDGE_TOL
+            });
+            if ok {
+                for k in s..e {
+                    if let Some(x) = self.track.boxes.get_mut(&self.photos[k]) {
+                        x.score = x.score.max(0.9);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 使用者手動把幾張標成要檢查（`flag`），或確認沒問題、從要檢查名單拿掉。
+    /// 只改把握程度，框的位置與來源不動；存專案時跟著框一起存
+    fn track_set_flag(&mut self, photos: &[PathBuf], flag: bool) {
+        for p in photos {
+            if let Some(s) = self.track.boxes.get_mut(p) {
+                s.score = if flag { TRACK_FLAGGED } else { 1.0 };
+            }
+        }
+        self.track.error = None;
+    }
+
     /// 拿掉某一張的主體框（框錯了、或那張根本沒有主體）
     fn track_remove_box(&mut self, photo: &Path) {
         if self.track.boxes.remove(photo).is_none() {
@@ -9826,22 +9914,26 @@ impl App {
                 affected[a + 1..b].fill(true);
             }
         }
+        // 要檢查的照片全部都追一次：手動框有變動的段落照常補框；沒變動的段落
+        // 只拿來重新判斷——追到的位置跟原本的框對得上就改成有把握，框不搬
+        //（使用者要求：每次追蹤後自動重新判斷哪幾張要檢查，不必一張張按「這張沒問題」）
         let need: Vec<bool> = self
             .photos
             .iter()
+            .map(|p| !self.track.box_of(p).is_some_and(|s| s.src == BoxSrc::Manual || s.sure()))
             .enumerate()
-            .map(|(i, p)| {
-                i > first && affected[i] && !self.track.box_of(p).is_some_and(|s| s.src == BoxSrc::Manual || s.sure())
-            })
+            .map(|(i, open)| i > first && open)
             .collect();
         if !need.iter().any(|x| *x) {
-            self.track.error = Some(if affected.iter().any(|x| *x) {
-                "有變動的手動框附近都已經框好了，沒有要追的".into()
-            } else {
-                "手動框跟上一次追蹤時一樣，沒有要重追的（新框一張或搬動手動框再按）".into()
-            });
+            self.track.error = Some("第一個手動框之後沒有要檢查的照片，沒有要追的".into());
             return;
         }
+        self.track.verify_only = (0..self.photos.len())
+            .filter(|&i| need[i] && !affected[i] && self.track.box_of(&self.photos[i]).is_some())
+            .map(|i| self.photos[i].clone())
+            .collect();
+        self.track.unsure_before = self.track_unsure().len();
+        self.track.follow_note = None;
         // 記下這一趟用到的手動框，下一趟拿來比對哪幾個有變動
         self.track.followed = marks.iter().map(|(i, r)| (self.photos[*i].clone(), *r)).collect();
         // 上一次追蹤補上、但沒把握的框：這次只在比對得更有把握時才換掉。
@@ -9854,7 +9946,7 @@ impl App {
             .collect();
         self.track.job = TrackJob::Follow;
         self.track.phase = None;
-        self.track.total = affected.iter().filter(|x| **x).count() + marks.len();
+        self.track.total = self.photos.len() - first;
         self.track.done = 0;
         let photos = self.photos.clone();
         let crop = self.effective_adj(&photos[marks[0].0]).crop;
@@ -9885,14 +9977,37 @@ impl App {
                     for (i, found) in list {
                         // 使用者可能在跑的中途自己框了一張，那份最大
                         if let (Some(p), Some(s)) = (self.photos.get(i), found) {
-                            if !self.track.box_of(p).is_some_and(|b| b.src == BoxSrc::Manual) {
-                                self.track.boxes.insert(p.clone(), s);
+                            if self.track.box_of(p).is_some_and(|b| b.src == BoxSrc::Manual) {
+                                continue;
                             }
+                            // 只拿來重新判斷的照片（手動框沒變的那幾段）：框不搬，追到的
+                            // 位置跟原本的框對得上、又有把握，才把原本的框改成有把握
+                            if self.track.verify_only.contains(p) {
+                                if let Some(old) = self.track.boxes.get_mut(p) {
+                                    let ((ax, ay), (bx, by)) = (old.centre(), s.centre());
+                                    let (w, h) = old.size();
+                                    if s.sure() && ((ax - bx) / w).hypot((ay - by) / h) < TRACK_VERIFY_TOL {
+                                        old.score = old.score.max(s.score);
+                                    }
+                                }
+                                continue;
+                            }
+                            self.track.boxes.insert(p.clone(), s);
                         }
                     }
                 }
                 TrackMsg::Done(found, total) => {
-                    self.track.report = Some((found, total));
+                    if self.track.job == TrackJob::Follow {
+                        self.track_rejudge_between();
+                        let after = self.track_unsure().len();
+                        self.track.follow_note = Some(format!(
+                            "追蹤完成：要檢查 {} → {} 張（比對沒把握的照片沿用原本的框）",
+                            self.track.unsure_before, after
+                        ));
+                    } else {
+                        self.track.report = Some((found, total));
+                        self.track.follow_note = None;
+                    }
                     finished = true;
                 }
                 TrackMsg::Failed(e) => {
@@ -9978,8 +10093,9 @@ impl App {
         }
     }
 
-    /// 全部檢查完的那一刻，自動退出檢查模式：關掉「🔍 檢查主體框」與
-    /// 「🔽 只顯示要檢查的」。
+    /// 全部檢查完的那一刻，關掉「🔽 只顯示要檢查的」（縮圖列回到全部照片）。
+    /// 「🔍 檢查主體框」維持開著：關掉的話預覽一下子換成套好鏡頭的放大畫面，
+    /// 使用者以為程式出錯（使用者回報：按完最後一張「這張沒問題」畫面被放大）。
     ///
     /// 只在「本來還有東西要檢查、現在歸零」的那一刻做——不能看到 0 就關，
     /// 否則使用者為了微調某張已經框好的照片而打開檢查模式，會馬上被踢出來
@@ -9994,7 +10110,6 @@ impl App {
         }
         let left = self.track_unsure().len();
         if left == 0 && self.track.was_reviewing {
-            self.track.picking = false;
             self.track.only_unsure = false;
             self.mark_preview_dirty();
         }
@@ -12872,6 +12987,13 @@ impl App {
                 }
             });
         }
+        // 追蹤的結果與「沒有要追的」提示放在按鈕正下方：放在面板最底下時要捲
+        // 很久才看得到，使用者以為按鈕沒反應（回報「從手動框追蹤 disable」）
+        if let Some(e) = self.track.error.clone() {
+            ui.label(egui::RichText::new(e).size(11.0).color(theme::ERROR));
+        } else if let Some(t) = self.track.follow_note.clone() {
+            ui.label(egui::RichText::new(t).size(11.0).color(theme::SUCCESS));
+        }
 
         // ② 檢查與修正
         ui.add_space(6.0);
@@ -13010,7 +13132,8 @@ impl App {
                 .and_then(|i| self.photos.get(i).map(|p| (i, p.clone())));
             if let Some((i, p)) = here {
                 let (state, color) = match self.track.box_of(&p) {
-                    Some(s) if s.src == BoxSrc::Manual => ("✋ 你自己框的", theme::TRACK),
+                    Some(s) if s.src == BoxSrc::Manual && s.sure() => ("✋ 你自己框的", theme::TRACK),
+                    Some(s) if s.src == BoxSrc::Manual => ("✋ 你自己框的（標成要檢查）", theme::ERROR),
                     Some(s) if s.sure() && s.src == BoxSrc::Auto => ("⚡ 自動框好了", theme::SUCCESS),
                     Some(s) if s.sure() => ("🔗 追蹤補上的", theme::SUCCESS),
                     Some(_) => ("⚠ 沒把握，請看一下", theme::ERROR),
@@ -13022,6 +13145,33 @@ impl App {
                             .size(11.0)
                             .color(color),
                     );
+                    // 使用者自己決定哪幾張要再看一次／哪幾張沒問題（有多選時套用到多選的那幾張）
+                    if let Some(s) = self.track.box_of(&p) {
+                        let (label, hover, flag) = if s.sure() {
+                            ("⚑ 標為要檢查", "把這張放進「要檢查」名單，之後再回來看", true)
+                        } else {
+                            ("✓ 這張沒問題", "框是對的，從「要檢查」名單拿掉", false)
+                        };
+                        if ui.small_button(label).on_hover_text(hover).clicked() {
+                            let mut which: Vec<PathBuf> = self.multi_sel.iter().cloned().collect();
+                            if !which.contains(&p) {
+                                which.push(p.clone());
+                            }
+                            self.track_set_flag(&which, flag);
+                            // 「這張沒問題」按完直接跳到下一張要檢查的（使用者要求）：
+                            // 逐張確認時不必再去按「下一張」
+                            if !flag {
+                                let left = self.track_unsure();
+                                let next = left.iter().copied().find(|&j| j > i).or(left.first().copied());
+                                if let Some(j) = next {
+                                    self.multi_sel.clear();
+                                    self.select_photo(Some(j));
+                                    self.scroll_to_selected = true;
+                                    self.mark_preview_dirty();
+                                }
+                            }
+                        }
+                    }
                     if self.track.box_of(&p).is_some()
                         && ui
                             .small_button("✕ 移除這張的框")
@@ -13257,9 +13407,6 @@ impl App {
                 .size(11.0)
                 .color(theme::TEXT_WEAK),
             );
-        }
-        if let Some(e) = self.track.error.clone() {
-            ui.label(egui::RichText::new(e).size(11.0).color(theme::ERROR));
         }
     }
 
@@ -31616,6 +31763,7 @@ fn crop_overlay(
     }
     if resp.drag_stopped() {
         ui.ctx().memory_mut(|m| m.data.remove::<i8>(id));
+        ui.ctx().memory_mut(|m| m.data.remove::<bool>(egui::Id::new("track_drag_live")));
     }
 
     if let (Some(g), Some(p)) = (grabbed.filter(|g| *g >= -1), resp.interact_pointer_pos()) {
@@ -31734,6 +31882,9 @@ fn crop_overlay(
 /// 五個像素就沒有花紋可認（見 `track` 模組）。但使用者框遠處的小鳥時，
 /// 拖出來的框常常比它還小——那時**不能默默丟掉**（那張會一直留在「要檢查」
 /// 裡，怎麼框都沒反應），而是以拖曳的中心把框撐到這個大小
+/// 拖框要從按下去那一點移動超過這麼多像素才算數（見 [`track_overlay`]）
+const TRACK_DRAG_MIN_PX: f32 = 10.0;
+
 const TRACK_BOX_MIN: f32 = 0.006;
 
 /// 自動框選完把框統一成同一個大小時，至少要有這麼大（佔畫面的比例）。
@@ -31755,6 +31906,10 @@ const TRACK_LIB_MIN_PX: f32 = 10.0;
 /// 才搬。實測兩批使用者標好的連拍（每 10 張框 1 張）：2.5 時其餘張落在標的位置
 /// 64/87、53/60；不設門檻 78/87、55/60，但姿態涵蓋不到的批次會被搬壞
 const TRACK_LIB_MATCH: f32 = 2.5;
+
+/// 使用者手動標成要檢查時給的把握程度（低於 [`TRACK_SURE`]）
+const TRACK_FLAGGED: f32 = 0.3;
+
 
 /// 照手動框校正時，原本已經框得有把握的照片最多只能移幾個框寬
 const TRACK_LIB_NUDGE: f32 = 1.0;
@@ -31869,14 +32024,25 @@ fn track_overlay(
 
     let mut out: Option<[f32; 4]> = None;
     let mut live = cur;
-    if resp.dragged() {
+    // 從按下去那一點算起總共移動不到幾個像素，就當作只是點了一下（點預覽取得
+    // 焦點、滑鼠手抖），不搬框也不畫新框——否則一碰就變成「手動、有把握」，
+    // 標成要檢查的標記跟著不見（使用者回報：最後一張要檢查的，滑鼠一靠近
+    // 動一下就變成「這張沒問題」）
+    let barely = ui.input(|i| {
+        i.pointer.press_origin().zip(i.pointer.interact_pos()).is_some_and(|(a, b)| a.distance(b) < TRACK_DRAG_MIN_PX)
+    });
+    if resp.dragged() && !barely {
         let start = ui.input(|i| i.pointer.press_origin());
         if let (Some(a), Some(b)) = (start, resp.interact_pointer_pos()) {
             let (ux, uy) = to_rel(b);
             let r = match (grabbed.unwrap_or(-2), cur) {
                 // 框內拖曳：整個框跟著滑鼠位移搬過去，大小不變
                 (-1, Some(c)) => {
-                    let d = resp.drag_delta();
+                    // 剛過門檻的那一下補上前面被忽略的位移，框才不會落後滑鼠
+                    let live_id = egui::Id::new("track_drag_live");
+                    let first = !ui.ctx().memory(|m| m.data.get_temp::<bool>(live_id).unwrap_or(false));
+                    ui.ctx().memory_mut(|m| m.data.insert_temp(live_id, true));
+                    let d = if first { b - a } else { resp.drag_delta() };
                     let (dx, dy) = (d.x / img.width(), d.y / img.height());
                     let (w, h) = (c[2] - c[0], c[3] - c[1]);
                     let x0 = (c[0] + dx).clamp(0.0, 1.0 - w);
