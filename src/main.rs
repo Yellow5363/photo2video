@@ -7874,6 +7874,8 @@ struct EnhanceTool {
     error: Option<String>,
     /// 批次輸出的進度（已完成張數）與取消旗標
     save_done: usize,
+    /// 這次要存幾張（進度的分母）：全部存檔是整批，另存新檔只有目前那一張
+    save_total: usize,
     save_cancel: Arc<AtomicBool>,
     /// 最近一次批次輸出的結果與時間（視窗內短暫顯示提示）
     saved: Option<(String, Instant)>,
@@ -7943,6 +7945,7 @@ impl Default for EnhanceTool {
             busy: EnhanceBusy::Idle,
             error: None,
             save_done: 0,
+            save_total: 0,
             save_cancel: Arc::new(AtomicBool::new(false)),
             saved: None,
             saved_path: None,
@@ -15473,10 +15476,46 @@ impl App {
         });
     }
 
-    /// 對每張照片以各自的有效參數去煙，全部存進指定資料夾
-    /// 批次輸出去煙成品。`here` 為真就直接存回每張照片自己的原始資料夾，
-    /// 否則跳資料夾對話框讓使用者自己挑
+    /// 去煙成品接在原檔名後面的標記：`_去煙`，有調整尺寸再加上尺寸
+    /// （`_去煙_2k`，與煙火疊圖同一套，見 [`export_size_tag`]）。
+    ///
+    /// 每張的原圖尺寸與裁切都可能不同，所以逐張算：尺寸只讀檔頭，與存檔時
+    /// `image::open` 一樣是沒套 EXIF 方向的原始像素
+    fn smoke_out_mark(&self, p: &Path) -> String {
+        let natural = export_natural_dims(
+            image::image_dimensions(p).ok(),
+            &self.smoke.finish_for(p).grade.crop,
+        );
+        match export_size_tag(&self.export_size, natural) {
+            Some(tag) => format!("_去煙_{tag}"),
+            None => "_去煙".into(),
+        }
+    }
+
+    /// 輸出去煙成品。`here` 為真（「💾 全部存檔」）就把整批（或縮圖列挑起來的
+    /// 那幾張）各自存回自己的原始資料夾；為假（「📁 另存新檔…」）只存**預覽
+    /// 上這一張**，跳存檔對話框讓使用者挑位置與檔名
     fn smoke_save_all(&mut self, ctx: &egui::Context, here: bool) {
+        if !here {
+            let Some(src) = self.smoke.current().cloned() else {
+                return;
+            };
+            let Some(out) = save_one_as(
+                LastDir::DehazeOutput,
+                &src,
+                &self.smoke_out_mark(&src),
+                "另存去煙成品",
+            ) else {
+                return;
+            };
+            if same_path_ci(&out, &src) {
+                self.smoke.error =
+                    Some("這個檔名就是原始照片，會把原檔蓋掉；請換一個名字".into());
+                return;
+            }
+            self.smoke_spawn_save(ctx, vec![src], vec![out]);
+            return;
+        }
         // 縮圖列挑過就只存挑到的那幾張，沒挑就整批（見 [`SmokeTool::multi_sel`]）。
         // 順序照縮圖列的順序，不照挑選的先後——存檔訊息與縮圖看起來才是同一件事
         let todo: Vec<PathBuf> = self
@@ -15489,47 +15528,29 @@ impl App {
         if todo.is_empty() {
             return;
         }
-        // None＝各自存回來源資料夾
-        let out_dir: Option<PathBuf> = if here {
-            None
-        } else {
-            // 上次另存到哪，名字就預填在「資料夾:」欄，要存回同一個直接按確定
-            // （見 pick_folder_remembering）；還沒存過才退回照片自己的資料夾
-            let here = self.smoke.current().and_then(|p| p.parent());
-            let Some(d) = pick_folder_remembering(
-                LastDir::DehazeOutput,
-                "選擇要存放去煙照片的資料夾",
-                here,
-            ) else {
-                return;
-            };
-            Some(d)
-        };
         // 輸出檔名先在這裡決定好，不留到背景執行緒——已經存在的要先問過
         // 使用者才寫下去（這一批是自動命名、沒有存檔對話框可以問）
-        let out_of = |src: &Path| -> PathBuf {
-            let stem = src
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "photo".into());
-            // 沒指定輸出資料夾就存回照片自己的資料夾（沒有上層目錄的極端
-            // 情況才退回工作目錄，總比整批失敗好）
-            let dir = match &out_dir {
-                Some(d) => d.clone(),
-                None => src.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+        let mut outs: Vec<PathBuf> = todo
+            .iter()
+            .map(|p| auto_output_path(p, &self.smoke_out_mark(p)))
+            .collect();
+        // 只存一張：已經存在就讓使用者自己改檔名（見 resolve_existing_output）
+        if let ([src], [out]) = (todo.as_slice(), outs.as_mut_slice()) {
+            let Some(p) = resolve_existing_output(out, "儲存去煙成品") else {
+                return;
             };
-            let out = dir.join(format!("{stem}_去煙.jpg"));
-            // 輸出到來源資料夾時，別讓成品覆蓋掉同名的原始照片
-            if same_path_ci(&out, src) {
-                dir.join(format!("{stem}_去煙(1).jpg"))
-            } else {
-                out
+            // 改名時挑到原始照片本身會把原檔毀掉
+            if same_path_ci(&p, src) {
+                self.smoke.error =
+                    Some("這個檔名就是原始照片，會把原檔蓋掉；請換一個名字".into());
+                return;
             }
-        };
-        let mut outs: Vec<PathBuf> = todo.iter().map(|p| out_of(p)).collect();
+            *out = p;
+        }
         // 一張一張問會問到天荒地老，整批只問一次
+        // （整批沒辦法一張張改名，只能自動編號）
         let exist = outs.iter().filter(|p| p.exists()).count();
-        if exist > 0 {
+        if exist > 0 && outs.len() > 1 {
             let sample = outs
                 .iter()
                 .find(|p| p.exists())
@@ -15558,6 +15579,11 @@ impl App {
                 Ask3::Cancel => return,
             }
         }
+        self.smoke_spawn_save(ctx, todo, outs);
+    }
+
+    /// 在背景把 `todo` 逐張去煙、存到對應的 `outs`（檔名已經問過使用者）
+    fn smoke_spawn_save(&mut self, ctx: &egui::Context, todo: Vec<PathBuf>, outs: Vec<PathBuf>) {
         // 每張照片連同它自己的參數與輸出位置一起交給背景執行緒
         let jobs: Vec<(PathBuf, PathBuf, SmokeParams, Finish)> = todo
             .iter()
@@ -21378,6 +21404,10 @@ impl App {
         self.stack.save_h = old.save_h;
         self.stack.zoom_h = old.zoom_h;
         self.stack.img_extra = old.img_extra;
+        // 存檔尺寸是 App 上與去煙霧共用的那份，不在 StackTool 裡，得另外關掉。
+        // 與剛開程式一樣回到「不調整」（見 load_export_size）：上一批縮成 2K
+        // 不代表下一批也要；常用的尺寸照樣記著，勾回去就是那一組
+        self.export_size.on = false;
     }
 
     /// 在背景把每張照片解成預覽底圖。疊圖要同時看到全部的層，所以不像
@@ -21799,6 +21829,13 @@ impl App {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "photo".into());
+        // 有縮尺寸就把尺寸寫進檔名（A1208249_去煙_疊圖_2k.jpg）：同一張疊圖
+        // 存一份原尺寸、一份 2K 發文用，才不會互相蓋掉、也一眼分得出來
+        let natural = export_natural_dims(self.stack.source_dims(), &self.stack.grade.crop);
+        let stem = match export_size_tag(&self.export_size, natural) {
+            Some(tag) => format!("{stem}_疊圖_{tag}"),
+            None => format!("{stem}_疊圖"),
+        };
         let out = if here {
             // 「存檔」：存回來源照片自己的資料夾，不再問位置。
             // 名字取自上面那張（不是地景），所以不會與任何來源檔同名
@@ -21806,55 +21843,22 @@ impl App {
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_default();
-            let out = dir.join(format!("{stem}_疊圖.jpg"));
-            // 自動命名沒有對話框可以問，已經存在就自己問一次
-            if out.exists() {
-                let name = out.file_name().unwrap_or_default().to_string_lossy();
-                match ask3(
-                    rfd::MessageLevel::Warning,
-                    "成品檔已存在",
-                    &format!(
-                        "「{name}」已經存在。\n\n\
-                         「覆蓋」：舊檔直接被蓋掉\n\
-                         「另取新檔名」：保留舊檔，這次自動改成不重複的檔名\n\
-                         「取消」：不存檔"
-                    ),
-                    "覆蓋",
-                    "另取新檔名",
-                    "取消",
-                ) {
-                    Ask3::First => out,
-                    Ask3::Second => next_free_path(&out),
-                    Ask3::Cancel => return false,
-                }
-            } else {
-                out
-            }
-        } else {
-            // 「另存新檔…」：檔名交給存檔對話框，使用者可以自己改；
-            // 檔案已存在時系統的存檔對話框會先問要不要覆蓋。
-            // 先指到地景那張自己的資料夾（見 output_start_dir）
-            let start = output_start_dir(LastDir::StackOutput, Some(ground.as_path()));
-            let dialog = file_dialog().set_directory(start);
-            let Some(out) = dialog
-                .set_title("儲存疊圖成品")
-                .set_file_name(format!("{stem}_疊圖.jpg"))
-                .add_filter("JPEG 圖片", &["jpg", "jpeg"])
-                .save_file()
+            // 自動命名沒有對話框可以問，已經存在就自己問一次（可以改檔名）
+            let Some(out) =
+                resolve_existing_output(&dir.join(format!("{stem}.jpg")), "儲存疊圖成品")
             else {
                 return false;
             };
-            // 對話框可能回一個沒有副檔名的路徑（使用者自己把它刪掉了）。
-            // 補上之後才成立的檔名，存檔對話框沒問過使用者，得自己補問一次
-            if out.extension().is_none() {
-                let fixed = out.with_extension("jpg");
-                if !confirm_overwrite(&fixed) {
-                    return false;
-                }
-                fixed
-            } else {
-                out
-            }
+            out
+        } else {
+            // 「另存新檔…」：檔名交給存檔對話框，使用者可以自己改。
+            // 先指到地景那張自己的資料夾（見 output_start_dir）
+            let start = output_start_dir(LastDir::StackOutput, Some(ground.as_path()));
+            let Some(out) = pick_jpeg_save_path(start, &format!("{stem}.jpg"), "儲存疊圖成品")
+            else {
+                return false;
+            };
+            out
         };
         // 存成來源照片本身會把原檔毀掉，這個不能讓它過
         if self.stack.photos.iter().any(|p| same_path_ci(&out, p)) {
@@ -24238,8 +24242,9 @@ impl App {
                                 .on_hover_text(
                                     "用原尺寸重疊一次存成一張，\n\
                                      存回來源照片所在的資料夾、不用再選位置。\n\
-                                     檔名取自目前選著的那一層（不是地景）加上 _疊圖；\n\
-                                     同名檔案已存在時會先問要覆蓋還是另取新檔名",
+                                     檔名取自目前選著的那一層（不是地景）加上 _疊圖，\n\
+                                     有調整尺寸再加上尺寸（例如 _疊圖_2k）；\n\
+                                     同名檔案已存在時會先問要覆蓋還是改檔名",
                                 )
                                 .clicked()
                             {
@@ -25690,16 +25695,18 @@ impl App {
                                 .on_hover_text(if picked > 0 {
                                     "只存縮圖列上挑起來的那幾張；\
                                      每張都存回它自己的原始資料夾，\n\
-                                     檔名加上 _去煙。\n\
+                                     檔名加上 _去煙（有調整尺寸再加上尺寸，例如 _去煙_2k）。\n\
                                      在縮圖上直接點一下就取消挑選，改成整批都存"
                                 } else if total > 1 {
                                     "每張都存回它自己的原始資料夾，\
-                                     檔名加上 _去煙，不用再選位置。\n\
+                                     檔名加上 _去煙（有調整尺寸再加上尺寸，例如 _去煙_2k），\
+                                     不用再選位置。\n\
                                      只想存其中幾張：在縮圖列上按住 Ctrl 逐張點、\
                                      或按住 Shift 選一整段"
                                 } else {
                                     "存回原始照片所在的資料夾，\
-                                     檔名加上 _去煙，不用再選位置"
+                                     檔名加上 _去煙（有調整尺寸再加上尺寸，例如 _去煙_2k），\
+                                     不用再選位置"
                                 })
                                 .clicked()
                             {
@@ -25711,7 +25718,7 @@ impl App {
                             ui.add_space(6.0);
                             if ui
                                 .small_button("📁 另存新檔…")
-                                .on_hover_text("自己挑一個資料夾存放成品")
+                                .on_hover_text("只存預覽上的這一張，自己挑位置與檔名")
                                 .clicked()
                             {
                                 save = Some(false);
@@ -26414,51 +26421,70 @@ impl App {
         });
     }
 
-    /// 批次輸出優化成品。`here` 為真就直接存回每張照片自己的原始資料夾，
-    /// 否則跳資料夾對話框讓使用者自己挑（與去煙霧同一套流程與命名規則）
-    fn enhance_save_all(&mut self, ctx: &egui::Context, here: bool) {
-        if self.enhance.photos.is_empty() {
-            return;
+    /// 優化成品接在原檔名後面的標記：`_優化`，有調整尺寸再加上尺寸
+    /// （`_優化_2k`，與去煙霧、煙火疊圖同一套，見 [`App::smoke_out_mark`]）
+    fn enhance_out_mark(&self, p: &Path) -> String {
+        let natural = export_natural_dims(
+            image::image_dimensions(p).ok(),
+            &self.enhance.params_for(p).grade.crop,
+        );
+        match export_size_tag(&self.export_size, natural) {
+            Some(tag) => format!("_優化_{tag}"),
+            None => "_優化".into(),
         }
-        // None＝各自存回來源資料夾
-        let out_dir: Option<PathBuf> = if here {
-            None
-        } else {
-            // 上次另存到哪，名字就預填在「資料夾:」欄（見 pick_folder_remembering）；
-            // 還沒存過才退回照片自己的資料夾
-            let here = self.enhance.current().and_then(|p| p.parent());
-            let Some(d) = pick_folder_remembering(
+    }
+
+    /// 輸出優化成品。`here` 為真（「💾 全部存檔」）就把整批各自存回自己的原始
+    /// 資料夾；為假（「📁 另存新檔…」）只存**預覽上這一張**，跳存檔對話框讓
+    /// 使用者挑位置與檔名（與去煙霧同一套流程與命名規則）
+    fn enhance_save_all(&mut self, ctx: &egui::Context, here: bool) {
+        if !here {
+            let Some(src) = self.enhance.current().cloned() else {
+                return;
+            };
+            let Some(out) = save_one_as(
                 LastDir::EnhanceOutput,
-                "選擇要存放優化照片的資料夾",
-                here,
+                &src,
+                &self.enhance_out_mark(&src),
+                "另存優化成品",
             ) else {
                 return;
             };
-            Some(d)
-        };
+            if same_path_ci(&out, &src) {
+                self.enhance.error =
+                    Some("這個檔名就是原始照片，會把原檔蓋掉；請換一個名字".into());
+                return;
+            }
+            self.enhance_spawn_save(ctx, vec![src], vec![out]);
+            return;
+        }
+        let todo = self.enhance.photos.clone();
+        if todo.is_empty() {
+            return;
+        }
         // 輸出檔名先在這裡決定好，不留到背景執行緒——已經存在的要先問過
         // 使用者才寫下去（這一批是自動命名、沒有存檔對話框可以問）
-        let out_of = |src: &Path| -> PathBuf {
-            let stem = src
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "photo".into());
-            let dir = match &out_dir {
-                Some(d) => d.clone(),
-                None => src.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+        let mut outs: Vec<PathBuf> = todo
+            .iter()
+            .map(|p| auto_output_path(p, &self.enhance_out_mark(p)))
+            .collect();
+        // 只存一張：已經存在就讓使用者自己改檔名（見 resolve_existing_output）
+        if let ([src], [out]) = (todo.as_slice(), outs.as_mut_slice()) {
+            let Some(p) = resolve_existing_output(out, "儲存優化成品") else {
+                return;
             };
-            let out = dir.join(format!("{stem}_優化.jpg"));
-            // 輸出到來源資料夾時，別讓成品覆蓋掉同名的原始照片
-            if same_path_ci(&out, src) {
-                dir.join(format!("{stem}_優化(1).jpg"))
-            } else {
-                out
+            // 改名時挑到原始照片本身會把原檔毀掉
+            if same_path_ci(&p, src) {
+                self.enhance.error =
+                    Some("這個檔名就是原始照片，會把原檔蓋掉；請換一個名字".into());
+                return;
             }
-        };
-        let mut outs: Vec<PathBuf> = self.enhance.photos.iter().map(|p| out_of(p)).collect();
+            *out = p;
+        }
         // 一張一張問會問到天荒地老，整批只問一次
+        // （整批沒辦法一張張改名，只能自動編號）
         let exist = outs.iter().filter(|p| p.exists()).count();
-        if exist > 0 {
+        if exist > 0 && outs.len() > 1 {
             let sample = outs
                 .iter()
                 .find(|p| p.exists())
@@ -26487,11 +26513,14 @@ impl App {
                 Ask3::Cancel => return,
             }
         }
+        self.enhance_spawn_save(ctx, todo, outs);
+    }
+
+    /// 在背景把 `todo` 逐張優化、存到對應的 `outs`（檔名已經問過使用者）
+    fn enhance_spawn_save(&mut self, ctx: &egui::Context, todo: Vec<PathBuf>, outs: Vec<PathBuf>) {
         // 每張照片連同它自己的設定、**自己的類型**與輸出位置一起交給
         // 背景執行緒（一批照片裡混著鳥與風景時，各張要照各自的類型處理）
-        let jobs: Vec<(PathBuf, PathBuf, EnhanceParams, enhance::Preset)> = self
-            .enhance
-            .photos
+        let jobs: Vec<(PathBuf, PathBuf, EnhanceParams, enhance::Preset)> = todo
             .iter()
             .zip(outs)
             .map(|(p, out)| {
@@ -26508,6 +26537,7 @@ impl App {
         let export = self.export_size;
         self.enhance.save_cancel = cancel.clone();
         self.enhance.save_done = 0;
+        self.enhance.save_total = jobs.len();
         self.enhance.busy = EnhanceBusy::Saving;
         self.enhance.error = None;
         self.enhance.saved = None;
@@ -26597,8 +26627,10 @@ impl App {
                             self.enhance.saved = Some((format!("已完成 {ok} 張"), Instant::now()));
                             self.enhance.saved_path = first_out;
                             // 中途按取消的那次不算存完，剩下的張數還在等著存
+                            // 另存新檔只存了目前那一張，其餘的還沒存（與去煙霧一致）
                             let cancelled = self.enhance.save_cancel.load(Ordering::Relaxed);
-                            self.enhance.dirty = cancelled || !errs.is_empty();
+                            let partial = self.enhance.save_total < self.enhance.photos.len();
+                            self.enhance.dirty = cancelled || partial || !errs.is_empty();
                             if !errs.is_empty() {
                                 let shown: Vec<String> = errs.iter().take(3).cloned().collect();
                                 let more = errs.len().saturating_sub(shown.len());
@@ -27299,10 +27331,12 @@ impl App {
                         let saving = busy == EnhanceBusy::Saving;
                         if saving {
                             let done = self.enhance.save_done;
+                            // 分母是這次要存幾張：另存新檔只存目前那一張
+                            let batch = self.enhance.save_total.max(1);
                             saving_button(
                                 ui,
-                                &format!("儲存中… {done}/{total}"),
-                                done as f32 / total.max(1) as f32,
+                                &format!("儲存中… {done}/{batch}"),
+                                done as f32 / batch as f32,
                             )
                             .on_hover_text("正在把處理好的照片寫成檔案，完成前請先別關視窗");
                         } else {
@@ -27314,10 +27348,12 @@ impl App {
                             if primary_button(ui, &label, busy == EnhanceBusy::Idle)
                                 .on_hover_text(if total > 1 {
                                     "每張都存回它自己的原始資料夾，\
-                                     檔名加上 _優化，不用再選位置"
+                                     檔名加上 _優化（有調整尺寸再加上尺寸，例如 _優化_2k），\
+                                     不用再選位置"
                                 } else {
                                     "存回原始照片所在的資料夾，\
-                                     檔名加上 _優化，不用再選位置"
+                                     檔名加上 _優化（有調整尺寸再加上尺寸，例如 _優化_2k），\
+                                     不用再選位置"
                                 })
                                 .clicked()
                             {
@@ -27328,7 +27364,7 @@ impl App {
                             ui.add_space(6.0);
                             if ui
                                 .small_button("📁 另存新檔…")
-                                .on_hover_text("自己挑一個資料夾存放成品")
+                                .on_hover_text("只存預覽上的這一張，自己挑位置與檔名")
                                 .clicked()
                             {
                                 save = Some(false);
@@ -35008,6 +35044,91 @@ fn confirm_overwrite(path: &Path) -> bool {
     )
 }
 
+/// 跳存檔對話框讓使用者挑成品（JPEG）的位置與檔名；按取消回 None。
+/// 檔案已存在時系統的對話框會先問要不要覆蓋
+fn pick_jpeg_save_path(start: PathBuf, name: &str, title: &str) -> Option<PathBuf> {
+    let out = file_dialog()
+        .set_directory(start)
+        .set_title(title)
+        .set_file_name(name)
+        .add_filter("JPEG 圖片", &["jpg", "jpeg"])
+        .save_file()?;
+    // 對話框可能回一個沒有副檔名的路徑（使用者自己把它刪掉了）。
+    // 補上之後才成立的檔名，存檔對話框沒問過使用者，得自己補問一次
+    if out.extension().is_none() {
+        let fixed = out.with_extension("jpg");
+        confirm_overwrite(&fixed).then_some(fixed)
+    } else {
+        Some(out)
+    }
+}
+
+/// 存回原始資料夾時自動取的成品檔名：`<原檔名><mark>.jpg`（mark 像 `_去煙`）。
+/// 萬一剛好就是原始照片本身（原檔就叫 `x_去煙.jpg`）改加 (1)，別把原檔蓋掉
+fn auto_output_path(src: &Path, mark: &str) -> PathBuf {
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "photo".into());
+    // 沒有上層目錄的極端情況才退回工作目錄，總比整批失敗好
+    let dir = src.parent().map(Path::to_path_buf).unwrap_or_default();
+    let out = dir.join(format!("{stem}{mark}.jpg"));
+    if same_path_ci(&out, src) {
+        dir.join(format!("{stem}{mark}(1).jpg"))
+    } else {
+        out
+    }
+}
+
+/// 「📁 另存新檔…」：只存預覽上的那一張，跳存檔對話框讓使用者挑位置與檔名。
+/// 從照片自己的資料夾開始、預填 `<原檔名><mark>.jpg`；選好就記下這次存到哪。
+/// 按取消回 None
+fn save_one_as(which: LastDir, src: &Path, mark: &str, title: &str) -> Option<PathBuf> {
+    let start = output_start_dir(which, Some(src));
+    let name = auto_output_path(src, mark)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let out = pick_jpeg_save_path(start, &name, title)?;
+    remember_dir(which, &out);
+    Some(out)
+}
+
+/// 自動取的成品檔名已經被佔用時（**只存一張**的時候）問一次：
+/// 「覆蓋」、「改檔名…」、「取消」。回 None＝不存了；檔案不存在就原樣回傳。
+///
+/// 「改檔名…」跳存檔對話框，停在同一個資料夾、預填一個不重複的名字
+/// （`_疊圖_2k(1).jpg`），使用者可以直接改成自己要的——以前是默默自動
+/// 加上 (1)，存完才發現檔名不是自己想要的
+fn resolve_existing_output(out: &Path, title: &str) -> Option<PathBuf> {
+    if !out.exists() {
+        return Some(out.to_path_buf());
+    }
+    let name = out.file_name().unwrap_or_default().to_string_lossy();
+    match ask3(
+        rfd::MessageLevel::Warning,
+        "成品檔已存在",
+        &format!(
+            "「{name}」已經存在。\n\n\
+             「覆蓋」：舊檔直接被蓋掉\n\
+             「改檔名…」：保留舊檔，自己取一個新的檔名\n\
+             「取消」：不存檔"
+        ),
+        "覆蓋",
+        "改檔名…",
+        "取消",
+    ) {
+        Ask3::First => Some(out.to_path_buf()),
+        Ask3::Second => {
+            let dir = out.parent().map(Path::to_path_buf).unwrap_or_default();
+            let free = next_free_path(out);
+            let suggest = free.file_name().unwrap_or_default().to_string_lossy();
+            pick_jpeg_save_path(dir, &suggest, title)
+        }
+        Ask3::Cancel => None,
+    }
+}
+
 /// 在檔名後面加序號，直到找到一個還沒被佔用的（`照片_去煙(1).jpg`…）。
 /// 找不到（極端情況）就回原本那個
 fn next_free_path(path: &Path) -> PathBuf {
@@ -35085,6 +35206,42 @@ fn size_tag(w: u32, h: u32) -> String {
         480 => "480p".into(),
         _ => format!("{w}x{h}"),
     }
+}
+
+/// 照片成品縮過尺寸時接在檔名後面的標記：`4k`、`2k`、`1080p`、`720p`，
+/// 其他（「網頁」、自訂）寫成品實際的寬x高——與 [`size_tag`] 同一套講法，
+/// 只有 2K 照使用者的叫法寫 `2k`（照片的 2K 是「塞得進 2560×1440」，
+/// 3:2 的照片縮完短邊不是 1440，寫 1440p 反而對不上）。
+///
+/// `natural` 是不縮的話會是幾乘幾（見 [`export_natural_dims`]）。
+/// 沒勾「調整尺寸」、或被「不放大」擋下來而成品其實沒縮的，都回 None：
+/// 檔名寫著 2k、打開卻是原尺寸，只會讓人搞不清楚
+fn export_size_tag(s: &ExportSize, natural: Option<(u32, u32)>) -> Option<String> {
+    if !s.on {
+        return None;
+    }
+    let s = s.clamped();
+    let out = match natural {
+        Some((nw, nh)) => {
+            let (ow, oh) = s.target(nw, nh).unwrap_or((nw, nh));
+            // 縮到框裡的成品一定有一邊貼齊框；兩邊都沒貼齊＝不放大擋下來了
+            if ow != s.w && oh != s.h {
+                return None;
+            }
+            Some((ow, oh))
+        }
+        None => None,
+    };
+    Some(match (s.w, s.h) {
+        (3840, 2160) => "4k".into(),
+        (2560, 1440) => "2k".into(),
+        (1920, 1080) => "1080p".into(),
+        (1280, 720) => "720p".into(),
+        (w, h) => {
+            let (w, h) = out.unwrap_or((w, h));
+            format!("{w}x{h}")
+        }
+    })
 }
 
 /// 影片成品的檔名：`<來源名稱>[_<標記>]_<解析度>`。
@@ -39630,6 +39787,42 @@ mod tests {
         };
         let out = fit_export(image::RgbImage::new(400, 200), s);
         assert_eq!((out.width(), out.height()), (100, 50));
+    }
+
+    /// 存檔尺寸寫進疊圖檔名的標記：常用尺寸用簡稱，其他寫成品實際的寬x高；
+    /// 沒勾、或被「不放大」擋下來沒縮的，都不加
+    #[test]
+    fn export_size_tag_names_the_preset() {
+        let photo = Some((6000, 4000));
+        let mut s = ExportSize {
+            on: true,
+            custom: false,
+            no_upscale: true,
+            ..ExportSize::default()
+        };
+        for ((_, w, h), want) in EXPORT_PRESETS.iter().zip([
+            "4k",
+            "2k",
+            "1080p",
+            "720p",
+            // 網頁不是影片那幾個常用尺寸：3:2 的照片塞進 1024×768 是 1024×683
+            "1024x683",
+        ]) {
+            (s.w, s.h) = (*w, *h);
+            assert_eq!(export_size_tag(&s, photo).as_deref(), Some(want));
+        }
+        assert_eq!(EXPORT_PRESETS.len(), 5, "常用尺寸有增減，這裡要跟著補");
+        // 自訂的寫實際尺寸
+        (s.w, s.h, s.custom) = (2048, 1400, true);
+        assert_eq!(export_size_tag(&s, photo).as_deref(), Some("2048x1365"));
+        // 原圖比 2K 還小、又勾了不放大：其實沒縮，不能寫 2k
+        (s.w, s.h) = (2560, 1440);
+        assert_eq!(export_size_tag(&s, Some((1600, 1067))), None);
+        s.no_upscale = false;
+        assert_eq!(export_size_tag(&s, Some((1600, 1067))).as_deref(), Some("2k"));
+        // 沒勾調整尺寸
+        s.on = false;
+        assert_eq!(export_size_tag(&s, photo), None);
     }
 
     /// 換成比較少的張數時，縮圖列上一幀的可視範圍會指到清單外
