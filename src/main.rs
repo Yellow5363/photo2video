@@ -9224,6 +9224,11 @@ struct App {
     /// 在起始畫面拖進了照片或影片（不是專案檔）：那裡還沒挑功能，收不了。
     /// 在起始畫面顯示一行提示，免得使用者以為程式沒反應
     home_drop_note: bool,
+    /// 起始畫面上「標誌以下」那一段實際排出來的高度（上一幀量的）。
+    /// 置中要拿整塊的高度去算，而字高與列距是字型決定的、估不準——估少多少
+    /// 整塊就往下掉多少的一半。量過一次就準了（見 [`App::ui_home`]）。
+    /// 標誌本身的高度不記在裡面：它是跟著視窗大小算的，記了換個大小就不能用
+    home_below_logo_h: Option<f32>,
     /// 最近開啟/儲存的專案檔（新的在前），顯示在空狀態畫面供一鍵開啟
     recent_projects: Vec<PathBuf>,
     /// 最近一次「專案儲存／開啟」的提示與時間，在按鈕旁短暫顯示。
@@ -9363,6 +9368,7 @@ impl App {
             crash_report: take_last_run_report(),
             import_found_nothing: false,
             home_drop_note: false,
+            home_below_logo_h: None,
             recent_projects: load_recent_projects(),
             project_note: None,
             convert_output: None,
@@ -13710,25 +13716,50 @@ impl App {
                 // 底下的「開啟專案」不管怎樣都要看得到
                 let logo_h = (card.height() * 0.36).clamp(96.0, 240.0);
                 let logo_w = (logo_h * 2.5).min(card.width() - 48.0).max(120.0);
-                let content_h = logo_h
-                    + 44.0 // 程式名稱
-                    + 20.0 // 底下那一句
-                    + 24.0 // 間距
-                    + 40.0 // 開啟專案
-                    + if recent.is_empty() {
-                        0.0
-                    } else {
-                        28.0 + recent.len() as f32 * 24.0
-                    };
+                // 要置中就得知道整塊有多高，而這個高度**不能用估的**：字高與
+                // 列距是字型算出來的，估少多少、整塊就往下掉多少的一半。
+                // 改成每一幀量實際排出來的高度、下一幀拿來用。
+                //
+                // 只記「標誌以下」那一段：標誌的高度是跟著視窗大小算的，
+                // 連它一起記，換個視窗大小記到的值就不能用了。
+                // 還沒量過的那一幀（開程式的第一幀）才用估的頂著
+                let below_logo = self.home_below_logo_h.unwrap_or_else(|| {
+                    44.0 // 程式名稱
+                        + 20.0 // 底下那一句
+                        + 24.0 // 間距
+                        + 40.0 // 開啟專案
+                        + if recent.is_empty() {
+                            0.0
+                        } else {
+                            28.0 + recent.len() as f32 * 24.0
+                        }
+                });
+                let content_h = logo_h + below_logo;
 
+                // 這一幀實際量到的「標誌以下」高度
+                let mut measured = below_logo;
                 // 視窗矮到擺不下時可以捲：整頁就這幾樣東西，一樣都不能被
                 // 切在畫面外（尤其是那幾個最近的專案）
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
-                            // 擺得下就置中，擺不下就從上面開始排（剩下的用捲的）
-                            ui.add_space(((card.height() - content_h) / 2.0).max(16.0));
+                            // 擺得下就置中，擺不下就從上面開始排（剩下的用捲的）。
+                            // 標誌畫出來的東西比它佔的那塊高（上面多一截散星，
+                            // 見 [`HERO_OVERSHOOT_RATIO`]），置中的是「框」、
+                            // 看的卻是「畫出來的東西」，所以整塊再往下挪半截
+                            //
+                            // 上限是「剩下的空間」：往下挪不能把內容推到卡片
+                            // 外面去，否則本來擺得下的視窗高度會莫名多一條捲軸
+                            let overshoot = logo_h * HERO_OVERSHOOT_RATIO;
+                            // 最少留的這一段也要把多出來的那一截算進去，
+                            // 不然視窗一矮，散星就直接貼在卡片的上緣上
+                            let min_top = 16.0 + overshoot;
+                            let slack = (card.height() - content_h).max(0.0);
+                            ui.add_space(
+                                ((card.height() - content_h) / 2.0 + overshoot / 2.0)
+                                    .clamp(min_top, slack.max(min_top)),
+                            );
 
                             let (logo_rect, _) = ui.allocate_exact_size(
                                 egui::vec2(logo_w, logo_h),
@@ -13799,9 +13830,19 @@ impl App {
                                     .color(theme::TEXT_WEAK),
                                 );
                             }
+                            // 量這一塊實際排出來有多高（標誌的底緣到最後一列），
+                            // 下一幀的置中就拿這個值算。底下那段留白不算進去，
+                            // 它是給捲動留的餘裕、不是內容
+                            measured = ui.min_rect().bottom() - logo_rect.bottom();
                             ui.add_space(16.0);
                         });
                     });
+                // 量到的跟這一幀用的不一樣（第一幀、換視窗大小、最近清單增減）
+                // 就記下來並要求再畫一次，否則會停在偏掉的那一幀上不動
+                if (measured - below_logo).abs() > 0.5 {
+                    self.home_below_logo_h = Some(measured);
+                    ui.ctx().request_repaint();
+                }
             });
     }
 
@@ -32884,6 +32925,14 @@ fn enhance_empty_state(ui: &mut egui::Ui, loading: bool) -> Option<bool> {
     act
 }
 
+/// [`paint_hero_logo`] 畫出來的東西超出它那塊 rect 上緣多少，佔 rect 高度的
+/// 比例。設計框是 208 單位高（-104～104），但散星最遠飛到 y≈-139，上面多出
+/// 35 個單位；下緣的膠捲只到 y≈98，反而還差一點。
+///
+/// 所以「把 rect 擺到正中央」看起來會整塊偏上——多出來的那一截全在上面。
+/// 要讓**看得到的東西**置中，就得把整塊往下挪這一截的一半（見 [`App::ui_home`]）
+const HERO_OVERSHOOT_RATIO: f32 = 35.0 / 208.0;
+
 /// 起始畫面正中央的標誌：一朵在膠捲上炸開的煙火，爆心是播放鍵
 /// ——影像（膠捲）、煙火（花火）、影片（播放鍵）三件事一次講完，
 /// 播放鍵也和工作列上的程式圖示是同一個符號。
@@ -32892,7 +32941,11 @@ fn enhance_empty_state(ui: &mut egui::Ui, loading: bool) -> Option<bool> {
 /// 也不必為了高解析度螢幕在執行檔裡多帶一張大圖。畫面是靜止的（不做動畫），
 /// 停在這一頁不會一直重畫。
 ///
-/// `backdrop` 是它畫在什麼底色上：膠捲兩端要淡進那個顏色，不能有硬邊
+/// `backdrop` 是它畫在什麼底色上：膠捲兩端要淡進那個顏色，不能有硬邊。
+///
+/// **畫出來的東西比 `rect` 高**：散星會衝出設計框的上緣（見
+/// [`HERO_OVERSHOOT_RATIO`]），下緣則留了一點空。拿這個 rect 去排版置中的人
+/// 要把那一截補回來，否則看起來整塊會偏上
 fn paint_hero_logo(p: &egui::Painter, rect: egui::Rect, backdrop: egui::Color32) {
     use egui::{pos2, Color32, Shape, Stroke};
     use std::f32::consts::TAU;
