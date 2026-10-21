@@ -883,6 +883,14 @@ const PROJECT_EXT: &str = "p2v";
 /// 「最近的專案」清單保留的最大筆數（載入與寫入共用同一上限）
 const RECENT_PROJECTS_MAX: usize = 8;
 
+/// 「照片轉影片」每秒張數的原始預設值。
+///
+/// **不跨次記憶**：每次開程式都從這裡開始，與格式（MP4）、解析度（Full HD）
+/// 一致。曾經把它記在設定檔裡當「慣用值」，但上一批用的張數會悄悄套到下一批
+/// 身上——換一批照片卻沒注意到底下還停在上次的設定，整支影片的速度就錯了，
+/// 而且要轉完才看得出來。開啟 .p2v 專案時用專案自己存的值，不受這裡影響
+const DEFAULT_FPS: u32 = 10;
+
 /// 專案檔內容：照片清單與所有編輯設定。
 /// 與 App 狀態分離的獨立結構，欄位盡量用穩定的表示法
 /// （字型存名稱而非索引、格式/轉場存字串），並全部給預設值，
@@ -1924,14 +1932,6 @@ fn windows_report(ours: &[WinInfo], fg: Option<&WinInfo>, dialog_phase: bool) ->
     s
 }
 
-/// 讀取上次儲存的每秒張數；沒有設定檔或值不合法時回傳 None
-fn load_saved_fps() -> Option<u32> {
-    let txt = std::fs::read_to_string(config_path()).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&txt).ok()?;
-    let fps = json.get("fps")?.as_u64()? as u32;
-    (1..=60).contains(&fps).then_some(fps)
-}
-
 /// 讀取整份設定檔 JSON；不存在或壞掉時回傳空物件
 fn load_config() -> serde_json::Value {
     std::fs::read_to_string(config_path())
@@ -2226,11 +2226,6 @@ fn export_size_row(
         },
     );
     *s != before
-}
-
-/// 儲存每秒張數設定
-fn save_fps(fps: u32) {
-    update_config("fps", serde_json::json!(fps));
 }
 
 /// 最近開啟/儲存的專案檔路徑（新的在前）
@@ -9215,8 +9210,6 @@ struct App {
     /// 顯示告知（啟動背景檢查失敗屬 Failed 但不設此，維持靜默不打擾）
     update_download_error: Option<String>,
     about_open: bool,
-    /// fps 最後一次變動的時間；拖動時不即時寫設定檔，停止變動後才寫
-    fps_pending_save: Option<Instant>,
     /// 上次執行留下的問題紀錄（閃退或畫面停止回應）；有值時在底欄顯示回報橫幅
     crash_report: Option<LastRunReport>,
     /// 剛選的資料夾/檔案沒有找到任何照片；在空狀態顯示提示，避免使用者以為沒反應
@@ -9314,7 +9307,7 @@ impl App {
             top_bars_bottom: 0.0,
             menu_bar_module: Module::Home,
             photos: Vec::new(),
-            fps: load_saved_fps().unwrap_or(10),
+            fps: DEFAULT_FPS,
             export_size: load_export_size(),
             format: OutputFormat::Mp4,
             resolution: Resolution { w: 1920, h: 1080 },
@@ -9364,7 +9357,6 @@ impl App {
             update_banner_dismissed: false,
             update_download_error: None,
             about_open: false,
-            fps_pending_save: None,
             crash_report: take_last_run_report(),
             import_found_nothing: false,
             home_drop_note: false,
@@ -10748,8 +10740,8 @@ impl App {
         }
     }
 
-    /// 開新專案：回到空狀態，所有編輯設定回復預設
-    /// （fps 保留使用者慣用值，與程式啟動時一致）
+    /// 開新專案：回到空狀態，所有編輯設定回復預設（確認框答應的就是
+    /// 「清空目前的照片與所有設定」，每秒張數也算在裡面）
     fn new_project(&mut self) {
         self.clear_photos(); // 內含轉換結果橫幅（state）的重置
         self.adj = Adjustments::default();
@@ -10762,6 +10754,7 @@ impl App {
         self.music_path = None;
         self.music_volume = 100;
         self.music_fade = true;
+        self.fps = DEFAULT_FPS;
         self.format = OutputFormat::Mp4;
         self.resolution = Resolution { w: 1920, h: 1080 };
         // 新專案不再屬於任何 .p2v：避免 Ctrl+S 把空白狀態覆寫進舊專案檔
@@ -10830,10 +10823,6 @@ impl App {
         self.clear_photos(); // 內含轉換結果橫幅（state）的重置
         self.photos = found.into_iter().flatten().collect();
         self.fps = pf.fps.clamp(1, 60);
-        // 取消尚未落盤的 fps 延遲寫入：設定檔的 fps 是「使用者慣用值」，
-        // 若剛拖完滑桿（計時器還掛著）就載入專案，時間一到會把「專案的
-        // fps」誤存成慣用值（關閉程式時 App::drop 的補寫同理）
-        self.fps_pending_save = None;
         self.format = OutputFormat::from_ext(&pf.format).unwrap_or(OutputFormat::Mp4);
         // 只接受選單裡有的解析度，避免手改出怪尺寸讓下拉選單對不上
         self.resolution = Resolution::ALL
@@ -11538,9 +11527,6 @@ impl App {
                 self.update_status = UpdateStatus::ReadyToRestart;
                 return;
             }
-        }
-        if self.fps_pending_save.take().is_some() {
-            save_fps(self.fps);
         }
         restart_app();
     }
@@ -12567,7 +12553,6 @@ impl App {
 
                 let working = self.is_working();
                 let res_before = self.resolution;
-                let fps_before = self.fps;
                 // 還沒加照片時整排輸出設定一起變灰：這些是「轉這批照片」的
                 // 設定，沒有照片就無從談起，跟旁邊已經停用的「開始轉換」一致，
                 // 起始畫面才不會擺著一排看似可用、按了也沒下文的控制項
@@ -12656,10 +12641,6 @@ impl App {
 
                 if self.resolution != res_before {
                     self.mark_preview_dirty();
-                }
-                if self.fps != fps_before {
-                    // 拖動中每格變動都會進來，延後到停止變動再寫檔（見 update）
-                    self.fps_pending_save = Some(Instant::now());
                 }
             });
     }
@@ -30797,10 +30778,6 @@ impl Drop for App {
                 }
             }
         }
-        // 關閉程式時若還有未寫入的 fps 設定，補寫一次
-        if self.fps_pending_save.is_some() {
-            save_fps(self.fps);
-        }
         clean_own_temp_files();
     }
 }
@@ -31081,16 +31058,6 @@ impl eframe::App for App {
             self.applied_title = desired_title;
         }
 
-        // fps 停止變動 800ms 後才寫設定檔，拖動過程不做磁碟 I/O
-        if let Some(t) = self.fps_pending_save {
-            let elapsed = t.elapsed();
-            if elapsed >= Duration::from_millis(800) {
-                save_fps(self.fps);
-                self.fps_pending_save = None;
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(820) - elapsed);
-            }
-        }
         self.poll_update();
         self.poll_worker();
         self.poll_preview(ctx);
