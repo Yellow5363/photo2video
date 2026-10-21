@@ -262,6 +262,390 @@ impl ScoreMap {
     }
 }
 
+/// 一個樣本的前向結果（倒傳用）
+struct Fwd {
+    x: Vec<f32>,
+    conv: Conv,
+    flat: Vec<f32>,
+    h4: Vec<f32>,
+    z: f32,
+}
+
+fn net_f(p: &[f32], x: Vec<f32>) -> Fwd {
+    let n = NP + 2 * CTX;
+    let conv = net_conv(p, &x, n, n);
+    let (flat, h4, z) = net_head(p, &conv.a3, n / 4, n / 4, CTX / 4, CTX / 4);
+    Fwd { x, conv, flat, h4, z }
+}
+
+/// 3×3 卷積的倒傳：累加權重與偏移的梯度，需要時回傳對輸入的梯度
+#[allow(clippy::too_many_arguments)]
+fn conv_b(x: &[f32], ci: usize, h: usize, w: usize, wt: &[f32], co: usize, dy: &[f32], dw: &mut [f32], db: &mut [f32], need_dx: bool) -> Vec<f32> {
+    let hw = h * w;
+    let mut dx = if need_dx { vec![0f32; ci * hw] } else { Vec::new() };
+    for o in 0..co {
+        let dyo = &dy[o * hw..(o + 1) * hw];
+        db[o] += dyo.iter().sum::<f32>();
+        for i in 0..ci {
+            let xi = &x[i * hw..(i + 1) * hw];
+            for ky in 0..3 {
+                for kx in 0..3 {
+                    let k = ((o * ci + i) * 3 + ky) * 3 + kx;
+                    let wv = wt[k];
+                    let mut g = 0f32;
+                    let (x0, x1) = (usize::from(kx == 0), if kx == 2 { w - 1 } else { w });
+                    for yy in 0..h {
+                        let sy = yy as isize + ky as isize - 1;
+                        if sy < 0 || sy >= h as isize {
+                            continue;
+                        }
+                        let sy = sy as usize;
+                        for xx in x0..x1 {
+                            let d = dyo[yy * w + xx];
+                            g += d * xi[sy * w + xx + kx - 1];
+                            if need_dx {
+                                dx[i * hw + sy * w + xx + kx - 1] += d * wv;
+                            }
+                        }
+                    }
+                    dw[k] += g;
+                }
+            }
+        }
+    }
+    dx
+}
+
+fn net_b(p: &[f32], f: &Fwd, dz: f32, g: &mut [f32]) {
+    let n = NP + 2 * CTX;
+    g[L.b5] += dz;
+    let mut dh4 = vec![0f32; FH];
+    for j in 0..FH {
+        g[L.w5 + j] += dz * f.h4[j];
+        dh4[j] = if f.h4[j] > 0.0 { dz * p[L.w5 + j] } else { 0.0 };
+    }
+    let mut dflat = vec![0f32; FLAT];
+    for j in 0..FH {
+        if dh4[j] == 0.0 {
+            continue;
+        }
+        g[L.b4 + j] += dh4[j];
+        for k in 0..FLAT {
+            g[L.w4 + j * FLAT + k] += dh4[j] * f.flat[k];
+            dflat[k] += dh4[j] * p[L.w4 + j * FLAT + k];
+        }
+    }
+    let (gq, o) = (n / 4, CTX / 4);
+    let c = &f.conv;
+    let mut da3 = vec![0f32; c.a3.len()];
+    for ch in 0..C3 {
+        for j in 0..6 {
+            for i in 0..6 {
+                let k = ch * gq * gq + (o + j) * gq + o + i;
+                if c.a3[k] > 0.0 {
+                    da3[k] = dflat[(ch * 6 + j) * 6 + i];
+                }
+            }
+        }
+    }
+    let (gw3, rest) = g[L.w3..].split_at_mut(L.b3 - L.w3);
+    let dp2 = conv_b(&c.p2, C2, gq, gq, &p[L.w3..L.b3], C3, &da3, gw3, &mut rest[..C3], true);
+    let mut da2 = vec![0f32; c.a2.len()];
+    for (k, &i) in c.i2.iter().enumerate() {
+        da2[i] += dp2[k];
+    }
+    for k in 0..da2.len() {
+        if c.a2[k] <= 0.0 {
+            da2[k] = 0.0;
+        }
+    }
+    let (gw2, rest) = g[L.w2..].split_at_mut(L.b2 - L.w2);
+    let dp1 = conv_b(&c.p1, C1, n / 2, n / 2, &p[L.w2..L.b2], C2, &da2, gw2, &mut rest[..C2], true);
+    let mut da1 = vec![0f32; c.a1.len()];
+    for (k, &i) in c.i1.iter().enumerate() {
+        da1[i] += dp1[k];
+    }
+    for k in 0..da1.len() {
+        if c.a1[k] <= 0.0 {
+            da1[k] = 0.0;
+        }
+    }
+    let (gw1, rest) = g[L.w1..].split_at_mut(L.b1 - L.w1);
+    conv_b(&f.x, 3, n, n, &p[L.w1..L.b1], C1, &da1, gw1, &mut rest[..C1], false);
+}
+
+/// 以 (cx, cy) 為中心、每格 step 像素、轉 ang、可左右翻，取 n×n 的彩色小塊
+#[allow(clippy::too_many_arguments)]
+fn patch(img: &RgbImage, cx: f32, cy: f32, n: usize, step: f32, ang: f32, mirror: bool, aug: [f32; 5]) -> Vec<f32> {
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let (ca, sa) = (ang.cos(), ang.sin());
+    let mut out = vec![0f32; 3 * n * n];
+    let half = n as f32 / 2.0;
+    for j in 0..n {
+        for i in 0..n {
+            let ii = if mirror { n - 1 - i } else { i };
+            let u = (ii as f32 + 0.5 - half) * step;
+            let v = (j as f32 + 0.5 - half) * step;
+            let x = (cx + u * ca - v * sa - 0.5).clamp(0.0, w - 1.001);
+            let y = (cy + u * sa + v * ca - 0.5).clamp(0.0, h - 1.001);
+            let (x0, y0) = (x as u32, y as u32);
+            let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+            let (x1, y1) = ((x0 + 1).min(img.width() - 1), (y0 + 1).min(img.height() - 1));
+            let (p00, p10, p01, p11) = (img.get_pixel(x0, y0), img.get_pixel(x1, y0), img.get_pixel(x0, y1), img.get_pixel(x1, y1));
+            for c in 0..3 {
+                let a = p00[c] as f32 * (1.0 - fx) + p10[c] as f32 * fx;
+                let b = p01[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
+                out[c * n * n + j * n + i] = (((a * (1.0 - fy) + b * fy) * aug[c] / 255.0).min(1.0) - 0.5) * aug[3] + aug[4];
+            }
+        }
+    }
+    out
+}
+
+/// 一張訓練照片：縮到頭寬 KS 的一層，加上 2、4、8 倍大的幾層
+/// （取「比頭小很多」的反例時要從清楚的那層取，才跟實際執行時一樣清楚）
+struct Shot {
+    lv: Vec<RgbImage>,
+    gx: f32,
+    gy: f32,
+}
+
+impl Shot {
+    #[allow(clippy::too_many_arguments)]
+    fn patch(&self, x: f32, y: f32, n: usize, step: f32, ang: f32, mirror: bool, aug: [f32; 5]) -> Vec<f32> {
+        let mut k = 0;
+        while k + 1 < self.lv.len() && step * ((1u32 << k) as f32) < 1.0 {
+            k += 1;
+        }
+        let m = (1u32 << k) as f32;
+        patch(&self.lv[k], x * m, y * m, n, step * m, ang, mirror, aug)
+    }
+}
+
+struct Rng(u64);
+impl Rng {
+    fn u(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 40) as f32 / (1u64 << 24) as f32
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn n(&mut self) -> f32 {
+        let (a, b) = (self.u().max(1e-7), self.u());
+        (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()
+    }
+}
+
+/// 明暗、色偏、對比的隨機變化：(三色增益, 對比, 平移)。圖庫大多是暗背景、
+/// 近距離的照片，只加一點變化的話，藍天前逆光、翅膀糊動的飛行照幾乎認不出來
+/// （實測一批 10 張整張找頭：0 張對；加大變化並挖難反例後 7 張）
+fn aug(rng: &mut Rng) -> [f32; 5] {
+    let gain = 0.5 + rng.u() * 1.1;
+    [
+        gain * (0.85 + rng.u() * 0.3),
+        gain * (0.85 + rng.u() * 0.3),
+        gain * (0.85 + rng.u() * 0.3),
+        0.6 + rng.u() * 0.7,
+        (rng.u() - 0.5) * 0.24,
+    ]
+}
+
+/// 難反例：拿目前的網路在整張照片上各種縮放找一遍，網路覺得像頭、其實不是的
+/// 地方（例如松針、水珠）。回傳 (x, y, 縮放倍數)，座標是頭寬 KS 那一層的。
+/// 位置對、大小也差不多的不算（那是真的頭）
+fn mine(p: &[f32], sh: &Shot) -> Vec<(f32, f32, f32)> {
+    let mut out = Vec::new();
+    for r in [0.3f32, 0.42, 0.6, 0.85, 1.0, 1.2, 1.7, 2.4] {
+        let mut k = 0;
+        while k + 1 < sh.lv.len() && ((1u32 << k) as f32) * r < 1.0 {
+            k += 1;
+        }
+        let src = &sh.lv[k];
+        let f = 1.0 / (r * (1u32 << k) as f32);
+        let (w, h) = ((src.width() as f32 * f).round() as u32, (src.height() as f32 * f).round() as u32);
+        if w < NP as u32 || h < NP as u32 {
+            continue;
+        }
+        let small = image::imageops::resize(src, w, h, image::imageops::FilterType::Triangle);
+        for (x, y, _) in score_map(p, &small).peaks(0.0, 6) {
+            let (x0, y0) = (x * r, y * r);
+            if (x0 - sh.gx).hypot(y0 - sh.gy) < 0.6 * KS && (0.65..=1.55).contains(&r) {
+                continue;
+            }
+            out.push((x0, y0, r));
+        }
+    }
+    out
+}
+
+impl Shot {
+    /// 一張照片與使用者框的位置（相對座標）：縮到「框寬＝[`KS`]」那一層，再加上
+    /// 2、4、8 倍大的幾層
+    pub fn new(img: &RgbImage, r: [f32; 4]) -> Option<Shot> {
+        let bw = (r[2] - r[0]) * img.width() as f32;
+        if bw < 2.0 {
+            return None;
+        }
+        let k = KS / bw;
+        let (w, h) = ((img.width() as f32 * k).round() as u32, (img.height() as f32 * k).round() as u32);
+        if w < 2 || h < 2 {
+            return None;
+        }
+        let lv = (0..4)
+            .map(|s| image::imageops::resize(img, w << s, h << s, image::imageops::FilterType::Triangle))
+            .collect();
+        Some(Shot { lv, gx: (r[0] + r[2]) / 2.0 * w as f32, gy: (r[1] + r[3]) / 2.0 * h as f32 })
+    }
+}
+
+/// 訓練的設定
+struct Train {
+    epochs: usize,
+    /// 學習率（最後四分之一輪降成四分之一）
+    lr: f32,
+    /// 從第幾輪起挖難反例、之後每隔幾輪重挖（見 [`mine`]）
+    hard_from: usize,
+    hard_every: usize,
+    seed: u64,
+    log: bool,
+}
+
+/// 拿 `shots` 訓練 `p`（就地改）。每張每輪取 8 個正樣本（框中心附近、隨意旋轉
+/// 翻轉、明暗與色偏、大小差兩成內）與 28 個反例：一部分在頭附近、一部分整張
+/// 隨意，還有大半是「大小不對」——不教它這個，多種縮放一起找時，羽毛上的小
+/// 斑點也會被當成很小的頭。再加上挖到的難反例
+fn train(p: &mut [f32], shots: &[Shot], t: &Train) {
+    let mut rng = Rng(t.seed);
+    let (mut m1, mut m2) = (vec![0f32; L.n], vec![0f32; L.n]);
+    let mut step = 0i32;
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let n_in = NP + 2 * CTX;
+    let mut hard: Vec<Vec<(f32, f32, f32)>> = vec![Vec::new(); shots.len()];
+    for ep in 0..t.epochs {
+        // （第幾張, x, y, 角度, 翻轉, 大小倍數, 明暗變化, 標籤）
+        let mut samples: Vec<(usize, f32, f32, f32, bool, f32, [f32; 5], f32)> = Vec::new();
+        if ep >= t.hard_from && (ep - t.hard_from) % t.hard_every == 0 {
+            let cur: &[f32] = p;
+            hard = std::thread::scope(|sc| {
+                let hs: Vec<_> = shots
+                    .chunks(shots.len().div_ceil(threads).max(1))
+                    .map(|part| sc.spawn(move || part.iter().map(|sh| mine(cur, sh)).collect::<Vec<_>>()))
+                    .collect();
+                hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            });
+        }
+        for (k, hv) in hard.iter().enumerate() {
+            for _ in 0..hv.len().min(8) {
+                let (x, y, r) = hv[(rng.u() * hv.len() as f32) as usize % hv.len()];
+                let g = aug(&mut rng);
+                samples.push((k, x, y, rng.u() * std::f32::consts::TAU, rng.u() < 0.5, r, g, 0.0));
+            }
+        }
+        for (k, sh) in shots.iter().enumerate() {
+            let (w, h) = (sh.lv[0].width() as f32, sh.lv[0].height() as f32);
+            for q in 0..36 {
+                let pos = q < 8;
+                let wrong_scale = !pos && q % 3 != 2;
+                let scale = if wrong_scale {
+                    if rng.u() < 0.6 {
+                        (0.1f32.ln() + rng.u() * 6.0f32.ln()).exp()
+                    } else {
+                        (1.6f32.ln() + rng.u() * 2.5f32.ln()).exp()
+                    }
+                } else {
+                    0.8 + rng.u() * 0.45
+                };
+                let (x, y) = if pos || (wrong_scale && q % 2 == 0) {
+                    (sh.gx + (rng.u() - 0.5) * 0.25 * KS, sh.gy + (rng.u() - 0.5) * 0.25 * KS)
+                } else {
+                    loop {
+                        let (x, y) = if q % 3 == 0 {
+                            (rng.u() * w, rng.u() * h)
+                        } else {
+                            let (a, d) = (rng.u() * std::f32::consts::TAU, (0.55 + rng.u() * 2.5) * KS);
+                            (sh.gx + a.cos() * d, sh.gy + a.sin() * d)
+                        };
+                        if (x - sh.gx).hypot(y - sh.gy) >= 0.55 * KS && x >= 0.0 && y >= 0.0 && x < w && y < h {
+                            break (x, y);
+                        }
+                    }
+                };
+                let g = aug(&mut rng);
+                samples.push((k, x, y, rng.u() * std::f32::consts::TAU, rng.u() < 0.5, scale, g, if pos { 1.0 } else { 0.0 }));
+            }
+        }
+        for i in (1..samples.len()).rev() {
+            let j = (rng.u() * (i + 1) as f32) as usize % (i + 1);
+            samples.swap(i, j);
+        }
+        let lr = t.lr * if ep >= t.epochs * 3 / 4 { 0.25 } else { 1.0 };
+        let mut loss = 0f64;
+        for batch in samples.chunks(64) {
+            let cur: &[f32] = p;
+            let grads: Vec<(Vec<f32>, f64)> = std::thread::scope(|sc| {
+                let hs: Vec<_> = batch
+                    .chunks(batch.len().div_ceil(threads))
+                    .map(|part| {
+                        sc.spawn(move || {
+                            let mut g = vec![0f32; L.n];
+                            let mut ls = 0f64;
+                            for &(k, x, y, a, mi, scale, gain, lab) in part {
+                                let f = net_f(cur, shots[k].patch(x, y, n_in, 2.0 * KS * scale / NP as f32, a, mi, gain));
+                                let pr = 1.0 / (1.0 + (-f.z).exp());
+                                let wt = if lab > 0.5 { 3.0 } else { 1.0 };
+                                ls -= (wt * if lab > 0.5 { pr.max(1e-6).ln() } else { (1.0 - pr).max(1e-6).ln() }) as f64;
+                                net_b(cur, &f, (pr - lab) * wt, &mut g);
+                            }
+                            (g, ls)
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let mut g = vec![0f32; L.n];
+            for (gg, ls) in &grads {
+                for i in 0..L.n {
+                    g[i] += gg[i];
+                }
+                loss += ls;
+            }
+            // Adam，加一點權重衰減
+            step += 1;
+            let bn = batch.len() as f32;
+            for i in 0..L.n {
+                let gi = g[i] / bn + 1e-4 * p[i];
+                m1[i] = 0.9 * m1[i] + 0.1 * gi;
+                m2[i] = 0.999 * m2[i] + 0.001 * gi * gi;
+                let mh = m1[i] / (1.0 - 0.9f32.powi(step));
+                let vh = m2[i] / (1.0 - 0.999f32.powi(step));
+                p[i] -= lr * mh / (vh.sqrt() + 1e-8);
+            }
+        }
+        if t.log {
+            println!("第 {ep} 輪 loss {:.4}", loss / samples.len() as f64);
+        }
+    }
+}
+
+/// 同一批先框幾張：拿使用者手動框的那幾張（工作圖與框）當場再訓練一下。
+///
+/// 圖庫的照片拍不到所有場景：實測一批藍天前、黃綠松針旁的飛行照，網路把松針
+/// 當成頭，9 張裡框了 3 張之後，其餘 6 張整張找頭只對 1 張；拿那 3 張再訓練
+/// [`TUNE_EPOCHS`] 輪（約一秒半，松針會被挖出來當反例）之後對 4～5 張。
+/// 種子固定，同樣的框每次學出來都一樣
+pub fn fine_tune(base: &[f32], marked: &[(RgbImage, [f32; 4])]) -> Vec<f32> {
+    let shots: Vec<Shot> = marked.iter().filter_map(|(img, r)| Shot::new(img, *r)).collect();
+    let mut p = base.to_vec();
+    if !shots.is_empty() {
+        train(&mut p, &shots, &Train { epochs: TUNE_EPOCHS, lr: 0.001, hard_from: 0, hard_every: 5, seed: 0x1234_5678_9abc_def1, log: false });
+    }
+    p
+}
+
+/// [`fine_tune`] 訓練幾輪
+const TUNE_EPOCHS: usize = 20;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,190 +675,12 @@ mod tests {
         assert!((z - whole).abs() < 1e-3, "{z} vs {whole}");
     }
 
-    /// 一個樣本的前向結果（倒傳用）
-    struct Fwd {
-        x: Vec<f32>,
-        conv: Conv,
-        flat: Vec<f32>,
-        h4: Vec<f32>,
-        z: f32,
-    }
-
-    fn net_f(p: &[f32], x: Vec<f32>) -> Fwd {
-        let n = NP + 2 * CTX;
-        let conv = net_conv(p, &x, n, n);
-        let (flat, h4, z) = net_head(p, &conv.a3, n / 4, n / 4, CTX / 4, CTX / 4);
-        Fwd { x, conv, flat, h4, z }
-    }
-
-    /// 3×3 卷積的倒傳：累加權重與偏移的梯度，需要時回傳對輸入的梯度
-    #[allow(clippy::too_many_arguments)]
-    fn conv_b(x: &[f32], ci: usize, h: usize, w: usize, wt: &[f32], co: usize, dy: &[f32], dw: &mut [f32], db: &mut [f32], need_dx: bool) -> Vec<f32> {
-        let hw = h * w;
-        let mut dx = if need_dx { vec![0f32; ci * hw] } else { Vec::new() };
-        for o in 0..co {
-            let dyo = &dy[o * hw..(o + 1) * hw];
-            db[o] += dyo.iter().sum::<f32>();
-            for i in 0..ci {
-                let xi = &x[i * hw..(i + 1) * hw];
-                for ky in 0..3 {
-                    for kx in 0..3 {
-                        let k = ((o * ci + i) * 3 + ky) * 3 + kx;
-                        let wv = wt[k];
-                        let mut g = 0f32;
-                        let (x0, x1) = (usize::from(kx == 0), if kx == 2 { w - 1 } else { w });
-                        for yy in 0..h {
-                            let sy = yy as isize + ky as isize - 1;
-                            if sy < 0 || sy >= h as isize {
-                                continue;
-                            }
-                            let sy = sy as usize;
-                            for xx in x0..x1 {
-                                let d = dyo[yy * w + xx];
-                                g += d * xi[sy * w + xx + kx - 1];
-                                if need_dx {
-                                    dx[i * hw + sy * w + xx + kx - 1] += d * wv;
-                                }
-                            }
-                        }
-                        dw[k] += g;
-                    }
-                }
-            }
-        }
-        dx
-    }
-
-    fn net_b(p: &[f32], f: &Fwd, dz: f32, g: &mut [f32]) {
-        let n = NP + 2 * CTX;
-        g[L.b5] += dz;
-        let mut dh4 = vec![0f32; FH];
-        for j in 0..FH {
-            g[L.w5 + j] += dz * f.h4[j];
-            dh4[j] = if f.h4[j] > 0.0 { dz * p[L.w5 + j] } else { 0.0 };
-        }
-        let mut dflat = vec![0f32; FLAT];
-        for j in 0..FH {
-            if dh4[j] == 0.0 {
-                continue;
-            }
-            g[L.b4 + j] += dh4[j];
-            for k in 0..FLAT {
-                g[L.w4 + j * FLAT + k] += dh4[j] * f.flat[k];
-                dflat[k] += dh4[j] * p[L.w4 + j * FLAT + k];
-            }
-        }
-        let (gq, o) = (n / 4, CTX / 4);
-        let c = &f.conv;
-        let mut da3 = vec![0f32; c.a3.len()];
-        for ch in 0..C3 {
-            for j in 0..6 {
-                for i in 0..6 {
-                    let k = ch * gq * gq + (o + j) * gq + o + i;
-                    if c.a3[k] > 0.0 {
-                        da3[k] = dflat[(ch * 6 + j) * 6 + i];
-                    }
-                }
-            }
-        }
-        let (gw3, rest) = g[L.w3..].split_at_mut(L.b3 - L.w3);
-        let dp2 = conv_b(&c.p2, C2, gq, gq, &p[L.w3..L.b3], C3, &da3, gw3, &mut rest[..C3], true);
-        let mut da2 = vec![0f32; c.a2.len()];
-        for (k, &i) in c.i2.iter().enumerate() {
-            da2[i] += dp2[k];
-        }
-        for k in 0..da2.len() {
-            if c.a2[k] <= 0.0 {
-                da2[k] = 0.0;
-            }
-        }
-        let (gw2, rest) = g[L.w2..].split_at_mut(L.b2 - L.w2);
-        let dp1 = conv_b(&c.p1, C1, n / 2, n / 2, &p[L.w2..L.b2], C2, &da2, gw2, &mut rest[..C2], true);
-        let mut da1 = vec![0f32; c.a1.len()];
-        for (k, &i) in c.i1.iter().enumerate() {
-            da1[i] += dp1[k];
-        }
-        for k in 0..da1.len() {
-            if c.a1[k] <= 0.0 {
-                da1[k] = 0.0;
-            }
-        }
-        let (gw1, rest) = g[L.w1..].split_at_mut(L.b1 - L.w1);
-        conv_b(&f.x, 3, n, n, &p[L.w1..L.b1], C1, &da1, gw1, &mut rest[..C1], false);
-    }
-
-    /// 以 (cx, cy) 為中心、每格 step 像素、轉 ang、可左右翻，取 n×n 的彩色小塊
-    #[allow(clippy::too_many_arguments)]
-    fn patch(img: &RgbImage, cx: f32, cy: f32, n: usize, step: f32, ang: f32, mirror: bool, gain: [f32; 3]) -> Vec<f32> {
-        let (w, h) = (img.width() as f32, img.height() as f32);
-        let (ca, sa) = (ang.cos(), ang.sin());
-        let mut out = vec![0f32; 3 * n * n];
-        let half = n as f32 / 2.0;
-        for j in 0..n {
-            for i in 0..n {
-                let ii = if mirror { n - 1 - i } else { i };
-                let u = (ii as f32 + 0.5 - half) * step;
-                let v = (j as f32 + 0.5 - half) * step;
-                let x = (cx + u * ca - v * sa - 0.5).clamp(0.0, w - 1.001);
-                let y = (cy + u * sa + v * ca - 0.5).clamp(0.0, h - 1.001);
-                let (x0, y0) = (x as u32, y as u32);
-                let (fx, fy) = (x - x0 as f32, y - y0 as f32);
-                let (x1, y1) = ((x0 + 1).min(img.width() - 1), (y0 + 1).min(img.height() - 1));
-                let (p00, p10, p01, p11) = (img.get_pixel(x0, y0), img.get_pixel(x1, y0), img.get_pixel(x0, y1), img.get_pixel(x1, y1));
-                for c in 0..3 {
-                    let a = p00[c] as f32 * (1.0 - fx) + p10[c] as f32 * fx;
-                    let b = p01[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
-                    out[c * n * n + j * n + i] = ((a * (1.0 - fy) + b * fy) * gain[c] / 255.0).min(1.0) - 0.5;
-                }
-            }
-        }
-        out
-    }
-
-    /// 一張訓練照片：縮到頭寬 KS 的一層，加上 2、4、8 倍大的幾層
-    /// （取「比頭小很多」的反例時要從清楚的那層取，才跟實際執行時一樣清楚）
-    struct Shot {
-        lv: Vec<RgbImage>,
-        gx: f32,
-        gy: f32,
-    }
-
-    impl Shot {
-        #[allow(clippy::too_many_arguments)]
-        fn patch(&self, x: f32, y: f32, n: usize, step: f32, ang: f32, mirror: bool, gain: [f32; 3]) -> Vec<f32> {
-            let mut k = 0;
-            while k + 1 < self.lv.len() && step * ((1u32 << k) as f32) < 1.0 {
-                k += 1;
-            }
-            let m = (1u32 << k) as f32;
-            patch(&self.lv[k], x * m, y * m, n, step * m, ang, mirror, gain)
-        }
-    }
-
-    struct Rng(u64);
-    impl Rng {
-        fn u(&mut self) -> f32 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            (self.0 >> 40) as f32 / (1u64 << 24) as f32
-        }
-        fn n(&mut self) -> f32 {
-            let (a, b) = (self.u().max(1e-7), self.u());
-            (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()
-        }
-    }
-
     /// 重新訓練：拿一個專案裡使用者手動框的照片當圖庫（框中心＝要學的位置，
     /// 框寬當作頭寬）。
     ///
     /// `P2V_HEAD_P2V=專案檔 P2V_HEAD_OUT=輸出.bin cargo test --release
     /// train_from_project -- --ignored --nocapture`，再把輸出檔換掉
-    /// `assets/` 裡對應的那一個。
-    ///
-    /// 每張每輪取 8 個正樣本（框中心附近、隨意旋轉翻轉、明暗與色偏、大小差兩成內）
-    /// 與 28 個反例：一部分在頭附近、一部分整張隨意，還有大半是「大小不對」——
-    /// 不教它這個，多種縮放一起找時，羽毛上的小斑點也會被當成很小的頭
+    /// `assets/` 裡對應的那一個。第 20 輪起每 10 輪挖一次難反例
     #[test]
     #[ignore]
     fn train_from_project() {
@@ -489,15 +695,7 @@ mod tests {
                 .map(|part| {
                     sc.spawn(move || {
                         part.iter()
-                            .filter_map(|(path, r, _, _)| {
-                                let img = image::open(path).ok()?.to_rgb8();
-                                let k = KS / ((r[2] - r[0]) * img.width() as f32);
-                                let (w, h) = ((img.width() as f32 * k).round() as u32, (img.height() as f32 * k).round() as u32);
-                                let lv = (0..4)
-                                    .map(|s| image::imageops::resize(&img, w << s, h << s, image::imageops::FilterType::Triangle))
-                                    .collect();
-                                Some(Shot { lv, gx: (r[0] + r[2]) / 2.0 * w as f32, gy: (r[1] + r[3]) / 2.0 * h as f32 })
-                            })
+                            .filter_map(|(path, r, _, _)| Shot::new(&image::open(path).ok()?.to_rgb8(), *r))
                             .collect::<Vec<_>>()
                     })
                 })
@@ -513,96 +711,7 @@ mod tests {
                 *v = rng.n() * sd;
             }
         }
-        let (mut m1, mut m2) = (vec![0f32; L.n], vec![0f32; L.n]);
-        let mut t = 0i32;
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let n_in = NP + 2 * CTX;
-        for ep in 0..epochs {
-            // （第幾張, x, y, 角度, 翻轉, 大小倍數, 增益, 標籤）
-            let mut samples: Vec<(usize, f32, f32, f32, bool, f32, [f32; 3], f32)> = Vec::new();
-            for (k, sh) in shots.iter().enumerate() {
-                let (w, h) = (sh.lv[0].width() as f32, sh.lv[0].height() as f32);
-                for q in 0..36 {
-                    let pos = q < 8;
-                    let wrong_scale = !pos && q % 3 != 2;
-                    let scale = if wrong_scale {
-                        if rng.u() < 0.6 {
-                            (0.1f32.ln() + rng.u() * 6.0f32.ln()).exp()
-                        } else {
-                            (1.6f32.ln() + rng.u() * 2.5f32.ln()).exp()
-                        }
-                    } else {
-                        0.8 + rng.u() * 0.45
-                    };
-                    let (x, y) = if pos || (wrong_scale && q % 2 == 0) {
-                        (sh.gx + (rng.u() - 0.5) * 0.25 * KS, sh.gy + (rng.u() - 0.5) * 0.25 * KS)
-                    } else {
-                        loop {
-                            let (x, y) = if q % 3 == 0 {
-                                (rng.u() * w, rng.u() * h)
-                            } else {
-                                let (a, d) = (rng.u() * std::f32::consts::TAU, (0.55 + rng.u() * 2.5) * KS);
-                                (sh.gx + a.cos() * d, sh.gy + a.sin() * d)
-                            };
-                            if (x - sh.gx).hypot(y - sh.gy) >= 0.55 * KS && x >= 0.0 && y >= 0.0 && x < w && y < h {
-                                break (x, y);
-                            }
-                        }
-                    };
-                    let gain = 0.7 + rng.u() * 0.6;
-                    let g = [gain * (0.92 + rng.u() * 0.16), gain * (0.92 + rng.u() * 0.16), gain * (0.92 + rng.u() * 0.16)];
-                    samples.push((k, x, y, rng.u() * std::f32::consts::TAU, rng.u() < 0.5, scale, g, if pos { 1.0 } else { 0.0 }));
-                }
-            }
-            for i in (1..samples.len()).rev() {
-                let j = (rng.u() * (i + 1) as f32) as usize % (i + 1);
-                samples.swap(i, j);
-            }
-            let lr = 0.002 * if ep >= epochs * 3 / 4 { 0.25 } else { 1.0 };
-            let mut loss = 0f64;
-            for batch in samples.chunks(64) {
-                let grads: Vec<(Vec<f32>, f64)> = std::thread::scope(|sc| {
-                    let hs: Vec<_> = batch
-                        .chunks(batch.len().div_ceil(threads))
-                        .map(|part| {
-                            let (p, shots) = (&p, &shots);
-                            sc.spawn(move || {
-                                let mut g = vec![0f32; L.n];
-                                let mut ls = 0f64;
-                                for &(k, x, y, a, mi, scale, gain, lab) in part {
-                                    let f = net_f(p, shots[k].patch(x, y, n_in, 2.0 * KS * scale / NP as f32, a, mi, gain));
-                                    let pr = 1.0 / (1.0 + (-f.z).exp());
-                                    let wt = if lab > 0.5 { 3.0 } else { 1.0 };
-                                    ls -= (wt * if lab > 0.5 { pr.max(1e-6).ln() } else { (1.0 - pr).max(1e-6).ln() }) as f64;
-                                    net_b(p, &f, (pr - lab) * wt, &mut g);
-                                }
-                                (g, ls)
-                            })
-                        })
-                        .collect();
-                    hs.into_iter().map(|h| h.join().unwrap()).collect()
-                });
-                let mut g = vec![0f32; L.n];
-                for (gg, ls) in &grads {
-                    for i in 0..L.n {
-                        g[i] += gg[i];
-                    }
-                    loss += ls;
-                }
-                // Adam，加一點權重衰減
-                t += 1;
-                let bn = batch.len() as f32;
-                for i in 0..L.n {
-                    let gi = g[i] / bn + 1e-4 * p[i];
-                    m1[i] = 0.9 * m1[i] + 0.1 * gi;
-                    m2[i] = 0.999 * m2[i] + 0.001 * gi * gi;
-                    let mh = m1[i] / (1.0 - 0.9f32.powi(t));
-                    let vh = m2[i] / (1.0 - 0.999f32.powi(t));
-                    p[i] -= lr * mh / (vh.sqrt() + 1e-8);
-                }
-            }
-            println!("第 {ep} 輪 loss {:.4}", loss / samples.len() as f64);
-        }
+        train(&mut p, &shots, &Train { epochs, lr: 0.002, hard_from: 20, hard_every: 10, seed: 0x9e3779b97f4a7c15, log: true });
         let bytes: Vec<u8> = p.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&out, bytes).unwrap();
     }

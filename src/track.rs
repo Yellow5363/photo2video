@@ -998,7 +998,7 @@ const NET_Z_SURE: f32 = 3.0;
 /// 估出這一批的頭寬之後，只認差這麼多倍以內的。同一組連拍頭的大小幾乎
 /// 不變；不限制的話，羽毛上的小斑點、水珠會被當成很小的頭（實測圖庫裡
 /// 21 段連拍，各張自由挑大小時 118 張對 90 張，限制之後 99 張）
-const NET_SIZE_BAND: f32 = 1.42;
+pub const NET_SIZE_BAND: f32 = 1.42;
 
 /// 同一張裡的幾處頭至少要隔多遠（以頭寬為單位）
 const NET_APART: f32 = 0.75;
@@ -1011,7 +1011,7 @@ const NET_Z_FULL: f32 = 20.0;
 impl Frame {
     /// 從灰階與色彩還原彩色圖（工作圖的大小）。色彩只有一半解析度，
     /// 像 JPEG 的色度取樣，網路看得出來的東西不受影響
-    fn rgb(&self) -> Option<RgbImage> {
+    pub fn rgb(&self) -> Option<RgbImage> {
         let c = self.colour.as_deref()?;
         if c.w == 0 || c.h == 0 {
             return None;
@@ -1039,25 +1039,98 @@ fn head_window(rect: [f32; 4]) -> [f32; 4] {
 
 /// 用網路 `net` 在 `cur` 上、各個動態候選附近找頭，各種縮放都試
 /// （頭多大要等整批找完才定得下來，見 [`settle_net_heads`]）
-pub fn net_heads(cur: &Frame, cands: &[Found], net: &[f32]) -> Vec<NetPeak> {
-    use crate::headnet::{score_map, KS, NP};
+pub fn net_heads(cur: &Frame, cands: &[Found], sizes: (f32, f32), net: &[f32]) -> Vec<NetPeak> {
     if cands.is_empty() {
         return Vec::new();
     }
-    let Some(rgb) = cur.rgb() else { return Vec::new() };
-    let (w, h) = (cur.w as f32, cur.h as f32);
     // 所有候選的搜尋範圍合起來算一次（彼此多半重疊）
     let win = cands.iter().map(|c| head_window(c.rect)).fold([1.0f32, 1.0, 0.0, 0.0], |a, b| {
         [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
     });
+    net_search(cur, win, sizes, net)
+}
+
+/// 要試的頭寬範圍（工作圖像素，`w` 是工作圖寬）：知道頭多大（`known`，佔畫面寬的
+/// 比例）就只試它的 `band` 倍以內，不知道就從最小試到最大
+pub fn net_sizes(known: Option<f32>, w: usize, band: f32) -> (f32, f32) {
+    match known {
+        Some(s) => (s * w as f32 / band, s * w as f32 * band),
+        None => (NET_SIZE_MIN, NET_SIZE_MAX),
+    }
+}
+
+/// 鳥嘴：從 (x, y)（工作圖像素）往外 32 個方向，找一條細長、比兩側暗的直線
+/// （翠鳥的嘴又長又直、顏色深，是最明顯的特徵——使用者提供：找得到鳥嘴，嘴尖的
+/// 反方向才是頭）。回傳分數：沿線「中間比兩側都暗」的比例 × 平均暗多少（0~255），
+/// 取最像的那個方向。`s` 是頭寬（像素）。
+///
+/// 嘴離頭多遠看姿態：正面、俯衝時嘴從額頭正下方伸出，側面時從眼睛前面約半個
+/// 頭寬才開始，所以量兩段（[`BEAK_SPANS`]）取較高的。實測圖庫 252 張：標記點
+/// 附近量得到嘴（≥10）的 83%，其他地方 11%
+pub fn beak_score(f: &Frame, x: f32, y: f32, s: f32) -> f32 {
+    let mut best = 0f32;
+    for (t0, t1, side) in BEAK_SPANS {
+        let w = side * s;
+        for k in 0..BEAK_DIRS {
+            let a = k as f32 * std::f32::consts::TAU / BEAK_DIRS as f32;
+            let (c, sn) = (a.cos(), a.sin());
+            let (nx, ny) = (-sn, c);
+            let (mut hit, mut n, mut sum) = (0f32, 0f32, 0f32);
+            let mut t = t0 * s;
+            while t <= t1 * s {
+                let (px, py) = (x + c * t, y + sn * t);
+                if px >= 0.0 && py >= 0.0 && px < f.w as f32 && py < f.h as f32 {
+                    let m = f.sample(px, py);
+                    let d = f.sample(px + nx * w, py + ny * w).min(f.sample(px - nx * w, py - ny * w)) - m;
+                    if d > BEAK_DARK {
+                        hit += 1.0;
+                    }
+                    sum += d.max(0.0);
+                    n += 1.0;
+                }
+                t += 1.0;
+            }
+            if n > 3.0 {
+                best = best.max(hit / n * (sum / n));
+            }
+        }
+    }
+    best
+}
+
+/// 量鳥嘴的方向數
+const BEAK_DIRS: usize = 32;
+
+/// 量鳥嘴的兩段：(從幾個頭寬起, 到幾個頭寬, 兩側比對點離中線幾個頭寬)
+const BEAK_SPANS: [(f32, f32, f32); 2] = [(0.2, 0.7, 0.125), (0.4, 1.0, 0.15)];
+
+/// 嘴上的一點要比兩側暗這麼多（0~255）才算
+const BEAK_DARK: f32 = 12.0;
+
+/// 鳥嘴分數到這裡就算「確定有嘴」，網路分數加 [`NET_BEAK_W`]
+const NET_BEAK_FULL: f32 = 30.0;
+
+/// 找得到鳥嘴的地方，網路分數最多加這麼多（見 [`beak_score`]）。網路單看一小塊
+/// 會把黃綠色的松針當成翠鳥頭頂的花紋，松針卻接不出一條又長又直的嘴。實測一批 9 張
+/// 飛行照框 3 張之後，其餘 6 張從 4 張對變成 5 張（俯衝時嘴很明顯的那張找回來了），
+/// 圖庫 21 段連拍維持 90/118；加到 6 反而變差
+const NET_BEAK_W: f32 = 3.0;
+
+/// 用網路 `net` 在 `cur` 的 `win`（相對座標）範圍內找頭，假設的頭寬從 `sizes.0` 試到
+/// `sizes.1`（工作圖像素）
+pub fn net_search(cur: &Frame, win: [f32; 4], sizes: (f32, f32), net: &[f32]) -> Vec<NetPeak> {
+    use crate::headnet::{score_map, KS, NP};
+    let Some(rgb) = cur.rgb() else { return Vec::new() };
+    let (w, h) = (cur.w as f32, cur.h as f32);
     let (wx0, wy0) = ((win[0] * w).max(0.0), (win[1] * h).max(0.0));
     let (wx1, wy1) = ((win[2] * w).min(w), (win[3] * h).min(h));
     if wx1 <= wx0 || wy1 <= wy0 {
         return Vec::new();
     }
+    let (lo, hi) = sizes;
     let mut sizes = Vec::new();
-    let mut sp = NET_SIZE_MIN;
-    while sp <= NET_SIZE_MAX.min((wx1 - wx0).max(wy1 - wy0)) {
+    let mut sp = lo.max(NET_SIZE_MIN);
+    while sp <= hi.min((wx1 - wx0).max(wy1 - wy0)) * 1.001 {
         sizes.push(sp);
         sp *= NET_SIZE_STEP;
     }
@@ -1082,12 +1155,11 @@ pub fn net_heads(cur: &Frame, cands: &[Found], net: &[f32]) -> Vec<NetPeak> {
                     score_map(net, &small)
                         .peaks(NET_Z_MIN, NET_PEAKS_PER_SIZE)
                         .into_iter()
-                        .map(|(px, py, z)| NetPeak {
-                            x: (x0 as f32 + px * kx) / w,
-                            y: (y0 as f32 + py * ky) / h,
-                            z,
-                            sx: sp / w,
-                            sy: sp / h,
+                        .map(|(px, py, z)| {
+                            let (ax, ay) = (x0 as f32 + px * kx, y0 as f32 + py * ky);
+                            // 找得到鳥嘴的才像頭（見 beak_score）
+                            let beak = (beak_score(cur, ax, ay, sp) / NET_BEAK_FULL).min(1.0);
+                            NetPeak { x: ax / w, y: ay / h, z: z + beak * NET_BEAK_W, sx: sp / w, sy: sp / h }
                         })
                         .collect::<Vec<_>>()
                 })
@@ -1097,11 +1169,84 @@ pub fn net_heads(cur: &Frame, cands: &[Found], net: &[f32]) -> Vec<NetPeak> {
     })
 }
 
+/// 動態偵測用不上時（同一批照片裁成不同大小，前後張沒得相減），直接拿網路
+/// 在整張找到的頭當候選：每處一個框（三個頭寬見方），把握程度照網路的分數。
+/// 最多 `max` 個，彼此至少隔 [`NET_APART`] 個頭寬
+pub fn net_found(cur: &Frame, peaks: &[NetPeak], max: usize) -> Vec<Found> {
+    let cp = cur.pyramid(DET_SHIFT);
+    let f = &cp[DET_DIFF];
+    let (fw, fh) = (f.w as f32, f.h as f32);
+    let mut sorted: Vec<&NetPeak> = peaks.iter().collect();
+    sorted.sort_by(|a, b| b.z.total_cmp(&a.z));
+    let mut out: Vec<Found> = Vec::new();
+    for p in sorted {
+        if out.len() == max {
+            break;
+        }
+        if out.iter().any(|o| ((o.heads[0].0 - p.x) / p.sx).hypot((o.heads[0].1 - p.y) / p.sy) < NET_APART) {
+            continue;
+        }
+        let rect = [
+            (p.x - 1.5 * p.sx).clamp(0.0, 1.0),
+            (p.y - 1.5 * p.sy).clamp(0.0, 1.0),
+            (p.x + 1.5 * p.sx).clamp(0.0, 1.0),
+            (p.y + 1.5 * p.sy).clamp(0.0, 1.0),
+        ];
+        out.push(Found {
+            rect,
+            score: (p.z / NET_Z_FOUND).clamp(0.0, 1.0),
+            shift_gain: 1.0,
+            heads: [(p.x, p.y, (p.z / NET_Z_FULL).clamp(0.0, 1.0)), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
+            reds: [None; HEAD_PEAKS],
+            sharp: 0.0,
+            sig: signature(f, rect[0] * fw, rect[1] * fh, rect[2] * fw, rect[3] * fh),
+        });
+    }
+    out
+}
+
+/// [`net_found`] 的候選分數：網路分數到這裡算滿分
+const NET_Z_FOUND: f32 = 8.0;
+
+/// 使用者手動框的那一張當成候選：只有這一個，頭就在框中心、滿分。
+/// 整批挑路徑時一定會經過它，其他張要跟它接得上（見 [`choose_path`]、
+/// [`choose_heads`]）——不放進來的話，那幾張等於空著，剩下的照片沒有依據，
+/// 實測一批 10 張框了 5 張，其餘 5 張有 3 張被挑到畫面邊上的松針
+pub fn anchor_found(cur: &Frame, rect: [f32; 4]) -> Found {
+    let cp = cur.pyramid(DET_SHIFT);
+    let f = &cp[DET_DIFF];
+    let (fw, fh) = (f.w as f32, f.h as f32);
+    let (cx, cy) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
+    Found {
+        rect,
+        score: 1.0,
+        shift_gain: 1.0,
+        heads: [(cx, cy, 1.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
+        reds: [None; HEAD_PEAKS],
+        sharp: 0.0,
+        sig: signature(f, rect[0] * fw, rect[1] * fh, rect[2] * fw, rect[3] * fh),
+    }
+}
+
 /// 整批找完之後定下頭的大小，再把每個候選的 `heads` 換成網路找到的頭。
 ///
 /// 頭多大：每張分數最高的那一處各投一票（分數夠高的才算），取中位數。
-/// 同一組連拍頭的大小幾乎不變，之後只認差 [`NET_SIZE_BAND`] 倍以內的
-pub fn settle_net_heads(cands: &mut [Vec<Found>], peaks: &[Vec<NetPeak>]) {
+/// 同一組連拍頭的大小幾乎不變，之後只認差 [`NET_SIZE_BAND`] 倍以內的。
+///
+/// `band` 是容許差幾倍（一般是 [`NET_SIZE_BAND`]；照片裁成不同大小時，同一顆頭
+/// 佔畫面的比例也跟著變，要放寬）。`drop_headless` 為真時，範圍內一個頭也沒有
+/// 的候選直接拿掉（候選本身就是網路找到的頭時用，見 [`net_found`]）。
+/// `known` 是已知的頭寬（佔畫面寬的比例，例如使用者手動框的大小——網路就是
+/// 照框的大小訓練的），有的話就不用投票。`fixed` 為真的那幾張是使用者手動框的
+/// （見 [`anchor_found`]），不動
+pub fn settle_net_heads(
+    cands: &mut [Vec<Found>],
+    peaks: &[Vec<NetPeak>],
+    band: f32,
+    drop_headless: bool,
+    known: Option<f32>,
+    fixed: &[bool],
+) {
     let mut votes: Vec<f32> = peaks
         .iter()
         .filter_map(|v| v.iter().max_by(|a, b| a.z.total_cmp(&b.z)))
@@ -1109,9 +1254,12 @@ pub fn settle_net_heads(cands: &mut [Vec<Found>], peaks: &[Vec<NetPeak>]) {
         .map(|p| p.sx)
         .collect();
     votes.sort_by(f32::total_cmp);
-    let size = votes.get(votes.len() / 2).copied();
-    let fits = |p: &NetPeak| size.is_none_or(|s| p.sx >= s / NET_SIZE_BAND && p.sx <= s * NET_SIZE_BAND);
-    for (list, found) in cands.iter_mut().zip(peaks) {
+    let size = known.or(votes.get(votes.len() / 2).copied());
+    let fits = |p: &NetPeak| size.is_none_or(|s| p.sx >= s / band && p.sx <= s * band);
+    for (i, (list, found)) in cands.iter_mut().zip(peaks).enumerate() {
+        if fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         for c in list.iter_mut() {
             let win = head_window(c.rect);
             let mut mine: Vec<&NetPeak> = found
@@ -1133,6 +1281,9 @@ pub fn settle_net_heads(cands: &mut [Vec<Found>], peaks: &[Vec<NetPeak>]) {
             }
             c.heads = heads;
             c.reds = [None; HEAD_PEAKS];
+        }
+        if drop_headless {
+            list.retain(|c| c.heads[0].2 > 0.0);
         }
     }
 }

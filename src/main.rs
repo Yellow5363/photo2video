@@ -4132,9 +4132,18 @@ fn run_auto_boxes(
     let mut pulled = 0usize;
     // 每張各留幾個候選，等整批找完再一起挑出「同一個主體」那一條路徑
     let mut cands: Vec<Vec<track::Found>> = vec![Vec::new(); n];
-    // 翠鳥：用圖庫學來的網路找頭，各種大小都試；頭多大等整批找完再定（見 track::settle_net_heads）
-    let net = bird.head_net();
+    // 翠鳥：用圖庫學來的網路找頭，各種大小都試；頭多大等整批找完再定（見 track::settle_net_heads）。
+    // 使用者框過幾張的話，先拿那幾張當場再學一下這一批（見 tune_on_manual），
+    // 頭多大也就照他框的大小——當場學的時候就是照框的大小學的
+    let tuned = bird.head_net().and_then(|base| tune_on_manual(&photos, manual, base, crop, send));
+    let net: Option<&[f32]> = tuned.as_deref().or(bird.head_net());
     let mut net_peaks: Vec<Vec<track::NetPeak>> = vec![Vec::new(); n];
+    let known_size = tuned.as_ref().and_then(|_| median_manual_size(manual)).map(|s| s.0);
+    // 同一批照片裁成不同大小（例如從圖庫挑出來各自裁過）：前後張的同一個位置
+    // 不是同一個地方，相減出來全是雜訊——動態偵測整個用不上（使用者回報：
+    // 10 張自動框選幾乎都框到樹葉上）
+    let mixed = net.is_some() && mixed_sizes(&photos);
+    let band = if mixed { NET_MIXED_BAND } else { track::NET_SIZE_BAND };
 
     for i in 0..n {
         if TRACK_CANCEL.load(Ordering::Relaxed) {
@@ -4158,22 +4167,34 @@ fn run_auto_boxes(
         // 使用者自己框過的不動；讀不到的那張就當作沒框到。
         // 第一張與最後一張要拿**同一側的兩張**來比，否則主體在鄰張留下的
         // 殘影與本尊一樣亮，框到哪一個純屬運氣（見 track::detect_candidates）
-        if let (false, Some(cur)) = (keep[i], at(i)) {
+        if let (true, false, Some(cur), Some(_), Some(r)) = (keep[i], mixed, at(i), net, manual[i]) {
+            // 使用者框的那一張當成固定點，其他張要跟它接得上（見 track::anchor_found）。
+            // 裁過的一批不這樣做：前後張的位置本來就對不起來，固定點只會把路徑拉歪，
+            // 那幾張照樣整張找頭、一起挑路徑，最後再照手動框校正（見 refine_by_net）
+            cands[i] = vec![track::anchor_found(cur, r)];
+        }
+        if let (false, Some(cur)) = (keep[i] && !mixed, at(i)) {
             let (a, b) = match (i, n) {
                 (0, _) => (at(1), at(2)),
                 (i, n) if i + 1 == n => (at(i - 1), at(i - 2)),
                 (i, _) => (at(i - 1), at(i + 1)),
             };
-            cands[i] = track::detect_candidates(a, cur, b, track::DET_CANDIDATES, bird.head_style());
-            if let Some(net) = net {
-                net_peaks[i] = track::net_heads(cur, &cands[i], net);
+            if let (Some(net), true) = (net, mixed) {
+                // 裁成不同大小的一批：前後張沒得相減，直接整張找頭
+                net_peaks[i] = track::net_search(cur, [0.0, 0.0, 1.0, 1.0], track::net_sizes(known_size, cur.w, band), net);
+                cands[i] = track::net_found(cur, &net_peaks[i], track::DET_CANDIDATES);
+            } else {
+                cands[i] = track::detect_candidates(a, cur, b, track::DET_CANDIDATES, bird.head_style());
+                if let Some(net) = net {
+                    net_peaks[i] = track::net_heads(cur, &cands[i], track::net_sizes(known_size, cur.w, band), net);
+                }
             }
         }
         send(TrackMsg::Step);
     }
 
     if net.is_some() {
-        track::settle_net_heads(&mut cands, &net_peaks);
+        track::settle_net_heads(&mut cands, &net_peaks, band, mixed, known_size, if mixed { &[] } else { &keep });
     }
     // 先剔除釘在畫面上的東西（浮水印、日期戳記）：相機一移動它們反而像在動，
     // 主體飛出畫面後整段都會黏在簽名上（見 track::drop_overlays）
@@ -4354,12 +4375,172 @@ fn run_auto_boxes(
         }
     }
     let mut latest = latest.lock().unwrap().clone();
-    refine_by_manual(&photos, manual, &mut latest, crop, send);
+    match net {
+        // 翠鳥：照手動框的大小用網路找（見 refine_by_net）
+        Some(net) => refine_by_net(&photos, manual, &vec![true; n], &mut latest, net, crop, send),
+        None => refine_by_manual(&photos, manual, &mut latest, crop, send),
+    }
     if head_mode {
         refine_by_neighbours(&photos, &keep, &mut latest, crop, send);
         refine_by_chain(&photos, &keep, &latest, crop, send);
     }
     send(TrackMsg::Done(found + keep.iter().filter(|k| **k).count(), n));
+}
+
+/// 使用者手動框的大小（寬、高的中位數，相對座標）；一張都沒框是 None
+fn median_manual_size(manual: &[Option<[f32; 4]>]) -> Option<(f32, f32)> {
+    let mut ws: Vec<f32> = manual.iter().flatten().map(|r| r[2] - r[0]).collect();
+    let mut hs: Vec<f32> = manual.iter().flatten().map(|r| r[3] - r[1]).collect();
+    if ws.is_empty() {
+        return None;
+    }
+    ws.sort_by(f32::total_cmp);
+    hs.sort_by(f32::total_cmp);
+    Some((ws[ws.len() / 2], hs[hs.len() / 2]))
+}
+
+/// 拿使用者在這一批手動框的那幾張，當場再訓練一下找頭的網路（見
+/// headnet::fine_tune）：圖庫拍不到所有場景，這一批的背景（例如黃綠色的松針）
+/// 網路可能沒看過、會當成頭；拿同一批框好的幾張學過之後就分得出來。
+/// 一張都沒框是 None
+fn tune_on_manual(photos: &[PathBuf], manual: &[Option<[f32; 4]>], base: &[f32], crop: Crop, send: &dyn Fn(TrackMsg)) -> Option<Vec<f32>> {
+    let count = manual.iter().flatten().count();
+    if count == 0 {
+        return None;
+    }
+    send(TrackMsg::Phase(format!("照你框的 {count} 張學這一批的樣子…")));
+    let marked: Vec<(image::RgbImage, [f32; 4])> = manual
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| Some((decode_for_track(&photos[i], crop)?.rgb()?, (*r)?)))
+        .collect();
+    (!marked.is_empty()).then(|| headnet::fine_tune(base, &marked))
+}
+
+/// 這一批照片的原始尺寸是不是不只一種（各自裁過）。讀不到尺寸的不算
+fn mixed_sizes(photos: &[PathBuf]) -> bool {
+    let mut first = None;
+    for p in photos {
+        let Ok(d) = image::image_dimensions(p) else { continue };
+        match first {
+            None => first = Some(d),
+            Some(f) if f != d => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// 照片裁成不同大小時，同一顆頭佔畫面寬的比例跟著裁切變（實測一批 10 張，
+/// 寬 2995～4826 像素，差 1.6 倍），頭寬的容許範圍要放寬到這麼多倍
+const NET_MIXED_BAND: f32 = 2.0;
+
+/// 用網路校正時，在現有框的幾個框寬以內找
+const NET_REFINE_REACH: f32 = 2.5;
+
+/// 網路分數（logit）至少要這樣才搬框
+const NET_REFINE_Z: f32 = 2.0;
+
+/// 用網路校正時，前後幾張以內有手動框就以手動框的位置為準找
+const NET_ANCHOR_GAP: usize = 3;
+
+/// 用網路校正時，現有的框中心這麼近（框寬的幾倍）以內就有一處像頭的，框就不搬
+const NET_KEEP_R: f32 = 0.5;
+
+/// 「像頭」：分數不比找到最好的那一處低超過這麼多
+const NET_KEEP_MARGIN: f32 = 2.0;
+
+/// 翠鳥（用網路找頭的鳥種）的「照手動框校正」：`net` 是拿手動框當場學過的網路
+/// （見 [`tune_on_manual`]），頭多大就照手動框的大小。在 `todo` 那幾張現有框的附近（[`NET_REFINE_REACH`]
+/// 個框寬內；還沒有框的就整張找）找網路最有把握的那一處，夠有把握才搬。
+///
+/// 實測一批藍天前、黃綠松針旁的 9 張飛行照，框 3 張之後其餘 6 張整張找頭：沒當場學
+/// 只對 1 張（十字落在松針上），學過之後對 4～5 張。
+/// 已經有把握的照片只准在一個框寬以內微調（同 [`refine_by_manual`] 的規矩）；
+/// 大小、來源、有沒有把握都照舊
+fn refine_by_net(
+    photos: &Arc<Vec<PathBuf>>,
+    manual: &[Option<[f32; 4]>],
+    todo: &[bool],
+    latest: &mut [Option<Subject>],
+    net: &[f32],
+    crop: Crop,
+    send: &dyn Fn(TrackMsg),
+) {
+    let Some((bw, bh)) = median_manual_size(manual) else { return };
+    let idx: Vec<usize> = (0..photos.len()).filter(|&i| todo[i] && manual[i].is_none()).collect();
+    if idx.is_empty() {
+        return;
+    }
+    send(TrackMsg::Phase(format!("照你框的大小找其他 {} 張的頭…", idx.len())));
+    let band = if mixed_sizes(photos) { NET_MIXED_BAND } else { track::NET_SIZE_BAND };
+    let rxs = spawn_decoders(&idx, photos, crop);
+    let mut moved: Vec<(usize, Option<Subject>)> = Vec::new();
+    for (k, &i) in idx.iter().enumerate() {
+        if TRACK_CANCEL.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok((j, frame)) = rxs[k % TRACK_DECODERS].recv() else { break };
+        debug_assert_eq!(i, j);
+        let Some(f) = frame else { continue };
+        // 前後幾張內有手動框：以它們內插的位置為中心找（現有的框可能整個錯到別處，
+        // 例如裁過的照片動態偵測用不上時框到松針）；離手動框遠的才以現有的框為中心
+        let near = |j: usize| manual[j].map(|r| ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0));
+        let prev = (i.saturating_sub(NET_ANCHOR_GAP)..i).rev().find_map(|j| near(j).map(|c| (j, c)));
+        let next = (i + 1..(i + 1 + NET_ANCHOR_GAP).min(photos.len())).find_map(|j| near(j).map(|c| (j, c)));
+        let anchor = match (prev, next) {
+            (Some((a, pa)), Some((b, pb))) => {
+                let t = (i - a) as f32 / (b - a) as f32;
+                Some((pa.0 + (pb.0 - pa.0) * t, pa.1 + (pb.1 - pa.1) * t))
+            }
+            (Some((_, p)), None) | (None, Some((_, p))) => Some(p),
+            (None, None) => None,
+        };
+        let win = match anchor.or(latest[i].map(|s| s.centre())) {
+            Some((cx, cy)) => {
+                let (rx, ry) = (bw * NET_REFINE_REACH, bh * NET_REFINE_REACH);
+                [cx - rx, cy - ry, cx + rx, cy + ry]
+            }
+            None => [0.0, 0.0, 1.0, 1.0],
+        };
+        let found = track::net_search(&f, win, track::net_sizes(Some(bw), f.w, band), net);
+        let Some(best) = found.iter().max_by(|a, b| a.z.total_cmp(&b.z)) else { continue };
+        if best.z < NET_REFINE_Z {
+            continue;
+        }
+        // 現有的框已經在一個像頭的地方（分數不輸最好的那一處太多）就不搬：
+        // 手動框內插出來的位置只是大概，鳥在兩張之間可能已經飛開
+        if let Some(old) = latest[i] {
+            let (ox, oy) = old.centre();
+            let (rx, ry) = (bw * NET_KEEP_R, bh * NET_KEEP_R);
+            let here = track::net_search(&f, [ox - rx, oy - ry, ox + rx, oy + ry], track::net_sizes(Some(bw), f.w, band), net);
+            if here.iter().any(|p| p.z >= NET_REFINE_Z.max(best.z - NET_KEEP_MARGIN) && (p.x - ox).abs() <= rx && (p.y - oy).abs() <= ry) {
+                continue;
+            }
+        }
+        let (nx, ny) = (best.x, best.y);
+        let next = match latest[i] {
+            Some(old) => {
+                let (w, h) = old.size();
+                let (ox, oy) = old.centre();
+                if old.sure() && ((nx - ox) / w).hypot((ny - oy) / h) > TRACK_LIB_NUDGE {
+                    continue;
+                }
+                Subject { rect: clamp_rect([nx - w / 2.0, ny - h / 2.0, nx + w / 2.0, ny + h / 2.0]), ..old }
+            }
+            // 原本沒框到：放一個框請使用者過目
+            None => Subject {
+                rect: clamp_rect([nx - bw / 2.0, ny - bh / 2.0, nx + bw / 2.0, ny + bh / 2.0]),
+                src: BoxSrc::Auto,
+                score: TRACK_FLAGGED,
+            },
+        };
+        latest[i] = Some(next);
+        moved.push((i, latest[i]));
+    }
+    if !moved.is_empty() {
+        send(TrackMsg::Boxes(moved));
+    }
 }
 
 /// 最後一趟：照使用者**在這一批裡手動框的那幾張**，校正其他張的框位置。
@@ -9973,16 +10154,56 @@ impl App {
         self.track.phase = None;
         self.track.total = self.photos.len() - first;
         self.track.done = 0;
+        // 翠鳥追完要用網路校正：手動框、目前的框、這一趟真的重追的那幾張（不含只拿來
+        // 重新判斷的）
+        let net = self.track.bird.head_net();
+        let manual: Vec<Option<[f32; 4]>> = self
+            .photos
+            .iter()
+            .map(|p| self.track.box_of(p).filter(|s| s.src == BoxSrc::Manual).map(|s| s.rect))
+            .collect();
+        let start: Vec<Option<Subject>> = self.photos.iter().map(|p| self.track.box_of(p)).collect();
+        let todo: Vec<bool> = (0..self.photos.len()).map(|i| need[i] && affected[i]).collect();
         let photos = self.photos.clone();
         let crop = self.effective_adj(&photos[marks[0].0]).crop;
         let (tx, rx) = std::sync::mpsc::channel();
         self.track.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            run_track(&photos, &marks, &need, &keep_own, crop, &|m| {
+            let send = |m: TrackMsg| {
                 let _ = tx.send(m);
                 ctx.request_repaint();
+            };
+            let Some(net) = net else {
+                run_track(&photos, &marks, &need, &keep_own, crop, &send);
+                return;
+            };
+            // 翠鳥：追完再照手動框的大小用網路校正這一趟補上的框（見 refine_by_net）。
+            // 追蹤只比「長得像不像」，鳥翻身俯衝時常黏在背上；網路認得頭。
+            // 「完成」要等校正做完才送出，畫面才會一起更新、重新判斷要檢查的
+            let latest = Mutex::new(start);
+            let done = Mutex::new(None);
+            run_track(&photos, &marks, &need, &keep_own, crop, &|m| match m {
+                TrackMsg::Done(a, b) => *done.lock().unwrap() = Some((a, b)),
+                TrackMsg::Boxes(list) => {
+                    let mut l = latest.lock().unwrap();
+                    for (i, s) in &list {
+                        if s.is_some() {
+                            l[*i] = *s;
+                        }
+                    }
+                    send(TrackMsg::Boxes(list));
+                }
+                m => send(m),
             });
+            let Some((a, b)) = done.into_inner().unwrap() else { return };
+            if !TRACK_CANCEL.load(Ordering::Relaxed) {
+                let mut latest = latest.into_inner().unwrap();
+                if let Some(tuned) = tune_on_manual(&photos, &manual, net, crop, &send) {
+                    refine_by_net(&Arc::new(photos), &manual, &todo, &mut latest, &tuned, crop, &send);
+                }
+            }
+            send(TrackMsg::Done(a, b));
         });
     }
 
