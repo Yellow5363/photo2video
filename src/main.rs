@@ -30,6 +30,8 @@ use edit::{Finish, TextItem};
 
 mod enhance;
 
+mod headnet;
+
 mod movie;
 use movie::{MovieMsg, VideoInfo};
 
@@ -4130,6 +4132,9 @@ fn run_auto_boxes(
     let mut pulled = 0usize;
     // 每張各留幾個候選，等整批找完再一起挑出「同一個主體」那一條路徑
     let mut cands: Vec<Vec<track::Found>> = vec![Vec::new(); n];
+    // 翠鳥：用圖庫學來的網路找頭，各種大小都試；頭多大等整批找完再定（見 track::settle_net_heads）
+    let net = bird.head_net();
+    let mut net_peaks: Vec<Vec<track::NetPeak>> = vec![Vec::new(); n];
 
     for i in 0..n {
         if TRACK_CANCEL.load(Ordering::Relaxed) {
@@ -4160,10 +4165,16 @@ fn run_auto_boxes(
                 (i, _) => (at(i - 1), at(i + 1)),
             };
             cands[i] = track::detect_candidates(a, cur, b, track::DET_CANDIDATES, bird.head_style());
+            if let Some(net) = net {
+                net_peaks[i] = track::net_heads(cur, &cands[i], net);
+            }
         }
         send(TrackMsg::Step);
     }
 
+    if net.is_some() {
+        track::settle_net_heads(&mut cands, &net_peaks);
+    }
     // 先剔除釘在畫面上的東西（浮水印、日期戳記）：相機一移動它們反而像在動，
     // 主體飛出畫面後整段都會黏在簽名上（見 track::drop_overlays）
     track::drop_overlays(&mut cands);
@@ -4252,6 +4263,7 @@ fn run_auto_boxes(
     // 共用同一個門檻的話八色鳥永遠被當成「頭不可信」，框對了也一半以上標要檢查
     //（使用者回報：158 張標了 77 張）
     let trust = match bird.head_style() {
+        _ if net.is_some() => HEAD_TRUST_NET,
         track::HeadStyle::Masked => HEAD_TRUST_MASKED,
         track::HeadStyle::Colourful => HEAD_TRUST,
     };
@@ -6326,6 +6338,15 @@ impl BirdKind {
             _ => track::HeadStyle::Colourful,
         }
     }
+
+    /// 有沒有從圖庫學來的網路可以找頭（見 [`headnet`]）。有的話找頭改用網路，
+    /// 不用 [`BirdKind::head_style`] 那種寫死的規則
+    fn head_net(self) -> Option<&'static [f32]> {
+        match self {
+            BirdKind::Kingfisher => Some(headnet::kingfisher()),
+            _ => None,
+        }
+    }
 }
 
 /// 主體框是怎麼來的。決定誰蓋得過誰：**手動框永遠不會被自動框選或追蹤蓋掉**
@@ -6393,6 +6414,9 @@ const HEAD_TRUST: f32 = 0.18;
 
 /// 同 [`HEAD_TRUST`]，八色鳥用（找頭的分數尺度不同）
 const HEAD_TRUST_MASKED: f32 = 0.10;
+
+/// 同 [`HEAD_TRUST`]，用網路找頭（翠鳥）時用：網路分數換算見 track::settle_net_heads
+const HEAD_TRUST_NET: f32 = 0.18;
 
 impl Subject {
     fn manual(rect: [f32; 4]) -> Subject {
@@ -12877,7 +12901,7 @@ impl App {
                             }
                         })
                         .response
-                        .on_hover_text("要找的鳥種。各鳥種的特徵不同；目前五色鳥調校過，
+                        .on_hover_text("要找的鳥種。各鳥種的特徵不同；五色鳥、八色鳥、翠鳥調校過，
 其他鳥種先用通用的找法。改了之後重按「自動框選主體」才會套用");
                 });
             }

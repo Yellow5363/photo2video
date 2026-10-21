@@ -965,6 +965,178 @@ pub fn detect_candidates(
     out
 }
 
+/// 用圖庫學來的網路找頭（翠鳥，見 [`crate::headnet`]）時，網路在一張照片上
+/// 找到的一處：位置（相對座標）、分數（logit），以及那一次縮放假設的頭寬
+/// （`sx` 佔畫面寬、`sy` 佔畫面高的比例）
+#[derive(Clone, Copy, Debug)]
+pub struct NetPeak {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub sx: f32,
+    pub sy: f32,
+}
+
+/// 網路假設的頭寬從幾像素試起（工作圖上）。再小就只剩幾個像素，看不出是頭
+const NET_SIZE_MIN: f32 = 12.0;
+
+/// 網路假設的頭寬最大試到幾像素（工作圖上，約長邊的兩成）
+const NET_SIZE_MAX: f32 = 220.0;
+
+/// 相鄰兩種縮放差幾倍。網路訓練時容許頭寬差兩成上下，這個間隔不會漏掉
+const NET_SIZE_STEP: f32 = 1.19;
+
+/// 每種縮放各留幾處最高點
+const NET_PEAKS_PER_SIZE: usize = 6;
+
+/// 分數（logit）至少要這樣才算「像頭」（0＝網路覺得一半一半）
+const NET_Z_MIN: f32 = 0.0;
+
+/// 分數到這裡才拿來估「這一批的頭多大」
+const NET_Z_SURE: f32 = 3.0;
+
+/// 估出這一批的頭寬之後，只認差這麼多倍以內的。同一組連拍頭的大小幾乎
+/// 不變；不限制的話，羽毛上的小斑點、水珠會被當成很小的頭（實測圖庫裡
+/// 21 段連拍，各張自由挑大小時 118 張對 90 張，限制之後 99 張）
+const NET_SIZE_BAND: f32 = 1.42;
+
+/// 同一張裡的幾處頭至少要隔多遠（以頭寬為單位）
+const NET_APART: f32 = 0.75;
+
+/// 分數換成 [`Found::heads`] 用的 0~1：分數到這裡算 1。網路有把握的頭分數
+/// 多在 5～12，換算後落在 0.25～0.6，與五色鳥的顏色變化量同一個量級，
+/// 挑頭路徑時的權重（見 [`choose_heads`] 的 HEAD_FULL）才不會失衡
+const NET_Z_FULL: f32 = 20.0;
+
+impl Frame {
+    /// 從灰階與色彩還原彩色圖（工作圖的大小）。色彩只有一半解析度，
+    /// 像 JPEG 的色度取樣，網路看得出來的東西不受影響
+    fn rgb(&self) -> Option<RgbImage> {
+        let c = self.colour.as_deref()?;
+        if c.w == 0 || c.h == 0 {
+            return None;
+        }
+        Some(RgbImage::from_fn(self.w as u32, self.h as u32, |x, y| {
+            let l = self.px[y as usize * self.w + x as usize];
+            let k = (y as usize / 2).min(c.h - 1) * c.w + (x as usize / 2).min(c.w - 1);
+            let (rg, yb) = (c.rg[k], c.yb[k]);
+            // lum = 0.299R + 0.587G + 0.114B、rg = R − G、yb = (R+G)/2 − B 反解
+            let r = l + 0.644 * rg + 0.114 * yb;
+            let g = r - rg;
+            let b = r - 0.5 * rg - yb;
+            image::Rgb([r.clamp(0.0, 255.0) as u8, g.clamp(0.0, 255.0) as u8, b.clamp(0.0, 255.0) as u8])
+        }))
+    }
+}
+
+/// 找鳥頭的範圍（相對座標）：動態框的 [`HEAD_WIN`] 倍、至少 [`HEAD_WIN_MIN`]
+fn head_window(rect: [f32; 4]) -> [f32; 4] {
+    let (cx, cy) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
+    let ww = ((rect[2] - rect[0]) * HEAD_WIN).max(HEAD_WIN_MIN) / 2.0;
+    let wh = ((rect[3] - rect[1]) * HEAD_WIN).max(HEAD_WIN_MIN) / 2.0;
+    [cx - ww, cy - wh, cx + ww, cy + wh]
+}
+
+/// 用網路 `net` 在 `cur` 上、各個動態候選附近找頭，各種縮放都試
+/// （頭多大要等整批找完才定得下來，見 [`settle_net_heads`]）
+pub fn net_heads(cur: &Frame, cands: &[Found], net: &[f32]) -> Vec<NetPeak> {
+    use crate::headnet::{score_map, KS, NP};
+    if cands.is_empty() {
+        return Vec::new();
+    }
+    let Some(rgb) = cur.rgb() else { return Vec::new() };
+    let (w, h) = (cur.w as f32, cur.h as f32);
+    // 所有候選的搜尋範圍合起來算一次（彼此多半重疊）
+    let win = cands.iter().map(|c| head_window(c.rect)).fold([1.0f32, 1.0, 0.0, 0.0], |a, b| {
+        [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+    });
+    let (wx0, wy0) = ((win[0] * w).max(0.0), (win[1] * h).max(0.0));
+    let (wx1, wy1) = ((win[2] * w).min(w), (win[3] * h).min(h));
+    if wx1 <= wx0 || wy1 <= wy0 {
+        return Vec::new();
+    }
+    let mut sizes = Vec::new();
+    let mut sp = NET_SIZE_MIN;
+    while sp <= NET_SIZE_MAX.min((wx1 - wx0).max(wy1 - wy0)) {
+        sizes.push(sp);
+        sp *= NET_SIZE_STEP;
+    }
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = sizes
+            .iter()
+            .map(|&sp| {
+                let rgb = &rgb;
+                sc.spawn(move || {
+                    // 範圍外多帶一圈（判斷範圍是兩個頭寬），邊上的頭才看得完整
+                    let pad = sp * NP as f32 / KS / 2.0;
+                    let (x0, y0) = ((wx0 - pad).max(0.0) as u32, (wy0 - pad).max(0.0) as u32);
+                    let (x1, y1) = (((wx1 + pad) as u32).min(rgb.width()), ((wy1 + pad) as u32).min(rgb.height()));
+                    let f = KS / sp;
+                    let (cw, ch) = (((x1 - x0) as f32 * f).round() as u32, ((y1 - y0) as f32 * f).round() as u32);
+                    if cw < NP as u32 || ch < NP as u32 {
+                        return Vec::new();
+                    }
+                    let sub = image::imageops::crop_imm(rgb, x0, y0, x1 - x0, y1 - y0).to_image();
+                    let small = image::imageops::resize(&sub, cw, ch, image::imageops::FilterType::Triangle);
+                    let (kx, ky) = ((x1 - x0) as f32 / cw as f32, (y1 - y0) as f32 / ch as f32);
+                    score_map(net, &small)
+                        .peaks(NET_Z_MIN, NET_PEAKS_PER_SIZE)
+                        .into_iter()
+                        .map(|(px, py, z)| NetPeak {
+                            x: (x0 as f32 + px * kx) / w,
+                            y: (y0 as f32 + py * ky) / h,
+                            z,
+                            sx: sp / w,
+                            sy: sp / h,
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
+}
+
+/// 整批找完之後定下頭的大小，再把每個候選的 `heads` 換成網路找到的頭。
+///
+/// 頭多大：每張分數最高的那一處各投一票（分數夠高的才算），取中位數。
+/// 同一組連拍頭的大小幾乎不變，之後只認差 [`NET_SIZE_BAND`] 倍以內的
+pub fn settle_net_heads(cands: &mut [Vec<Found>], peaks: &[Vec<NetPeak>]) {
+    let mut votes: Vec<f32> = peaks
+        .iter()
+        .filter_map(|v| v.iter().max_by(|a, b| a.z.total_cmp(&b.z)))
+        .filter(|p| p.z >= NET_Z_SURE)
+        .map(|p| p.sx)
+        .collect();
+    votes.sort_by(f32::total_cmp);
+    let size = votes.get(votes.len() / 2).copied();
+    let fits = |p: &NetPeak| size.is_none_or(|s| p.sx >= s / NET_SIZE_BAND && p.sx <= s * NET_SIZE_BAND);
+    for (list, found) in cands.iter_mut().zip(peaks) {
+        for c in list.iter_mut() {
+            let win = head_window(c.rect);
+            let mut mine: Vec<&NetPeak> = found
+                .iter()
+                .filter(|p| fits(p) && p.x >= win[0] && p.x <= win[2] && p.y >= win[1] && p.y <= win[3])
+                .collect();
+            mine.sort_by(|a, b| b.z.total_cmp(&a.z));
+            let mut heads = [(0.0, 0.0, 0.0); HEAD_PEAKS];
+            let mut got = 0;
+            for p in mine {
+                let far = heads[..got].iter().all(|&(x, y, _)| ((x - p.x) / p.sx).hypot((y - p.y) / p.sy) >= NET_APART);
+                if far {
+                    heads[got] = (p.x, p.y, (p.z / NET_Z_FULL).clamp(0.0, 1.0));
+                    got += 1;
+                    if got == HEAD_PEAKS {
+                        break;
+                    }
+                }
+            }
+            c.heads = heads;
+            c.reds = [None; HEAD_PEAKS];
+        }
+    }
+}
+
 /// 找鳥頭時搜尋的範圍：動態框的幾倍大（至少畫面的 [`HEAD_WIN_MIN`]）。
 ///
 /// 動態框常常落在拍動的翅膀上，頭在旁邊；鳥飛近時翅膀很大，頭可以離框中心
