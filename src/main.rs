@@ -8526,8 +8526,8 @@ enum DiskBusy {
 
 /// 背景執行緒回報給硬碟檔案管理的訊息
 enum DiskMsg {
-    /// 已經掃到幾個資料夾、現在走到哪一個
-    At(usize, String),
+    /// 已經掃到幾個資料夾、算過幾個位元組（百分比用）
+    At(usize, u64),
     /// 掃描結束，開始寫檔
     Writing,
     /// 整件事做完了（Box 起來：成功那一份帶著整張總表，直接放進
@@ -8571,9 +8571,11 @@ struct DiskTool {
     busy: DiskBusy,
     rx: Option<Receiver<DiskMsg>>,
     cancel: Arc<AtomicBool>,
-    /// 掃到幾個資料夾、現在走到哪（進度那兩行）
+    /// 掃到幾個資料夾、算過幾個位元組，與這顆碟用掉多少空間（百分比的分母，
+    /// 問不到就是 None，見 [`disk::used_bytes`]）
     found: usize,
-    at: String,
+    seen: u64,
+    total: Option<u64>,
     result: Option<String>,
     error: Option<String>,
     /// 上一次掃描讀不進去而跳過的資料夾
@@ -8596,7 +8598,8 @@ impl Default for DiskTool {
             rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
             found: 0,
-            at: String::new(),
+            seen: 0,
+            total: None,
             result: None,
             error: None,
             skipped: Vec::new(),
@@ -28215,24 +28218,39 @@ impl App {
 
         match busy {
             DiskBusy::Scanning => {
+                // 百分比＝算過的檔案大小 ÷ 這顆碟用掉的空間。以前是一路顯示
+                // 正在讀的資料夾路徑，跳得看不清，也看不出還要多久（使用者
+                // 要的是百分比）。用掉的空間含檔案系統自己的資料，走完多半
+                // 停在九十幾 %，所以封頂 99%，寫完總表才算做完
+                let frac = self
+                    .disk
+                    .total
+                    .filter(|&t| t > 0)
+                    .map(|t| (self.disk.seen as f64 / t as f64).min(0.99) as f32);
+                if let Some(f) = frac {
+                    ui.add(
+                        egui::ProgressBar::new(f)
+                            .desired_width(420.0)
+                            .desired_height(10.0)
+                            .fill(theme::ACCENT),
+                    );
+                    ui.add_space(4.0);
+                }
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "正在走這顆碟…已經記下 {} 個資料夾",
-                            self.disk.found
-                        ))
-                        .size(12.5)
-                        .color(theme::TEXT),
-                    );
+                    let text = match frac {
+                        Some(f) => format!(
+                            "正在讀這顆碟… {:.0}%（已經記下 {} 個資料夾）",
+                            f * 100.0,
+                            thousands(self.disk.found as u64)
+                        ),
+                        None => format!(
+                            "正在讀這顆碟…已經記下 {} 個資料夾",
+                            thousands(self.disk.found as u64)
+                        ),
+                    };
+                    ui.label(egui::RichText::new(text).size(12.5).color(theme::TEXT));
                 });
-                if !self.disk.at.is_empty() {
-                    ui.label(
-                        egui::RichText::new(&self.disk.at)
-                            .size(11.5)
-                            .color(theme::TEXT_WEAK),
-                    );
-                }
             }
             DiskBusy::Writing => {
                 ui.horizontal(|ui| {
@@ -28465,7 +28483,18 @@ impl App {
     /// 見 [`disk::Table::disk_of_serial`]）：碟插回來重建一次是常態，
     /// 再給它一個新號只會讓同一顆碟在表裡出現兩次。認不出來才回到空號
     fn disk_set_drive(&mut self, d: disk::Drive) {
-        match self.disk.table.disk_of_serial(d.serial) {
+        // 這個磁區還沒建過、但同一顆實體硬碟上的另一個磁區建過了
+        // （L: 建好接著選 M:）：用那一號。同一顆碟就是同一號（使用者定的）
+        let sibling = || {
+            let phys = d.physical?;
+            self.disk
+                .drives
+                .iter()
+                .filter(|o| o.root != d.root && o.physical == Some(phys))
+                .find_map(|o| self.disk.table.disk_of_serial(o.serial))
+        };
+        let known = self.disk.table.disk_of_serial(d.serial).or_else(sibling);
+        match known {
             Some(no) => self.disk.no_text = disk::fmt_no(no),
             None => {
                 // 使用者自己打過一個還沒用過的號就尊重它，否則回到下一個空號
@@ -28596,18 +28625,20 @@ impl App {
         self.disk.result = None;
         self.disk.skipped.clear();
         self.disk.found = 0;
-        self.disk.at.clear();
+        self.disk.seen = 0;
+        // 問一下用掉多少空間，一瞬間的事，不必丟到背景
+        self.disk.total = disk::used_bytes(&root);
         let (tx, rx) = std::sync::mpsc::channel();
         self.disk.rx = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
             let mut last = Instant::now();
-            let scanned = disk::scan(&root, depth, no, &cancel, &mut |n, at| {
+            let scanned = disk::scan(&root, depth, no, &cancel, &mut |n, seen| {
                 // 節流：幾萬個資料夾一個一個回報會把通道塞爆，畫面也只是
                 // 跳得人眼看不清。十分之一秒更新一次就夠了
                 if last.elapsed() >= Duration::from_millis(100) {
                     last = Instant::now();
-                    let _ = tx.send(DiskMsg::At(n, at.to_string_lossy().into_owned()));
+                    let _ = tx.send(DiskMsg::At(n, seen));
                     ctx.request_repaint();
                 }
             });
@@ -28663,22 +28694,22 @@ impl App {
         loop {
             let Some(rx) = &self.disk.rx else { break };
             match rx.try_recv() {
-                Ok(DiskMsg::At(n, at)) => {
+                Ok(DiskMsg::At(n, seen)) => {
                     self.disk.found = n;
-                    self.disk.at = at;
+                    self.disk.seen = seen;
                 }
                 Ok(DiskMsg::Writing) => self.disk.busy = DiskBusy::Writing,
                 Ok(DiskMsg::Done(res)) => {
                     self.disk.rx = None;
                     self.disk.busy = DiskBusy::Idle;
-                    self.disk.at.clear();
                     match *res {
                         Ok(done) => {
                             self.disk.skipped = done.skipped;
                             self.disk.table = done.table;
                             self.disk.result = Some(done.msg);
-                            // 下一顆碟接著用下一個空號，不必自己改
-                            self.disk.no_text = disk::fmt_no(self.disk.table.next_no());
+                            // 編號維持剛才那一號（使用者定的）：做完馬上跳成下一個
+                            // 空號，看起來像剛才建的不是這一號。換一顆碟時
+                            // disk_set_drive 才會帶出那顆碟的號或下一個空號
                             // 總表換了一份，搜尋那一頁的結果要重算
                             self.search.dirty = true;
                         }

@@ -196,7 +196,7 @@ pub struct Scanned {
 /// `depth`＝清單最多列到第幾層，**根底下的第一層算第 1 層**。更深的資料夾
 /// 不列，但還是會走進去算大小（每一列都是含子資料夾的總和）。
 ///
-/// `report(已掃到幾個, 現在在哪)` 每掃完一個資料夾叫一次，給畫面更新進度用；
+/// `report(已掃到幾個資料夾, 已經算過幾個位元組)` 每掃完一個資料夾叫一次，給畫面更新進度用；
 /// 叫得很頻繁，節流由呼叫端決定（見 `App::disk_scan`）。
 ///
 /// 根資料夾讀不進去就直接失敗——那是碟拔掉了或選錯地方，繼續跑只會得到一份
@@ -206,11 +206,12 @@ pub fn scan(
     depth: u32,
     disk: u32,
     cancel: &AtomicBool,
-    report: &mut dyn FnMut(usize, &Path),
+    report: &mut dyn FnMut(usize, u64),
 ) -> Result<Scanned, String> {
     let mut w = Walker {
         rows: Vec::new(),
         skipped: Vec::new(),
+        seen: 0,
         depth,
         disk,
         cancel,
@@ -230,10 +231,12 @@ pub fn scan(
 struct Walker<'a> {
     rows: Vec<Row>,
     skipped: Vec<String>,
+    /// 到目前為止算過的檔案大小總和（畫面上的百分比靠它，見 [`used_bytes`]）
+    seen: u64,
     depth: u32,
     disk: u32,
     cancel: &'a AtomicBool,
-    report: &'a mut dyn FnMut(usize, &Path),
+    report: &'a mut dyn FnMut(usize, u64),
 }
 
 impl Walker<'_> {
@@ -298,6 +301,7 @@ impl Walker<'_> {
                 }
                 if let Ok(md) = e.metadata() {
                     bytes += md.len();
+                    self.seen += md.len();
                 }
             }
         }
@@ -315,7 +319,7 @@ impl Walker<'_> {
                 mtime: dir_mtime(dir),
             });
         }
-        (self.report)(self.rows.len(), dir);
+        (self.report)(self.rows.len(), self.seen);
         Ok(bytes)
     }
 }
@@ -628,6 +632,11 @@ pub struct Drive {
     /// 磁碟區序號。同一顆碟插到別台電腦、拿到別的代號，這個數字不會變——
     /// 靠它認得出「這顆碟上次是幾號」（見 [`Table::disk_of_serial`]）
     pub serial: u32,
+    /// 這個磁區在哪一顆**實體硬碟**上（Windows 的磁碟編號，磁碟管理裡的
+    /// 「磁碟 3」）。同一顆碟切成 L:、M: 兩個磁區時兩個一樣——還沒建過檔的
+    /// 磁區靠它帶出兄弟磁區的那一號。只在這次開機、這次插著時有效，
+    /// 不存進總表；問不到就是 None
+    pub physical: Option<u32>,
 }
 
 impl Drive {
@@ -709,9 +718,108 @@ pub fn list_drives() -> Vec<Drive> {
             letter: letter.to_string(),
             label,
             serial: if ok { serial } else { 0 },
+            physical: physical_disk(letter),
         });
     }
     out
+}
+
+/// 這個磁碟機代號在哪一顆實體硬碟上（見 [`Drive::physical`]）。
+///
+/// 開 `\\.\L:` 這個磁區、問它的裝置編號（IOCTL_STORAGE_GET_DEVICE_NUMBER）。
+/// 開的時候不要求任何讀寫權限，一般使用者就問得到，不必系統管理員
+#[cfg(windows)]
+fn physical_disk(letter: char) -> Option<u32> {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: isize,
+        ) -> isize;
+        fn DeviceIoControl(
+            dev: isize,
+            code: u32,
+            input: *mut c_void,
+            input_len: u32,
+            output: *mut c_void,
+            output_len: u32,
+            returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+        fn CloseHandle(h: isize) -> i32;
+    }
+    /// STORAGE_DEVICE_NUMBER
+    #[repr(C)]
+    #[derive(Default)]
+    struct DeviceNumber {
+        device_type: u32,
+        device_number: u32,
+        partition_number: u32,
+    }
+    const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002D_1080;
+    /// FILE_SHARE_READ | FILE_SHARE_WRITE
+    const SHARE: u32 = 0x1 | 0x2;
+    const OPEN_EXISTING: u32 = 3;
+    const INVALID: isize = -1;
+
+    let name: Vec<u16> = format!(r"\\.\{letter}:").encode_utf16().chain(Some(0)).collect();
+    let h = unsafe {
+        CreateFileW(name.as_ptr(), 0, SHARE, std::ptr::null_mut(), OPEN_EXISTING, 0, 0)
+    };
+    if h == INVALID {
+        return None;
+    }
+    let mut out = DeviceNumber::default();
+    let mut got = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            h,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            std::ptr::null_mut(),
+            0,
+            &mut out as *mut DeviceNumber as *mut c_void,
+            std::mem::size_of::<DeviceNumber>() as u32,
+            &mut got,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(h) };
+    (ok != 0).then_some(out.device_number)
+}
+
+/// 這顆碟用掉了多少空間（總容量 − 剩餘）。建檔時的百分比拿它當分母：
+/// 掃描一路把檔案大小加起來，加到這個數字就差不多走完了。
+///
+/// 只是估計——用掉的空間還包含檔案系統自己的資料、讀不進去的系統資料夾，
+/// 所以走完時多半停在九十幾 %，畫面上封頂在 99%，做完才算 100%。
+/// 問不到就是 None（畫面改成只報資料夾數）
+#[cfg(windows)]
+pub fn used_bytes(root: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    let w: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    let ok = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut avail, &mut total, &mut free) };
+    (ok != 0 && total > free).then(|| total - free)
+}
+
+/// macOS／Linux：專案沒有引入 libc，問不到用量，畫面改成只報資料夾數
+#[cfg(not(windows))]
+pub fn used_bytes(_root: &Path) -> Option<u64> {
+    None
 }
 
 /// macOS／Linux：掛在 `/Volumes` 底下的那些，加上根目錄本身。
@@ -723,6 +831,7 @@ pub fn list_drives() -> Vec<Drive> {
         letter: "/".into(),
         label: "開機磁碟".into(),
         serial: 0,
+        physical: None,
     }];
     if let Ok(rd) = fs::read_dir("/Volumes") {
         for e in rd.flatten() {
@@ -734,6 +843,7 @@ pub fn list_drives() -> Vec<Drive> {
                     letter: label.clone(),
                     label,
                     serial: 0,
+                    physical: None,
                 });
             }
         }
@@ -1267,6 +1377,17 @@ mod tests {
         assert_eq!(t.created_of(9), None);
     }
 
+    /// 一般使用者權限就問得到磁區在哪一顆實體硬碟上（L:、M: 是同一顆碟
+    /// 時帶同一號靠的就是它）；同一顆碟的磁區要拿到同一個編號
+    #[cfg(windows)]
+    #[test]
+    fn 問得到磁區在哪一顆實體硬碟() {
+        let drives = list_drives();
+        let c = drives.iter().find(|d| d.letter == "C").expect("要有 C 碟");
+        assert!(c.physical.is_some(), "C 碟問不到實體硬碟編號");
+        assert_eq!(physical_disk('C'), c.physical, "問兩次要一樣");
+    }
+
     #[test]
     fn 空號要補回去() {
         let mut t = Table::default();
@@ -1455,7 +1576,11 @@ mod tests {
         fs::create_dir_all(top.join("target")).unwrap();
         fs::write(top.join("target").join("CACHEDIR.TAG"), [0u8; 3]).unwrap();
         let cancel = AtomicBool::new(false);
-        let out = scan(&base, 5, 1, &cancel, &mut |_, _| {}).unwrap();
+        let mut seen = 0u64;
+        let out = scan(&base, 5, 1, &cancel, &mut |_, b| seen = b).unwrap();
+        assert_eq!(seen, 118, "百分比的分子：最後要報到全部算過的大小");
+        #[cfg(windows)]
+        assert!(used_bytes(&base).is_some_and(|u| u > 0), "問得到這顆碟用了多少");
         let size = |n: &str| out.rows.iter().find(|r| r.name == n).map(|r| r.bytes);
         assert_eq!(size("1樹鴨"), Some(100));
         assert_eq!(size("鳥_精選"), Some(110));
