@@ -8551,6 +8551,9 @@ struct DiskDone {
 struct DiskTool {
     /// 要建檔的是哪一顆碟（整顆，從根目錄開始）
     drive: Option<disk::Drive>,
+    /// 選到的那顆碟上次建檔是（幾號, 什麼時候, 是不是從碟裡的紀錄讀到的）。
+    /// None＝沒建過（或認不出來）。見 [`App::disk_last_build`]
+    last_build: Option<(u32, u64, bool)>,
     /// 現在接著的硬碟有哪些（進這一頁時找一次，按「↻」再找一次：
     /// 外接碟隨時會插上或拔掉）
     drives: Vec<disk::Drive>,
@@ -8586,6 +8589,7 @@ impl Default for DiskTool {
     fn default() -> Self {
         Self {
             drive: None,
+            last_build: None,
             drives: Vec::new(),
             no_text: String::new(),
             // 使用者舊工具的預設值，照搬
@@ -28129,6 +28133,26 @@ impl App {
                     .color(theme::TEXT_WEAK),
             );
         });
+        // 這顆碟建過沒有、上次是幾號：同一顆碟不小心建成兩號的事發生過，
+        // 選碟時先看到這一行就不會再犯
+        if self.disk.drive.is_some() {
+            ui.horizontal(|ui| {
+                ui.add_space(2.0);
+                let (text, color) = match self.disk.last_build {
+                    Some((no, at, on_disk)) => (
+                        format!(
+                            "這顆硬碟上次建檔：{}（{}）{}",
+                            disk::fmt_no(no),
+                            disk::fmt_time(at),
+                            if on_disk { "" } else { "　依總表" }
+                        ),
+                        theme::LINK,
+                    ),
+                    None => ("這顆硬碟還沒建過檔".to_string(), theme::TEXT_WEAK),
+                };
+                ui.label(egui::RichText::new(text).size(12.5).color(color));
+            });
+        }
         ui.add_space(6.0);
 
         ui.horizontal(|ui| {
@@ -28483,19 +28507,10 @@ impl App {
     /// 見 [`disk::Table::disk_of_serial`]）：碟插回來重建一次是常態，
     /// 再給它一個新號只會讓同一顆碟在表裡出現兩次。認不出來才回到空號
     fn disk_set_drive(&mut self, d: disk::Drive) {
-        // 這個磁區還沒建過、但同一顆實體硬碟上的另一個磁區建過了
-        // （L: 建好接著選 M:）：用那一號。同一顆碟就是同一號（使用者定的）
-        let sibling = || {
-            let phys = d.physical?;
-            self.disk
-                .drives
-                .iter()
-                .filter(|o| o.root != d.root && o.physical == Some(phys))
-                .find_map(|o| self.disk.table.disk_of_serial(o.serial))
-        };
-        let known = self.disk.table.disk_of_serial(d.serial).or_else(sibling);
-        match known {
-            Some(no) => self.disk.no_text = disk::fmt_no(no),
+        let last = self.disk_last_build(&d);
+        self.disk.last_build = last;
+        match last {
+            Some((no, ..)) => self.disk.no_text = disk::fmt_no(no),
             None => {
                 // 使用者自己打過一個還沒用過的號就尊重它，否則回到下一個空號
                 let keep = self
@@ -28510,6 +28525,34 @@ impl App {
         }
         self.disk.drive = Some(d);
         self.disk.error = None;
+    }
+
+    /// 這顆碟上次建檔是（幾號, 什麼時候, 是不是從碟裡的紀錄讀到的）。依序看：
+    ///
+    /// 1. **碟裡的紀錄**（[`disk::MARK_FILE`]）：碟自己帶著，總表不見、換了
+    ///    電腦、磁區重新格式化都還在，最可靠；
+    /// 2. 總表裡照磁碟區序號找（同一顆碟建過好幾號時認最後一次）；
+    /// 3. 這個磁區還沒建過、但同一顆實體硬碟上的另一個磁區建過了
+    ///    （L: 建好接著選 M:）：用那一號。同一顆碟就是同一號（使用者定的）
+    fn disk_last_build(&self, d: &disk::Drive) -> Option<(u32, u64, bool)> {
+        let of = |o: &disk::Drive| {
+            disk::read_mark(&o.root)
+                .map(|m| (m.no, m.at, true))
+                .or_else(|| {
+                    self.disk
+                        .table
+                        .last_build_of_serial(o.serial)
+                        .map(|(no, at)| (no, at, false))
+                })
+        };
+        of(d).or_else(|| {
+            let phys = d.physical?;
+            self.disk
+                .drives
+                .iter()
+                .filter(|o| o.root != d.root && o.physical == Some(phys))
+                .find_map(of)
+        })
     }
 
     /// 換一個資料夾放總表：換完**立刻把那裡的總表讀進來**。
@@ -28646,16 +28689,17 @@ impl App {
                 let _ = tx.send(DiskMsg::Writing);
                 ctx.request_repaint();
                 let found = s.rows.len();
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 table.put_disk(
                     no,
                     &root.to_string_lossy(),
                     s.rows,
                     disk::DiskNote {
                         root: drive.show(),
-                        at: SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0),
+                        at: now,
                         label: drive.label.clone(),
                         serial: drive.serial,
                         serials: Vec::new(),
@@ -28678,6 +28722,17 @@ impl App {
                     thousands(table.count_of(no) as u64),
                     thousands(table.rows.len() as u64)
                 );
+                // 碟裡也記一份這次的編號與時間（總表上面已經記了）。總表存好
+                // 才寫：總表沒存成的話，碟上不該說「這顆建過了」
+                let mark = disk::DiskMark {
+                    no,
+                    at: now,
+                    label: drive.label.clone(),
+                };
+                let msg = match disk::write_mark(&root, &mark) {
+                    Ok(()) => msg,
+                    Err(e) => format!("{msg}。建檔紀錄沒寫進硬碟（{e}），只記在總表"),
+                };
                 Ok(DiskDone {
                     table,
                     msg,
@@ -28707,6 +28762,10 @@ impl App {
                             self.disk.skipped = done.skipped;
                             self.disk.table = done.table;
                             self.disk.result = Some(done.msg);
+                            // 「這顆硬碟上次建檔」那一行換成剛才這一次
+                            if let Some(d) = self.disk.drive.clone() {
+                                self.disk.last_build = self.disk_last_build(&d);
+                            }
                             // 編號維持剛才那一號（使用者定的）：做完馬上跳成下一個
                             // 空號，看起來像剛才建的不是這一號。換一顆碟時
                             // disk_set_drive 才會帶出那顆碟的號或下一個空號

@@ -506,14 +506,23 @@ impl Table {
     /// 碟插到別台電腦、或別的碟先占走代號時，同一顆碟的代號就變了；序號
     /// 不會變。靠它才能在碟插回來時直接帶出「上次的那個號」，而不是又給它
     /// 一個新號、讓同一顆碟在表裡出現兩次
+    ///
+    /// 同一顆碟被建成好幾號時（實際發生過：同一天先建 0134、下午又建 0151），
+    /// 認的是**最後一次建檔的那一號**
     pub fn disk_of_serial(&self, serial: u32) -> Option<u32> {
+        self.last_build_of_serial(serial).map(|(no, _)| no)
+    }
+
+    /// 這顆碟（照磁碟區序號認）最後一次建檔是（幾號, 什麼時候）
+    pub fn last_build_of_serial(&self, serial: u32) -> Option<(u32, u64)> {
         if serial == 0 {
             return None;
         }
         self.notes
             .iter()
-            .find(|(_, n)| n.serial == serial || n.serials.contains(&serial))
-            .map(|(no, _)| *no)
+            .filter(|(_, n)| n.serial == serial || n.serials.contains(&serial))
+            .max_by_key(|(no, n)| (n.at, **no))
+            .map(|(no, n)| (*no, n.at))
     }
 
     /// 下一個要用的編號：**從 1 開始找第一個空號**，中間沒有空號就接在
@@ -723,6 +732,71 @@ pub fn list_drives() -> Vec<Drive> {
     }
     out
 }
+
+// ---------- 寫在硬碟裡的建檔紀錄 ----------
+
+/// 建檔時放在磁區最上層的那個小檔（隱藏）。總表不見、碟拿到別台電腦、
+/// 磁區重新格式化（序號會變）都還認得出這顆碟上次是幾號——總表靠序號認，
+/// 這個靠碟自己帶著（使用者要的：兩邊都記）
+pub const MARK_FILE: &str = "硬碟編號.json";
+
+/// [`MARK_FILE`] 的內容
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiskMark {
+    /// 最後一次建檔的硬碟編號
+    pub no: u32,
+    /// 最後一次建檔的時間（unix 秒）
+    pub at: u64,
+    /// 建檔時的磁區名稱（人打開這個檔看得懂是哪顆碟）
+    #[serde(default)]
+    pub label: String,
+}
+
+/// 讀這個磁區上的建檔紀錄。沒有、讀不到、內容壞了都是 None
+pub fn read_mark(root: &Path) -> Option<DiskMark> {
+    let text = fs::read_to_string(root.join(MARK_FILE)).ok()?;
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
+}
+
+/// 把這次建檔的編號與時間寫進磁區最上層，並設成隱藏（檔案總管裡不會多一個
+/// 檔案擋路）。唯讀的碟、沒有權限時回傳錯誤，呼叫端照樣當作建檔成功——
+/// 總表那邊已經記下來了
+pub fn write_mark(root: &Path, mark: &DiskMark) -> Result<(), String> {
+    let p = root.join(MARK_FILE);
+    let text = serde_json::to_string_pretty(mark).map_err(|e| e.to_string())?;
+    // 已經有一份隱藏的：Windows 不讓「建立並覆寫」直接蓋掉隱藏檔，
+    // 先拿掉隱藏屬性再寫
+    set_hidden(&p, false);
+    fs::write(&p, text).map_err(|e| format!("「{}」寫不進去（{e}）", p.display()))?;
+    set_hidden(&p, true);
+    Ok(())
+}
+
+/// 設定／拿掉隱藏屬性。設不成不算錯（檔案內容已經對了）
+#[cfg(windows)]
+fn set_hidden(p: &Path, hidden: bool) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    extern "system" {
+        fn SetFileAttributesW(path: *const u16, attrs: u32) -> i32;
+    }
+    /// FILE_ATTRIBUTE_HIDDEN
+    const HIDDEN: u32 = 0x2;
+    /// FILE_ATTRIBUTE_NORMAL（屬性全拿掉時要給這個，不能給 0）
+    const NORMAL: u32 = 0x80;
+    let Ok(md) = fs::metadata(p) else { return };
+    let now = md.file_attributes();
+    let want = if hidden { now | HIDDEN } else { now & !HIDDEN };
+    if want == now {
+        return;
+    }
+    let w: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe { SetFileAttributesW(w.as_ptr(), if want == 0 { NORMAL } else { want }) };
+}
+
+/// macOS／Linux 的隱藏靠檔名開頭的點，這個檔名不是——不處理
+#[cfg(not(windows))]
+fn set_hidden(_p: &Path, _hidden: bool) {}
 
 /// 這個磁碟機代號在哪一顆實體硬碟上（見 [`Drive::physical`]）。
 ///
@@ -1386,6 +1460,40 @@ mod tests {
         let c = drives.iter().find(|d| d.letter == "C").expect("要有 C 碟");
         assert!(c.physical.is_some(), "C 碟問不到實體硬碟編號");
         assert_eq!(physical_disk('C'), c.physical, "問兩次要一樣");
+    }
+
+    /// 建檔紀錄寫在碟裡：寫得進去、讀得回來、重寫一次（已經是隱藏檔）也蓋得掉
+    #[test]
+    fn 建檔紀錄寫進硬碟讀得回來() {
+        let base = std::env::temp_dir().join(format!("p2v_mark_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        assert_eq!(read_mark(&base), None, "還沒建過檔");
+        let m1 = DiskMark { no: 134, at: 1000, label: "202501new#1".into() };
+        write_mark(&base, &m1).unwrap();
+        assert_eq!(read_mark(&base), Some(m1));
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let a = fs::metadata(base.join(MARK_FILE)).unwrap().file_attributes();
+            assert!(a & 0x2 != 0, "要是隱藏檔");
+        }
+        let m2 = DiskMark { no: 151, at: 2000, label: "202501new#1".into() };
+        write_mark(&base, &m2).unwrap();
+        assert_eq!(read_mark(&base), Some(m2), "隱藏檔要蓋得掉");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// 同一顆碟被建成好幾號：認最後一次建的那一號
+    #[test]
+    fn 同一顆碟建過好幾號認最後一次() {
+        let mut t = Table::default();
+        let note = |at: u64| DiskNote { at, serial: 77, ..DiskNote::default() };
+        t.put_disk(151, "J:\\", Vec::new(), note(2000), Merge::Replace);
+        t.put_disk(134, "J:\\", Vec::new(), note(1000), Merge::Replace);
+        assert_eq!(t.last_build_of_serial(77), Some((151, 2000)));
+        assert_eq!(t.disk_of_serial(77), Some(151));
+        assert_eq!(t.last_build_of_serial(0), None);
     }
 
     #[test]
