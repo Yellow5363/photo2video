@@ -62,20 +62,31 @@ const L: Lay = {
 };
 
 static KINGFISHER: &[u8] = include_bytes!("../assets/kingfisher_head.bin");
+static HARRIER: &[u8] = include_bytes!("../assets/harrier_head.bin");
 
 /// 翠鳥的權重
 pub fn kingfisher() -> &'static [f32] {
     static W: OnceLock<Vec<f32>> = OnceLock::new();
-    W.get_or_init(|| {
-        // 量測時可以換成別份權重（例如沒看過考題的那一份）
-        #[cfg(test)]
-        if let Ok(p) = std::env::var("P2V_HEAD_NET") {
-            return std::fs::read(p).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-        }
-        let w: Vec<f32> = KINGFISHER.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-        assert_eq!(w.len(), L.n, "kingfisher_head.bin 的大小與網路不合");
-        w
-    })
+    W.get_or_init(|| load(KINGFISHER))
+}
+
+/// 灰澤鵟的權重：使用者的四組連拍與幾張單張，不同隨機種子訓練三個網路一起投票
+/// （見 [`score_map`]）。輪流留一組不學當考題，單一網路平均第 1 組 11/22、第 3 組
+/// 19～30/86，三個一起 19/22、62/86
+pub fn harrier() -> &'static [f32] {
+    static W: OnceLock<Vec<f32>> = OnceLock::new();
+    W.get_or_init(|| load(HARRIER))
+}
+
+fn load(bytes: &[u8]) -> Vec<f32> {
+    // 量測時可以換成別份權重（例如沒看過考題的那一份）
+    #[cfg(test)]
+    if let Ok(p) = std::env::var("P2V_HEAD_NET") {
+        return std::fs::read(p).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    }
+    let w: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    assert!(!w.is_empty() && w.len() % L.n == 0, "權重檔的大小與網路不合");
+    w
 }
 
 /// 3×3 卷積（邊上補零），輸入 ci×h×w → 輸出 co×h×w
@@ -190,7 +201,34 @@ pub struct ScoreMap {
 }
 
 /// 把一張彩色圖（已縮到頭寬約 [`KS`]）整片算一遍
+///
+/// `p` 可以是好幾個網路接在一起（同樣的資料、不同隨機種子訓練的）：分數取平均。
+/// 單一網路很不穩定——實測灰澤鵟換一個種子重訓，沒看過的那組對的張數能從 6 張
+/// 跳到 18 張；幾個一起投票就穩得多
 pub fn score_map(p: &[f32], img: &RgbImage) -> ScoreMap {
+    if p.len() <= L.n {
+        return score_map_one(p, img);
+    }
+    // 各網路同時算（多核心）
+    let maps: Vec<ScoreMap> = std::thread::scope(|sc| {
+        let hs: Vec<_> = p.chunks_exact(L.n).map(|q| sc.spawn(move || score_map_one(q, img))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let k = maps.len() as f32;
+    let mut maps = maps.into_iter();
+    let mut out = maps.next().unwrap();
+    for m in maps {
+        for (a, b) in out.z.iter_mut().zip(&m.z) {
+            *a += b;
+        }
+    }
+    for a in out.z.iter_mut() {
+        *a /= k;
+    }
+    out
+}
+
+fn score_map_one(p: &[f32], img: &RgbImage) -> ScoreMap {
     let (w, h) = ((img.width() as usize) / STRIDE * STRIDE, (img.height() as usize) / STRIDE * STRIDE);
     if w < NP || h < NP {
         return ScoreMap { w: 0, h: 0, z: Vec::new() };
@@ -638,7 +676,10 @@ pub fn fine_tune(base: &[f32], marked: &[(RgbImage, [f32; 4])]) -> Vec<f32> {
     let shots: Vec<Shot> = marked.iter().filter_map(|(img, r)| Shot::new(img, *r)).collect();
     let mut p = base.to_vec();
     if !shots.is_empty() {
-        train(&mut p, &shots, &Train { epochs: TUNE_EPOCHS, lr: 0.001, hard_from: 0, hard_every: 5, seed: 0x1234_5678_9abc_def1, log: false });
+        // 好幾個網路接在一起時各學各的
+        for q in p.chunks_exact_mut(L.n) {
+            train(q, &shots, &Train { epochs: TUNE_EPOCHS, lr: 0.001, hard_from: 0, hard_every: 5, seed: 0x1234_5678_9abc_def1, log: false });
+        }
     }
     p
 }
@@ -675,7 +716,7 @@ mod tests {
         assert!((z - whole).abs() < 1e-3, "{z} vs {whole}");
     }
 
-    /// 重新訓練：拿一個專案裡使用者手動框的照片當圖庫（框中心＝要學的位置，
+    /// 重新訓練：拿專案裡使用者手動框的照片當圖庫（框中心＝要學的位置，
     /// 框寬當作頭寬）。
     ///
     /// `P2V_HEAD_P2V=專案檔 P2V_HEAD_OUT=輸出.bin cargo test --release
@@ -687,8 +728,14 @@ mod tests {
         let proj = std::env::var("P2V_HEAD_P2V").expect("P2V_HEAD_P2V");
         let out = std::env::var("P2V_HEAD_OUT").expect("P2V_HEAD_OUT");
         let epochs: usize = std::env::var("P2V_HEAD_EPOCHS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-        let pf: crate::ProjectFile = serde_json::from_str(&std::fs::read_to_string(&proj).unwrap()).unwrap();
-        let labels: Vec<_> = pf.track_boxes.iter().filter(|b| b.2 == 0).cloned().collect();
+        // 可以給好幾個專案，以分號隔開
+        let labels: Vec<_> = proj
+            .split(';')
+            .flat_map(|f| {
+                let pf: crate::ProjectFile = serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
+                pf.track_boxes.into_iter().filter(|b| b.2 == 0)
+            })
+            .collect();
         let shots: Vec<Shot> = std::thread::scope(|sc| {
             let hs: Vec<_> = labels
                 .chunks(labels.len().div_ceil(8).max(1))
@@ -711,7 +758,8 @@ mod tests {
                 *v = rng.n() * sd;
             }
         }
-        train(&mut p, &shots, &Train { epochs, lr: 0.002, hard_from: 20, hard_every: 10, seed: 0x9e3779b97f4a7c15, log: true });
+        let seed = std::env::var("P2V_HEAD_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0x9e3779b97f4a7c15);
+        train(&mut p, &shots, &Train { epochs, lr: 0.002, hard_from: 20, hard_every: 10, seed, log: true });
         let bytes: Vec<u8> = p.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&out, bytes).unwrap();
     }

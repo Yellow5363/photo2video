@@ -4181,12 +4181,12 @@ fn run_auto_boxes(
             };
             if let (Some(net), true) = (net, mixed) {
                 // 裁成不同大小的一批：前後張沒得相減，直接整張找頭
-                net_peaks[i] = track::net_search(cur, [0.0, 0.0, 1.0, 1.0], track::net_sizes(known_size, cur.w, band), net);
+                net_peaks[i] = track::net_search(cur, [0.0, 0.0, 1.0, 1.0], track::net_sizes(known_size, cur.w, band), net, bird.net_look());
                 cands[i] = track::net_found(cur, &net_peaks[i], track::DET_CANDIDATES);
             } else {
                 cands[i] = track::detect_candidates(a, cur, b, track::DET_CANDIDATES, bird.head_style());
                 if let Some(net) = net {
-                    net_peaks[i] = track::net_heads(cur, &cands[i], track::net_sizes(known_size, cur.w, band), net);
+                    net_peaks[i] = track::net_heads(cur, &cands[i], track::net_sizes(known_size, cur.w, band), net, bird.net_look());
                 }
             }
         }
@@ -4299,7 +4299,7 @@ fn run_auto_boxes(
     // 的辨識特徵）。只在這裡用：挑頭、驗證、要不要檢查都照原本的頭判斷
     let aim: Vec<Option<(f32, f32)>> = (0..n)
         .map(|i| head[i].map(|(hx, hy)| {
-            if bird.red_spots() { track::red_of(&cands[i], hx, hy).unwrap_or((hx, hy)) } else { (hx, hy) }
+            if bird.red_spots() || net.is_some() { track::red_of(&cands[i], hx, hy).unwrap_or((hx, hy)) } else { (hx, hy) }
         }))
         .collect();
     let shown = |i: usize, k: usize| -> [f32; 4] {
@@ -4377,7 +4377,7 @@ fn run_auto_boxes(
     let mut latest = latest.lock().unwrap().clone();
     match net {
         // 翠鳥：照手動框的大小用網路找（見 refine_by_net）
-        Some(net) => refine_by_net(&photos, manual, &vec![true; n], &mut latest, net, crop, send),
+        Some(net) => refine_by_net(&photos, manual, &vec![true; n], &mut latest, net, bird.net_look(), crop, send),
         None => refine_by_manual(&photos, manual, &mut latest, crop, send),
     }
     if head_mode {
@@ -4464,6 +4464,7 @@ fn refine_by_net(
     todo: &[bool],
     latest: &mut [Option<Subject>],
     net: &[f32],
+    look: track::NetLook,
     crop: Crop,
     send: &dyn Fn(TrackMsg),
 ) {
@@ -4503,7 +4504,7 @@ fn refine_by_net(
             }
             None => [0.0, 0.0, 1.0, 1.0],
         };
-        let found = track::net_search(&f, win, track::net_sizes(Some(bw), f.w, band), net);
+        let found = track::net_search(&f, win, track::net_sizes(Some(bw), f.w, band), net, look);
         let Some(best) = found.iter().max_by(|a, b| a.z.total_cmp(&b.z)) else { continue };
         if best.z < NET_REFINE_Z {
             continue;
@@ -4513,12 +4514,12 @@ fn refine_by_net(
         if let Some(old) = latest[i] {
             let (ox, oy) = old.centre();
             let (rx, ry) = (bw * NET_KEEP_R, bh * NET_KEEP_R);
-            let here = track::net_search(&f, [ox - rx, oy - ry, ox + rx, oy + ry], track::net_sizes(Some(bw), f.w, band), net);
+            let here = track::net_search(&f, [ox - rx, oy - ry, ox + rx, oy + ry], track::net_sizes(Some(bw), f.w, band), net, look);
             if here.iter().any(|p| p.z >= NET_REFINE_Z.max(best.z - NET_KEEP_MARGIN) && (p.x - ox).abs() <= rx && (p.y - oy).abs() <= ry) {
                 continue;
             }
         }
-        let (nx, ny) = (best.x, best.y);
+        let (nx, ny) = best.aim.unwrap_or((best.x, best.y));
         let next = match latest[i] {
             Some(old) => {
                 let (w, h) = old.size();
@@ -6525,7 +6526,18 @@ impl BirdKind {
     fn head_net(self) -> Option<&'static [f32]> {
         match self {
             BirdKind::Kingfisher => Some(headnet::kingfisher()),
+            BirdKind::Harrier => Some(headnet::harrier()),
             _ => None,
+        }
+    }
+
+    /// 用網路找頭時另外看的線索（見 track::NetLook）。翠鳥看鳥嘴：又長又直的深色嘴是
+    /// 牠最明顯的特徵（灰澤鵟的嘴短而帶鉤，那套量法不適用）；灰澤鵟看黃色的鼻子
+    fn net_look(self) -> track::NetLook {
+        match self {
+            BirdKind::Kingfisher => track::NetLook { beak_w: track::KINGFISHER_BEAK_W, cere: false },
+            BirdKind::Harrier => track::NetLook { beak_w: 0.0, cere: true },
+            _ => track::NetLook::default(),
         }
     }
 }
@@ -10164,6 +10176,7 @@ impl App {
         // 翠鳥追完要用網路校正：手動框、目前的框、這一趟真的重追的那幾張（不含只拿來
         // 重新判斷的）
         let net = self.track.bird.head_net();
+        let look = self.track.bird.net_look();
         let manual: Vec<Option<[f32; 4]>> = self
             .photos
             .iter()
@@ -10207,7 +10220,7 @@ impl App {
             if !TRACK_CANCEL.load(Ordering::Relaxed) {
                 let mut latest = latest.into_inner().unwrap();
                 if let Some(tuned) = tune_on_manual(&photos, &manual, net, crop, &send) {
-                    refine_by_net(&Arc::new(photos), &manual, &todo, &mut latest, &tuned, crop, &send);
+                    refine_by_net(&Arc::new(photos), &manual, &todo, &mut latest, &tuned, look, crop, &send);
                 }
             }
             send(TrackMsg::Done(a, b));
@@ -13129,7 +13142,7 @@ impl App {
                             }
                         })
                         .response
-                        .on_hover_text("要找的鳥種。各鳥種的特徵不同；五色鳥、八色鳥、翠鳥調校過，
+                        .on_hover_text("要找的鳥種。各鳥種的特徵不同；五色鳥、八色鳥、翠鳥、灰澤鵟調校過，
 其他鳥種先用通用的找法。改了之後重按「自動框選主體」才會套用");
                 });
             }

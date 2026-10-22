@@ -965,6 +965,126 @@ pub fn detect_candidates(
     out
 }
 
+/// 灰澤鵟：在頭 (x, y)（工作圖像素，頭寬 `s`）附近找黃色的鼻子（蠟膜），回傳十字
+/// 該擺的位置——鼻子正上方一點（[`CERE_UP`] 個頭寬）。使用者提供的特徵：嘴巴黑色
+/// 有倒鉤、鼻子黃色，正面時眼睛在黃鼻子稍微上方的兩側。
+///
+/// 實測使用者框好的三組連拍：正面的那組 22 張全部找得到，使用者標的位置一律在
+/// 鼻子正上方 0.04～0.15 個框寬；側面時也多在鼻子旁邊不遠。
+///
+/// 只認**小小一點**、旁邊還有深色鉤嘴的黃色：黃色的腳、枯黃的草都是一大片，
+/// 旁邊也沒有嘴
+pub fn cere_aim(img: &RgbImage, x: f32, y: f32, s: f32) -> Option<(f32, f32)> {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let r = (s * CERE_REACH).ceil() as i32;
+    let (cx, cy) = (x as i32, y as i32);
+    let (x0, y0, x1, y1) = ((cx - r).max(0), (cy - r).max(0), (cx + r).min(w - 1), (cy + r).min(h - 1));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let ww = (x1 - x0 + 1) as usize;
+    let yellow = |px: i32, py: i32| -> bool {
+        let p = img.get_pixel(px as u32, py as u32);
+        let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+        r > 140.0 && g > 110.0 && r - b > 70.0 && g - b > 45.0 && r - g < 90.0
+    };
+    let dark = |px: i32, py: i32| -> bool {
+        if px < 0 || py < 0 || px >= w || py >= h {
+            return false;
+        }
+        let p = img.get_pixel(px as u32, py as u32);
+        (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) < CERE_DARK
+    };
+    let max_area = (CERE_MAX_AREA * s * s).max(4.0) as usize;
+    let mut seen = vec![false; ww * (y1 - y0 + 1) as usize];
+    let mut best: Option<(f32, f32, f32)> = None;
+    let mut stack = Vec::new();
+    for sy in y0..=y1 {
+        for sx in x0..=x1 {
+            let k = (sy - y0) as usize * ww + (sx - x0) as usize;
+            if seen[k] || !yellow(sx, sy) {
+                continue;
+            }
+            seen[k] = true;
+            stack.push((sx, sy));
+            let (mut tx, mut ty, mut n) = (0f32, 0f32, 0usize);
+            while let Some((px, py)) = stack.pop() {
+                tx += px as f32;
+                ty += py as f32;
+                n += 1;
+                for (qx, qy) in [(px + 1, py), (px - 1, py), (px, py + 1), (px, py - 1)] {
+                    if qx < x0 || qy < y0 || qx > x1 || qy > y1 {
+                        continue;
+                    }
+                    let q = (qy - y0) as usize * ww + (qx - x0) as usize;
+                    if !seen[q] && yellow(qx, qy) {
+                        seen[q] = true;
+                        stack.push((qx, qy));
+                    }
+                }
+            }
+            if n > max_area {
+                continue;
+            }
+            let (mx, my) = (tx / n as f32, ty / n as f32);
+            // 孤立的一小點：周圍一圈（[`CERE_ALONE`] 個頭寬內）的黃色不能比它本身多太多。
+            // 枯草、草地上的光斑是一大片都偏黃
+            let ar = (s * CERE_ALONE).ceil() as i32;
+            let around = (-ar..=ar)
+                .flat_map(|dy| (-ar..=ar).map(move |dx| (dx, dy)))
+                .filter(|&(dx, dy)| {
+                    let (qx, qy) = (mx as i32 + dx, my as i32 + dy);
+                    qx >= 0 && qy >= 0 && qx < w && qy < h && yellow(qx, qy)
+                })
+                .count();
+            if around > n * CERE_ALONE_MAX {
+                continue;
+            }
+            // 鉤嘴：鼻子周圍一小圈裡要有深色
+            let br = (s * CERE_BEAK).ceil() as i32;
+            let has_beak = (-br..=br).any(|dy| (-br..=br).any(|dx| dark(mx as i32 + dx, my as i32 + dy)));
+            if !has_beak {
+                continue;
+            }
+            let d = (mx - x).hypot(my - y);
+            if best.is_none_or(|b| d < b.2) {
+                best = Some((mx, my, d));
+            }
+        }
+    }
+    best.map(|(mx, my, _)| (mx, my - CERE_UP * s))
+}
+
+/// 在頭附近幾個頭寬內找黃鼻子
+const CERE_REACH: f32 = 0.8;
+
+/// 黃鼻子最大的面積（頭寬平方的幾倍）：比這大的是腳或枯草
+const CERE_MAX_AREA: f32 = 0.004;
+
+/// 黃鼻子周圍幾個頭寬內要有深色的鉤嘴
+const CERE_BEAK: f32 = 0.2;
+
+/// 鉤嘴要多暗（亮度 0~255）
+const CERE_DARK: f32 = 70.0;
+
+/// 黃鼻子周圍多大一圈（頭寬的幾倍）裡看還有沒有別的黃色
+const CERE_ALONE: f32 = 0.3;
+
+/// 那一圈裡的黃色最多是鼻子本身的幾倍
+const CERE_ALONE_MAX: usize = 2;
+
+/// 十字擺在黃鼻子上方幾個頭寬：正面時兩眼就在這個高度的兩側
+const CERE_UP: f32 = 0.1;
+
+/// 各鳥種找頭時另外看的線索（見 [`net_search`]）
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetLook {
+    /// 找得到鳥嘴的地方網路分數加多少（翠鳥，見 [`beak_score`]）
+    pub beak_w: f32,
+    /// 十字擺在黃色鼻子（蠟膜）正上方（灰澤鵟，見 [`cere_aim`]）
+    pub cere: bool,
+}
+
 /// 用圖庫學來的網路找頭（翠鳥，見 [`crate::headnet`]）時，網路在一張照片上
 /// 找到的一處：位置（相對座標）、分數（logit），以及那一次縮放假設的頭寬
 /// （`sx` 佔畫面寬、`sy` 佔畫面高的比例）
@@ -975,6 +1095,8 @@ pub struct NetPeak {
     pub z: f32,
     pub sx: f32,
     pub sy: f32,
+    /// 十字該擺的位置（相對座標），跟頭的位置不同時才有（灰澤鵟的黃鼻子，見 [`cere_aim`]）
+    pub aim: Option<(f32, f32)>,
 }
 
 /// 網路假設的頭寬從幾像素試起（工作圖上）。再小就只剩幾個像素，看不出是頭
@@ -999,6 +1121,9 @@ const NET_Z_SURE: f32 = 3.0;
 /// 不變；不限制的話，羽毛上的小斑點、水珠會被當成很小的頭（實測圖庫裡
 /// 21 段連拍，各張自由挑大小時 118 張對 90 張，限制之後 99 張）
 pub const NET_SIZE_BAND: f32 = 1.42;
+
+/// 估頭多大時看前後幾張（見 [`settle_net_heads`]）
+const NET_SIZE_SPAN: usize = 4;
 
 /// 同一張裡的幾處頭至少要隔多遠（以頭寬為單位）
 const NET_APART: f32 = 0.75;
@@ -1039,7 +1164,7 @@ fn head_window(rect: [f32; 4]) -> [f32; 4] {
 
 /// 用網路 `net` 在 `cur` 上、各個動態候選附近找頭，各種縮放都試
 /// （頭多大要等整批找完才定得下來，見 [`settle_net_heads`]）
-pub fn net_heads(cur: &Frame, cands: &[Found], sizes: (f32, f32), net: &[f32]) -> Vec<NetPeak> {
+pub fn net_heads(cur: &Frame, cands: &[Found], sizes: (f32, f32), net: &[f32], look: NetLook) -> Vec<NetPeak> {
     if cands.is_empty() {
         return Vec::new();
     }
@@ -1047,7 +1172,7 @@ pub fn net_heads(cur: &Frame, cands: &[Found], sizes: (f32, f32), net: &[f32]) -
     let win = cands.iter().map(|c| head_window(c.rect)).fold([1.0f32, 1.0, 0.0, 0.0], |a, b| {
         [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
     });
-    net_search(cur, win, sizes, net)
+    net_search(cur, win, sizes, net, look)
 }
 
 /// 要試的頭寬範圍（工作圖像素，`w` 是工作圖寬）：知道頭多大（`known`，佔畫面寬的
@@ -1110,15 +1235,16 @@ const BEAK_DARK: f32 = 12.0;
 /// 鳥嘴分數到這裡就算「確定有嘴」，網路分數加 [`NET_BEAK_W`]
 const NET_BEAK_FULL: f32 = 30.0;
 
-/// 找得到鳥嘴的地方，網路分數最多加這麼多（見 [`beak_score`]）。網路單看一小塊
+/// 翠鳥：找得到鳥嘴的地方，網路分數最多加這麼多（見 [`beak_score`]、`net_search` 的
+/// `beak_w`）。灰澤鵟這類嘴短而帶鉤的鳥不加。網路單看一小塊
 /// 會把黃綠色的松針當成翠鳥頭頂的花紋，松針卻接不出一條又長又直的嘴。實測一批 9 張
 /// 飛行照框 3 張之後，其餘 6 張從 4 張對變成 5 張（俯衝時嘴很明顯的那張找回來了），
 /// 圖庫 21 段連拍維持 90/118；加到 6 反而變差
-const NET_BEAK_W: f32 = 3.0;
+pub const KINGFISHER_BEAK_W: f32 = 3.0;
 
 /// 用網路 `net` 在 `cur` 的 `win`（相對座標）範圍內找頭，假設的頭寬從 `sizes.0` 試到
-/// `sizes.1`（工作圖像素）
-pub fn net_search(cur: &Frame, win: [f32; 4], sizes: (f32, f32), net: &[f32]) -> Vec<NetPeak> {
+/// `sizes.1`（工作圖像素）。找得到鳥嘴的地方分數加 `beak_w`（見 [`beak_score`]）
+pub fn net_search(cur: &Frame, win: [f32; 4], sizes: (f32, f32), net: &[f32], look: NetLook) -> Vec<NetPeak> {
     use crate::headnet::{score_map, KS, NP};
     let Some(rgb) = cur.rgb() else { return Vec::new() };
     let (w, h) = (cur.w as f32, cur.h as f32);
@@ -1158,8 +1284,15 @@ pub fn net_search(cur: &Frame, win: [f32; 4], sizes: (f32, f32), net: &[f32]) ->
                         .map(|(px, py, z)| {
                             let (ax, ay) = (x0 as f32 + px * kx, y0 as f32 + py * ky);
                             // 找得到鳥嘴的才像頭（見 beak_score）
-                            let beak = (beak_score(cur, ax, ay, sp) / NET_BEAK_FULL).min(1.0);
-                            NetPeak { x: ax / w, y: ay / h, z: z + beak * NET_BEAK_W, sx: sp / w, sy: sp / h }
+                            let beak = if look.beak_w > 0.0 { (beak_score(cur, ax, ay, sp) / NET_BEAK_FULL).min(1.0) } else { 0.0 };
+                            NetPeak {
+                                x: ax / w,
+                                y: ay / h,
+                                z: z + beak * look.beak_w,
+                                sx: sp / w,
+                                sy: sp / h,
+                                aim: if look.cere { cere_aim(rgb, ax, ay, sp).map(|(x, y)| (x / w, y / h)) } else { None },
+                            }
                         })
                         .collect::<Vec<_>>()
                 })
@@ -1197,7 +1330,7 @@ pub fn net_found(cur: &Frame, peaks: &[NetPeak], max: usize) -> Vec<Found> {
             score: (p.z / NET_Z_FOUND).clamp(0.0, 1.0),
             shift_gain: 1.0,
             heads: [(p.x, p.y, (p.z / NET_Z_FULL).clamp(0.0, 1.0)), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
-            reds: [None; HEAD_PEAKS],
+            reds: [p.aim, None, None],
             sharp: 0.0,
             sig: signature(f, rect[0] * fw, rect[1] * fh, rect[2] * fw, rect[3] * fh),
         });
@@ -1247,19 +1380,34 @@ pub fn settle_net_heads(
     known: Option<f32>,
     fixed: &[bool],
 ) {
-    let mut votes: Vec<f32> = peaks
+    // 每張最有把握的那一處投一票（分數夠高的才算）
+    let vote: Vec<Option<f32>> = peaks
         .iter()
-        .filter_map(|v| v.iter().max_by(|a, b| a.z.total_cmp(&b.z)))
-        .filter(|p| p.z >= NET_Z_SURE)
-        .map(|p| p.sx)
+        .map(|v| v.iter().max_by(|a, b| a.z.total_cmp(&b.z)).filter(|p| p.z >= NET_Z_SURE).map(|p| p.sx))
         .collect();
-    votes.sort_by(f32::total_cmp);
-    let size = known.or(votes.get(votes.len() / 2).copied());
-    let fits = |p: &NetPeak| size.is_none_or(|s| p.sx >= s / band && p.sx <= s * band);
+    // 頭多大只看前後 NET_SIZE_SPAN 張：鳥迎面飛近時頭越來越大，整批取一個
+    // 中位數的話後半段的頭全被排除（實測一批 22 張的灰澤鵟，後 10 張十字全落在背景）
+    let size_at = |i: usize| -> Option<f32> {
+        if known.is_some() {
+            return known;
+        }
+        let near = |r: usize| -> Vec<f32> {
+            let mut v: Vec<f32> = vote[i.saturating_sub(r)..(i + r + 1).min(vote.len())].iter().flatten().copied().collect();
+            v.sort_by(f32::total_cmp);
+            v
+        };
+        let mut v = near(NET_SIZE_SPAN);
+        if v.len() < 3 {
+            v = near(vote.len());
+        }
+        v.get(v.len() / 2).copied()
+    };
     for (i, (list, found)) in cands.iter_mut().zip(peaks).enumerate() {
         if fixed.get(i).copied().unwrap_or(false) {
             continue;
         }
+        let size = size_at(i);
+        let fits = |p: &NetPeak| size.is_none_or(|s| p.sx >= s / band && p.sx <= s * band);
         for c in list.iter_mut() {
             let win = head_window(c.rect);
             let mut mine: Vec<&NetPeak> = found
@@ -1268,11 +1416,13 @@ pub fn settle_net_heads(
                 .collect();
             mine.sort_by(|a, b| b.z.total_cmp(&a.z));
             let mut heads = [(0.0, 0.0, 0.0); HEAD_PEAKS];
+            let mut reds = [None; HEAD_PEAKS];
             let mut got = 0;
             for p in mine {
                 let far = heads[..got].iter().all(|&(x, y, _)| ((x - p.x) / p.sx).hypot((y - p.y) / p.sy) >= NET_APART);
                 if far {
                     heads[got] = (p.x, p.y, (p.z / NET_Z_FULL).clamp(0.0, 1.0));
+                    reds[got] = p.aim;
                     got += 1;
                     if got == HEAD_PEAKS {
                         break;
@@ -1280,7 +1430,7 @@ pub fn settle_net_heads(
                 }
             }
             c.heads = heads;
-            c.reds = [None; HEAD_PEAKS];
+            c.reds = reds;
         }
         if drop_headless {
             list.retain(|c| c.heads[0].2 > 0.0);
