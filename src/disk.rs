@@ -890,10 +890,33 @@ pub fn used_bytes(root: &Path) -> Option<u64> {
     (ok != 0 && total > free).then(|| total - free)
 }
 
-/// macOS／Linux：專案沒有引入 libc，問不到用量，畫面改成只報資料夾數
+/// macOS／Linux：專案沒有引入 libc，改問系統內建的 `df`。`-P` 讓每顆碟
+/// 固定一行，第三欄就是用掉的 KB。以前直接回 None，Mac 上整條進度條
+/// 都不畫（使用者要看到百分比）
 #[cfg(not(windows))]
-pub fn used_bytes(_root: &Path) -> Option<u64> {
-    None
+pub fn used_bytes(root: &Path) -> Option<u64> {
+    // Mac 的開機磁碟拆成兩塊：「/」只有系統唯讀那一塊，/Users 這些其實在
+    // Data 磁區（掃「/」時一樣走得到），要加起來才是真正的分母
+    let data = Path::new("/System/Volumes/Data");
+    if root == Path::new("/") && data.is_dir() {
+        return Some(df_used(root)? + df_used(data).unwrap_or(0));
+    }
+    df_used(root)
+}
+
+#[cfg(not(windows))]
+fn df_used(root: &Path) -> Option<u64> {
+    let out = std::process::Command::new("/bin/df")
+        .arg("-kP")
+        .arg(root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kb: u64 = text.lines().nth(1)?.split_whitespace().nth(2)?.parse().ok()?;
+    (kb > 0).then(|| kb * 1024)
 }
 
 /// macOS／Linux：掛在 `/Volumes` 底下的那些，加上根目錄本身。
@@ -1284,6 +1307,13 @@ pub fn write_all(table: &Table, dir: &Path, font: Option<&[u8]>) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 問得到開機磁碟用掉多少() {
+        // Mac 上以前一律 None，建檔時整條進度條都不出來
+        let used = used_bytes(&std::env::temp_dir()).expect("問不到用量");
+        assert!(used > 0);
+    }
 
     #[test]
     fn 匯出的_excel_與_pdf_都寫得出來() {
