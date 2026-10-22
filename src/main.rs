@@ -28252,27 +28252,29 @@ impl App {
                     .filter(|&t| t > 0)
                     .map(|t| (self.disk.seen as f64 / t as f64).min(0.99) as f32);
                 if let Some(f) = frac {
-                    ui.add(
+                    // 像 Windows 的進度條一樣把百分比寫在條子正中央（使用者
+                    // 要的）；egui 內建的文字靠左，所以自己畫
+                    let bar = ui.add(
                         egui::ProgressBar::new(f)
                             .desired_width(420.0)
-                            .desired_height(10.0)
+                            .desired_height(20.0)
                             .fill(theme::ACCENT),
+                    );
+                    ui.painter().text(
+                        bar.rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{:.0}%", f * 100.0),
+                        egui::FontId::proportional(13.0),
+                        theme::TEXT,
                     );
                     ui.add_space(4.0);
                 }
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    let text = match frac {
-                        Some(f) => format!(
-                            "正在讀這顆碟… {:.0}%（已經記下 {} 個資料夾）",
-                            f * 100.0,
-                            thousands(self.disk.found as u64)
-                        ),
-                        None => format!(
-                            "正在讀這顆碟…已經記下 {} 個資料夾",
-                            thousands(self.disk.found as u64)
-                        ),
-                    };
+                    let text = format!(
+                        "正在讀這顆碟…已經記下 {} 個資料夾",
+                        thousands(self.disk.found as u64)
+                    );
                     ui.label(egui::RichText::new(text).size(12.5).color(theme::TEXT));
                 });
             }
