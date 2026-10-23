@@ -733,6 +733,20 @@ pub fn list_drives() -> Vec<Drive> {
     out
 }
 
+/// 現在有哪幾個磁碟機代號（GetLogicalDrives 的位元遮罩）。
+///
+/// 只問代號、不碰碟本身，便宜到可以每秒問一次：數字一變就是有碟插上或
+/// 拔掉，這時才重新 [`list_drives`]。以前清單只在進這一頁時找一次，
+/// 檔案總管早就看到新碟了、我們的清單還是舊的（使用者回報）
+#[cfg(windows)]
+pub fn drive_stamp() -> u64 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    unsafe { GetLogicalDrives() as u64 }
+}
+
 // ---------- 寫在硬碟裡的建檔紀錄 ----------
 
 /// 建檔時放在磁區最上層的那個小檔（隱藏）。總表不見、碟拿到別台電腦、
@@ -946,6 +960,19 @@ pub fn list_drives() -> Vec<Drive> {
         }
     }
     out
+}
+
+/// macOS／Linux：`/Volumes` 底下有哪些名字（見 Windows 版的說明）
+#[cfg(not(windows))]
+pub fn drive_stamp() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut names: Vec<_> = fs::read_dir("/Volumes")
+        .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    names.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    names.hash(&mut h);
+    h.finish()
 }
 
 // ---------- 匯出 ----------

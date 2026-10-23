@@ -8558,6 +8558,9 @@ struct DiskDone {
     skipped: Vec<String>,
 }
 
+/// 路徑深度的預設值（使用者舊工具的預設值，照搬）
+const DISK_DEPTH_DEFAULT: &str = "5";
+
 /// 「硬碟管理 ▸ 硬碟檔案管理」的狀態。
 /// 切到別的模組時整份留著，切回來就是剛才離開的樣子
 struct DiskTool {
@@ -8566,9 +8569,13 @@ struct DiskTool {
     /// 選到的那顆碟上次建檔是（幾號, 什麼時候, 是不是從碟裡的紀錄讀到的）。
     /// None＝沒建過（或認不出來）。見 [`App::disk_last_build`]
     last_build: Option<(u32, u64, bool)>,
-    /// 現在接著的硬碟有哪些（進這一頁時找一次，按「↻」再找一次：
-    /// 外接碟隨時會插上或拔掉）
+    /// 現在接著的硬碟有哪些（進這一頁時找一次，按「重新選擇硬碟」再找一次，
+    /// 有碟插上或拔掉時也自動重找：外接碟隨時會換）
     drives: Vec<disk::Drive>,
+    /// 上次找硬碟時的代號遮罩（見 [`disk::drive_stamp`]）與上次比對的時間。
+    /// 停在這一頁時每秒比一次，不一樣就重找
+    drive_stamp: u64,
+    stamp_at: Option<Instant>,
     /// 硬碟編號。畫面上是可以改的文字框，所以存字串
     /// （四位數的寫法見 [`disk::fmt_no`]）
     no_text: String,
@@ -8603,9 +8610,10 @@ impl Default for DiskTool {
             drive: None,
             last_build: None,
             drives: Vec::new(),
+            drive_stamp: 0,
+            stamp_at: None,
             no_text: String::new(),
-            // 使用者舊工具的預設值，照搬
-            depth_text: "5".into(),
+            depth_text: DISK_DEPTH_DEFAULT.into(),
             dir: load_last_dir(LastDir::DiskTable).unwrap_or_else(pictures_dir),
             table: disk::Table::default(),
             loaded: false,
@@ -8897,8 +8905,8 @@ fn search_cell(ui: &mut egui::Ui, w: f32, h: f32, text: &str, color: egui::Color
 struct DiskClicks {
     /// 從清單上挑了哪一顆碟
     pick_drive: Option<disk::Drive>,
-    /// 按了「↻」重新找硬碟
-    refresh: bool,
+    /// 按了「重新選擇硬碟」：重新找硬碟，上一顆碟的資訊清回預設
+    reselect: bool,
     pick_dir: bool,
     scan: bool,
     stop: bool,
@@ -28045,6 +28053,7 @@ impl App {
     /// 左邊挑碟與設定，右邊一欄是總表現況（收了哪幾顆碟、各幾筆）
     fn ui_files_disk(&mut self, ctx: &egui::Context) {
         self.disk_ensure_loaded();
+        self.disk_watch_drives(ctx);
         let mut clicks = DiskClicks::default();
         egui::SidePanel::right("disk_table")
             .frame(
@@ -28072,8 +28081,8 @@ impl App {
         if let Some(d) = clicks.pick_drive.take() {
             self.disk_set_drive(d);
         }
-        if clicks.refresh {
-            self.disk.drives = disk::list_drives();
+        if clicks.reselect {
+            self.disk_reselect();
         }
         if clicks.pick_dir {
             self.disk_pick_table_dir();
@@ -28108,13 +28117,18 @@ impl App {
                 Some(d) => d.show(),
                 None => "請選擇一顆硬碟".to_string(),
             };
+            // 選單有幾顆碟就拉多高，上限是這格底下到視窗底的空間。以前固定
+            // 一個高度，只排得下七顆，再多的要捲才看得到（捲軸平常又是隱藏的），
+            // 外接碟 J:、K: 明明在、看起來卻像沒找到（使用者回報）
+            let room = ui.ctx().screen_rect().bottom()
+                - ui.next_widget_position().y
+                - ui.spacing().interact_size.y
+                - 32.0;
             ui.add_enabled_ui(idle, |ui| {
                 egui::ComboBox::from_id_salt("disk_drive")
                     .selected_text(egui::RichText::new(text).size(13.0))
                     .width(330.0)
-                    // 預設的選單高度在高解析度螢幕上只排得下六顆碟，再多的
-                    // 要捲才看得到——外接碟多的人會以為清單漏了幾顆
-                    .height(560.0)
+                    .height(room.max(200.0))
                     .show_ui(ui, |ui| {
                         if self.disk.drives.is_empty() {
                             ui.label(
@@ -28132,11 +28146,14 @@ impl App {
                     });
             });
             if ui
-                .add_enabled(idle, egui::Button::new("↻").small())
-                .tip("重新找一次硬碟（剛插上的外接碟按這個）")
+                .add_enabled(idle, egui::Button::new("↻  重新選擇硬碟"))
+                .tip(
+                    "重新找一次這台電腦上的硬碟，上一顆碟的資訊（選了哪顆、\n\
+                     上次建檔、編號、深度、做完的訊息）全部回到預設，從頭選起",
+                )
                 .clicked()
             {
-                clicks.refresh = true;
+                clicks.reselect = true;
             }
             // 這一格只收「一整顆碟」。講清楚它不是資料夾選擇器——
             // 沒講的話，第一個反應會是把資料夾拖進來
@@ -28500,8 +28517,7 @@ impl App {
             return;
         }
         self.disk.loaded = true;
-        // 外接碟隨時會插上或拔掉，進這一頁就重新找一次
-        self.disk.drives = disk::list_drives();
+        self.disk_refresh_drives();
         match disk::Table::load(&self.disk.dir) {
             Ok(t) => {
                 self.disk.table = t;
@@ -28514,6 +28530,61 @@ impl App {
                 self.disk.load_error = Some(e);
             }
         }
+    }
+
+    /// 重新找一次接著的硬碟。
+    ///
+    /// 原本選的那顆碟不在了（拔掉，或同一個代號換成另一顆碟）就把選擇清掉：
+    /// 不清的話畫面還寫著舊碟的名字，按下建檔走的卻是同代號的新碟
+    fn disk_refresh_drives(&mut self) {
+        self.disk.drives = disk::list_drives();
+        self.disk.drive_stamp = disk::drive_stamp();
+        self.disk.stamp_at = Some(Instant::now());
+        let gone = self.disk.drive.as_ref().is_some_and(|d| {
+            !self
+                .disk
+                .drives
+                .iter()
+                .any(|o| o.root == d.root && o.serial == d.serial)
+        });
+        if gone {
+            self.disk.drive = None;
+            self.disk.last_build = None;
+        }
+    }
+
+    /// 停在這一頁時每秒看一次代號有沒有變，變了就重找硬碟——剛插上的
+    /// 外接碟不必按按鈕就會出現在清單裡。建檔中不動清單
+    fn disk_watch_drives(&mut self, ctx: &egui::Context) {
+        if self.disk.busy != DiskBusy::Idle {
+            return;
+        }
+        const EVERY: Duration = Duration::from_secs(1);
+        if self.disk.stamp_at.is_none_or(|t| t.elapsed() >= EVERY) {
+            self.disk.stamp_at = Some(Instant::now());
+            if disk::drive_stamp() != self.disk.drive_stamp {
+                self.disk_refresh_drives();
+            }
+        }
+        ctx.request_repaint_after(EVERY);
+    }
+
+    /// 按下「重新選擇硬碟」：重新找硬碟，上一批的資訊全部回到預設
+    /// （使用者要的）——選的碟、上次建檔那一行、做完的訊息、跳過的資料夾
+    /// 清掉，編號回到下一個空號，深度回到預設
+    fn disk_reselect(&mut self) {
+        self.disk_refresh_drives();
+        let d = &mut self.disk;
+        d.drive = None;
+        d.last_build = None;
+        d.no_text = disk::fmt_no(d.table.next_no());
+        d.depth_text = DISK_DEPTH_DEFAULT.into();
+        d.found = 0;
+        d.seen = 0;
+        d.total = None;
+        d.result = None;
+        d.error = None;
+        d.skipped.clear();
     }
 
     /// 選定要建檔的那一顆碟。
