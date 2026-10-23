@@ -8600,6 +8600,10 @@ struct DiskTool {
     total: Option<u64>,
     result: Option<String>,
     error: Option<String>,
+    /// `result`／`error` 是哪一頁做的事留下的：建檔在「2. 硬碟檔案管理」、
+    /// 刪除一號在「3. 檔案搜尋」。兩頁共用這兩格，各自只顯示自己的，
+    /// 建完檔的訊息才不會疊到搜尋頁上
+    msg_from: FilesTab,
     /// 上一次掃描讀不進去而跳過的資料夾
     skipped: Vec<String>,
 }
@@ -8626,6 +8630,7 @@ impl Default for DiskTool {
             total: None,
             result: None,
             error: None,
+            msg_from: FilesTab::Disk,
             skipped: Vec::new(),
         }
     }
@@ -28117,19 +28122,54 @@ impl App {
                 Some(d) => d.show(),
                 None => "請選擇一顆硬碟".to_string(),
             };
-            // 選單有幾顆碟就拉多高，上限是這格底下到視窗底的空間。以前固定
-            // 一個高度，只排得下七顆，再多的要捲才看得到（捲軸平常又是隱藏的），
-            // 外接碟 J:、K: 明明在、看起來卻像沒找到（使用者回報）
-            let room = ui.ctx().screen_rect().bottom()
-                - ui.next_widget_position().y
-                - ui.spacing().interact_size.y
-                - 32.0;
-            ui.add_enabled_ui(idle, |ui| {
-                egui::ComboBox::from_id_salt("disk_drive")
-                    .selected_text(egui::RichText::new(text).size(13.0))
-                    .width(330.0)
-                    .height(room.max(200.0))
-                    .show_ui(ui, |ui| {
+            // 自己做的下拉選單，不用 egui 的 ComboBox：ComboBox 的選單包在
+            // 捲動區裡，高度記住第一次打開時的大小（預設只排得下九顆）就再也
+            // 長不高，多出來的碟要捲才看得到、捲軸平常又是隱藏的——外接碟
+            // 明明在、看起來卻像沒找到（使用者回報兩次）。這裡有幾顆碟就
+            // 拉多高；視窗太矮放不下時才捲，捲軸一直畫出來（使用者要的）
+            let popup = ui.make_persistent_id("disk_drive_popup");
+            let pick = ui.add_enabled(
+                idle,
+                egui::Button::new(egui::RichText::new(text).size(13.0))
+                    .shortcut_text("▼")
+                    .min_size(egui::vec2(330.0, ui.spacing().interact_size.y)),
+            );
+            if pick.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(popup));
+            }
+            // 選單最多拉到視窗底（扣掉選單外框、再留一點邊）。從按鈕底下
+            // 往下量，不能從選單裡面量：選單一超出視窗就會被往上推、蓋住
+            // 按鈕，從被推上去的位置量只會一直維持那個錯的高度
+            let room = (ui.ctx().screen_rect().bottom()
+                - pick.rect.bottom()
+                - egui::Frame::popup(ui.style()).total_margin().sum().y
+                - 8.0)
+                .max(80.0);
+            egui::popup_below_widget(
+                ui,
+                popup,
+                &pick,
+                egui::PopupCloseBehavior::CloseOnClick,
+                |ui| {
+                    // 名字長的碟不折行，選單跟著變寬（ComboBox 也是這樣）
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    // 實心捲軸：要捲的時候一直看得到，不是滑鼠移過去才浮出來
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                    // 先把選單撐到要的高度再放捲動區：選單會記住上一次的大小，
+                    // 不撐開的話捲動區只拿得到那麼高（ComboBox 就是卡在這裡）。
+                    // 要的高度＝上一次量到的清單高度；第一次打開還沒量過，
+                    // 照一列的高度估
+                    let key = popup.with("content_h");
+                    let want = ui.data(|m| m.get_temp::<f32>(key)).unwrap_or_else(|| {
+                        let s = ui.spacing();
+                        let row = (ui.text_style_height(&egui::TextStyle::Button)
+                            + 2.0 * s.button_padding.y)
+                            .max(s.interact_size.y);
+                        let n = self.disk.drives.len().max(1) as f32;
+                        n * row + (n - 1.0) * s.item_spacing.y
+                    });
+                    ui.set_min_height(want.min(room));
+                    let out = egui::ScrollArea::vertical().max_height(room).show(ui, |ui| {
                         if self.disk.drives.is_empty() {
                             ui.label(
                                 egui::RichText::new("找不到硬碟")
@@ -28144,7 +28184,9 @@ impl App {
                             }
                         }
                     });
-            });
+                    ui.data_mut(|m| m.insert_temp(key, out.content_size.y));
+                },
+            );
             if ui
                 .add_enabled(idle, egui::Button::new("↻  重新選擇硬碟"))
                 .tip(
@@ -28337,7 +28379,9 @@ impl App {
             );
             ui.add_space(6.0);
         }
-        if let Some(e) = &self.disk.error {
+        // 訊息只在做那件事的那一頁出現（見 [`DiskTool::msg_from`]）
+        let mine = self.disk.msg_from == FilesTab::Disk;
+        if let Some(e) = self.disk.error.as_ref().filter(|_| mine) {
             ui.label(
                 egui::RichText::new(format!("✖ {e}"))
                     .size(12.0)
@@ -28345,7 +28389,7 @@ impl App {
             );
             ui.add_space(6.0);
         }
-        if let Some(r) = &self.disk.result {
+        if let Some(r) = self.disk.result.as_ref().filter(|_| mine) {
             ui.label(
                 egui::RichText::new(format!("✔ {r}"))
                     .size(12.5)
@@ -28666,6 +28710,8 @@ impl App {
     /// 只會讓畫面在「掃完了嗎」「存好了嗎」之間閃；要讓使用者看的只有
     /// 「現在做到哪、好了沒」
     fn disk_scan(&mut self, ctx: &egui::Context) {
+        self.disk.msg_from = FilesTab::Disk;
+        self.disk.result = None;
         let Some(drive) = self.disk.drive.clone() else {
             self.disk.error = Some("還沒挑要建檔的硬碟".into());
             return;
@@ -29348,7 +29394,11 @@ impl App {
             });
         });
 
-        if let Some(e) = &self.disk.error {
+        // 刪除是在這一頁按的，做完的那句話要在這裡看得到（只寫在「2. 硬碟
+        // 檔案管理」的話按完等於沒有回應）；反過來，建檔的訊息只屬於那一頁，
+        // 不能疊到這裡來（使用者回報）
+        let mine = self.disk.msg_from == FilesTab::Search;
+        if let Some(e) = self.disk.error.as_ref().filter(|_| mine) {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(format!("✖ {e}"))
@@ -29356,9 +29406,7 @@ impl App {
                     .color(theme::ERROR),
             );
         }
-        // 做完的那句話也要在這一頁看得到：刪除是在這裡按的，結果卻只寫在
-        // 「2. 硬碟檔案管理」那一頁的話，按完等於沒有任何回應
-        if let Some(r) = &self.disk.result {
+        if let Some(r) = self.disk.result.as_ref().filter(|_| mine) {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(format!("✔ {r}"))
@@ -29781,6 +29829,7 @@ impl App {
         let dir = self.disk.dir.clone();
         let font = CJK_FONT.get().cloned();
         self.disk.busy = DiskBusy::Writing;
+        self.disk.msg_from = FilesTab::Search;
         self.disk.error = None;
         self.disk.result = None;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -31644,6 +31693,8 @@ impl eframe::App for App {
             } else if self.files_tab == FilesTab::Disk && self.disk.busy == DiskBusy::Idle {
                 // 硬碟檔案管理只從清單挑一整顆碟，拖進來的東西一律不收；
                 // 這裡仍要把它接住（不能往下掉到影片模組去），順便講一句
+                self.disk.msg_from = FilesTab::Disk;
+                self.disk.result = None;
                 self.disk.error =
                     Some("「指定硬碟」只能從上面的清單挑一整顆碟，不收拖進來的資料夾".into());
             }
