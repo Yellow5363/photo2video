@@ -4144,7 +4144,8 @@ fn run_auto_boxes(
     // 同一批照片裁成不同大小（例如從圖庫挑出來各自裁過）：前後張的同一個位置
     // 不是同一個地方，相減出來全是雜訊——動態偵測整個用不上（使用者回報：
     // 10 張自動框選幾乎都框到樹葉上）
-    let mixed = net.is_some() && mixed_sizes(&photos);
+    // 灰澤鵟框過幾張時也這樣做（頭優先，見 BirdKind::head_first_with_manual）
+    let mixed = net.is_some() && (mixed_sizes(&photos) || (bird.head_first_with_manual() && manual.iter().any(|m| m.is_some())));
     let band = if mixed { NET_MIXED_BAND } else { track::NET_SIZE_BAND };
 
     for i in 0..n {
@@ -4455,6 +4456,23 @@ fn mixed_sizes(photos: &[PathBuf]) -> bool {
         }
     }
     false
+}
+
+/// 見 [`App::track_edited_segments`]：`marks` 是手動框的張數（照順序），其餘三個每張一格：
+/// 動過手動框、現在是手動框、現在有框
+fn edited_segments(marks: &[usize], edited: &[bool], manual: &[bool], has_box: &[bool]) -> Vec<bool> {
+    let n = edited.len();
+    // 拿掉的手動框：動過、現在卻不是手動框
+    let removed: Vec<usize> = (0..n).filter(|&i| edited[i] && !manual[i]).collect();
+    let mut affected = vec![false; n];
+    for (k, &a) in marks.iter().enumerate() {
+        let b = marks.get(k + 1).copied().unwrap_or(n);
+        let hit = edited[a] || removed.iter().any(|&r| r > a && r < b) || (a + 1..b).any(|i| !has_box[i]);
+        if hit {
+            affected[a + 1..b].fill(true);
+        }
+    }
+    affected
 }
 
 /// 照片裁成不同大小時，同一顆頭佔畫面寬的比例跟著裁切變（實測一批 10 張，
@@ -6569,6 +6587,15 @@ impl BirdKind {
         matches!(self, BirdKind::Kingfisher)
     }
 
+    /// 使用者框了幾張時，改成「頭優先」：每張直接用網路整張找像頭的地方當候選、挑一條
+    /// 前後連貫的路徑，不先經過動態偵測（同照片裁成不同大小時的做法，見
+    /// track::net_found）。動態偵測一挑錯（背景被風吹的樹、相機跟拍時的樹幹），後面
+    /// 找頭就救不回來。灰澤鵟三組沒學過的連拍，每 8 張框 1 張：88 → 123/140，框錯卻
+    /// 自認有把握的 17 → 0 張。一張都沒框時不這樣做：那三組反而從 88 掉到 44
+    fn head_first_with_manual(self) -> bool {
+        matches!(self, BirdKind::Harrier)
+    }
+
     fn net_look(self) -> track::NetLook {
         match self {
             BirdKind::Kingfisher => track::NetLook { beak_w: track::KINGFISHER_BEAK_W, ..Default::default() },
@@ -6704,9 +6731,14 @@ const TRACK_ZOOM_DEFAULT: f32 = 6.0;
 /// 不必重跑
 #[derive(Default)]
 struct TrackTool {
-    /// 上一次「從手動框追蹤」時用到的手動框（照片 → 框）。下一次只重追
-    /// 手動框有變動的那幾段（見 [`App::spawn_track`]）；清除追蹤時一併忘掉
-    followed: HashMap<PathBuf, [f32; 4]>,
+    /// 上一次「從手動框追蹤」或「自動框選主體」之後，使用者新增、搬過或拿掉手動框的
+    /// 照片。下一次只重算這些框之後的那一段（見 [`App::spawn_track`]、
+    /// [`App::spawn_auto_boxes`]）。改框的當下就記，不靠跟上一趟比對——那份只在記憶體
+    /// 裡，重開專案後會當成每個手動框都動過、從頭重算（使用者回報）
+    edited: std::collections::HashSet<PathBuf>,
+    /// 同 `edited`，但從上一次「自動框選主體」之後算（兩個按鈕各記各的：先框幾張、
+    /// 按自動框選、再按從手動框追蹤時，追蹤仍要知道那幾張動過）
+    edited_auto: std::collections::HashSet<PathBuf>,
     /// 要找的鳥種（見 [`BirdKind`]），存在專案裡
     bird: BirdKind,
     /// 正在預覽上檢查／拖曳修改主體框
@@ -10011,6 +10043,11 @@ impl App {
         }
         // 背景還在跑的話，它算出來的框會蓋掉使用者剛畫的，先叫停
         self.track_cancel();
+        // 真的搬過或新框的手動框，下一次「從手動框追蹤」要重追它之後那一段
+        if next.src == BoxSrc::Manual {
+            self.track.edited.insert(photo.clone());
+            self.track.edited_auto.insert(photo.clone());
+        }
         self.track.boxes.insert(photo, next);
         self.track.error = None;
         // 已經套上鏡頭了就順手重算：改完框立刻看得到新的構圖
@@ -10080,8 +10117,10 @@ impl App {
 
     /// 拿掉某一張的主體框（框錯了、或那張根本沒有主體）
     fn track_remove_box(&mut self, photo: &Path) {
-        if self.track.boxes.remove(photo).is_none() {
-            return;
+        let Some(old) = self.track.boxes.remove(photo) else { return };
+        if old.src == BoxSrc::Manual {
+            self.track.edited.insert(photo.to_path_buf());
+            self.track.edited_auto.insert(photo.to_path_buf());
         }
         if self.track.applied {
             self.apply_track();
@@ -10118,11 +10157,22 @@ impl App {
         TRACK_CANCEL.store(false, Ordering::Relaxed);
         self.track.error = None;
         // 有手動框時只從第一個手動框那張往後修正（使用者定的規矩）：之前的照片原本
-        // 有框的一律不動。每次都從第一張重算，會把原本框對的改錯
-        let first = self.track_manual_idx().first().map(|m| m.0);
-        let kept: Vec<(PathBuf, Subject)> = first
-            .map(|f| self.photos[..f].iter().filter_map(|p| Some((p.clone(), self.track.box_of(p)?))).collect())
-            .unwrap_or_default();
+        // 有框的一律不動。每次都從第一張重算，會把原本框對的改錯。
+        // 上一次之後動過手動框的話，更只重算「動過的手動框之後」那幾段（同從手動框
+        // 追蹤，見 track_edited_segments）；一個都沒動過就照舊重算第一個手動框之後的全部
+        // （例如換了鳥種想整批重跑）
+        let marks = self.track_manual_idx();
+        let first = marks.first().map(|m| m.0);
+        let redo: Option<Vec<bool>> =
+            (!self.track.edited_auto.is_empty() && first.is_some()).then(|| self.track_edited_segments(&marks, &self.track.edited_auto));
+        let kept: Vec<(PathBuf, Subject)> = self
+            .photos
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| first.is_some_and(|f| *i < f) || redo.as_ref().is_some_and(|r| !r[*i]))
+            .filter_map(|(_, p)| self.track.box_of(p).filter(|s| s.src != BoxSrc::Manual).map(|s| (p.clone(), s)))
+            .collect();
+        self.track.edited_auto.clear();
         self.track.clear_derived();
         self.track.auto_keep = kept.iter().map(|(p, _)| p.clone()).collect();
         self.track.boxes.extend(kept);
@@ -10155,6 +10205,19 @@ impl App {
         });
     }
 
+    /// 哪幾張在「動過的手動框之後」那一段（使用者定的規矩，追蹤與自動框選共用）：例如
+    /// 動了 74、78，就用 74 修 75、76、77，用 78 修 79、80；動過的框之前、沒動過的段落都
+    /// 不重算——重算只會冒著把對的改壞的風險。動過＝新框的、搬過的；拿掉的手動框，
+    /// 它原本所在的那一段也算（前後兩個框之間變成新的一段）。整段一個框都沒有的也算。
+    /// `marks` 是手動框（照順序），`edited` 是動過手動框的照片
+    fn track_edited_segments(&self, marks: &[(usize, [f32; 4])], edited: &std::collections::HashSet<PathBuf>) -> Vec<bool> {
+        let marks: Vec<usize> = marks.iter().map(|m| m.0).collect();
+        let edited: Vec<bool> = self.photos.iter().map(|p| edited.contains(p)).collect();
+        let manual: Vec<bool> = self.photos.iter().map(|p| self.track.box_of(p).is_some_and(|s| s.src == BoxSrc::Manual)).collect();
+        let has_box: Vec<bool> = self.photos.iter().map(|p| self.track.box_of(p).is_some()).collect();
+        edited_segments(&marks, &edited, &manual, &has_box)
+    }
+
     /// 從手動框追蹤：把手動框之間（與前後）沒框到的照片一路補起來
     /// （見 [`run_track`]）
     fn spawn_track(&mut self, ctx: &egui::Context) {
@@ -10174,32 +10237,8 @@ impl App {
         // 照片也不動（使用者定的規矩：追蹤不能把原本框對的位置移開），只補
         // 還沒框到、或框得沒把握的
         let first = marks[0].0;
-        // 只重追「手動框有變動」的那幾段（使用者定的規矩）：上一趟追蹤時就在、
-        // 位置也沒動過的手動框，它前後那兩段上一趟已經追過了，不再重算——
-        // 重算只會冒著把對的改壞的風險。變動＝新框的、搬過的；拿掉的手動框，
-        // 它原本所在的那一段也算變動（前後兩個框之間變成新的一段）
-        let changed: Vec<bool> = marks
-            .iter()
-            .map(|(i, r)| self.track.followed.get(&self.photos[*i]) != Some(r))
-            .collect();
-        let removed: Vec<usize> = self
-            .photos
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| self.track.followed.contains_key(*p) && !self.track.box_of(p).is_some_and(|s| s.src == BoxSrc::Manual))
-            .map(|(i, _)| i)
-            .collect();
-        let mut affected = vec![false; self.photos.len()];
-        for k in 0..marks.len() {
-            let a = marks[k].0;
-            let b = marks.get(k + 1).map_or(self.photos.len(), |m| m.0);
-            let hit = changed[k]
-                || changed.get(k + 1).copied().unwrap_or(false)
-                || removed.iter().any(|&r| r > a && r < b);
-            if hit {
-                affected[a + 1..b].fill(true);
-            }
-        }
+        // 只重追「動過的手動框之後」那一段（見 track_edited_segments）
+        let affected = self.track_edited_segments(&marks, &self.track.edited);
         // 要檢查的照片全部都追一次：手動框有變動的段落照常補框；沒變動的段落
         // 只拿來重新判斷——追到的位置跟原本的框對得上就改成有把握，框不搬
         //（使用者要求：每次追蹤後自動重新判斷哪幾張要檢查，不必一張張按「這張沒問題」）
@@ -10220,8 +10259,8 @@ impl App {
             .collect();
         self.track.unsure_before = self.track_unsure().len();
         self.track.follow_note = None;
-        // 記下這一趟用到的手動框，下一趟拿來比對哪幾個有變動
-        self.track.followed = marks.iter().map(|(i, r)| (self.photos[*i].clone(), *r)).collect();
+        // 這一趟已經照這些變動追過了，下一次重新記
+        self.track.edited.clear();
         // 上一次追蹤補上、但沒把握的框：這次只在比對得更有把握時才換掉。
         // 沒把握不代表錯——實測一批八色鳥，多框一張再追蹤一次，有一張原本
         // 對的（沒把握）被重算成錯的直接蓋掉（使用者回報「把對的改成不對」）
@@ -37443,6 +37482,36 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 使用者的例子：80 張，手動框在第 61、73、74、78 張，這次動了 73、74、78——只重算
+    /// 75～77（照 74）與 79、80（照 78）；61 之後那段沒動過不重算
+    #[test]
+    fn only_segments_after_edited_manual_boxes() {
+        let n = 80;
+        let marks = [60usize, 72, 73, 77];
+        let mut edited = vec![false; n];
+        for i in [72, 73, 77] {
+            edited[i] = true;
+        }
+        let mut manual = vec![false; n];
+        for &i in &marks {
+            manual[i] = true;
+        }
+        let has_box = vec![true; n];
+        let a = edited_segments(&marks, &edited, &manual, &has_box);
+        let got: Vec<usize> = (0..n).filter(|&i| a[i]).collect();
+        assert_eq!(got, vec![74, 75, 76, 78, 79]);
+        // 拿掉第 66 張的手動框：61～72 那段變成新的一段，也要重算
+        let mut edited2 = vec![false; n];
+        edited2[65] = true;
+        let a = edited_segments(&marks, &edited2, &manual, &has_box);
+        assert!((61..72).all(|i| a[i]) && !a[74]);
+        // 沒框的那一段也算
+        let mut no_box = has_box.clone();
+        no_box[50] = false;
+        let a = edited_segments(&[40], &vec![false; n], &manual, &no_box);
+        assert!(a[41] && a[79]);
+    }
     use std::path::PathBuf;
 
     /// 一鍵更新的暫存檔名是「接在執行檔名後面」，不是換掉副檔名。Windows 上
