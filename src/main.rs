@@ -4135,9 +4135,11 @@ fn run_auto_boxes(
     // 翠鳥：用圖庫學來的網路找頭，各種大小都試；頭多大等整批找完再定（見 track::settle_net_heads）。
     // 使用者框過幾張的話，先拿那幾張當場再學一下這一批（見 tune_on_manual），
     // 頭多大也就照他框的大小——當場學的時候就是照框的大小學的
-    let tuned = bird.head_net().and_then(|base| tune_on_manual(&photos, manual, base, crop, send));
+    let tuned = bird.head_net().filter(|_| bird.tune_on_manual()).and_then(|base| tune_on_manual(&photos, manual, base, crop, send));
     let net: Option<&[f32]> = tuned.as_deref().or(bird.head_net());
     let mut net_peaks: Vec<Vec<track::NetPeak>> = vec![Vec::new(); n];
+    // 灰澤鵟找不到頭時的備援：脖子的半圓（見 track::collar_heads）
+    let mut collar: Vec<Vec<(f32, f32, f32)>> = vec![Vec::new(); n];
     let known_size = tuned.as_ref().and_then(|_| median_manual_size(manual)).map(|s| s.0);
     // 同一批照片裁成不同大小（例如從圖庫挑出來各自裁過）：前後張的同一個位置
     // 不是同一個地方，相減出來全是雜訊——動態偵測整個用不上（使用者回報：
@@ -4164,16 +4166,12 @@ fn run_auto_boxes(
                 .find(|(k, _)| *k == j)
                 .and_then(|(_, f)| f.as_ref())
         };
-        // 使用者自己框過的不動；讀不到的那張就當作沒框到。
+        // 使用者自己框過的不動；讀不到的那張就當作沒框到。用網路找頭的鳥種（翠鳥、灰澤鵟）
+        // 手動框的那張照樣找（框不會被改，最後一律跳過）：少了它，挑路徑、前後張互相
+        // 驗證頭的位置時那幾張就成了空洞。
         // 第一張與最後一張要拿**同一側的兩張**來比，否則主體在鄰張留下的
         // 殘影與本尊一樣亮，框到哪一個純屬運氣（見 track::detect_candidates）
-        if let (true, false, Some(cur), Some(_), Some(r)) = (keep[i], mixed, at(i), net, manual[i]) {
-            // 使用者框的那一張當成固定點，其他張要跟它接得上（見 track::anchor_found）。
-            // 裁過的一批不這樣做：前後張的位置本來就對不起來，固定點只會把路徑拉歪，
-            // 那幾張照樣整張找頭、一起挑路徑，最後再照手動框校正（見 refine_by_net）
-            cands[i] = vec![track::anchor_found(cur, r)];
-        }
-        if let (false, Some(cur)) = (keep[i] && !mixed, at(i)) {
+        if let (false, Some(cur)) = (keep[i] && net.is_none(), at(i)) {
             let (a, b) = match (i, n) {
                 (0, _) => (at(1), at(2)),
                 (i, n) if i + 1 == n => (at(i - 1), at(i - 2)),
@@ -4186,7 +4184,21 @@ fn run_auto_boxes(
             } else {
                 cands[i] = track::detect_candidates(a, cur, b, track::DET_CANDIDATES, bird.head_style());
                 if let Some(net) = net {
-                    net_peaks[i] = track::net_heads(cur, &cands[i], track::net_sizes(known_size, cur.w, band), net, bird.net_look());
+                    let look = bird.net_look();
+                    if look.whole {
+                        // 整張也找（見 track::NetLook::whole），網路找到的頭另外當幾個候選
+                        net_peaks[i] = track::net_search(cur, [0.0, 0.0, 1.0, 1.0], track::net_sizes(known_size, cur.w, band), net, look);
+                        let extra = track::net_found(cur, &net_peaks[i], NET_WHOLE_CANDS);
+                        cands[i].extend(extra);
+                    } else {
+                        net_peaks[i] = track::net_heads(cur, &cands[i], track::net_sizes(known_size, cur.w, band), net, bird.net_look());
+                    }
+                    if look.collar && !cands[i].is_empty() {
+                        let win = cands[i].iter().map(|c| track::head_window(c.rect)).fold([1.0f32, 1.0, 0.0, 0.0], |a, b| {
+                            [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+                        });
+                        collar[i] = track::collar_heads(cur, &[win]);
+                    }
                 }
             }
         }
@@ -4194,7 +4206,7 @@ fn run_auto_boxes(
     }
 
     if net.is_some() {
-        track::settle_net_heads(&mut cands, &net_peaks, band, mixed, known_size, if mixed { &[] } else { &keep });
+        track::settle_net_heads(&mut cands, &net_peaks, band, mixed, known_size);
     }
     // 先剔除釘在畫面上的東西（浮水印、日期戳記）：相機一移動它們反而像在動，
     // 主體飛出畫面後整段都會黏在簽名上（見 track::drop_overlays）
@@ -4298,9 +4310,15 @@ fn run_auto_boxes(
     // 正面時兩點的重心正好在兩眼之間，側面時那一點緊貼著眼睛（使用者提供
     // 的辨識特徵）。只在這裡用：挑頭、驗證、要不要檢查都照原本的頭判斷
     let aim: Vec<Option<(f32, f32)>> = (0..n)
-        .map(|i| head[i].map(|(hx, hy)| {
-            if bird.red_spots() || net.is_some() { track::red_of(&cands[i], hx, hy).unwrap_or((hx, hy)) } else { (hx, hy) }
-        }))
+        .map(|i| match head[i] {
+            Some((hx, hy)) => Some(if bird.red_spots() || net.is_some() { track::red_of(&cands[i], hx, hy).unwrap_or((hx, hy)) } else { (hx, hy) }),
+            // 找不到頭：灰澤鵟改找脖子的半圓（只在選中的那一團附近找），照樣標要檢查
+            None if headless[i] => picked[i].and_then(|k| {
+                let win = track::head_window(cands[i][k].rect);
+                collar[i].iter().find(|p| p.0 >= win[0] && p.0 <= win[2] && p.1 >= win[1] && p.1 <= win[3]).map(|p| (p.0, p.1))
+            }),
+            None => None,
+        })
         .collect();
     let shown = |i: usize, k: usize| -> [f32; 4] {
         let r = cands[i][k].rect;
@@ -4375,6 +4393,14 @@ fn run_auto_boxes(
         }
     }
     let mut latest = latest.lock().unwrap().clone();
+    // 使用者手動框的那幾張也放進來：最後幾趟核對會拿前後最近的可靠照片當範本，
+    // 手動框算可靠，卻沒有位置可用的話，旁邊那幾張整個跳過不核對（實測一批灰澤鵟，
+    // 每 8 張框 1 張反而比一張都不框還差）
+    for (i, r) in manual.iter().enumerate() {
+        if let Some(r) = r {
+            latest[i] = Some(Subject { rect: *r, src: BoxSrc::Manual, score: 1.0 });
+        }
+    }
     match net {
         // 翠鳥：照手動框的大小用網路找（見 refine_by_net）
         Some(net) => refine_by_net(&photos, manual, &vec![true; n], &mut latest, net, bird.net_look(), crop, send),
@@ -4435,11 +4461,14 @@ fn mixed_sizes(photos: &[PathBuf]) -> bool {
 /// 寬 2995～4826 像素，差 1.6 倍），頭寬的容許範圍要放寬到這麼多倍
 const NET_MIXED_BAND: f32 = 2.0;
 
+/// 整張用網路找到的頭另外當幾個候選（見 track::NetLook::whole）
+const NET_WHOLE_CANDS: usize = 3;
+
 /// 用網路校正時，在現有框的幾個框寬以內找
 const NET_REFINE_REACH: f32 = 2.5;
 
 /// 網路分數（logit）至少要這樣才搬框
-const NET_REFINE_Z: f32 = 2.0;
+const NET_REFINE_Z: f32 = 1.0;
 
 /// 用網路校正時，前後幾張以內有手動框就以手動框的位置為準找
 const NET_ANCHOR_GAP: usize = 3;
@@ -4448,7 +4477,7 @@ const NET_ANCHOR_GAP: usize = 3;
 const NET_KEEP_R: f32 = 0.5;
 
 /// 「像頭」：分數不比找到最好的那一處低超過這麼多
-const NET_KEEP_MARGIN: f32 = 2.0;
+const NET_KEEP_MARGIN: f32 = 0.5;
 
 /// 翠鳥（用網路找頭的鳥種）的「照手動框校正」：`net` 是拿手動框當場學過的網路
 /// （見 [`tune_on_manual`]），頭多大就照手動框的大小。在 `todo` 那幾張現有框的附近（[`NET_REFINE_REACH`]
@@ -6533,10 +6562,17 @@ impl BirdKind {
 
     /// 用網路找頭時另外看的線索（見 track::NetLook）。翠鳥看鳥嘴：又長又直的深色嘴是
     /// 牠最明顯的特徵（灰澤鵟的嘴短而帶鉤，那套量法不適用）；灰澤鵟看黃色的鼻子
+    /// 使用者框了幾張時，要不要先拿那幾張當場再訓練網路（見 tune_on_manual）。
+    /// 翠鳥要：一批藍天前、黃綠松針旁的飛行照，框 3 張其餘 6 張學過對 6 張、沒學只對 2 張。
+    /// 灰澤鵟不要：每 8 張框 1 張，三組沒看過的連拍學過反而從 108/140 掉到 90/140
+    fn tune_on_manual(self) -> bool {
+        matches!(self, BirdKind::Kingfisher)
+    }
+
     fn net_look(self) -> track::NetLook {
         match self {
-            BirdKind::Kingfisher => track::NetLook { beak_w: track::KINGFISHER_BEAK_W, cere: false },
-            BirdKind::Harrier => track::NetLook { beak_w: 0.0, cere: true },
+            BirdKind::Kingfisher => track::NetLook { beak_w: track::KINGFISHER_BEAK_W, ..Default::default() },
+            BirdKind::Harrier => track::NetLook { cere: true, sharp_w: 3.0, whole: true, collar: true, ..Default::default() },
             _ => track::NetLook::default(),
         }
     }
@@ -6721,6 +6757,9 @@ struct TrackTool {
     unsure_before: usize,
     /// 這一趟追蹤裡「只重新判斷、不搬框」的照片（手動框沒變的段落裡要檢查的）
     verify_only: std::collections::HashSet<PathBuf>,
+    /// 這一趟自動框選不動的照片：第一個手動框之前、原本就有框的（使用者定的規矩，
+    /// 見 spawn_auto_boxes）
+    auto_keep: std::collections::HashSet<PathBuf>,
 }
 
 impl Default for TrackJob {
@@ -10051,6 +10090,7 @@ impl App {
 
     /// 中止背景工作（使用者按取消、照片換掉、關程式）
     fn track_cancel(&mut self) {
+        self.track.auto_keep.clear();
         if self.track.rx.is_some() {
             TRACK_CANCEL.store(true, Ordering::Relaxed);
             self.track.rx = None;
@@ -10077,7 +10117,15 @@ impl App {
         self.track_cancel();
         TRACK_CANCEL.store(false, Ordering::Relaxed);
         self.track.error = None;
+        // 有手動框時只從第一個手動框那張往後修正（使用者定的規矩）：之前的照片原本
+        // 有框的一律不動。每次都從第一張重算，會把原本框對的改錯
+        let first = self.track_manual_idx().first().map(|m| m.0);
+        let kept: Vec<(PathBuf, Subject)> = first
+            .map(|f| self.photos[..f].iter().filter_map(|p| Some((p.clone(), self.track.box_of(p)?))).collect())
+            .unwrap_or_default();
         self.track.clear_derived();
+        self.track.auto_keep = kept.iter().map(|(p, _)| p.clone()).collect();
+        self.track.boxes.extend(kept);
         self.track.job = TrackJob::Auto;
         self.track.phase = None;
         self.track.total = self.photos.len();
@@ -10190,6 +10238,7 @@ impl App {
         // 重新判斷的）
         let net = self.track.bird.head_net();
         let look = self.track.bird.net_look();
+        let tune = self.track.bird.tune_on_manual();
         let manual: Vec<Option<[f32; 4]>> = self
             .photos
             .iter()
@@ -10232,9 +10281,8 @@ impl App {
             let Some((a, b)) = done.into_inner().unwrap() else { return };
             if !TRACK_CANCEL.load(Ordering::Relaxed) {
                 let mut latest = latest.into_inner().unwrap();
-                if let Some(tuned) = tune_on_manual(&photos, &manual, net, crop, &send) {
-                    refine_by_net(&Arc::new(photos), &manual, &todo, &mut latest, &tuned, look, crop, &send);
-                }
+                let tuned = if tune { tune_on_manual(&photos, &manual, net, crop, &send) } else { None };
+                refine_by_net(&Arc::new(photos), &manual, &todo, &mut latest, tuned.as_deref().unwrap_or(net), look, crop, &send);
             }
             send(TrackMsg::Done(a, b));
         });
@@ -10259,6 +10307,9 @@ impl App {
                             if self.track.box_of(p).is_some_and(|b| b.src == BoxSrc::Manual) {
                                 continue;
                             }
+                            if self.track.auto_keep.contains(p) {
+                                continue;
+                            }
                             // 只拿來重新判斷的照片（手動框沒變的那幾段）：框不搬，追到的
                             // 位置跟原本的框對得上、又有把握，才把原本的框改成有把握
                             if self.track.verify_only.contains(p) {
@@ -10276,6 +10327,7 @@ impl App {
                     }
                 }
                 TrackMsg::Done(found, total) => {
+                    self.track.auto_keep.clear();
                     if self.track.job == TrackJob::Follow {
                         self.track_rejudge_between();
                         let after = self.track_unsure().len();
@@ -10290,6 +10342,7 @@ impl App {
                     finished = true;
                 }
                 TrackMsg::Failed(e) => {
+                    self.track.auto_keep.clear();
                     self.track.error = Some(e);
                     finished = true;
                 }

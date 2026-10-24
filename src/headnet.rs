@@ -70,7 +70,7 @@ pub fn kingfisher() -> &'static [f32] {
     W.get_or_init(|| load(KINGFISHER))
 }
 
-/// 灰澤鵟的權重：使用者的四組連拍與幾張單張，不同隨機種子訓練三個網路一起投票
+/// 灰澤鵟的權重：使用者的六組連拍與幾張單張，不同隨機種子訓練三個網路一起投票
 /// （見 [`score_map`]）。輪流留一組不學當考題，單一網路平均第 1 組 11/22、第 3 組
 /// 19～30/86，三個一起 19/22、62/86
 pub fn harrier() -> &'static [f32] {
@@ -540,6 +540,10 @@ impl Shot {
 /// 訓練的設定
 struct Train {
     epochs: usize,
+    /// 正樣本在標記點附近多大範圍內取（框寬的幾倍，正方形的半邊）
+    pos_r: f32,
+    /// 反例至少離標記點多遠（框寬的幾倍）
+    neg_r: f32,
     /// 學習率（最後四分之一輪降成四分之一）
     lr: f32,
     /// 從第幾輪起挖難反例、之後每隔幾輪重挖（見 [`mine`]）
@@ -595,16 +599,16 @@ fn train(p: &mut [f32], shots: &[Shot], t: &Train) {
                     0.8 + rng.u() * 0.45
                 };
                 let (x, y) = if pos || (wrong_scale && q % 2 == 0) {
-                    (sh.gx + (rng.u() - 0.5) * 0.25 * KS, sh.gy + (rng.u() - 0.5) * 0.25 * KS)
+                    (sh.gx + (rng.u() - 0.5) * 2.0 * t.pos_r * KS, sh.gy + (rng.u() - 0.5) * 2.0 * t.pos_r * KS)
                 } else {
                     loop {
                         let (x, y) = if q % 3 == 0 {
                             (rng.u() * w, rng.u() * h)
                         } else {
-                            let (a, d) = (rng.u() * std::f32::consts::TAU, (0.55 + rng.u() * 2.5) * KS);
+                            let (a, d) = (rng.u() * std::f32::consts::TAU, (t.neg_r + rng.u() * 2.5) * KS);
                             (sh.gx + a.cos() * d, sh.gy + a.sin() * d)
                         };
-                        if (x - sh.gx).hypot(y - sh.gy) >= 0.55 * KS && x >= 0.0 && y >= 0.0 && x < w && y < h {
+                        if (x - sh.gx).hypot(y - sh.gy) >= t.neg_r * KS && x >= 0.0 && y >= 0.0 && x < w && y < h {
                             break (x, y);
                         }
                     }
@@ -678,7 +682,7 @@ pub fn fine_tune(base: &[f32], marked: &[(RgbImage, [f32; 4])]) -> Vec<f32> {
     if !shots.is_empty() {
         // 好幾個網路接在一起時各學各的
         for q in p.chunks_exact_mut(L.n) {
-            train(q, &shots, &Train { epochs: TUNE_EPOCHS, lr: 0.001, hard_from: 0, hard_every: 5, seed: 0x1234_5678_9abc_def1, log: false });
+            train(q, &shots, &Train { epochs: TUNE_EPOCHS, pos_r: 0.125, neg_r: 0.55, lr: 0.001, hard_from: 0, hard_every: 5, seed: 0x1234_5678_9abc_def1, log: false });
         }
     }
     p
@@ -728,12 +732,17 @@ mod tests {
         let proj = std::env::var("P2V_HEAD_P2V").expect("P2V_HEAD_P2V");
         let out = std::env::var("P2V_HEAD_OUT").expect("P2V_HEAD_OUT");
         let epochs: usize = std::env::var("P2V_HEAD_EPOCHS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-        // 可以給好幾個專案，以分號隔開
+        // 可以給好幾個專案，以分號隔開。只取手動框；專案路徑後面加「*」的連自動框也算
+        // （使用者看過、說那些也都對的專案）
         let labels: Vec<_> = proj
             .split(';')
             .flat_map(|f| {
+                let (f, all) = match f.strip_suffix('*') {
+                    Some(f) => (f, true),
+                    None => (f, false),
+                };
                 let pf: crate::ProjectFile = serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
-                pf.track_boxes.into_iter().filter(|b| b.2 == 0)
+                pf.track_boxes.into_iter().filter(move |b| all || b.2 == 0)
             })
             .collect();
         let shots: Vec<Shot> = std::thread::scope(|sc| {
@@ -759,7 +768,11 @@ mod tests {
             }
         }
         let seed = std::env::var("P2V_HEAD_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0x9e3779b97f4a7c15);
-        train(&mut p, &shots, &Train { epochs, lr: 0.002, hard_from: 20, hard_every: 10, seed, log: true });
+        train(&mut p, &shots, &Train {
+                epochs,
+                pos_r: std::env::var("P2V_HEAD_POSR").ok().and_then(|v| v.parse().ok()).unwrap_or(0.125),
+                neg_r: std::env::var("P2V_HEAD_NEGR").ok().and_then(|v| v.parse().ok()).unwrap_or(0.55),
+                lr: 0.002, hard_from: 20, hard_every: 10, seed, log: true });
         let bytes: Vec<u8> = p.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&out, bytes).unwrap();
     }

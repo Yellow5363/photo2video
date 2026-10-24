@@ -1076,6 +1076,168 @@ const CERE_ALONE_MAX: usize = 2;
 /// 十字擺在黃鼻子上方幾個頭寬：正面時兩眼就在這個高度的兩側
 const CERE_UP: f32 = 0.1;
 
+/// 一張照片哪裡清晰（用網路找頭時用，見 [`net_search`]）：與 [`HeadMaps`] 同一套量法，
+/// 最細的細節強度，以及「細節 ÷ 粗一級的輪廓」（見 [`HeadMaps::crisp_at`]），
+/// 各取全張前 1% 當尺
+struct SharpMap {
+    w: usize,
+    h: usize,
+    s_fine: Vec<f64>,
+    s_coarse: Vec<f64>,
+    floor: f64,
+    ref_sharp: f64,
+    ref_crisp: f64,
+}
+
+impl SharpMap {
+    fn new(cur: &Frame) -> SharpMap {
+        let p = cur.pyramid(2);
+        let fine = sharpness(&p[0], &p[1]);
+        let coarse = coarse_detail(&p[2], &p[1]);
+        let (w, h) = (fine.w.min(coarse.w), fine.h.min(coarse.h));
+        let w1 = w + 1;
+        let (mut s_fine, mut s_coarse) = (vec![0f64; w1 * (h + 1)], vec![0f64; w1 * (h + 1)]);
+        for y in 0..h {
+            let (mut a, mut b) = (0f64, 0f64);
+            for x in 0..w {
+                a += fine.px[y * fine.w + x] as f64;
+                b += coarse.px[y * coarse.w + x] as f64;
+                s_fine[(y + 1) * w1 + x + 1] = s_fine[y * w1 + x + 1] + a;
+                s_coarse[(y + 1) * w1 + x + 1] = s_coarse[y * w1 + x + 1] + b;
+            }
+        }
+        let mut cs: Vec<f32> = coarse.px.clone();
+        cs.sort_by(f32::total_cmp);
+        let floor = cs.get(cs.len() / 2).copied().unwrap_or(0.0).max(1.0) as f64;
+        let mut m = SharpMap { w, h, s_fine, s_coarse, floor, ref_sharp: 0.0, ref_crisp: 0.0 };
+        let r = ((w.max(h) as f32 * HEAD_RADIUS).round() as usize).max(2);
+        let (mut vs, mut vc) = (Vec::new(), Vec::new());
+        let mut y = r;
+        while y + r + 1 < h {
+            let mut x = r;
+            while x + r + 1 < w {
+                let (s, c) = m.at(x - r, y - r, x + r + 1, y + r + 1);
+                vs.push(s);
+                vc.push(c);
+                x += 2;
+            }
+            y += 2;
+        }
+        vs.sort_by(f64::total_cmp);
+        vc.sort_by(f64::total_cmp);
+        m.ref_sharp = vs.get(vs.len() * 99 / 100).copied().unwrap_or(0.0);
+        m.ref_crisp = vc.get(vc.len() * 99 / 100).copied().unwrap_or(0.0);
+        m
+    }
+
+    /// [x0, x1) × [y0, y1)（這張圖的格子）的（平均細節, 細節 ÷ 輪廓）
+    fn at(&self, x0: usize, y0: usize, x1: usize, y1: usize) -> (f64, f64) {
+        let w1 = self.w + 1;
+        let sum = |v: &[f64]| v[y1 * w1 + x1] + v[y0 * w1 + x0] - v[y0 * w1 + x1] - v[y1 * w1 + x0];
+        let n = ((x1 - x0) * (y1 - y0)).max(1) as f64;
+        let (f, c) = (sum(&self.s_fine), sum(&self.s_coarse));
+        (f / n, f / (c + self.floor * n))
+    }
+
+    /// 工作圖上 (x, y) 附近（頭寬 `s` 像素那麼大一塊）有多清晰：0（糊）～1（跟全張
+    /// 最清晰的地方一樣）。門檻同 [`HEAD_SHARP`]、[`HEAD_CRISP`]
+    fn gate(&self, x: f32, y: f32, s: f32) -> f32 {
+        let (cx, cy, r) = (x / 2.0, y / 2.0, (s / 4.0).max(2.0));
+        let cl = |v: f32, n: usize| (v.max(0.0) as usize).min(n);
+        let (x0, y0, x1, y1) = (cl(cx - r, self.w), cl(cy - r, self.h), cl(cx + r + 1.0, self.w), cl(cy + r + 1.0, self.h));
+        if x1 <= x0 || y1 <= y0 || self.ref_sharp <= 0.0 {
+            return 1.0;
+        }
+        let (s, c) = self.at(x0, y0, x1, y1);
+        let a = (s / (self.ref_sharp * HEAD_SHARP as f64)).min(1.0);
+        let b = (c / (self.ref_crisp * HEAD_CRISP as f64).max(1e-9)).min(1.0);
+        (a * b) as f32
+    }
+}
+
+/// 灰澤鵟：找不到頭時的備援——找脖子那一圈偏白偏黃的半圓（使用者提供：側面時臉盤
+/// 後面有一圈半圓的羽毛就是脖子，脖子往飛行方向那一側就是頭）。
+///
+/// 在 `wins`（相對座標）範圍內逐點試：以那一點為圓心、半徑半個頭寬的圓上，有沒有
+/// 一段（[`COLLAR_ARC`] 度）比圓裡面、圓外面都亮的弧——有的話，圓心就是被脖子圍住
+/// 的頭。頭多大不知道，幾種大小都試。回傳最像的幾處 (x, y, 亮多少)，相對座標。
+///
+/// 實測使用者框好的五組連拍：標記點（頭）上量得到這種弧（亮 10 以上）的 43%，
+/// 身體與旁邊其他地方 22%——單獨拿來找頭不夠準，所以只在原本的找法找不到頭時才用
+pub fn collar_heads(cur: &Frame, wins: &[[f32; 4]]) -> Vec<(f32, f32, f32)> {
+    let (w, h) = (cur.w as f32, cur.h as f32);
+    let mut all: Vec<(f32, f32, f32)> = Vec::new();
+    for frac in COLLAR_SIZES {
+        let hs = frac * w;
+        let r = hs * 0.5;
+        let step = (r / 2.0).max(2.0);
+        for win in wins {
+            let (x0, y0) = ((win[0] * w).max(r * 1.5), (win[1] * h).max(r * 1.5));
+            let (x1, y1) = ((win[2] * w).min(w - r * 1.5), (win[3] * h).min(h - r * 1.5));
+            let mut y = y0;
+            while y <= y1 {
+                let mut x = x0;
+                while x <= x1 {
+                    let v = collar_at(cur, x, y, r);
+                    if v >= COLLAR_MIN {
+                        all.push((x / w, y / h, v));
+                    }
+                    x += step;
+                }
+                y += step;
+            }
+        }
+    }
+    all.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let mut out: Vec<(f32, f32, f32)> = Vec::new();
+    for p in all {
+        if out.iter().all(|q| ((q.0 - p.0) * w).hypot((q.1 - p.1) * h) > COLLAR_SIZES[0] * w) {
+            out.push(p);
+            if out.len() == COLLAR_KEEP {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 以 (x, y) 為圓心、半徑 r 的圓上，最亮的一段弧比圓裡面（0.5r）與外面（1.5r）亮多少
+fn collar_at(f: &Frame, x: f32, y: f32, r: f32) -> f32 {
+    const N: usize = 36;
+    let ring = |rr: f32| -> [f32; N] {
+        std::array::from_fn(|k| {
+            let a = k as f32 * std::f32::consts::TAU / N as f32;
+            f.sample(x + a.cos() * rr, y + a.sin() * rr)
+        })
+    };
+    let (mid, inn, out) = (ring(r), ring(r * 0.5), ring(r * 1.5));
+    let span = ((COLLAR_ARC / 360.0) * N as f32).round() as usize;
+    let mut best = f32::MIN;
+    for c in 0..N {
+        let (mut sm, mut si, mut so) = (0f32, 0f32, 0f32);
+        for d in 0..span {
+            let k = (c + N - span / 2 + d) % N;
+            sm += mid[k];
+            si += inn[k];
+            so += out[k];
+        }
+        best = best.max((sm - si.max(so)) / span as f32);
+    }
+    best
+}
+
+/// 脖子那段弧的角度
+const COLLAR_ARC: f32 = 120.0;
+
+/// 弧至少要比裡外亮這麼多（0~255）
+const COLLAR_MIN: f32 = 10.0;
+
+/// 試的頭寬（佔畫面寬的比例）
+const COLLAR_SIZES: [f32; 5] = [0.02, 0.03, 0.045, 0.065, 0.09];
+
+/// 每張留幾處
+const COLLAR_KEEP: usize = 3;
+
 /// 各鳥種找頭時另外看的線索（見 [`net_search`]）
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NetLook {
@@ -1083,6 +1245,14 @@ pub struct NetLook {
     pub beak_w: f32,
     /// 十字擺在黃色鼻子（蠟膜）正上方（灰澤鵟，見 [`cere_aim`]）
     pub cere: bool,
+    /// 模糊的地方網路分數最多扣多少（見 [`SharpMap::gate`]）：鳥幾乎都在全張最清晰的
+    /// 地方，背景散景裡像頭的花紋不算
+    pub sharp_w: f32,
+    /// 除了動態偵測的候選，也整張用網路找頭當候選（見 [`net_found`]）：相機跟著鳥轉時
+    /// 背景被風吹的竹子、草也像在動，動態偵測會抓錯，鳥不在找頭的範圍裡
+    pub whole: bool,
+    /// 找不到頭時改找脖子那一圈偏白偏黃的半圓（灰澤鵟，見 [`collar_heads`]）
+    pub collar: bool,
 }
 
 /// 用圖庫學來的網路找頭（翠鳥，見 [`crate::headnet`]）時，網路在一張照片上
@@ -1155,7 +1325,7 @@ impl Frame {
 }
 
 /// 找鳥頭的範圍（相對座標）：動態框的 [`HEAD_WIN`] 倍、至少 [`HEAD_WIN_MIN`]
-fn head_window(rect: [f32; 4]) -> [f32; 4] {
+pub fn head_window(rect: [f32; 4]) -> [f32; 4] {
     let (cx, cy) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
     let ww = ((rect[2] - rect[0]) * HEAD_WIN).max(HEAD_WIN_MIN) / 2.0;
     let wh = ((rect[3] - rect[1]) * HEAD_WIN).max(HEAD_WIN_MIN) / 2.0;
@@ -1247,6 +1417,8 @@ pub const KINGFISHER_BEAK_W: f32 = 3.0;
 pub fn net_search(cur: &Frame, win: [f32; 4], sizes: (f32, f32), net: &[f32], look: NetLook) -> Vec<NetPeak> {
     use crate::headnet::{score_map, KS, NP};
     let Some(rgb) = cur.rgb() else { return Vec::new() };
+    let sharp = (look.sharp_w > 0.0).then(|| SharpMap::new(cur));
+    let sharp = sharp.as_ref();
     let (w, h) = (cur.w as f32, cur.h as f32);
     let (wx0, wy0) = ((win[0] * w).max(0.0), (win[1] * h).max(0.0));
     let (wx1, wy1) = ((win[2] * w).min(w), (win[3] * h).min(h));
@@ -1288,7 +1460,7 @@ pub fn net_search(cur: &Frame, win: [f32; 4], sizes: (f32, f32), net: &[f32], lo
                             NetPeak {
                                 x: ax / w,
                                 y: ay / h,
-                                z: z + beak * look.beak_w,
+                                z: z + beak * look.beak_w - sharp.map_or(0.0, |m| look.sharp_w * (1.0 - m.gate(ax, ay, sp))),
                                 sx: sp / w,
                                 sy: sp / h,
                                 aim: if look.cere { cere_aim(rgb, ax, ay, sp).map(|(x, y)| (x / w, y / h)) } else { None },
@@ -1341,26 +1513,6 @@ pub fn net_found(cur: &Frame, peaks: &[NetPeak], max: usize) -> Vec<Found> {
 /// [`net_found`] 的候選分數：網路分數到這裡算滿分
 const NET_Z_FOUND: f32 = 8.0;
 
-/// 使用者手動框的那一張當成候選：只有這一個，頭就在框中心、滿分。
-/// 整批挑路徑時一定會經過它，其他張要跟它接得上（見 [`choose_path`]、
-/// [`choose_heads`]）——不放進來的話，那幾張等於空著，剩下的照片沒有依據，
-/// 實測一批 10 張框了 5 張，其餘 5 張有 3 張被挑到畫面邊上的松針
-pub fn anchor_found(cur: &Frame, rect: [f32; 4]) -> Found {
-    let cp = cur.pyramid(DET_SHIFT);
-    let f = &cp[DET_DIFF];
-    let (fw, fh) = (f.w as f32, f.h as f32);
-    let (cx, cy) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
-    Found {
-        rect,
-        score: 1.0,
-        shift_gain: 1.0,
-        heads: [(cx, cy, 1.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
-        reds: [None; HEAD_PEAKS],
-        sharp: 0.0,
-        sig: signature(f, rect[0] * fw, rect[1] * fh, rect[2] * fw, rect[3] * fh),
-    }
-}
-
 /// 整批找完之後定下頭的大小，再把每個候選的 `heads` 換成網路找到的頭。
 ///
 /// 頭多大：每張分數最高的那一處各投一票（分數夠高的才算），取中位數。
@@ -1370,15 +1522,13 @@ pub fn anchor_found(cur: &Frame, rect: [f32; 4]) -> Found {
 /// 佔畫面的比例也跟著變，要放寬）。`drop_headless` 為真時，範圍內一個頭也沒有
 /// 的候選直接拿掉（候選本身就是網路找到的頭時用，見 [`net_found`]）。
 /// `known` 是已知的頭寬（佔畫面寬的比例，例如使用者手動框的大小——網路就是
-/// 照框的大小訓練的），有的話就不用投票。`fixed` 為真的那幾張是使用者手動框的
-/// （見 [`anchor_found`]），不動
+/// 照框的大小訓練的），有的話就不用投票
 pub fn settle_net_heads(
     cands: &mut [Vec<Found>],
     peaks: &[Vec<NetPeak>],
     band: f32,
     drop_headless: bool,
     known: Option<f32>,
-    fixed: &[bool],
 ) {
     // 每張最有把握的那一處投一票（分數夠高的才算）
     let vote: Vec<Option<f32>> = peaks
@@ -1403,9 +1553,6 @@ pub fn settle_net_heads(
         v.get(v.len() / 2).copied()
     };
     for (i, (list, found)) in cands.iter_mut().zip(peaks).enumerate() {
-        if fixed.get(i).copied().unwrap_or(false) {
-            continue;
-        }
         let size = size_at(i);
         let fits = |p: &NetPeak| size.is_none_or(|s| p.sx >= s / band && p.sx <= s * band);
         for c in list.iter_mut() {
