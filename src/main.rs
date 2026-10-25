@@ -4313,11 +4313,19 @@ fn run_auto_boxes(
     let aim: Vec<Option<(f32, f32)>> = (0..n)
         .map(|i| match head[i] {
             Some((hx, hy)) => Some(if bird.red_spots() || net.is_some() { track::red_of(&cands[i], hx, hy).unwrap_or((hx, hy)) } else { (hx, hy) }),
-            // 找不到頭：灰澤鵟改找脖子的半圓（只在選中的那一團附近找），照樣標要檢查
-            None if headless[i] => picked[i].and_then(|k| {
-                let win = track::head_window(cands[i][k].rect);
-                collar[i].iter().find(|p| p.0 >= win[0] && p.0 <= win[2] && p.1 >= win[1] && p.1 <= win[3]).map(|p| (p.0, p.1))
-            }),
+            // 頭沒通過前後張的驗證（或根本沒找到）：照樣標要檢查，但十字不退回「會動那一團」
+            // 的中心——用網路找的鳥種，網路找到的頭多半就是頭，只是前後張沒找到、驗證不了
+            //（實測一批灰澤鵟，網路找到的頭跟使用者標的差不到一成框寬，十字卻退到尾巴上）。
+            // 連頭都沒有，灰澤鵟再找脖子的半圓（只在選中的那一團附近找）
+            None if headless[i] => found_head[i]
+                .filter(|_| net.is_some())
+                .map(|(hx, hy, _)| track::red_of(&cands[i], hx, hy).unwrap_or((hx, hy)))
+                .or_else(|| {
+                    picked[i].and_then(|k| {
+                        let win = track::head_window(cands[i][k].rect);
+                        collar[i].iter().find(|p| p.0 >= win[0] && p.0 <= win[2] && p.1 >= win[1] && p.1 <= win[3]).map(|p| (p.0, p.1))
+                    })
+                }),
             None => None,
         })
         .collect();
