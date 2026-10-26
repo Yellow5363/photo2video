@@ -3844,6 +3844,18 @@ fn spread_drift(hits: &mut [(usize, Option<track::Hit>)], target: (f32, f32)) {
     }
 }
 
+/// 「從手動框追蹤」的起點：手動框，加上沿途**有把握的框**（自動框選或上一趟追蹤找的）。
+/// 有把握的框本來就不動（使用者定的規矩），拿來當新的起點，每一段就從最近的可靠框出發、
+/// 到下一個可靠框為止——只拿手動框當起點的話，最後一個手動框之後要一路追到最後一張，
+/// 實測一批翠鳥從第 13 張追到第 82 張，後段框對了只是沒把握的那幾張全被追偏
+fn follow_marks(boxes: &[Option<Subject>]) -> Vec<(usize, [f32; 4])> {
+    boxes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.filter(|s| s.src == BoxSrc::Manual || s.sure()).map(|s| (i, s.rect)))
+        .collect()
+}
+
 /// 追蹤整批照片。
 ///
 /// `marks` 是使用者框過的照片（照片順序，至少一個），`need` 是要補的那幾張
@@ -10269,14 +10281,11 @@ impl App {
         self.track.follow_note = None;
         // 這一趟已經照這些變動追過了，下一次重新記
         self.track.edited.clear();
-        // 上一次追蹤補上、但沒把握的框：這次只在比對得更有把握時才換掉。
-        // 沒把握不代表錯——實測一批八色鳥，多框一張再追蹤一次，有一張原本
-        // 對的（沒把握）被重算成錯的直接蓋掉（使用者回報「把對的改成不對」）
-        let keep_own: Vec<bool> = self
-            .photos
-            .iter()
-            .map(|p| self.track.box_of(p).is_some_and(|s| s.src == BoxSrc::Tracked))
-            .collect();
+        // 已經有框（上一趟追蹤補的、自動框選找的）但沒把握的：這次只在比對得更有把握時
+        // 才換掉。沒把握不代表錯——實測一批八色鳥，多框一張再追蹤一次，有一張原本對的
+        // （沒把握）被重算成錯的直接蓋掉；一批翠鳥自動框選框對、卻標要檢查的 4 張，追蹤後
+        // 全被搬到 5～9 個框寬外（使用者回報「本來框到的都被移走了」）
+        let keep_own: Vec<bool> = self.photos.iter().map(|p| self.track.box_of(p).is_some()).collect();
         self.track.job = TrackJob::Follow;
         self.track.phase = None;
         self.track.total = self.photos.len() - first;
@@ -10292,6 +10301,8 @@ impl App {
             .map(|p| self.track.box_of(p).filter(|s| s.src == BoxSrc::Manual).map(|s| s.rect))
             .collect();
         let start: Vec<Option<Subject>> = self.photos.iter().map(|p| self.track.box_of(p)).collect();
+        // 追蹤的起點：手動框，加上沿途有把握的框（見 follow_marks）
+        let seeds = follow_marks(&start);
         let todo: Vec<bool> = (0..self.photos.len()).map(|i| need[i] && affected[i]).collect();
         let photos = self.photos.clone();
         let crop = self.effective_adj(&photos[marks[0].0]).crop;
@@ -10304,7 +10315,7 @@ impl App {
                 ctx.request_repaint();
             };
             let Some(net) = net else {
-                run_track(&photos, &marks, &need, &keep_own, crop, &send);
+                run_track(&photos, &seeds, &need, &keep_own, crop, &send);
                 return;
             };
             // 翠鳥：追完再照手動框的大小用網路校正這一趟補上的框（見 refine_by_net）。
@@ -10312,7 +10323,7 @@ impl App {
             // 「完成」要等校正做完才送出，畫面才會一起更新、重新判斷要檢查的
             let latest = Mutex::new(start);
             let done = Mutex::new(None);
-            run_track(&photos, &marks, &need, &keep_own, crop, &|m| match m {
+            run_track(&photos, &seeds, &need, &keep_own, crop, &|m| match m {
                 TrackMsg::Done(a, b) => *done.lock().unwrap() = Some((a, b)),
                 TrackMsg::Boxes(list) => {
                     let mut l = latest.lock().unwrap();

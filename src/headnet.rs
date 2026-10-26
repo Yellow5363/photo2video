@@ -64,7 +64,7 @@ const L: Lay = {
 static KINGFISHER: &[u8] = include_bytes!("../assets/kingfisher_head.bin");
 static HARRIER: &[u8] = include_bytes!("../assets/harrier_head.bin");
 
-/// 翠鳥的權重
+/// 翠鳥的權重：使用者的翠鳥圖庫（252 張）加上一批青年公園的連拍（82 張）
 pub fn kingfisher() -> &'static [f32] {
     static W: OnceLock<Vec<f32>> = OnceLock::new();
     W.get_or_init(|| load(KINGFISHER))
