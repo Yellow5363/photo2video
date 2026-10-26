@@ -13442,6 +13442,13 @@ impl App {
                                     self.mark_preview_dirty();
                                 }
                             }
+                        } else if !self.photos.is_empty() {
+                            // 取消時預覽回到第一張：縮圖列又排回全部照片，停在中間某張還得自己捲回去
+                            //（使用者要求）
+                            self.multi_sel.clear();
+                            self.select_photo(Some(0));
+                            self.scroll_to_selected = true;
+                            self.mark_preview_dirty();
                         }
                         self.scroll_to_selected = true;
                     }
@@ -13642,6 +13649,9 @@ impl App {
                     self.track.zoom = z;
                     self.track.fitted_zoom = None;
                     recompute = true;
+                    // 改了鏡頭範圍就是要看鏡頭切下來的樣子：關掉「檢查主體框」（那時預覽顯示
+                    // 整張照片），預覽才看得到實際的鏡頭範圍（使用者要求）
+                    self.track.picking = false;
                 }
             });
             // 一鍵挑一個「主體幾乎都在正中央」的範圍：鏡頭開太大時主體會一直
@@ -13659,6 +13669,7 @@ impl App {
                     self.track.zoom = z.clamp(TRACK_ZOOM_MIN, TRACK_ZOOM_MAX);
                     self.track.fitted_zoom = Some(self.track.zoom);
                     recompute = true;
+                    self.track.picking = false;
                 }
             }
             let before_smooth = self.track.smooth;
@@ -14470,14 +14481,23 @@ impl App {
             let (cw, ch) = preview_canvas(out_res);
             let canvas_rect =
                 fit_rect(egui::vec2(cw as f32, ch as f32), rect.shrink(14.0));
-            let img_rect = fit_rect(tex.size_vec2(), canvas_rect);
+            // 佔位縮圖是整張照片，正式預覽卻已經套了裁切（例如追蹤的鏡頭範圍）：照樣切同一塊
+            // 再放，換張時構圖才不會先整張、再跳成裁切後的樣子（使用者回報一閃一閃）。
+            // 有拉直、轉 90° 的對不上，維持整張；調裁切、檢查主體框時預覽本來就顯示整張
+            let uv = match (self.preview_tex.is_none(), self.preview_selected) {
+                (true, Some(i)) if !self.crop_editing && !self.track.picking => self
+                    .photos
+                    .get(i)
+                    .map(|ph| self.effective_adj(ph).crop)
+                    .filter(|c| c.angle == 0.0 && c.quarter == 0 && c.x1 > c.x0 && c.y1 > c.y0)
+                    .map_or(egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), |c| {
+                        egui::Rect::from_min_max(egui::pos2(c.x0, c.y0), egui::pos2(c.x1, c.y1))
+                    }),
+                _ => egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            };
+            let img_rect = fit_rect(tex.size_vec2() * uv.size(), canvas_rect);
             img_rect_opt = Some(canvas_rect);
-            p.image(
-                tex.id(),
-                img_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+            p.image(tex.id(), img_rect, uv, egui::Color32::WHITE);
         } else if self.preview_selected.is_some() {
             p.text(
                 rect.center(),
