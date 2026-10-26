@@ -2251,6 +2251,52 @@ fn save_recent_projects(list: &[PathBuf]) {
     update_config("recent_projects", serde_json::json!(arr));
 }
 
+/// 設定檔裡最多記幾個資料夾的鳥種（[`remember_folder_bird`]）
+const FOLDER_BIRDS_MAX: usize = 300;
+
+/// 存專案時記下「這些照片資料夾用哪種鳥」，下次再加入同一個資料夾就自動選回來
+/// （見 [`folder_bird`]）。鍵是小寫的資料夾路徑（Windows 不分大小寫）
+fn remember_folder_bird(dirs: &[PathBuf], bird: BirdKind) {
+    let mut map = load_config()
+        .get("track_bird_dirs")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    for d in dirs {
+        map.insert(d.to_string_lossy().to_lowercase(), serde_json::json!(bird.id()));
+    }
+    while map.len() > FOLDER_BIRDS_MAX {
+        let Some(k) = map.keys().next().cloned() else { break };
+        map.remove(&k);
+    }
+    update_config("track_bird_dirs", serde_json::Value::Object(map));
+}
+
+/// 這個照片資料夾上次存專案時用的鳥種。設定檔裡沒記（這功能之前存的專案）
+/// 就翻最近的專案：照片在這個資料夾的影片專案記的是哪種鳥
+fn folder_bird(dir: &Path, recent: &[PathBuf]) -> Option<BirdKind> {
+    let key = dir.to_string_lossy().to_lowercase();
+    if let Some(id) = load_config()
+        .get("track_bird_dirs")
+        .and_then(|m| m.get(&key))
+        .and_then(|v| v.as_str())
+    {
+        return Some(BirdKind::from_id(id));
+    }
+    recent.iter().find_map(|p| {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()?;
+        if v.get("module")?.as_str()? != "video" {
+            return None;
+        }
+        let first = Path::new(v.get("photos")?.as_array()?.first()?.as_str()?);
+        if !same_path_ci(first.parent()?, dir) {
+            return None;
+        }
+        let id = v.get("track_bird")?.as_str()?;
+        (!id.is_empty()).then(|| BirdKind::from_id(id))
+    })
+}
+
 /// 「上次停在哪個資料夾」的記錄欄位：**每個模組、每種用途各記一份**。
 ///
 /// 開檔與存檔分開、模組之間也不共用——去煙霧的照片來源不會把影片的輸出
@@ -10755,6 +10801,16 @@ impl App {
         self.native_res_cache = None;
         // 加入前的照片順序：供下方把文字段落的編號對回排序後的新位置
         let old_photos: Vec<PathBuf> = self.photos.clone();
+        // 從空的開始加：這個資料夾存過專案就選回當時的鳥種（使用者要求）
+        if old_photos.is_empty() {
+            if let Some(b) = files
+                .first()
+                .and_then(|f| f.parent())
+                .and_then(|d| folder_bird(d, &self.recent_projects))
+            {
+                self.track.bird = b;
+            }
+        }
         // 用 HashSet 去重；逐一 contains 是 O(n²)，加入數千張照片要數百萬次路徑比對。
         // 去重 key 用小寫路徑：Windows 檔案系統不分大小寫，但 PathBuf 比較區分，
         // 同一張照片以不同大小寫路徑加入（命令列/開啟方式 vs 對話框）會被當成
@@ -11106,6 +11162,11 @@ impl App {
         match write_project_atomic(path, &json) {
             Ok(()) => {
                 self.remember_recent_project(path);
+                let mut dirs: Vec<PathBuf> =
+                    self.photos.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
+                dirs.sort();
+                dirs.dedup();
+                remember_folder_bird(&dirs, self.track.bird);
                 self.current_project = Some(path.to_path_buf());
                 self.project_saved_at = Some(Instant::now());
                 self.mark_project_clean(); // 存檔成功＝目前內容即乾淨狀態
@@ -37521,6 +37582,27 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 設定檔沒記的資料夾，從最近的專案找回鳥種：要照片在這個資料夾、而且是影片專案
+    #[test]
+    fn folder_bird_from_recent_project() {
+        let base = std::env::temp_dir().join(format!("photo2video_{}_folder_bird", std::process::id()));
+        let (a, b) = (base.join("翠鳥連拍"), base.join("別的"));
+        std::fs::create_dir_all(&a).unwrap();
+        let write = |name: &str, module: &str, photo: &Path, bird: &str| {
+            let p = base.join(name);
+            let v = serde_json::json!({ "module": module, "photos": [photo], "track_bird": bird });
+            std::fs::write(&p, v.to_string()).unwrap();
+            p
+        };
+        let other = write("other.p2v", "video", &b.join("1.jpg"), "harrier");
+        let stack = write("stack.p2v", "stack", &a.join("1.jpg"), "osprey");
+        let mine = write("mine.p2v", "video", &a.join("1.jpg"), "kingfisher");
+        let upper = PathBuf::from(a.to_string_lossy().to_uppercase());
+        assert_eq!(folder_bird(&upper, &[other.clone(), stack.clone(), mine]), Some(BirdKind::Kingfisher));
+        assert_eq!(folder_bird(&a, &[other, stack]), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// 使用者的例子：80 張，手動框在第 61、73、74、78 張，這次動了 73、74、78——只重算
     /// 75～77（照 74）與 79、80（照 78）；61 之後那段沒動過不重算
