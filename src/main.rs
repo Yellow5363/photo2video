@@ -883,7 +883,10 @@ const FADE_OUT_SECS: f64 = 1.0;
 const PROJECT_EXT: &str = "p2v";
 
 /// 「最近的專案」清單保留的最大筆數（載入與寫入共用同一上限）
-const RECENT_PROJECTS_MAX: usize = 8;
+/// 清單本身放在捲動區裡（見 [`recent_projects_list`]），多存幾份不佔版面。
+/// 五個模組共用這一份、各自只列自己的（見 [`App::recent_of`]），
+/// 所以總數要多留一些，常用的模組才不會把別的模組擠到一份都不剩
+const RECENT_PROJECTS_MAX: usize = 40;
 
 /// 「照片轉影片」每秒張數的原始預設值。
 ///
@@ -9598,6 +9601,10 @@ struct App {
     home_below_logo_h: Option<f32>,
     /// 最近開啟/儲存的專案檔（新的在前），顯示在空狀態畫面供一鍵開啟
     recent_projects: Vec<PathBuf>,
+    /// 最近清單裡每份專案是哪個模組的（各模組只列自己的，見
+    /// [`App::recent_of`]）。要開檔才知道，所以每份只讀一次記在這裡；
+    /// None＝讀不到（檔案不在、隨身碟拔了）或不是專案檔，各模組都不列
+    recent_modules: std::collections::HashMap<PathBuf, Option<Module>>,
     /// 最近一次「專案儲存／開啟」的提示與時間，在按鈕旁短暫顯示。
     /// 五個模組共用一份：同一時間只會有一個模組在畫面上
     project_note: Option<(String, Instant)>,
@@ -9736,6 +9743,7 @@ impl App {
             home_drop_note: false,
             home_below_logo_h: None,
             recent_projects: load_recent_projects(),
+            recent_modules: Default::default(),
             project_note: None,
             convert_output: None,
             current_project: None,
@@ -11213,7 +11221,7 @@ impl App {
         self.saved_snapshot = None;
     }
 
-    /// 記到最近專案清單最前面（去重、最多保留 8 筆）並寫入設定檔
+    /// 記到最近專案清單最前面（去重、最多保留 [`RECENT_PROJECTS_MAX`] 筆）並寫入設定檔
     fn remember_recent_project(&mut self, path: &Path) {
         // Windows 路徑不分大小寫：精確比對會讓同一專案檔因大小寫寫法
         // 不同（D:\a.p2v 與 d:\a.p2v）在清單重複出現
@@ -11221,6 +11229,31 @@ impl App {
         self.recent_projects.insert(0, path.to_path_buf());
         self.recent_projects.truncate(RECENT_PROJECTS_MAX);
         save_recent_projects(&self.recent_projects);
+        // 剛存／剛開的這一份重新認一次模組：同一個檔名可能被別的模組另存蓋過
+        self.recent_modules.retain(|p, _| !same_path_ci(p, path));
+    }
+
+    /// 最近的專案裡屬於模組 `m` 的那幾份（新的在前）。起始畫面與硬碟管理
+    /// 沒有自己的專案，列全部（功能表的「最近的專案」在這兩處才有東西可開）。
+    /// 每份專案是哪個模組的要開檔才知道，只在第一次用到時讀一次
+    /// （見 `recent_modules`），之後每幀都是查表
+    fn recent_of(&mut self, m: Module) -> Vec<PathBuf> {
+        if matches!(m, Module::Home | Module::Files) {
+            return self.recent_projects.clone();
+        }
+        let cache = &mut self.recent_modules;
+        self.recent_projects
+            .iter()
+            .filter(|p| {
+                *cache.entry((*p).clone()).or_insert_with(|| {
+                    std::fs::read_to_string(p)
+                        .ok()
+                        .and_then(|t| project::module_of(&t))
+                })
+                    == Some(m)
+            })
+            .cloned()
+            .collect()
     }
 
     /// 還原一份影片模組的專案。照片檔已不在原路徑時略過該張並提醒；
@@ -12053,6 +12086,8 @@ impl App {
         // 在選單的 closure 裡直接呼叫等於邊借用 self 邊開對話框
         let mut act: Option<MenuAction> = None;
         let working = self.is_working();
+        // 「最近的專案」子選單：在哪個模組就只列那個模組的（起始畫面列全部）
+        let menu_recent = self.recent_of(self.module);
         egui::TopBottomPanel::top("menubar")
             .frame(
                 egui::Frame::default()
@@ -12115,12 +12150,12 @@ impl App {
                             ui.close_menu();
                         }
                         ui.separator();
-                        ui.add_enabled_ui(!working && !self.recent_projects.is_empty(), |ui| {
+                        ui.add_enabled_ui(!working && !menu_recent.is_empty(), |ui| {
                             ui.menu_button("🕘  最近的專案", |ui| {
                                 // 不在這裡檢查檔案還在不在（每幀摸磁碟太浪費）；
                                 // 開不起來時 load_project 會提示並把它移出清單
                                 let recent: Vec<PathBuf> =
-                                    self.recent_projects.iter().take(8).cloned().collect();
+                                    menu_recent.iter().take(8).cloned().collect();
                                 for p in recent {
                                     let name = p
                                         .file_stem()
@@ -14152,8 +14187,7 @@ impl App {
                 let card = ui.available_rect_before_wrap().shrink(4.0);
                 ui.painter().rect_filled(card, 14, BACKDROP);
 
-                let recent: Vec<PathBuf> =
-                    self.recent_projects.iter().take(5).cloned().collect();
+                let recent: Vec<PathBuf> = self.recent_projects.clone();
                 // 標誌的大小跟著視窗縮：視窗矮的時候先讓圖讓位，
                 // 底下的「開啟專案」不管怎樣都要看得到
                 let logo_h = (card.height() * 0.36).clamp(96.0, 240.0);
@@ -14173,7 +14207,7 @@ impl App {
                         + if recent.is_empty() {
                             0.0
                         } else {
-                            28.0 + recent.len() as f32 * 24.0
+                            28.0 + recent.len().min(RECENT_VISIBLE_ROWS) as f32 * 24.0
                         }
                 });
                 let content_h = logo_h + below_logo;
@@ -14229,29 +14263,12 @@ impl App {
                                 self.open_any_project(&ctx);
                             }
 
-                            // 最近的專案：點檔名直接開啟，不用再走檔案對話框。
-                            // 不在這裡檢查檔案是否存在（每幀摸磁碟太浪費），
-                            // 開啟失敗時 open_project_path 會提示並把它移出清單
+                            // 最近的專案：點檔名直接開啟，不用再走檔案對話框
                             if !recent.is_empty() {
                                 ui.add_space(16.0);
-                                ui.label(
-                                    egui::RichText::new("最近的專案")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(theme::TEXT_WEAK),
-                                );
-                                ui.add_space(2.0);
-                                for p in recent {
-                                    let name = p
-                                        .file_stem()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| p.to_string_lossy().into_owned());
-                                    let r = recent_link(ui, format!("🕘  {name}"))
-                                        .on_hover_text(p.to_string_lossy());
-                                    if r.clicked() {
-                                        let ctx = ui.ctx().clone();
-                                        self.open_project_path(&p, &ctx);
-                                    }
+                                if let Some(p) = recent_projects_list(ui, &recent) {
+                                    let ctx = ui.ctx().clone();
+                                    self.open_project_path(&p, &ctx);
                                 }
                             }
 
@@ -14305,29 +14322,29 @@ impl App {
     }
 
     fn ui_empty_state(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.available_rect_before_wrap();
-        let r = rect.shrink(4.0);
-        ui.painter()
-            .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
-        // 虛線外框
-        let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
-        let rr = r.shrink(1.5);
-        for (a, b) in [
-            (rr.left_top(), rr.right_top()),
-            (rr.right_top(), rr.right_bottom()),
-            (rr.right_bottom(), rr.left_bottom()),
-            (rr.left_bottom(), rr.left_top()),
-        ] {
-            ui.painter().extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
+        let mut open_project = false;
+        // 空狀態裡點了最近的哪一份專案（見 empty_state_projects）
+        let mut open_recent: Option<PathBuf> = None;
+        let recent = self.recent_of(Module::Video);
+        empty_state_card(ui, "video", |child| {
+            self.ui_empty_state_contents(child, &recent, &mut open_project, &mut open_recent)
+        });
+        let ctx = ui.ctx().clone();
+        if open_project {
+            self.open_module_project(Module::Video, &ctx);
         }
+        if let Some(p) = open_recent {
+            self.open_project_path(&p, &ctx);
+        }
+    }
 
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(r)
-                .layout(egui::Layout::top_down(egui::Align::Center)),
-        );
-        let content_h = 210.0;
-        child.add_space(((r.height() - content_h) / 2.0).max(24.0));
+    fn ui_empty_state_contents(
+        &mut self,
+        child: &mut egui::Ui,
+        recent: &[PathBuf],
+        open_project: &mut bool,
+        open_recent: &mut Option<PathBuf>,
+    ) {
         child.label(egui::RichText::new("🎬").size(46.0));
         child.add_space(8.0);
         child.label(
@@ -14359,47 +14376,8 @@ impl App {
                 }
             },
         );
-        child.add_space(10.0);
-        if child
-            .add(egui::Button::new(
-                egui::RichText::new("📂  開啟之前存的專案…")
-                    .size(12.5)
-                    .color(theme::TEXT_WEAK),
-            ))
-            .clicked()
-        {
-            let ctx = child.ctx().clone();
-            self.open_module_project(Module::Video, &ctx);
-        }
-        // 最近的專案：點檔名直接開啟，不用再走檔案對話框。
-        // 不在這裡檢查檔案是否存在（每幀摸磁碟太浪費），
-        // 開啟失敗時 load_project 會提示並將它從清單移除
-        if !self.recent_projects.is_empty() {
-            child.add_space(18.0);
-            child.label(
-                egui::RichText::new("最近的專案")
-                    .size(12.0)
-                    .strong()
-                    .color(theme::TEXT_WEAK),
-            );
-            child.add_space(2.0);
-            let recent: Vec<PathBuf> = self.recent_projects.iter().take(5).cloned().collect();
-            for p in recent {
-                let name = p
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| p.to_string_lossy().into_owned());
-                // 與起始畫面同一套（見 [`recent_link`]）：藍字畫在這片深色上
-                // 太不起眼，換成標誌上那個暖金
-                if recent_link(&mut child, format!("🕘  {name}"))
-                    .on_hover_text(p.to_string_lossy())
-                    .clicked()
-                {
-                    let ctx = child.ctx().clone();
-                    self.open_project_path(&p, &ctx);
-                }
-            }
-        }
+        // 最近的專案：點檔名直接開啟，不用再走檔案對話框
+        empty_state_projects(child, recent, true, open_project, open_recent);
         // 剛選的資料夾掃不到照片時明講原因，避免使用者以為程式沒反應
         if self.import_found_nothing {
             child.add_space(14.0);
@@ -18854,6 +18832,10 @@ impl App {
         // 側欄輸出鈕旁的「💾 專案儲存」與工具列的「📂 開啟專案」
         let mut save_project = false;
         let mut open_project = false;
+        // 空狀態裡點了最近的哪一份專案（見 empty_state_projects）
+        let mut open_recent: Option<PathBuf> = None;
+        // 空狀態只列這個模組自己的專案
+        let recent = self.recent_of(Module::Movie);
         let busy = self.movie.busy;
         let exporting = busy == MovieBusy::Exporting;
         let side_frame = egui::Frame::default()
@@ -19056,7 +19038,13 @@ impl App {
                 }
 
                 if self.movie.src.is_none() {
-                    if movie_empty_state(ui) {
+                    if movie_empty_state(
+                        ui,
+                        &recent,
+                        !exporting,
+                        &mut open_project,
+                        &mut open_recent,
+                    ) {
                         pick = true;
                     }
                     return;
@@ -19075,6 +19063,9 @@ impl App {
         }
         if open_project {
             self.open_module_project(Module::Movie, ctx);
+        }
+        if let Some(p) = open_recent {
+            self.open_project_path(&p, ctx);
         }
         if let Some((from, to)) = move_to {
             self.movie_reorder(from, to, ctx);
@@ -23523,6 +23514,10 @@ impl App {
         // 存檔列的「💾 專案儲存」與工具列的「📂 開啟專案」
         let mut save_project = false;
         let mut open_project = false;
+        // 空狀態裡點了最近的哪一份專案（見 empty_state_projects）
+        let mut open_recent: Option<PathBuf> = None;
+        // 空狀態只列這個模組自己的專案
+        let recent = self.recent_of(Module::Stack);
         let mut clear = false;
         let mut goto: Option<usize> = None;
         let mut set_ground: Option<usize> = None;
@@ -23761,7 +23756,14 @@ impl App {
 
                 // 還沒選照片：整塊工作區就是一張引導畫面
                 if self.stack.photos.is_empty() {
-                    if stack_empty_state(ui, false) {
+                    if stack_empty_state(
+                        ui,
+                        false,
+                        &recent,
+                        busy != StackBusy::Saving,
+                        &mut open_project,
+                        &mut open_recent,
+                    ) {
                         pick = true;
                     }
                     return;
@@ -23770,7 +23772,14 @@ impl App {
                 // 只選了一張：疊圖至少要兩張。這裡按下去是**追加**——
                 // 已經挑好的那張要留著，不是叫人重挑一次
                 if total < 2 {
-                    if stack_empty_state(ui, true) {
+                    if stack_empty_state(
+                        ui,
+                        true,
+                        &recent,
+                        false,
+                        &mut open_project,
+                        &mut open_recent,
+                    ) {
                         add = true;
                     }
                     return;
@@ -24882,6 +24891,9 @@ impl App {
         if open_project {
             self.open_module_project(Module::Stack, ctx);
         }
+        if let Some(p) = open_recent {
+            self.open_project_path(&p, ctx);
+        }
         // Ctrl+V：焦點在輸入框裡時讓給輸入框（那時貼的是文字）
         let hotkey = self.stack.busy != StackBusy::Saving
             && self.stack.photos.len() < MAX_STACK_PHOTOS
@@ -24944,6 +24956,10 @@ impl App {
         // 存檔列的「💾 專案儲存」與工具列的「📂 開啟專案」
         let mut save_project = false;
         let mut open_project = false;
+        // 空狀態裡點了最近的哪一份專案（見 empty_state_projects）
+        let mut open_recent: Option<PathBuf> = None;
+        // 空狀態只列這個模組自己的專案
+        let recent = self.recent_of(Module::Dehaze);
         // 工具列的「🖼 疊圖片」與「📋 貼上圖片」（畫完這一幀才處理，
         // 檔案對話框不能開在版面中間）
         let mut add_overlay = false;
@@ -25169,7 +25185,13 @@ impl App {
                 // 看起來就像自己切回「選擇照片」再切回來。載入中的版面照畫，
                 // 只在預覽區留一句「照片載入中…」
                 if self.smoke.photos.is_empty() {
-                    if smoke_empty_state(ui, busy == SmokeBusy::Loading) {
+                    if smoke_empty_state(
+                        ui,
+                        busy == SmokeBusy::Loading,
+                        &recent,
+                        &mut open_project,
+                        &mut open_recent,
+                    ) {
                         pick = true;
                     }
                     return;
@@ -26342,6 +26364,9 @@ impl App {
         if open_project {
             self.open_module_project(Module::Dehaze, ctx);
         }
+        if let Some(p) = open_recent {
+            self.open_project_path(&p, ctx);
+        }
         if add_overlay {
             if let Some(p) = dir_dialog(LastDir::DehazeOverlay)
                 .add_filter("圖片", IMAGE_EXTS)
@@ -27342,6 +27367,10 @@ impl App {
         // 存檔列的「💾 專案儲存」與工具列的「📂 開啟專案」
         let mut save_project = false;
         let mut open_project = false;
+        // 空狀態裡點了最近的哪一份專案（見 empty_state_projects）
+        let mut open_recent: Option<PathBuf> = None;
+        // 空狀態只列這個模組自己的專案
+        let recent = self.recent_of(Module::Enhance);
         let mut reset = false;
         let mut goto: Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
@@ -27470,7 +27499,13 @@ impl App {
 
                 // 還沒選照片：整塊工作區就是一張引導畫面（版面比照另外三個模組）
                 if self.enhance.photos.is_empty() {
-                    match enhance_empty_state(ui, busy == EnhanceBusy::Loading) {
+                    match enhance_empty_state(
+                        ui,
+                        busy == EnhanceBusy::Loading,
+                        &recent,
+                        &mut open_project,
+                        &mut open_recent,
+                    ) {
                         Some(true) => pick = true,
                         Some(false) => pick_folder = true,
                         None => {}
@@ -27983,6 +28018,9 @@ impl App {
         }
         if open_project {
             self.open_module_project(Module::Enhance, ctx);
+        }
+        if let Some(p) = open_recent {
+            self.open_project_path(&p, ctx);
         }
         if let Some(i) = goto {
             self.enhance_select(i, ctx);
@@ -33342,218 +33380,182 @@ fn thumb_badge_colored(ui: &egui::Ui, rect: egui::Rect, text: &str, fill: egui::
 }
 
 /// 疊圖模組還沒選夠照片時的引導畫面（版面比照另外兩個模組的空狀態）。
-/// `need_more` ＝已經選了但只有一張，疊圖至少要兩張
-fn stack_empty_state(ui: &mut egui::Ui, need_more: bool) -> bool {
-    let mut pick = false;
-    let r = ui.available_rect_before_wrap().shrink(4.0);
-    ui.painter()
-        .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
-    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
-    let rr = r.shrink(1.5);
-    for (a, b) in [
-        (rr.left_top(), rr.right_top()),
-        (rr.right_top(), rr.right_bottom()),
-        (rr.right_bottom(), rr.left_bottom()),
-        (rr.left_bottom(), rr.left_top()),
-    ] {
-        ui.painter()
-            .extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
-    }
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(r)
-            .layout(egui::Layout::top_down(egui::Align::Center)),
-    );
-    child.add_space(((r.height() - 190.0) / 2.0).max(24.0));
-    child.label(egui::RichText::new("🎆").size(46.0));
-    child.add_space(8.0);
-    child.label(
-        egui::RichText::new(if need_more {
-            "還差一張——疊圖至少要兩張"
-        } else {
-            "選幾張煙火，疊成一張"
-        })
-        .size(17.0)
-        .strong()
-        .color(theme::TEXT),
-    );
-    child.add_space(2.0);
-    child.label(
-        egui::RichText::new(if need_more {
-            "再挑一張加進來（已經選好的那張會留著）；也可以直接把照片拖曳進來"
-        } else {
-            "同機位、同構圖（腳架連拍）的照片疊起來才對得準；也可以直接把照片拖曳進來"
-        })
-        .size(12.0)
-        .color(theme::TEXT_WEAK),
-    );
-    child.add_space(16.0);
-    // 已經有一張了就是「再加一張」，不是重選（回傳值由呼叫端接去做追加）
-    let label = if need_more { "➕  加入照片" } else { "🖼  選擇照片" };
-    if primary_button(&mut child, label, true).clicked() {
-        pick = true;
-    }
-    pick
-}
-
-/// 去煙霧模組還沒選照片時的引導畫面（版面比照影片模組的空狀態）。
-/// 回傳 true＝使用者按了「選擇照片」
-fn smoke_empty_state(ui: &mut egui::Ui, loading: bool) -> bool {
-    let mut pick = false;
-    let r = ui.available_rect_before_wrap().shrink(4.0);
-    ui.painter()
-        .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
-    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
-    let rr = r.shrink(1.5);
-    for (a, b) in [
-        (rr.left_top(), rr.right_top()),
-        (rr.right_top(), rr.right_bottom()),
-        (rr.right_bottom(), rr.left_bottom()),
-        (rr.left_bottom(), rr.left_top()),
-    ] {
-        ui.painter()
-            .extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
-    }
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(r)
-            .layout(egui::Layout::top_down(egui::Align::Center)),
-    );
-    child.add_space(((r.height() - 190.0) / 2.0).max(24.0));
-    child.label(egui::RichText::new("💨").size(46.0));
-    child.add_space(8.0);
-    child.label(
-        egui::RichText::new(if loading {
-            "照片載入中…"
-        } else {
-            "選煙火照片，把煙霧散去"
-        })
-        .size(17.0)
-        .strong()
-        .color(theme::TEXT),
-    );
-    child.add_space(2.0);
-    child.label(
-        egui::RichText::new("可一次選多張，用同一組設定處理；也可以直接把照片拖曳進來")
-            .size(12.0)
-            .color(theme::TEXT_WEAK),
-    );
-    child.add_space(16.0);
-    if primary_button(&mut child, "🖼  選擇照片", !loading).clicked() {
-        pick = true;
-    }
-    pick
-}
-
-/// 影片去煙霧模組還沒選影片時的引導畫面（版面比照另外兩個模組的空狀態）。
-/// 回傳 true＝使用者按了「選擇影片」
-fn movie_empty_state(ui: &mut egui::Ui) -> bool {
-    let mut pick = false;
-    let r = ui.available_rect_before_wrap().shrink(4.0);
-    ui.painter()
-        .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
-    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
-    let rr = r.shrink(1.5);
-    for (a, b) in [
-        (rr.left_top(), rr.right_top()),
-        (rr.right_top(), rr.right_bottom()),
-        (rr.right_bottom(), rr.left_bottom()),
-        (rr.left_bottom(), rr.left_top()),
-    ] {
-        ui.painter()
-            .extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
-    }
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(r)
-            .layout(egui::Layout::top_down(egui::Align::Center)),
-    );
-    child.add_space(((r.height() - 190.0) / 2.0).max(24.0));
-    child.label(egui::RichText::new("🎥").size(46.0));
-    child.add_space(8.0);
-    child.label(
-        egui::RichText::new("選一支煙火影片，把煙霧散去")
+/// `need_more` ＝已經選了但只有一張，疊圖至少要兩張（這時已經有照片了，
+/// 不放開啟專案與最近的專案——要的是再補一張，不是換一批）。
+/// 開啟專案的兩個輸出見 [`empty_state_projects`]
+fn stack_empty_state(
+    ui: &mut egui::Ui,
+    need_more: bool,
+    recent: &[PathBuf],
+    enabled: bool,
+    open_project: &mut bool,
+    open_recent: &mut Option<PathBuf>,
+) -> bool {
+    let salt = if need_more { "stack_more" } else { "stack" };
+    empty_state_card(ui, salt, |child| {
+        let mut pick = false;
+        child.label(egui::RichText::new("🎆").size(46.0));
+        child.add_space(8.0);
+        child.label(
+            egui::RichText::new(if need_more {
+                "還差一張——疊圖至少要兩張"
+            } else {
+                "選幾張煙火，疊成一張"
+            })
             .size(17.0)
             .strong()
             .color(theme::TEXT),
-    );
-    child.add_space(2.0);
-    child.label(
-        egui::RichText::new(
-            "整支影片逐格處理，聲音原樣保留；可一次選多支，也可以直接把影片拖曳進來",
-        )
-        .size(12.0)
-        .color(theme::TEXT_WEAK),
-    );
-    child.add_space(16.0);
-    if primary_button(&mut child, "🎥  選擇影片", true).clicked() {
-        pick = true;
-    }
-    pick
+        );
+        child.add_space(2.0);
+        child.label(
+            egui::RichText::new(if need_more {
+                "再挑一張加進來（已經選好的那張會留著）；也可以直接把照片拖曳進來"
+            } else {
+                "同機位、同構圖（腳架連拍）的照片疊起來才對得準；也可以直接把照片拖曳進來"
+            })
+            .size(12.0)
+            .color(theme::TEXT_WEAK),
+        );
+        child.add_space(16.0);
+        // 已經有一張了就是「再加一張」，不是重選（回傳值由呼叫端接去做追加）
+        let label = if need_more { "➕  加入照片" } else { "🖼  選擇照片" };
+        if primary_button(child, label, true).clicked() {
+            pick = true;
+        }
+        if !need_more {
+            empty_state_projects(child, recent, enabled, open_project, open_recent);
+        }
+        pick
+    })
+}
+
+/// 去煙霧模組還沒選照片時的引導畫面（版面比照影片模組的空狀態）。
+/// 回傳 true＝使用者按了「選擇照片」；開啟專案的兩個輸出見 [`empty_state_projects`]
+fn smoke_empty_state(
+    ui: &mut egui::Ui,
+    loading: bool,
+    recent: &[PathBuf],
+    open_project: &mut bool,
+    open_recent: &mut Option<PathBuf>,
+) -> bool {
+    empty_state_card(ui, "smoke", |child| {
+        let mut pick = false;
+        child.label(egui::RichText::new("💨").size(46.0));
+        child.add_space(8.0);
+        child.label(
+            egui::RichText::new(if loading {
+                "照片載入中…"
+            } else {
+                "選煙火照片，把煙霧散去"
+            })
+            .size(17.0)
+            .strong()
+            .color(theme::TEXT),
+        );
+        child.add_space(2.0);
+        child.label(
+            egui::RichText::new("可一次選多張，用同一組設定處理；也可以直接把照片拖曳進來")
+                .size(12.0)
+                .color(theme::TEXT_WEAK),
+        );
+        child.add_space(16.0);
+        if primary_button(child, "🖼  選擇照片", !loading).clicked() {
+            pick = true;
+        }
+        empty_state_projects(child, recent, !loading, open_project, open_recent);
+        pick
+    })
+}
+
+/// 影片去煙霧模組還沒選影片時的引導畫面（版面比照另外兩個模組的空狀態）。
+/// 回傳 true＝使用者按了「選擇影片」；開啟專案的兩個輸出見 [`empty_state_projects`]
+fn movie_empty_state(
+    ui: &mut egui::Ui,
+    recent: &[PathBuf],
+    enabled: bool,
+    open_project: &mut bool,
+    open_recent: &mut Option<PathBuf>,
+) -> bool {
+    empty_state_card(ui, "movie", |child| {
+        let mut pick = false;
+        child.label(egui::RichText::new("🎥").size(46.0));
+        child.add_space(8.0);
+        child.label(
+            egui::RichText::new("選一支煙火影片，把煙霧散去")
+                .size(17.0)
+                .strong()
+                .color(theme::TEXT),
+        );
+        child.add_space(2.0);
+        child.label(
+            egui::RichText::new(
+                "整支影片逐格處理，聲音原樣保留；可一次選多支，也可以直接把影片拖曳進來",
+            )
+            .size(12.0)
+            .color(theme::TEXT_WEAK),
+        );
+        child.add_space(16.0);
+        if primary_button(child, "🎥  選擇影片", true).clicked() {
+            pick = true;
+        }
+        empty_state_projects(child, recent, enabled, open_project, open_recent);
+        pick
+    })
 }
 
 /// 優化影像模組還沒選照片時的引導畫面（版面比照另外三個模組的空狀態）。
-/// 回傳 `Some(true)`＝按了「選擇照片」、`Some(false)`＝按了「選擇資料夾」
-fn enhance_empty_state(ui: &mut egui::Ui, loading: bool) -> Option<bool> {
-    let mut act = None;
-    let r = ui.available_rect_before_wrap().shrink(4.0);
-    ui.painter()
-        .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
-    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
-    let rr = r.shrink(1.5);
-    for (a, b) in [
-        (rr.left_top(), rr.right_top()),
-        (rr.right_top(), rr.right_bottom()),
-        (rr.right_bottom(), rr.left_bottom()),
-        (rr.left_bottom(), rr.left_top()),
-    ] {
-        ui.painter()
-            .extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
-    }
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(r)
-            .layout(egui::Layout::top_down(egui::Align::Center)),
-    );
-    child.add_space(((r.height() - 200.0) / 2.0).max(24.0));
-    child.label(egui::RichText::new("✨").size(46.0));
-    child.add_space(8.0);
-    child.label(
-        egui::RichText::new(if loading {
-            "照片載入中…"
-        } else {
-            "選一批照片，一次調好層次、光影與主體"
-        })
-        .size(17.0)
-        .strong()
-        .color(theme::TEXT),
-    );
-    child.add_space(2.0);
-    child.label(
-        egui::RichText::new(
-            "每張各自分析，調色滑桿自動就位，主體再另外提亮加銳；也可以直接把照片或資料夾拖曳進來",
-        )
-        .size(12.0)
-        .color(theme::TEXT_WEAK),
-    );
-    child.add_space(16.0);
-    child.horizontal(|ui| {
-        // 兩顆按鈕擺中間：這一層是 top_down(Center)，水平排的那一列
-        // 得自己往右推半個寬度才會落在正中間
-        let w = 300.0;
-        ui.add_space(((r.width() - w) / 2.0).max(0.0));
-        if primary_button(ui, "🖼  選擇照片", !loading).clicked() {
-            act = Some(true);
-        }
-        ui.add_space(8.0);
-        if ui
-            .add_enabled(!loading, egui::Button::new("📂  選擇資料夾"))
-            .clicked()
-        {
-            act = Some(false);
-        }
-    });
-    act
+/// 回傳 `Some(true)`＝按了「選擇照片」、`Some(false)`＝按了「選擇資料夾」；
+/// 開啟專案的兩個輸出見 [`empty_state_projects`]
+fn enhance_empty_state(
+    ui: &mut egui::Ui,
+    loading: bool,
+    recent: &[PathBuf],
+    open_project: &mut bool,
+    open_recent: &mut Option<PathBuf>,
+) -> Option<bool> {
+    let card_w = ui.available_width() - 8.0;
+    empty_state_card(ui, "enhance", |child| {
+        let mut act = None;
+        child.label(egui::RichText::new("✨").size(46.0));
+        child.add_space(8.0);
+        child.label(
+            egui::RichText::new(if loading {
+                "照片載入中…"
+            } else {
+                "選一批照片，一次調好層次、光影與主體"
+            })
+            .size(17.0)
+            .strong()
+            .color(theme::TEXT),
+        );
+        child.add_space(2.0);
+        child.label(
+            egui::RichText::new(
+                "每張各自分析，調色滑桿自動就位，主體再另外提亮加銳；也可以直接把照片或資料夾拖曳進來",
+            )
+            .size(12.0)
+            .color(theme::TEXT_WEAK),
+        );
+        child.add_space(16.0);
+        child.horizontal(|ui| {
+            // 兩顆按鈕擺中間：這一層是 top_down(Center)，水平排的那一列
+            // 得自己往右推半個寬度才會落在正中間
+            let w = 300.0;
+            ui.add_space(((card_w - w) / 2.0).max(0.0));
+            if primary_button(ui, "🖼  選擇照片", !loading).clicked() {
+                act = Some(true);
+            }
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(!loading, egui::Button::new("📂  選擇資料夾"))
+                .clicked()
+            {
+                act = Some(false);
+            }
+        });
+        empty_state_projects(child, recent, !loading, open_project, open_recent);
+        act
+    })
 }
 
 /// [`paint_hero_logo`] 畫出來的東西超出它那塊 rect 上緣多少，佔 rect 高度的
@@ -33778,7 +33780,7 @@ fn paint_hero_logo(p: &egui::Painter, rect: egui::Rect, backdrop: egui::Color32)
 }
 
 /// 「最近的專案」清單的一列：沒有按鈕框，只有一行字，指過去亮一階。
-/// 起始畫面與「照片轉影片」還沒加照片時的空狀態共用這一個。
+/// 起始畫面與各模組的空狀態共用這一個（經由 [`recent_projects_list`]）。
 ///
 /// 不用 [`egui::Button`]：整體樣式設了 `override_text_color`
 /// （見 [`apply_theme`]），Button 上的文字顏色會被它整個蓋掉，
@@ -33810,6 +33812,162 @@ fn recent_link(ui: &mut egui::Ui, text: String) -> egui::Response {
         color,
     );
     resp
+}
+
+/// 「最近的專案」一次看得到幾列，多的用捲的
+const RECENT_VISIBLE_ROWS: usize = 5;
+
+/// 「最近的專案」標題加清單，起始畫面與各模組的空狀態共用。
+///
+/// 清單比 [`RECENT_VISIBLE_ROWS`] 長就放進捲動區：整塊高度固定，
+/// 不會因為多存了幾份專案就把上面的按鈕推出畫面。回傳點了哪一份。
+/// 不在這裡檢查檔案是否存在（每幀摸磁碟太浪費），
+/// 開啟失敗時 open_project_path 會提示並把它移出清單
+fn recent_projects_list(ui: &mut egui::Ui, recent: &[PathBuf]) -> Option<PathBuf> {
+    if recent.is_empty() {
+        return None;
+    }
+    ui.label(
+        egui::RichText::new("最近的專案")
+            .size(12.0)
+            .strong()
+            .color(theme::TEXT_WEAK),
+    );
+    ui.add_space(2.0);
+    let names: Vec<String> = recent
+        .iter()
+        .map(|p| {
+            let name = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned());
+            format!("🕘  {name}")
+        })
+        .collect();
+    // 一列的高度與寬度跟 [`recent_link`] 同一套算法：捲動區要先知道
+    // 五列多高才能把高度定住，寬度則讓最長的檔名放得下、再留捲軸的位置
+    let font = egui::FontId::proportional(14.0);
+    let gap = ui.spacing().item_spacing.y;
+    let row_h = ui.fonts(|f| f.row_height(&font)) + 9.0;
+    let text_w = ui.fonts(|f| {
+        names
+            .iter()
+            .map(|n| {
+                f.layout_no_wrap(n.clone(), font.clone(), egui::Color32::PLACEHOLDER)
+                    .size()
+                    .x
+            })
+            .fold(0.0, f32::max)
+    });
+    let max_h = (row_h + gap) * RECENT_VISIBLE_ROWS as f32 - gap;
+    let w = (text_w + 18.0 + 28.0).min(ui.available_width());
+    let mut picked = None;
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, max_h),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            // 實心捲軸：要捲的時候一直看得到，不是滑鼠移過去才浮出來
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            egui::ScrollArea::vertical()
+                .id_salt("recent_projects")
+                .max_height(max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        for (p, name) in recent.iter().zip(names) {
+                            if recent_link(ui, name)
+                                .on_hover_text(p.to_string_lossy())
+                                .clicked()
+                            {
+                                picked = Some(p.clone());
+                            }
+                        }
+                    });
+                });
+        },
+    );
+    picked
+}
+
+/// 各模組空狀態那張卡：深一階的底色加虛線外框，內容整塊擺在比正中央
+/// 再高一點的位置——視覺上的中心本來就偏上，擺正中央反而看起來往下掉。
+///
+/// 內容多高**不用估的**：最近的專案有幾列、底下有沒有警告都會變，
+/// 估少多少整塊就往下掉多少。改成每一幀量實際排出來的高度、下一幀
+/// 拿來用（記在 egui 的暫存裡，`salt` 分開各模組，切模組時才不會
+/// 拿到別的模組量的值）
+fn empty_state_card<R>(
+    ui: &mut egui::Ui,
+    salt: &str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let r = ui.available_rect_before_wrap().shrink(4.0);
+    ui.painter()
+        .rect_filled(r, 14, egui::Color32::from_rgb(0x23, 0x24, 0x2A));
+    let dash = egui::Stroke::new(1.2, egui::Color32::from_rgb(0x46, 0x49, 0x53));
+    let rr = r.shrink(1.5);
+    for (a, b) in [
+        (rr.left_top(), rr.right_top()),
+        (rr.right_top(), rr.right_bottom()),
+        (rr.right_bottom(), rr.left_bottom()),
+        (rr.left_bottom(), rr.left_top()),
+    ] {
+        ui.painter()
+            .extend(egui::Shape::dashed_line(&[a, b], dash, 7.0, 6.0));
+    }
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(r)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+    );
+    let key = egui::Id::new("empty_state_h").with(salt);
+    let used = ui.ctx().data(|d| d.get_temp::<f32>(key)).unwrap_or(240.0);
+    child.add_space(((r.height() - used) * 0.4).max(24.0));
+    let top = child.cursor().min.y;
+    let out = add_contents(&mut child);
+    let measured = child.min_rect().bottom() - top;
+    // 量到的跟這一幀用的不一樣（第一幀、最近清單增減、跳出警告）
+    // 就記下來並要求再畫一次，否則會停在偏掉的那一幀上不動
+    if (measured - used).abs() > 0.5 {
+        ui.ctx().data_mut(|d| d.insert_temp(key, measured));
+        ui.ctx().request_repaint();
+    }
+    out
+}
+
+/// 各模組空狀態底下的「開啟之前存的專案…」與最近的專案（照片轉影片、
+/// 去煙霧、疊圖、影片去煙霧、優化影像共用；起始畫面另有自己的大按鈕）。
+/// 按了開啟就設 `open_project`、點了最近的哪一份就放進 `open_recent`，
+/// 由呼叫端在畫完之後處理（與工具列的「開啟專案」同一條路）
+fn empty_state_projects(
+    ui: &mut egui::Ui,
+    recent: &[PathBuf],
+    enabled: bool,
+    open_project: &mut bool,
+    open_recent: &mut Option<PathBuf>,
+) {
+    ui.add_space(10.0);
+    if ui
+        .add_enabled(
+            enabled,
+            egui::Button::new(
+                egui::RichText::new("📂  開啟之前存的專案…")
+                    .size(12.5)
+                    .color(theme::TEXT_WEAK),
+            ),
+        )
+        .clicked()
+    {
+        *open_project = true;
+    }
+    if !recent.is_empty() {
+        ui.add_space(18.0);
+        ui.add_enabled_ui(enabled, |ui| {
+            if let Some(p) = recent_projects_list(ui, recent) {
+                *open_recent = Some(p);
+            }
+        });
+    }
 }
 
 /// 模組列上的一個模組名稱。比照 Lightroom：沒有按鈕框，選中的那個亮起來
@@ -38745,7 +38903,16 @@ mod tests {
                 "{} 的專案檔認錯模組",
                 m.label()
             );
+            // 「最近的專案」分模組列時只看 module 欄位，要與完整解析認得一樣
+            assert_eq!(
+                project::module_of(&txt),
+                Some(m),
+                "{} 的專案檔在最近清單被分錯模組",
+                m.label()
+            );
         }
+        assert_eq!(project::module_of(old), Some(Module::Video));
+        assert_eq!(project::module_of("{ 這不是 JSON"), None);
         // 壞掉的內容要回錯誤，不是 panic
         assert!(project::parse("{ 這不是 JSON").is_err());
         // 用記事本開來改過再存回去會多一個 UTF-8 BOM，那不該讓整份開不起來

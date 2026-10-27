@@ -505,14 +505,9 @@ pub fn parse(txt: &str) -> Result<AnyProject, String> {
     // 拿掉開頭的 UTF-8 BOM：我們自己寫出來的沒有，但使用者用記事本開來改過
     // 存回去就會多這三個位元組，serde 認不得它、整份專案就開不起來
     let txt = txt.strip_prefix('\u{feff}').unwrap_or(txt);
-    let probe: serde_json::Value =
-        serde_json::from_str(txt).map_err(|e| format!("內容不是有效的專案檔：{e}"))?;
-    let kind = probe
-        .get("module")
-        .and_then(|v| v.as_str())
-        .unwrap_or(KIND_VIDEO);
+    let kind = probe_kind(txt)?;
     let bad = |e: serde_json::Error| format!("專案內容讀不起來：{e}");
-    Ok(match kind {
+    Ok(match kind.as_str() {
         KIND_DEHAZE => AnyProject::Dehaze(Box::new(serde_json::from_str(txt).map_err(bad)?)),
         KIND_STACK => AnyProject::Stack(Box::new(serde_json::from_str(txt).map_err(bad)?)),
         KIND_MOVIE => AnyProject::Movie(Box::new(serde_json::from_str(txt).map_err(bad)?)),
@@ -520,6 +515,31 @@ pub fn parse(txt: &str) -> Result<AnyProject, String> {
         // 認不得的 module（更新版寫的、或手改壞了）也照影片模組試一次：
         // 讀得起來就當影片專案，讀不起來才報錯
         _ => AnyProject::Video(Box::new(serde_json::from_str(txt).map_err(bad)?)),
+    })
+}
+
+/// 只看 `module` 一個欄位（`txt` 已去掉 BOM）；沒有這個欄位＝影片專案
+fn probe_kind(txt: &str) -> Result<String, String> {
+    let probe: serde_json::Value =
+        serde_json::from_str(txt).map_err(|e| format!("內容不是有效的專案檔：{e}"))?;
+    Ok(probe
+        .get("module")
+        .and_then(|v| v.as_str())
+        .unwrap_or(KIND_VIDEO)
+        .to_string())
+}
+
+/// 這份專案是哪個模組的，只認 `module` 欄位、不完整解析（「最近的專案」
+/// 依模組分開列時用）。規則與 [`parse`] 相同：沒有這個欄位、或認不得的
+/// 都算影片專案；內容不是 JSON 才回 None
+pub fn module_of(txt: &str) -> Option<crate::Module> {
+    let txt = txt.strip_prefix('\u{feff}').unwrap_or(txt);
+    Some(match probe_kind(txt).ok()?.as_str() {
+        KIND_DEHAZE => crate::Module::Dehaze,
+        KIND_STACK => crate::Module::Stack,
+        KIND_MOVIE => crate::Module::Movie,
+        KIND_ENHANCE => crate::Module::Enhance,
+        _ => crate::Module::Video,
     })
 }
 
