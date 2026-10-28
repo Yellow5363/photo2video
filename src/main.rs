@@ -6638,11 +6638,16 @@ impl BirdKind {
     }
 
     /// 有沒有從圖庫學來的網路可以找頭（見 [`headnet`]）。有的話找頭改用網路，
-    /// 不用 [`BirdKind::head_style`] 那種寫死的規則
+    /// 不用 [`BirdKind::head_style`] 那種寫死的規則。
+    ///
+    /// 五色鳥原本用規則（顏色最雜、冠羽、紅點），鳥頭朝下俯衝時十字會被背上、後頸的
+    /// 黃拉走（前山連拍）。改用網路後，六批使用者框好的連拍輪流留一批不學當考題，
+    /// 一張都不框時落在半框寬內 286 → 449/499
     fn head_net(self) -> Option<&'static [f32]> {
         match self {
             BirdKind::Kingfisher => Some(headnet::kingfisher()),
             BirdKind::Harrier => Some(headnet::harrier()),
+            BirdKind::Barbet => Some(headnet::barbet()),
             _ => None,
         }
     }
@@ -6651,9 +6656,10 @@ impl BirdKind {
     /// 牠最明顯的特徵（灰澤鵟的嘴短而帶鉤，那套量法不適用）；灰澤鵟看黃色的鼻子
     /// 使用者框了幾張時，要不要先拿那幾張當場再訓練網路（見 tune_on_manual）。
     /// 翠鳥要：一批藍天前、黃綠松針旁的飛行照，框 3 張其餘 6 張學過對 6 張、沒學只對 2 張。
-    /// 灰澤鵟不要：每 8 張框 1 張，三組沒看過的連拍學過反而從 108/140 掉到 90/140
+    /// 灰澤鵟不要：每 8 張框 1 張，三組沒看過的連拍學過反而從 108/140 掉到 90/140。
+    /// 五色鳥要：每 10 張框 1 張，六批沒看過的連拍落在四分之一框寬內 270 → 320/447
     fn tune_on_manual(self) -> bool {
-        matches!(self, BirdKind::Kingfisher)
+        matches!(self, BirdKind::Kingfisher | BirdKind::Barbet)
     }
 
     /// 使用者框了幾張時，改成「頭優先」：每張直接用網路整張找像頭的地方當候選、挑一條
@@ -6672,6 +6678,17 @@ impl BirdKind {
             _ => track::NetLook::default(),
         }
     }
+}
+
+/// 縮圖右鍵選單對主體框的操作
+#[derive(Clone, Copy)]
+enum BoxAct {
+    /// 這張沒問題：從「要檢查」名單拿掉
+    Fine,
+    /// 拿掉這張的框
+    Unbox,
+    /// 標成要檢查
+    Flag,
 }
 
 /// 主體框是怎麼來的。決定誰蓋得過誰：**手動框永遠不會被自動框選或追蹤蓋掉**
@@ -9866,6 +9883,17 @@ impl App {
         }
     }
 
+    /// 多選起來、而且縮圖列上看得到的那幾張（照片編號）。縮圖列被過濾時（只顯示
+    /// 要檢查的），藏起來的照片就算還在多選裡也不算——使用者回報：只列出 37 張
+    /// 要檢查的，「移除選取的」卻是 112 張
+    fn sel_in_view(&self) -> Vec<usize> {
+        let view = self.filtered_view().filter(|v| !v.is_empty());
+        (0..self.photos.len())
+            .filter(|&i| self.multi_sel.contains(&self.photos[i]))
+            .filter(|i| view.as_ref().is_none_or(|v| v.contains(i)))
+            .collect()
+    }
+
     /// 預覽切到上一張（-1）或下一張（+1）。縮圖列被過濾時只在那幾張之間
     /// 切——否則滾輪、方向鍵會切到沒列出來的照片，預覽跟縮圖列對不上
     /// （使用者回報：只顯示手動時，預覽卻停在一張自動框的）
@@ -10191,12 +10219,21 @@ impl App {
 
     /// 拿掉某一張的主體框（框錯了、或那張根本沒有主體）
     fn track_remove_box(&mut self, photo: &Path) {
-        let Some(old) = self.track.boxes.remove(photo) else { return };
-        if old.src == BoxSrc::Manual {
-            self.track.edited.insert(photo.to_path_buf());
-            self.track.edited_auto.insert(photo.to_path_buf());
+        self.track_remove_boxes(&[photo.to_path_buf()]);
+    }
+
+    /// 一次拿掉好幾張的主體框（縮圖右鍵、多選時），鏡頭路徑只重算一次
+    fn track_remove_boxes(&mut self, photos: &[PathBuf]) {
+        let mut any = false;
+        for photo in photos {
+            let Some(old) = self.track.boxes.remove(photo) else { continue };
+            any = true;
+            if old.src == BoxSrc::Manual {
+                self.track.edited.insert(photo.clone());
+                self.track.edited_auto.insert(photo.clone());
+            }
         }
-        if self.track.applied {
+        if any && self.track.applied {
             self.apply_track();
         }
     }
@@ -10555,6 +10592,8 @@ impl App {
         let left = self.track_unsure().len();
         if left == 0 && self.track.was_reviewing {
             self.track.only_unsure = false;
+            // 縮圖列換回全部照片、從頭排起，要捲回目前預覽的那一張，不然兩邊對不上
+            self.scroll_to_selected = true;
             self.mark_preview_dirty();
         }
         self.track.was_reviewing = left > 0;
@@ -11170,11 +11209,7 @@ impl App {
         match write_project_atomic(path, &json) {
             Ok(()) => {
                 self.remember_recent_project(path);
-                let mut dirs: Vec<PathBuf> =
-                    self.photos.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
-                dirs.sort();
-                dirs.dedup();
-                remember_folder_bird(&dirs, self.track.bird);
+                self.remember_photo_dirs_bird();
                 self.current_project = Some(path.to_path_buf());
                 self.project_saved_at = Some(Instant::now());
                 self.mark_project_clean(); // 存檔成功＝目前內容即乾淨狀態
@@ -11219,6 +11254,16 @@ impl App {
         self.current_project = None;
         // 空白新專案＝乾淨狀態（快照設 None，加照片後才算有未儲存變更）
         self.saved_snapshot = None;
+    }
+
+    /// 存專案時記下照片所在的資料夾用哪種鳥（見 [`remember_folder_bird`]）。
+    /// 「儲存專案」按鈕與 Ctrl+S 走不同的存檔路線，兩邊都要叫
+    fn remember_photo_dirs_bird(&self) {
+        let mut dirs: Vec<PathBuf> =
+            self.photos.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
+        dirs.sort();
+        dirs.dedup();
+        remember_folder_bird(&dirs, self.track.bird);
     }
 
     /// 記到最近專案清單最前面（去重、最多保留 [`RECENT_PROJECTS_MAX`] 筆）並寫入設定檔
@@ -11571,6 +11616,7 @@ impl App {
                     self.current_project = Some(path.clone());
                     self.project_saved_at = Some(Instant::now());
                     self.mark_project_clean();
+                    self.remember_photo_dirs_bird();
                 }
                 let name = path
                     .file_name()
@@ -13635,18 +13681,24 @@ impl App {
                             ("✓ 這張沒問題", "框是對的，從「要檢查」名單拿掉", false)
                         };
                         if ui.small_button(label).on_hover_text(hover).clicked() {
-                            let mut which: Vec<PathBuf> = self.multi_sel.iter().cloned().collect();
+                            let mut which: Vec<PathBuf> = self
+                                .sel_in_view()
+                                .into_iter()
+                                .map(|k| self.photos[k].clone())
+                                .collect();
                             if !which.contains(&p) {
                                 which.push(p.clone());
                             }
                             self.track_set_flag(&which, flag);
+                            // 套用到多選的那幾張之後，多選就用完了：留著的話，全部檢查完、
+                            // 縮圖列換回全部照片時，那幾張的勾勾忽然散落在整排裡（使用者回報）
+                            self.multi_sel.clear();
                             // 「這張沒問題」按完直接跳到下一張要檢查的（使用者要求）：
                             // 逐張確認時不必再去按「下一張」
                             if !flag {
                                 let left = self.track_unsure();
                                 let next = left.iter().copied().find(|&j| j > i).or(left.first().copied());
                                 if let Some(j) = next {
-                                    self.multi_sel.clear();
                                     self.select_photo(Some(j));
                                     self.scroll_to_selected = true;
                                     self.mark_preview_dirty();
@@ -13704,7 +13756,7 @@ impl App {
                         self.remove_photos(list);
                     }
                 }
-                let sel = self.multi_sel.len();
+                let sel = self.sel_in_view().len();
                 if sel > 0
                     && ui
                         .button(format!("🗑 移除選取的 {sel} 張"))
@@ -13898,9 +13950,7 @@ impl App {
 
     /// 移除縮圖列上多選起來的那幾張（先確認）。「不要的照片一次刪掉」用的
     fn remove_selected_photos(&mut self) {
-        let which: Vec<usize> = (0..self.photos.len())
-            .filter(|&i| self.multi_sel.contains(&self.photos[i]))
-            .collect();
+        let which = self.sel_in_view();
         if which.is_empty() {
             return;
         }
@@ -14724,6 +14774,8 @@ impl App {
         let mut remove_idx: Option<usize> = None;
         let mut remove_sel = false;
         let mut clear_all = false;
+        // 縮圖右鍵對主體框的操作：(第幾張, 動作)
+        let mut box_act: Option<(usize, BoxAct)> = None;
         let mut vis_range: Option<(usize, usize)> = None;
         // 有在用主體追蹤才在縮圖上標框的狀態（沒用到的人畫面維持乾淨）。
         // 正在跑的時候不標也不過濾：那時框是整批算完才一起送回來的，
@@ -14841,13 +14893,29 @@ impl App {
                             // 後面的 !working 守門擋掉的話，點了毫無反應也沒有
                             // 回饋，使用者會以為程式壞了
                             ui.add_enabled_ui(!working, |ui| {
+                                // 主體框的處理也放在右鍵：在縮圖列上一張張看過去時，
+                                // 不必再移到右邊的面板去按（使用者要求）。這一張在
+                                // 多選裡時套用到多選的那幾張
+                                if track_on && self.track.box_of(photo).is_some() {
+                                    for (label, act) in [
+                                        ("✓ 這張沒問題", BoxAct::Fine),
+                                        ("✕ 移除這張的框", BoxAct::Unbox),
+                                        ("⚑ 要檢查", BoxAct::Flag),
+                                    ] {
+                                        if ui.button(label).clicked() {
+                                            box_act = Some((i, act));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    ui.separator();
+                                }
                                 if ui.button("移除這張照片").clicked() {
                                     remove_idx = Some(i);
                                     ui.close_menu();
                                 }
                                 // 多選起來的一次移除：挑掉不要的那幾張時，
                                 // 一張一張右鍵刪太慢（Delete 鍵也走同一條路）
-                                let sel = self.multi_sel.len();
+                                let sel = self.sel_in_view().len();
                                 if sel > 0
                                     && ui.button(format!("移除選取的 {sel} 張照片")).clicked()
                                 {
@@ -14913,11 +14981,42 @@ impl App {
         }
         if let Some(i) = range_idx {
             let anchor = self.preview_selected.unwrap_or(i);
-            for k in anchor.min(i)..=anchor.max(i) {
+            // 只連選縮圖列上排出來的那幾張：過濾時（只顯示要檢查的）藏起來的照片
+            // 不能跟著被選進去
+            for &k in view.iter().filter(|&&k| (anchor.min(i)..=anchor.max(i)).contains(&k)) {
                 self.multi_sel.insert(self.photos[k].clone());
             }
             self.select_photo(Some(i));
             self.sync_sel_adj();
+        }
+        if let Some((i, act)) = box_act.filter(|_| !working) {
+            let p = self.photos[i].clone();
+            let on_sel = self.multi_sel.contains(&p);
+            let which: Vec<PathBuf> = if on_sel {
+                self.sel_in_view().into_iter().map(|k| self.photos[k].clone()).collect()
+            } else {
+                vec![p]
+            };
+            match act {
+                BoxAct::Fine => self.track_set_flag(&which, false),
+                BoxAct::Flag => self.track_set_flag(&which, true),
+                BoxAct::Unbox => self.track_remove_boxes(&which),
+            }
+            // 預覽跟著換：「這張沒問題」跟面板上的按鈕一樣跳到下一張要檢查的，
+            // 其他的停在按右鍵的那一張（使用者回報：右鍵處理完畫面沒更新）
+            let left = self.track_unsure();
+            let next = match act {
+                BoxAct::Fine => left.iter().copied().find(|&j| j > i).or(left.first().copied()).unwrap_or(i),
+                _ => i,
+            };
+            // 套用到多選的那幾張之後，多選就用完了：留著的話，全部檢查完、縮圖列
+            // 換回全部照片時，那幾張的勾勾忽然散落在整排裡（使用者回報）
+            if on_sel || next != i {
+                self.multi_sel.clear();
+            }
+            self.select_photo(Some(next));
+            self.scroll_to_selected = true;
+            self.mark_preview_dirty();
         }
         if !working {
             if clear_all {

@@ -1,7 +1,7 @@
 //! 從圖庫學來的鳥頭辨識：一個很小的卷積網路，判斷「這一點是不是使用者會標的
 //! 那個位置」（側面是眼睛，正面、俯衝時是額頭、頭頂中央）。
 //!
-//! 為什麼不像五色鳥、八色鳥那樣寫規則：翠鳥的頭頂是深藍綠帶鮮綠橫紋，翅膀
+//! 為什麼不像八色鳥那樣寫規則（五色鳥原本也是規則，後來也改用網路，見 [`barbet`]）：翠鳥的頭頂是深藍綠帶鮮綠橫紋，翅膀
 //! 覆羽也是藍綠帶淺藍斑點，橘色的耳羽、胸口與紅腳又搶走「顏色雜」的分數；
 //! 俯衝時頭朝下、出水時頭朝上，什麼角度都有。實測用顏色組成判斷（各色比例
 //! 加上周圍一圈），在鳥附近找頭只對三成；拿圖庫的頭當範本（含旋轉、翻轉）
@@ -63,6 +63,7 @@ const L: Lay = {
 
 static KINGFISHER: &[u8] = include_bytes!("../assets/kingfisher_head.bin");
 static HARRIER: &[u8] = include_bytes!("../assets/harrier_head.bin");
+static BARBET: &[u8] = include_bytes!("../assets/barbet_head.bin");
 
 /// 翠鳥的權重：使用者的翠鳥圖庫（252 張）加上一批青年公園的連拍（82 張）
 pub fn kingfisher() -> &'static [f32] {
@@ -76,6 +77,14 @@ pub fn kingfisher() -> &'static [f32] {
 pub fn harrier() -> &'static [f32] {
     static W: OnceLock<Vec<f32>> = OnceLock::new();
     W.get_or_init(|| load(HARRIER))
+}
+
+/// 五色鳥的權重：使用者框好的六批（7/21、8/10 兩份圖庫，大溪連拍3、0712、大安連拍4、
+/// 前山連拍1，共約 500 張），三個種子一起投票。輪流留一批不學當考題（單一網路）：
+/// 一張都不框時 449/499 落在半框寬內，原本的規則只有 286
+pub fn barbet() -> &'static [f32] {
+    static W: OnceLock<Vec<f32>> = OnceLock::new();
+    W.get_or_init(|| load(BARBET))
 }
 
 fn load(bytes: &[u8]) -> Vec<f32> {
