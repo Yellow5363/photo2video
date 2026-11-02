@@ -1077,6 +1077,64 @@ pub fn concat(parts: &[PathBuf], dst: &Path) -> Result<(), String> {
     }
 }
 
+/// 把影片的 `start` 秒起、長 `secs` 秒的那一段，照每秒 `fps` 格拆成 JPG，
+/// 寫進 `dir`（檔名 000001.jpg 起，照檔名排就是時間順序）。
+///
+/// 「照片轉影片」用的：拆出來的影格當成一批照片，主體追蹤、調色、輸出全部
+/// 照照片那一套走，不必另做一份給影片。`done` 每拆完幾格回報一次；`cancel`
+/// 一設起來就停掉 ffmpeg、回傳空字串的錯誤（呼叫端自己清掉拆了一半的檔）
+pub fn split_frames(
+    src: &Path,
+    dir: &Path,
+    start: f64,
+    secs: f64,
+    fps: u32,
+    cancel: &AtomicBool,
+    done: &dyn Fn(u64),
+) -> Result<Vec<PathBuf>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("建立資料夾失敗：{e}"))?;
+    let mut cmd = FfmpegCommand::new();
+    // -ss 放在 -i 前面：長片跳到中段是瞬間的事（見 grab）
+    cmd.args(["-y", "-ss", &format!("{:.3}", start.max(0.0))])
+        .input(src.to_string_lossy())
+        .args(["-t", &format!("{:.3}", secs.max(0.0))])
+        // q:v 2＝JPG 高畫質：之後還要調色、裁切放大，壓太狠會看得到方塊
+        .args(["-vf", &format!("fps={fps}"), "-q:v", "2", "-an"])
+        .output(dir.join("%06d.jpg").to_string_lossy());
+    let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
+    let mut errs: Vec<String> = Vec::new();
+    let mut stopped = false;
+    if let Ok(iter) = child.iter() {
+        for ev in iter {
+            if cancel.load(Ordering::Relaxed) {
+                stopped = true;
+                break;
+            }
+            match ev {
+                FfmpegEvent::Progress(p) => done(p.frame as u64),
+                FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, m) => errs.push(m),
+                _ => {}
+            }
+        }
+    }
+    if stopped {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(String::new());
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("讀不到拆好的影格：{e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("jpg")))
+        .collect();
+    files.sort();
+    if !ok || files.is_empty() {
+        return Err(if errs.is_empty() { "拆不出影格（格式可能不支援）".into() } else { errs.join("\n") });
+    }
+    Ok(files)
+}
+
 /// 把背景音樂混進一支**已經做好**的影片，寫成另一支。
 ///
 /// 合併輸出時走這一條：各段是分開跑的，音樂要是各段各配一次，接起來會變成

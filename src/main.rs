@@ -6680,6 +6680,51 @@ impl BirdKind {
     }
 }
 
+/// 「照片轉影片」的「選擇影片」：一支影片拆成影格（當成一批照片）之前的設定，
+/// 與拆的進度。拆成照片之後，主體追蹤、調色、輸出全部照照片那一套走
+struct VideoImport {
+    src: PathBuf,
+    info: VideoInfo,
+    /// 每秒取幾格（1～60）
+    fps: u32,
+    /// 只取這一段（秒）
+    start: f64,
+    end: f64,
+    /// 拆好的影格放這裡：影片旁的「檔名_影格」資料夾（使用者選的）
+    dir: PathBuf,
+    running: Option<VideoSplit>,
+    error: Option<String>,
+}
+
+/// 正在拆的那一次：已經拆好幾格、取消旗標、結果
+struct VideoSplit {
+    done: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<Result<Vec<PathBuf>, String>>,
+}
+
+impl VideoImport {
+    /// 照目前的設定會拆出幾格
+    fn frames(&self) -> u64 {
+        ((self.end - self.start).max(0.0) * self.fps as f64).ceil() as u64
+    }
+}
+
+/// 拆出來的一格 JPG 大約幾個位元組／像素（高畫質 q:v 2，實測 4K 一格 2～3MB）
+const SPLIT_BYTES_PER_PX: f64 = 0.3;
+
+/// 拆出來超過這麼多張就提醒：自動框選、縮圖都要跑比較久
+const SPLIT_MANY: u64 = 1500;
+
+/// 追蹤的鏡頭切下的寬 `px` 夠不夠輸出寬 `w` 用（不必放大）。差 [`CROP_FIT_SLACK`] 以內
+/// 也算夠：切 1277 寬配 1280 的輸出，放大 0.2% 看不出來，標成「會被放大」只會嚇人
+fn fits_output(px: u32, w: u32) -> bool {
+    px as f32 * CROP_FIT_SLACK >= w as f32
+}
+
+/// 見 [`fits_output`]
+const CROP_FIT_SLACK: f32 = 1.02;
+
 /// 縮圖右鍵選單對主體框的操作
 #[derive(Clone, Copy)]
 enum BoxAct {
@@ -9608,6 +9653,8 @@ struct App {
     crash_report: Option<LastRunReport>,
     /// 剛選的資料夾/檔案沒有找到任何照片；在空狀態顯示提示，避免使用者以為沒反應
     import_found_nothing: bool,
+    /// 「選擇影片」：把一支影片拆成影格當照片（見 [`App::ui_video_import`]）
+    vid_import: Option<VideoImport>,
     /// 在起始畫面拖進了照片或影片（不是專案檔）：那裡還沒挑功能，收不了。
     /// 在起始畫面顯示一行提示，免得使用者以為程式沒反應
     home_drop_note: bool,
@@ -9757,6 +9804,7 @@ impl App {
             about_open: false,
             crash_report: take_last_run_report(),
             import_found_nothing: false,
+            vid_import: None,
             home_drop_note: false,
             home_below_logo_h: None,
             recent_projects: load_recent_projects(),
@@ -9938,6 +9986,27 @@ impl App {
             canvas,
             res.w as f32 / res.h as f32,
         ))
+    }
+
+    /// 追蹤的鏡頭每張實際切下幾乘幾像素（[`App::track_crop_size`] 換成原圖像素）。
+    /// 比輸出解析度小就得放大，畫質會變軟
+    fn track_crop_px(&mut self, res: Resolution) -> Option<(u32, u32)> {
+        let (w, h) = self.track_crop_size(res)?;
+        let base = self.track_base_photo()?;
+        let (pw, ph) = self.photo_dims(&base)?;
+        let (cw, ch) = self.effective_adj(&base).crop.canvas(pw as f32, ph as f32);
+        Some(((w * cw).round() as u32, (h * ch).round() as u32))
+    }
+
+    /// 輸出解析度裡畫質最好的那一個：不必放大（不超過鏡頭切下的寬）之中最大的。
+    /// 追蹤沒在用、或切下的比最小的選項還小時是 None
+    fn best_track_resolution(&mut self) -> Option<Resolution> {
+        if !self.track.applied {
+            return None;
+        }
+        let res = self.resolved_resolution();
+        let (px, _) = self.track_crop_px(res)?;
+        Resolution::ALL.into_iter().filter(|r| !r.is_native() && fits_output(px, r.w)).max_by_key(|r| r.w)
     }
 
     /// 拿哪一張當「原圖多大」的代表（有框的第一張）
@@ -11103,6 +11172,195 @@ impl App {
                 self.import_found_nothing = true;
             }
             self.add_photos(files);
+        }
+    }
+
+    /// 「選擇影片」：挑一支影片，拆成影格當照片（先跳出設定視窗，見 [`App::ui_video_import`]）
+    fn pick_video(&mut self) {
+        if let Some(f) = dir_dialog(LastDir::VideoPhotos)
+            .set_title("選擇影片")
+            .add_filter("影片檔", VIDEO_EXTS)
+            .pick_file()
+        {
+            remember_dir(LastDir::VideoPhotos, &f);
+            self.open_video_import(f);
+        }
+    }
+
+    /// 量好影片的基本資料，跳出「從影片取格」的設定視窗
+    fn open_video_import(&mut self, src: PathBuf) {
+        let info = match movie::probe(&src) {
+            Ok(i) => i,
+            Err(e) => {
+                message_dialog()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("讀不到這支影片")
+                    .set_description(e)
+                    .show();
+                return;
+            }
+        };
+        // 影片旁邊的「檔名_影格」資料夾；已經有東西（上次拆過）就換個編號，不覆蓋
+        let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "影片".into());
+        let parent = src.parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = (1..)
+            .map(|k| parent.join(if k == 1 { format!("{stem}_影格") } else { format!("{stem}_影格{k}") }))
+            .find(|d| std::fs::read_dir(d).map_or(true, |mut r| r.next().is_none()))
+            .unwrap_or_else(|| parent.join(format!("{stem}_影格")));
+        let fps = (info.fps.round() as u32).clamp(1, 60);
+        let end = info.secs;
+        self.vid_import = Some(VideoImport { src, info, fps, start: 0.0, end, dir, running: None, error: None });
+    }
+
+    /// 「從影片取格」的設定視窗：每秒取幾格、取哪一段，按下去在背景拆，
+    /// 拆好就當成一批照片加進來，每秒張數也設成取格的速度（輸出跟原片一樣快）
+    fn ui_video_import(&mut self, ctx: &egui::Context) {
+        let Some(vi) = self.vid_import.as_mut() else { return };
+        // 拆完了沒
+        let mut finished: Option<Result<Vec<PathBuf>, String>> = None;
+        if let Some(run) = &vi.running {
+            match run.rx.try_recv() {
+                Ok(r) => finished = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => finished = Some(Err("拆格中斷".into())),
+                Err(_) => ctx.request_repaint_after(Duration::from_millis(150)),
+            }
+        }
+        if let Some(r) = finished {
+            vi.running = None;
+            match r {
+                Ok(files) => {
+                    let fps = vi.fps;
+                    self.vid_import = None;
+                    self.add_photos(files);
+                    self.fps = fps.clamp(1, 60);
+                    return;
+                }
+                Err(e) => {
+                    // 取消或失敗：拆了一半的影格整個資料夾清掉（資料夾是這次新開的）
+                    let _ = std::fs::remove_dir_all(&vi.dir);
+                    vi.error = (!e.is_empty()).then_some(e);
+                }
+            }
+        }
+        let mut open = true;
+        let mut start_split = false;
+        let mut cancel = false;
+        let busy = vi.running.is_some();
+        egui::Window::new("從影片取格")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                let name = vi.src.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                ui.label(egui::RichText::new(name).strong().color(theme::TEXT));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} × {} · 每秒 {:.2} 格 · {}",
+                        vi.info.w,
+                        vi.info.h,
+                        vi.info.fps,
+                        fmt_video_len(vi.info.secs)
+                    ))
+                    .size(12.0)
+                    .color(theme::TEXT_WEAK),
+                );
+                ui.add_space(8.0);
+                ui.add_enabled_ui(!busy, |ui| {
+                    let all = (vi.info.fps.round() as u32).clamp(1, 60);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("每秒取幾格");
+                        ui.radio_value(&mut vi.fps, all, format!("全部（{all}）"));
+                        for k in [30u32, 15, 10] {
+                            if k < all {
+                                ui.radio_value(&mut vi.fps, k, k.to_string());
+                            }
+                        }
+                        ui.add(egui::DragValue::new(&mut vi.fps).range(1..=all).speed(0.2).suffix(" 格"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("取哪一段");
+                        let secs = vi.info.secs;
+                        ui.add(egui::DragValue::new(&mut vi.start).range(0.0..=secs).speed(0.1).max_decimals(1).suffix(" 秒"));
+                        ui.label("到");
+                        ui.add(egui::DragValue::new(&mut vi.end).range(0.0..=secs).speed(0.1).max_decimals(1).suffix(" 秒"));
+                        if vi.end < vi.start {
+                            vi.end = vi.start;
+                        }
+                    });
+                });
+                let n = vi.frames();
+                let bytes = n as f64 * vi.info.w as f64 * vi.info.h as f64 * SPLIT_BYTES_PER_PX;
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "會拆出約 {n} 張，約佔 {}，輸出的影片每秒 {} 張（跟原片一樣快）",
+                        backup::fmt_size(bytes as u64),
+                        vi.fps
+                    ))
+                    .size(12.0),
+                );
+                ui.label(
+                    egui::RichText::new(format!("存到 {}", vi.dir.display()))
+                        .size(11.5)
+                        .color(theme::TEXT_WEAK),
+                );
+                if n > SPLIT_MANY {
+                    ui.label(
+                        egui::RichText::new("⚠ 張數很多，自動框選主體會跑比較久；可以少取幾格或只取一段")
+                            .size(11.5)
+                            .color(theme::TRACK),
+                    );
+                }
+                if let Some(e) = &vi.error {
+                    ui.label(egui::RichText::new(format!("⚠ {e}")).size(11.5).color(theme::ERROR));
+                }
+                ui.add_space(8.0);
+                if let Some(run) = &vi.running {
+                    let d = run.done.load(Ordering::Relaxed);
+                    ui.add(
+                        egui::ProgressBar::new((d as f32 / n.max(1) as f32).min(1.0))
+                            .text(format!("拆格中 {d} / {n}")),
+                    );
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        if primary_button(ui, "開始拆格", n > 0).clicked() {
+                            start_split = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+            });
+        if !open {
+            cancel = true;
+        }
+        if cancel {
+            match &vi.running {
+                // 拆到一半：叫 ffmpeg 停下來，等它回報再清資料夾
+                Some(run) => run.cancel.store(true, Ordering::Relaxed),
+                None => self.vid_import = None,
+            }
+            return;
+        }
+        if start_split {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let done = Arc::new(AtomicU64::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (src, dir, start, secs, fps) = (vi.src.clone(), vi.dir.clone(), vi.start, vi.end - vi.start, vi.fps);
+            let (d2, s2, ctx2) = (done.clone(), stop.clone(), ctx.clone());
+            thread::spawn(move || {
+                let r = movie::split_frames(&src, &dir, start, secs, fps, &s2, &|k| d2.store(k, Ordering::Relaxed));
+                let _ = tx.send(r);
+                ctx2.request_repaint();
+            });
+            vi.error = None;
+            vi.running = Some(VideoSplit { done, cancel: stop, rx });
         }
     }
 
@@ -13110,12 +13368,22 @@ impl App {
                             });
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("解析度").color(theme::TEXT_WEAK));
+                        // 有在用追蹤時，不必放大的選項裡最大的那個標綠色：再大只是放大，
+                        // 不會更清楚（使用者要求）
+                        let best = self.best_track_resolution();
+                        let label = |r: Resolution| {
+                            let t = egui::RichText::new(r.label());
+                            if Some(r) == best { t.color(theme::SUCCESS) } else { t }
+                        };
                         egui::ComboBox::from_id_salt("resolution")
-                            .selected_text(self.resolution.label())
+                            .selected_text(label(self.resolution))
                             .width(170.0)
                             .show_ui(ui, |ui| {
                                 for r in Resolution::ALL {
-                                    check_value(ui, &mut self.resolution, r, r.label());
+                                    let resp = check_value(ui, &mut self.resolution, r, label(r));
+                                    if Some(r) == best {
+                                        resp.on_hover_text("鏡頭切下的大小夠，不必放大：這是畫質最好的選擇");
+                                    }
                                 }
                             });
                         // 預計影片長度。讓使用者一眼知道成品多長，好搭配背景音樂
@@ -13872,27 +14140,23 @@ impl App {
         }
         if self.track.applied {
             let res = self.resolved_resolution();
-            let base = self.track_base_photo();
-            if let (Some((w, h)), Some(base)) = (self.track_crop_size(res), base) {
-                if let Some((pw, ph)) = self.photo_dims(&base) {
-                    let (cw, ch) = self.effective_adj(&base).crop.canvas(pw as f32, ph as f32);
-                    let (px, py) = ((w * cw).round() as u32, (h * ch).round() as u32);
-                    // 切下來比輸出還小就要放大，畫質會軟一點——講清楚，
-                    // 使用者才知道要把鏡頭範圍調大還是把輸出解析度調小
-                    let note = if px < res.w {
-                        format!("，比輸出的 {} 小，會被放大", res.w)
-                    } else {
-                        String::new()
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "鏡頭每張切下 {px} × {py} 像素（原圖的 {:.0}%{note}）",
-                            w * h * 100.0
-                        ))
-                        .size(11.0)
-                        .color(if px < res.w { theme::ERROR } else { theme::TEXT_WEAK }),
-                    );
-                }
+            if let (Some((w, h)), Some((px, py))) = (self.track_crop_size(res), self.track_crop_px(res)) {
+                // 切下來比輸出還小就要放大，畫質會軟一點——講清楚，
+                // 使用者才知道要把鏡頭範圍調大還是把輸出解析度調小。
+                // 夠大時改成綠字，拖鏡頭範圍時一看就知道到了不傷畫質的地方（使用者要求）
+                let (note, color) = if !fits_output(px, res.w) {
+                    (format!("，比輸出的 {} 小，會被放大", res.w), theme::ERROR)
+                } else {
+                    (format!("，不比輸出的 {} 小，畫質不受影響", res.w), theme::SUCCESS)
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "鏡頭每張切下 {px} × {py} 像素（原圖的 {:.0}%{note}）",
+                        w * h * 100.0
+                    ))
+                    .size(11.0)
+                    .color(color),
+                );
             }
             match (self.track.fitted_zoom, self.track.fitted_smooth) {
                 (Some(z), Some(s)) => ui.label(
@@ -14411,7 +14675,7 @@ impl App {
         );
         child.add_space(16.0);
         child.allocate_ui_with_layout(
-            egui::vec2(330.0, 40.0),
+            egui::vec2(460.0, 40.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 if primary_button(ui, "📁  選擇資料夾", true).clicked() {
@@ -14423,6 +14687,15 @@ impl App {
                     .clicked()
                 {
                     self.pick_files();
+                }
+                ui.add_space(4.0);
+                // 影片拆成影格當照片，主體追蹤等功能照照片那一套（使用者要求）
+                if ui
+                    .add(egui::Button::new("🎥  選擇影片").min_size(egui::vec2(120.0, 38.0)))
+                    .on_hover_text("把一支影片拆成一張張影格，再像照片一樣框主體、讓鏡頭跟著牠走")
+                    .clicked()
+                {
+                    self.pick_video();
                 }
             },
         );
@@ -32035,6 +32308,10 @@ impl eframe::App for App {
             // 多個專案檔也只取第一個，不連續跳出多個確認框
             if let Some(proj) = dropped.iter().find(|p| is_project_file(p)) {
                 self.open_project_path(proj, ctx);
+            } else if let Some(v) = dropped.iter().find(|p| is_video(p)) {
+                // 拖進影片＝拆成影格當照片（同「選擇影片」）；一次只處理一支
+                remember_dir(LastDir::VideoPhotos, v);
+                self.open_video_import(v.clone());
             } else {
                 let mut files = Vec::new();
                 let mut any_dir = false;
@@ -32137,6 +32414,7 @@ impl eframe::App for App {
         self.top_bars_bottom = ctx.available_rect().top();
         self.ui_module_body(ctx);
         self.ui_about_window(ctx);
+        self.ui_video_import(ctx);
         self.ui_drop_overlay(ctx);
 
         // update 跑完了，接下來是繪製與等事件：卡在這個階段代表問題不在
@@ -36553,6 +36831,9 @@ fn test_encoder(codec_args: &[&str]) -> bool {
     ok
 }
 
+/// 顯示卡的 H.264 編碼器做得到的最大寬高（像素）。輸出比這大就直接用軟體編碼
+const HW_H264_MAX: u32 = 4096;
+
 /// 偵測可用的 H.264 硬體編碼器（只偵測一次並快取）
 fn detect_h264_encoder() -> H264Encoder {
     static DETECTED: OnceLock<H264Encoder> = OnceLock::new();
@@ -37579,8 +37860,15 @@ fn run_conversion(
             ])
         }
         _ => {
-            send(WorkerMsg::Status("偵測硬體編碼器…".into()));
-            let enc = detect_h264_encoder();
+            // 顯示卡的 H.264 編碼器大多只做到 4096 寬高（NVENC、AMF、Quick Sync
+            // 都是）：超過的一定失敗，先跑一次再退回軟體只是白等（使用者回報：
+            // 原始像素 6000×4000 轉到 34% 才跳「硬體編碼器失敗」從頭再來）
+            let enc = if w.max(h) > HW_H264_MAX {
+                H264Encoder::Software
+            } else {
+                send(WorkerMsg::Status("偵測硬體編碼器…".into()));
+                detect_h264_encoder()
+            };
             send(WorkerMsg::Status(format!(
                 "轉換中…（編碼器：{}）",
                 enc.display_name()
