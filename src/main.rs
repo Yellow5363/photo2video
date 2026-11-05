@@ -6642,12 +6642,15 @@ impl BirdKind {
     ///
     /// 五色鳥原本用規則（顏色最雜、冠羽、紅點），鳥頭朝下俯衝時十字會被背上、後頸的
     /// 黃拉走（前山連拍）。改用網路後，六批使用者框好的連拍輪流留一批不學當考題，
-    /// 一張都不框時落在半框寬內 286 → 449/499
+    /// 一張都不框時落在半框寬內 286 → 449/499。
+    ///
+    /// 魚鷹同理：兩批互考（學一批考另一批）79 → 148/205
     fn head_net(self) -> Option<&'static [f32]> {
         match self {
             BirdKind::Kingfisher => Some(headnet::kingfisher()),
             BirdKind::Harrier => Some(headnet::harrier()),
             BirdKind::Barbet => Some(headnet::barbet()),
+            BirdKind::Osprey => Some(headnet::osprey()),
             _ => None,
         }
     }
@@ -6658,6 +6661,7 @@ impl BirdKind {
     /// 翠鳥要：一批藍天前、黃綠松針旁的飛行照，框 3 張其餘 6 張學過對 6 張、沒學只對 2 張。
     /// 灰澤鵟不要：每 8 張框 1 張，三組沒看過的連拍學過反而從 108/140 掉到 90/140。
     /// 五色鳥要：每 10 張框 1 張，六批沒看過的連拍落在四分之一框寬內 270 → 320/447
+    /// 魚鷹不要：每 10 張框 1 張，半框寬內 177 → 174/183、框錯沒標 6 → 9，好壞參半
     fn tune_on_manual(self) -> bool {
         matches!(self, BirdKind::Kingfisher | BirdKind::Barbet)
     }

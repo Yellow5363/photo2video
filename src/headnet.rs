@@ -64,6 +64,7 @@ const L: Lay = {
 static KINGFISHER: &[u8] = include_bytes!("../assets/kingfisher_head.bin");
 static HARRIER: &[u8] = include_bytes!("../assets/harrier_head.bin");
 static BARBET: &[u8] = include_bytes!("../assets/barbet_head.bin");
+static OSPREY: &[u8] = include_bytes!("../assets/osprey_head.bin");
 
 /// 翠鳥的權重：使用者的翠鳥圖庫（252 張）加上一批青年公園的連拍（82 張）
 pub fn kingfisher() -> &'static [f32] {
@@ -85,6 +86,14 @@ pub fn harrier() -> &'static [f32] {
 pub fn barbet() -> &'static [f32] {
     static W: OnceLock<Vec<f32>> = OnceLock::new();
     W.get_or_init(|| load(BARBET))
+}
+
+/// 魚鷹的權重：使用者框好的兩批連拍（20211218 連拍1、連拍2，共 205 張，有天空與深綠
+/// 兩種背景），三個種子一起投票。沒看過的背景認不太出來：學只有深綠背景的連拍2，
+/// 考連拍1 的天空那段 63 張幾乎都錯；天空留一半學，另一半 30 張對 29 張
+pub fn osprey() -> &'static [f32] {
+    static W: OnceLock<Vec<f32>> = OnceLock::new();
+    W.get_or_init(|| load(OSPREY))
 }
 
 fn load(bytes: &[u8]) -> Vec<f32> {
