@@ -1076,6 +1076,140 @@ const CERE_ALONE_MAX: usize = 2;
 /// 十字擺在黃鼻子上方幾個頭寬：正面時兩眼就在這個高度的兩側
 const CERE_UP: f32 = 0.1;
 
+/// 魚鷹：在主體框那一塊**原圖**裡找眼睛——黃色的眼圈、中間黑色的瞳孔（使用者
+/// 提供的特徵）。眼睛在原圖上只有二、三十個像素，縮成工作圖只剩五個像素左右，
+/// 所以要回原圖找。`img` 是框附近裁下來的一塊，`bw` 是框（整批的中位數）在這塊上的寬（像素）。
+///
+/// 先縮到框寬 [`EYE_BOX_PX`]，再試幾種眼睛大小：以某點為中心，瞳孔那一小圈
+/// 要夠黑、外面眼圈那一圈要夠黃、再外面一圈（過眼帶）要夠暗。回傳每個過得了門檻
+/// 的位置（`img` 的像素座標）與分數（0~1，眼圈多黃 × 瞳孔多黑），由呼叫端挑
+pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32)> {
+    if bw < 8.0 || img.width() < 8 || img.height() < 8 {
+        return Vec::new();
+    }
+    let k = (EYE_BOX_PX / bw).min(1.0);
+    let small;
+    let src = if k < 1.0 {
+        let (w, h) = (((img.width() as f32 * k).round() as u32).max(1), ((img.height() as f32 * k).round() as u32).max(1));
+        small = image::imageops::resize(img, w, h, image::imageops::FilterType::Triangle);
+        &small
+    } else {
+        img
+    };
+    let (w, h) = (src.width() as usize, src.height() as usize);
+    let mut yellow = vec![false; w * h];
+    let mut dark = vec![false; w * h];
+    let mut black = vec![false; w * h];
+    for (x, y, p) in src.enumerate_pixels() {
+        let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+        let lo = r.min(g);
+        yellow[y as usize * w + x as usize] = lo > EYE_YELLOW_MIN && b < lo * EYE_YELLOW_B && lo - b > 18.0 && r > EYE_RG * g && g > EYE_GR * r;
+        dark[y as usize * w + x as usize] = 0.299 * r + 0.587 * g + 0.114 * b < EYE_DARK;
+        black[y as usize * w + x as usize] = 0.299 * r + 0.587 * g + 0.114 * b < EYE_PUPIL_DARK;
+    }
+    let at = |m: &[bool], x: f32, y: f32| -> bool {
+        let (xi, yi) = (x.round() as i64, y.round() as i64);
+        xi >= 0 && yi >= 0 && (xi as usize) < w && (yi as usize) < h && m[yi as usize * w + xi as usize]
+    };
+    let ring: Vec<(f32, f32)> = (0..16).map(|i| (i as f32 * std::f32::consts::TAU / 16.0).sin_cos()).collect();
+    let inner: Vec<(f32, f32)> = (0..8).map(|i| (i as f32 * std::f32::consts::TAU / 8.0).sin_cos()).collect();
+    let bwk = bw * k;
+    let mut found = Vec::new();
+    for &ri in EYE_RADII {
+        // 眼圈半徑（框寬的幾分之幾）換成像素；瞳孔約眼圈的一半
+        let ri = ri * bwk;
+        let rp = ri * 0.45;
+        let pad = ri.ceil() as usize + 1;
+        if w <= 2 * pad || h <= 2 * pad {
+            continue;
+        }
+        for y in pad..h - pad {
+            for x in pad..w - pad {
+                let (fx, fy) = (x as f32, y as f32);
+                if !at(&black, fx, fy) {
+                    continue;
+                }
+                let pd = 1 + inner.iter().filter(|(s, c)| at(&black, fx + c * rp * 0.6, fy + s * rp * 0.6)).count();
+                if pd < EYE_PUPIL_MIN {
+                    continue;
+                }
+                let ry = ring.iter().filter(|(s, c)| at(&yellow, fx + c * ri * 0.78, fy + s * ri * 0.78)).count();
+                if ry < EYE_RING_MIN {
+                    continue;
+                }
+                // 眼睛長在黑色的過眼帶裡：眼圈外面一圈要有不少深色。背景裡偏黃的綠圍著
+                // 暗點（實測水面、樹叢）外面還是綠的
+                let od = ring.iter().filter(|(s, c)| at(&dark, fx + c * ri * EYE_OUTER, fy + s * ri * EYE_OUTER)).count();
+                if od < EYE_OUTER_DARK_MIN {
+                    continue;
+                }
+                // 分數看「多黃、多黑」而不只是過門檻的點數：鮮黃圍著全黑的真眼睛，跟橄欖褐圍著
+                // 深褐的羽毛點數差不多，飽和度與黑的程度差很多（連拍1 實測真的 0.44、假的 0.67）
+                let px = |x: f32, y: f32| -> Option<[f32; 3]> {
+                    let (xi, yi) = (x.round() as i64, y.round() as i64);
+                    (xi >= 0 && yi >= 0 && (xi as u32) < src.width() && (yi as u32) < src.height()).then(|| {
+                        let p = src.get_pixel(xi as u32, yi as u32);
+                        [p[0] as f32, p[1] as f32, p[2] as f32]
+                    })
+                };
+                let yel = ring
+                    .iter()
+                    .filter_map(|(s, c)| px(fx + c * ri * 0.78, fy + s * ri * 0.78))
+                    .map(|[r, g, b]| {
+                        let lo = r.min(g).max(1.0);
+                        ((lo - b) / lo).clamp(0.0, 1.0) * (lo / EYE_YELLOW_FULL).min(1.0)
+                    })
+                    .sum::<f32>()
+                    / 16.0;
+                let blk = std::iter::once((0.0, 0.0))
+                    .chain(inner.iter().map(|(s, c)| (c * rp * 0.6, s * rp * 0.6)))
+                    .filter_map(|(dx, dy)| px(fx + dx, fy + dy))
+                    .map(|[r, g, b]| (1.0 - (0.299 * r + 0.587 * g + 0.114 * b) / EYE_PUPIL_DARK).max(0.0))
+                    .sum::<f32>()
+                    / 9.0;
+                let score = yel * blk;
+                found.push((fx / k, fy / k, score));
+            }
+        }
+    }
+    found
+}
+
+/// 找眼睛前把框縮到幾個像素寬（再大只是慢）
+const EYE_BOX_PX: f32 = 240.0;
+
+/// 眼圈半徑試這幾種（框寬的幾倍）：使用者的框約是頭的兩倍大，眼圈約是框寬的 2%～6%
+/// （連拍1 抓魚那幾張遠一點，只有 1.9%）
+const EYE_RADII: &[f32] = &[0.018, 0.021, 0.025, 0.032, 0.04, 0.05, 0.062];
+
+/// 眼圈的黃：紅綠差不多、藍明顯比紅綠低。眼圈常在陰影裡（實測 RGB 約 50～130，
+/// 偏暗的黃綠），所以亮度只要求一點點
+const EYE_YELLOW_MIN: f32 = 35.0;
+const EYE_YELLOW_B: f32 = 0.55;
+
+/// 紅至少是綠的幾倍：眼圈的紅綠差不多（實測 0.96～1.17），背景偏黃的綠在 0.8 左右
+const EYE_RG: f32 = 0.9;
+/// 綠至少是紅的幾倍：再低就是棕色（翅膀、脖子的羽毛）
+const EYE_GR: f32 = 0.78;
+
+/// 眼圈外面那一圈量在眼圈半徑的幾倍，16 點裡至少幾點要暗（過眼帶）
+const EYE_OUTER: f32 = 1.45;
+const EYE_OUTER_DARK_MIN: usize = 4;
+
+/// 過眼帶要多暗（亮度 0~255）
+const EYE_DARK: f32 = 70.0;
+
+/// 瞳孔要多黑：真的瞳孔幾乎全黑（實測 3～15），翅膀上橄欖褐的暗處、羽毛旁的深綠
+/// 背景只是「有點暗」（約 50～70），用過眼帶那條門檻會被當成瞳孔（連拍1 實測）
+const EYE_PUPIL_DARK: f32 = 45.0;
+
+/// 眼圈的紅綠到這個亮度就算「夠亮」（分數不再加）
+const EYE_YELLOW_FULL: f32 = 100.0;
+
+/// 瞳孔那一小圈（中心加周圍 8 點）至少幾點暗、眼圈 16 點至少幾點黃
+const EYE_PUPIL_MIN: usize = 6;
+const EYE_RING_MIN: usize = 8;
+
 /// 一張照片哪裡清晰（用網路找頭時用，見 [`net_search`]）：與 [`HeadMaps`] 同一套量法，
 /// 最細的細節強度，以及「細節 ÷ 粗一級的輪廓」（見 [`HeadMaps::crisp_at`]），
 /// 各取全張前 1% 當尺

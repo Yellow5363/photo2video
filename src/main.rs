@@ -4462,6 +4462,8 @@ fn run_auto_boxes(
             found += filled;
         }
     }
+    // 最後找眼睛要從「最後送出去的框」出發，下面的 latest 會蓋掉這個名字
+    let sent = &latest;
     let mut latest = latest.lock().unwrap().clone();
     // 使用者手動框的那幾張也放進來：最後幾趟核對會拿前後最近的可靠照片當範本，
     // 手動框算可靠，卻沒有位置可用的話，旁邊那幾張整個跳過不核對（實測一批灰澤鵟，
@@ -4480,7 +4482,122 @@ fn run_auto_boxes(
         refine_by_neighbours(&photos, &keep, &mut latest, crop, send);
         refine_by_chain(&photos, &keep, &latest, crop, send);
     }
+    if bird.find_eye() {
+        let last = sent.lock().unwrap().clone();
+        refine_by_eye(&photos, manual, &last, crop, send);
+    }
     send(TrackMsg::Done(found + keep.iter().filter(|k| **k).count(), n));
+}
+
+/// 回原圖找眼睛（魚鷹，見 [`track::eye_candidates`]），找到就把框搬過去、讓十字落在
+/// 眼睛上。眼睛在原圖上只有二、三十個像素，工作圖上看不出來，所以每張再解一次
+/// 原圖、只取框中心附近一塊。框中心 [`EYE_REACH`] 個框寬內的照常找；再遠（到
+/// [`EYE_REACH_FAR`]）的要分數夠高才算，有把握的框附近有眼睛時不去遠處挑。
+/// 找到很像的眼睛（[`EYE_SURE_SCORE`]）就改成有把握。手動框不動
+fn refine_by_eye(
+    photos: &Arc<Vec<PathBuf>>,
+    manual: &[Option<[f32; 4]>],
+    latest: &[Option<Subject>],
+    crop: Crop,
+    send: &dyn Fn(TrackMsg),
+) {
+    let todo: Vec<(usize, Subject)> = latest
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.filter(|s| s.src != BoxSrc::Manual && manual.get(i).is_none_or(|m| m.is_none())).map(|s| (i, s)))
+        .collect();
+    if todo.is_empty() {
+        return;
+    }
+    send(TrackMsg::Phase(format!("找眼睛（{} 張）…", todo.len())));
+    // 眼睛多大、找多遠都照整批框寬的中位數換算：自動框選剛跑完時每張框大小不一（實測
+    // 連拍1 從 191 到 908 像素），框得特別大的那張照它換算，眼睛就找不到了。同一批
+    // 連拍頭的大小幾乎不變
+    let mut widths: Vec<f32> = latest.iter().flatten().map(|s| s.rect[2] - s.rect[0]).collect();
+    widths.sort_by(|a, b| a.total_cmp(b));
+    let ref_w = widths[widths.len() / 2];
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    let moved: Vec<(usize, Option<Subject>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = todo
+            .chunks(todo.len().div_ceil(threads))
+            .map(|part| {
+                sc.spawn(move || {
+                    part.iter()
+                        .filter_map(|&(i, s)| {
+                            let img = decode_full_for_track(&photos[i], crop)?;
+                            let (w, h) = (img.width() as f32, img.height() as f32);
+                            let r = s.rect;
+                            let bw = ref_w * w;
+                            let (cx, cy) = ((r[0] + r[2]) / 2.0 * w, (r[1] + r[3]) / 2.0 * h);
+                            // 框錯的時候頭常在框外（使用者回報連拍1：框在胸口、翅膀尖、水裡的倒影，
+                            // 眼睛在 0.8～2 個框寬外），所以找到 EYE_REACH_FAR 那麼遠；框外的要更像才算
+                            let reach = EYE_REACH_FAR;
+                            // 眼圈本身最大約 0.1 個框寬，多帶這一圈，中心才找得到 reach 那麼遠
+                            let half = bw * (reach + 0.1);
+                            let (x0, y0) = ((cx - half).max(0.0) as u32, (cy - half).max(0.0) as u32);
+                            let (x1, y1) = (((cx + half) as u32).min(img.width()), ((cy + half) as u32).min(img.height()));
+                            if x1 <= x0 + 8 || y1 <= y0 + 8 {
+                                return None;
+                            }
+                            let sub = image::imageops::crop_imm(&img, x0, y0, x1 - x0, y1 - y0).to_image();
+                            // 先去掉範圍外的再挑最像的：裁下來的是方塊，角落比 reach 遠，
+                            // 那裡的假眼睛分數較高時會把真的擠掉（實測連拍1 第 47 張）
+                            let cands: Vec<(f32, f32, f32, f32)> = track::eye_candidates(&sub, bw)
+                                .into_iter()
+                                .map(|(x, y, sc)| (x, y, sc, (x0 as f32 + x - cx).hypot(y0 as f32 + y - cy) / bw))
+                                .filter(|&(_, _, sc, d)| sc >= EYE_MIN_SCORE && d <= reach && (d <= EYE_REACH || sc >= EYE_FAR_SCORE))
+                                .collect();
+                            // 有把握的框附近有眼睛就用附近的，不去遠處挑
+                            let near = s.sure() && cands.iter().any(|c| c.3 <= EYE_REACH);
+                            let (ex, ey, sc, _) = cands
+                                .into_iter()
+                                .filter(|c| !near || c.3 <= EYE_REACH)
+                                .max_by(|a, b| a.2.total_cmp(&b.2))?;
+                            let (ex, ey) = ((x0 as f32 + ex) / w, (y0 as f32 + ey) / h);
+                            let (dx, dy) = (ex - (r[0] + r[2]) / 2.0, ey - (r[1] + r[3]) / 2.0);
+                            let rect = clamp_rect([r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy]);
+                            // 找到很像的眼睛就是找到頭了，不必再標要檢查（使用者回報：眼睛找到了卻說要檢查）
+                            let score = if sc >= EYE_SURE_SCORE { s.score.max(TRACK_SURE) } else { s.score };
+                            Some((i, Some(Subject { rect, score, ..s })))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    });
+    if !moved.is_empty() {
+        send(TrackMsg::Boxes(moved));
+    }
+}
+
+/// 框中心幾個框寬內算「附近」（網路找到的頭本來就在眼睛附近）
+const EYE_REACH: f32 = 0.4;
+
+/// 最遠找到幾個框寬外（框寬照整批的中位數）：實測連拍1 框錯時（胸口、翅膀尖、水裡的倒影）
+/// 眼睛在 1～2.7 個框寬外
+const EYE_REACH_FAR: f32 = 3.5;
+
+/// 眼睛分數到這裡就把框改成有把握
+const EYE_SURE_SCORE: f32 = 0.15;
+
+/// 原本框外（[`EYE_REACH`] 以外）的眼睛分數至少要多少：連拍1 框外的真眼睛 0.18～0.27，
+/// 連拍5 遠處水面、背景上的假眼睛 0.12～0.15
+const EYE_FAR_SCORE: f32 = 0.17;
+
+/// 眼睛分數至少要多少（見 [`track::eye_candidates`]：眼圈多黃 × 瞳孔多黑）。實測連拍1
+/// 真的眼睛 0.18～0.35，翅膀、背景上的假眼睛 0.04～0.08
+const EYE_MIN_SCORE: f32 = 0.06;
+
+/// 解出原尺寸的照片給找眼睛用：照 EXIF 轉正、套上使用者的旋轉（與
+/// [`decode_for_track`] 同一個畫布，只是不縮小）
+fn decode_full_for_track(path: &Path, crop: Crop) -> Option<image::RgbImage> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_decoder().ok()?;
+    let orientation = decoder.orientation().ok()?;
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    Some(edit::apply_rotate(img.to_rgb8(), crop))
 }
 
 /// 使用者手動框的大小（寬、高的中位數，相對座標）；一張都沒框是 None
@@ -6676,6 +6793,15 @@ impl BirdKind {
         matches!(self, BirdKind::Harrier)
     }
 
+    /// 自動框選最後回原圖找眼睛、把十字移到眼睛上（見 [`refine_by_eye`]）。
+    /// 魚鷹：黃色的眼圈、中間黑色的瞳孔（使用者提供的特徵）。
+    /// 魚鷹連拍5（使用者框的 94 張）一張都不框時，十字在眼睛上（0.1 個框寬內）
+    /// 17 → 43 張、每 10 張框 1 張時 23 → 45 張，要檢查 43 → 36 張、框錯沒標 4 → 3 張；
+    /// 連拍1 框在胸口、翅膀尖、倒影上的幾張都搬到眼睛上
+    fn find_eye(self) -> bool {
+        matches!(self, BirdKind::Osprey)
+    }
+
     fn net_look(self) -> track::NetLook {
         match self {
             BirdKind::Kingfisher => track::NetLook { beak_w: track::KINGFISHER_BEAK_W, ..Default::default() },
@@ -6888,6 +7014,9 @@ struct TrackTool {
     /// 縮圖列只顯示使用者自己框的那幾張（回頭檢查手動框時用）。與
     /// `only_unsure` 互斥：打開其中一個就關掉另一個
     only_manual: bool,
+    /// 縮圖列只顯示程式框好了的那幾張（自動框選與追蹤補上、沒標要檢查的，不含手動框）。
+    /// 與上面兩個互斥
+    only_auto: bool,
     /// 每張照片的主體框。三種來源共用這一份（見 [`BoxSrc`]）：
     /// 自動框選填滿它，使用者拖曳覆蓋其中幾張，追蹤則把手動框之間補起來
     boxes: HashMap<PathBuf, Subject>,
@@ -9925,12 +10054,23 @@ impl App {
         v
     }
 
-    /// 縮圖列被過濾時排的是哪幾張（「只顯示要檢查的」「只顯示手動」）；
+    /// 程式框好了的照片是清單裡的第幾張：自動框選與追蹤補上的、而且沒標要檢查的
+    /// （不含手動框）。使用者要一張張確認「程式說框好了」的是不是真的對——全部程式框的
+    /// 都列的話，一張都沒手動框時等於沒過濾（使用者回報）
+    fn track_auto_idx(&self) -> Vec<usize> {
+        (0..self.photos.len())
+            .filter(|&i| self.track.box_of(&self.photos[i]).is_some_and(|s| s.src != BoxSrc::Manual && s.sure()))
+            .collect()
+    }
+
+    /// 縮圖列被過濾時排的是哪幾張（「只顯示要檢查的」「只顯示手動」「只顯示自動」）；
     /// 沒過濾、或追蹤沒在用時是 None
     fn filtered_view(&self) -> Option<Vec<usize>> {
         let track_on = self.track.has_boxes() && !self.track.busy();
         if self.track.only_manual && track_on {
             Some(self.track_manual_idx().iter().map(|m| m.0).collect())
+        } else if self.track.only_auto && track_on {
+            Some(self.track_auto_idx())
         } else {
             (self.track.only_unsure && track_on).then(|| self.track_unsure())
         }
@@ -10460,6 +10600,7 @@ impl App {
         let net = self.track.bird.head_net();
         let look = self.track.bird.net_look();
         let tune = self.track.bird.tune_on_manual();
+        let eye = self.track.bird.find_eye();
         let manual: Vec<Option<[f32; 4]>> = self
             .photos
             .iter()
@@ -10505,7 +10646,13 @@ impl App {
             if !TRACK_CANCEL.load(Ordering::Relaxed) {
                 let mut latest = latest.into_inner().unwrap();
                 let tuned = if tune { tune_on_manual(&photos, &manual, net, crop, &send) } else { None };
-                refine_by_net(&Arc::new(photos), &manual, &todo, &mut latest, tuned.as_deref().unwrap_or(net), look, crop, &send);
+                let photos = Arc::new(photos);
+                refine_by_net(&photos, &manual, &todo, &mut latest, tuned.as_deref().unwrap_or(net), look, crop, &send);
+                // 魚鷹：最後回原圖找眼睛，只動這一趟重追的那幾張（使用者要求追蹤也要找眼睛）
+                if eye && !TRACK_CANCEL.load(Ordering::Relaxed) {
+                    let mine: Vec<Option<Subject>> = (0..latest.len()).map(|i| latest[i].filter(|_| todo[i])).collect();
+                    refine_by_eye(&photos, &manual, &mine, crop, &send);
+                }
             }
             send(TrackMsg::Done(a, b));
         });
@@ -13812,6 +13959,8 @@ impl App {
                         self.track_unsure().first().copied().unwrap_or(0)
                     } else if self.track.only_manual {
                         self.track_manual_idx().first().map_or(0, |m| m.0)
+                    } else if self.track.only_auto {
+                        self.track_auto_idx().first().copied().unwrap_or(0)
                     } else {
                         0
                     };
@@ -13822,9 +13971,10 @@ impl App {
                     }
                     self.mark_preview_dirty();
                 }
-                // 兩個過濾勾選自成一行、並排：跟上面的按鈕擠在一起時會被折成兩行
+                // 過濾勾選自成一行、並排：跟上面的按鈕擠在一起時會被折成兩行。三個放不下
+                // 就再折一行（使用者回報面板窄時最後一個被裁掉）
                 ui.end_row();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                 // 只留要檢查的那幾張在縮圖列上，逐一處理不必大海撈針。
                 //
                 // 這顆**只要在用追蹤就一直顯示**：把它藏在「還有要檢查的」條件裡
@@ -13847,6 +13997,7 @@ impl App {
                         self.track.only_unsure = !self.track.only_unsure;
                         if self.track.only_unsure {
                             self.track.only_manual = false;
+                            self.track.only_auto = false;
                             // 目前這張不在要檢查的名單裡就跳到第一張要檢查的：
                             // 縮圖列只排那幾張，預覽停在別張會對不上（使用者回報）
                             let left = self.track_unsure();
@@ -13879,6 +14030,7 @@ impl App {
                         self.track.only_manual = !self.track.only_manual;
                         if self.track.only_manual {
                             self.track.only_unsure = false;
+                            self.track.only_auto = false;
                             // 目前這張不是手動框的就跳到第一張手動框的
                             let manual: Vec<usize> = self.track_manual_idx().iter().map(|m| m.0).collect();
                             if !self.preview_selected.is_some_and(|i| manual.contains(&i)) {
@@ -13892,15 +14044,44 @@ impl App {
                         self.scroll_to_selected = true;
                     }
                 }
+                // 只留程式說框好了的那幾張（使用者要求）：一張張確認程式框得對不對
+                let auto_n = self.track_auto_idx().len();
+                if auto_n > 0 || self.track.only_auto {
+                    let label = format!("⚡ 只顯示自動框選的（{auto_n}）");
+                    if check_label(ui, self.track.only_auto, label)
+                        .on_hover_text("下面的縮圖列只排程式說「框好了」的照片（自動框選、追蹤補上的，沒標要檢查的），\n方便一張張確認是不是真的對；不含你自己框的")
+                        .clicked()
+                    {
+                        self.track.only_auto = !self.track.only_auto;
+                        if self.track.only_auto {
+                            self.track.only_unsure = false;
+                            self.track.only_manual = false;
+                            // 目前這張不是程式框的就跳到第一張程式框的
+                            let auto = self.track_auto_idx();
+                            if !self.preview_selected.is_some_and(|i| auto.contains(&i)) {
+                                if let Some(&i) = auto.first() {
+                                    self.multi_sel.clear();
+                                    self.select_photo(Some(i));
+                                    self.mark_preview_dirty();
+                                }
+                            }
+                        }
+                        self.scroll_to_selected = true;
+                    }
+                }
                 });
                 ui.end_row();
-                // 「只顯示手動框選的」開著時，這顆改成在手動框的照片之間跳：
-                // 縮圖列只排手動框的，跳到要檢查的那張預覽會對不上縮圖列
+                // 「只顯示手動框選的」「只顯示自動框選的」開著時，這顆改成在那幾張之間跳：
+                // 縮圖列只排那幾張，跳到要檢查的那張預覽會對不上縮圖列
                 let manual_view = self.track.only_manual;
                 let (targets, label, hover) = if manual_view {
                     let m: Vec<usize> = self.track_manual_idx().iter().map(|m| m.0).collect();
                     let label = format!("⏭ 下一張手動框選的（{}）", m.len());
                     (m, label, "跳到下一張你自己框的照片")
+                } else if self.track.only_auto {
+                    let a = self.track_auto_idx();
+                    let label = format!("⏭ 下一張自動框選的（{}）", a.len());
+                    (a, label, "跳到下一張程式框的照片")
                 } else {
                     let label = format!("⏭ 下一張要檢查的（{}）", unsure.len());
                     (unsure.clone(), label, "跳到下一張沒框到、或框得沒把握的照片")
@@ -15074,7 +15255,7 @@ impl App {
             _ => all,
         };
         let n = view.len();
-        if nothing_left && !self.track.only_manual && !self.photos.is_empty() {
+        if nothing_left && !self.track.only_manual && !self.track.only_auto && !self.photos.is_empty() {
             ui.label(
                 egui::RichText::new("✔ 每一張都框好了，沒有要檢查的——下面照原來的順序顯示全部照片")
                     .size(11.0)
