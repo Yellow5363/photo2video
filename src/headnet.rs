@@ -755,16 +755,20 @@ mod tests {
         let out = std::env::var("P2V_HEAD_OUT").expect("P2V_HEAD_OUT");
         let epochs: usize = std::env::var("P2V_HEAD_EPOCHS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
         // 可以給好幾個專案，以分號隔開。只取手動框；專案路徑後面加「*」的連自動框也算
-        // （使用者看過、說那些也都對的專案）
+        // （使用者看過、說那些也都對的專案），加「+」的再加上有把握（沒標要檢查）的框
+        // （使用者說「沒標要檢查的都檢查過、都對」的專案）
         let labels: Vec<_> = proj
             .split(';')
             .flat_map(|f| {
-                let (f, all) = match f.strip_suffix('*') {
-                    Some(f) => (f, true),
-                    None => (f, false),
+                let (f, all, sure) = if let Some(f) = f.strip_suffix('*') {
+                    (f, true, false)
+                } else if let Some(f) = f.strip_suffix('+') {
+                    (f, false, true)
+                } else {
+                    (f, false, false)
                 };
                 let pf: crate::ProjectFile = serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
-                pf.track_boxes.into_iter().filter(move |b| all || b.2 == 0)
+                pf.track_boxes.into_iter().filter(move |b| all || b.2 == 0 || (sure && b.3 >= crate::TRACK_SURE))
             })
             .collect();
         let shots: Vec<Shot> = std::thread::scope(|sc| {

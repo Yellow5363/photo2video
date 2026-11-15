@@ -1082,8 +1082,9 @@ const CERE_UP: f32 = 0.1;
 ///
 /// 先縮到框寬 [`EYE_BOX_PX`]，再試幾種眼睛大小：以某點為中心，瞳孔那一小圈
 /// 要夠黑、外面眼圈那一圈要夠黃、再外面一圈（過眼帶）要夠暗。回傳每個過得了門檻
-/// 的位置（`img` 的像素座標）與分數（0~1，眼圈多黃 × 瞳孔多黑），由呼叫端挑
-pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32)> {
+/// 的位置（`img` 的像素座標）與分數（0~1，眼圈多黃 × 瞳孔多黑），以及眼圈是不是黃的
+/// （不是的話是只靠淺色過關，比較容易認錯），由呼叫端挑
+pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32, bool)> {
     if bw < 8.0 || img.width() < 8 || img.height() < 8 {
         return Vec::new();
     }
@@ -1098,12 +1099,17 @@ pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32)> {
     };
     let (w, h) = (src.width() as usize, src.height() as usize);
     let mut yellow = vec![false; w * h];
+    let mut light = vec![false; w * h];
     let mut dark = vec![false; w * h];
     let mut black = vec![false; w * h];
     for (x, y, p) in src.enumerate_pixels() {
         let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
         let lo = r.min(g);
+        // 眼圈：黃色，或夠亮的淺色——白平衡偏冷時眼圈拍成偏藍的灰白（連拍2 實測約
+        // 140,150,160，連白色頭頂都帶藍），一點黃都沒有
+        let lum = 0.299 * r + 0.587 * g + 0.114 * b;
         yellow[y as usize * w + x as usize] = lo > EYE_YELLOW_MIN && b < lo * EYE_YELLOW_B && lo - b > 18.0 && r > EYE_RG * g && g > EYE_GR * r;
+        light[y as usize * w + x as usize] = lum > EYE_LIGHT_MIN;
         dark[y as usize * w + x as usize] = 0.299 * r + 0.587 * g + 0.114 * b < EYE_DARK;
         black[y as usize * w + x as usize] = 0.299 * r + 0.587 * g + 0.114 * b < EYE_PUPIL_DARK;
     }
@@ -1134,13 +1140,23 @@ pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32)> {
                     continue;
                 }
                 let ry = ring.iter().filter(|(s, c)| at(&yellow, fx + c * ri * 0.78, fy + s * ri * 0.78)).count();
-                if ry < EYE_RING_MIN {
+                let rl = ring
+                    .iter()
+                    .filter(|(s, c)| {
+                        let (qx, qy) = (fx + c * ri * 0.78, fy + s * ri * 0.78);
+                        at(&yellow, qx, qy) || at(&light, qx, qy)
+                    })
+                    .count();
+                let is_yellow = ry >= EYE_RING_MIN;
+                if !is_yellow && rl < EYE_LIGHT_RING_MIN {
                     continue;
                 }
                 // 眼睛長在黑色的過眼帶裡：眼圈外面一圈要有不少深色。背景裡偏黃的綠圍著
                 // 暗點（實測水面、樹叢）外面還是綠的
                 let od = ring.iter().filter(|(s, c)| at(&dark, fx + c * ri * EYE_OUTER, fy + s * ri * EYE_OUTER)).count();
-                if od < EYE_OUTER_DARK_MIN {
+                // 只靠淺色過關的要更嚴：白色頭頂上的深色斑點也是「亮圍著暗」（連拍2 十字常被
+                // 搬到頭頂與過眼帶交界），真的灰白眼圈外面整圈都是深色的眼眶
+                if od < if is_yellow { EYE_OUTER_DARK_MIN } else { EYE_LIGHT_OUTER_DARK_MIN } {
                     continue;
                 }
                 // 分數看「多黃、多黑」而不只是過門檻的點數：鮮黃圍著全黑的真眼睛，跟橄欖褐圍著
@@ -1157,7 +1173,11 @@ pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32)> {
                     .filter_map(|(s, c)| px(fx + c * ri * 0.78, fy + s * ri * 0.78))
                     .map(|[r, g, b]| {
                         let lo = r.min(g).max(1.0);
-                        ((lo - b) / lo).clamp(0.0, 1.0) * (lo / EYE_YELLOW_FULL).min(1.0)
+                        let yellow = ((lo - b) / lo).clamp(0.0, 1.0) * (lo / EYE_YELLOW_FULL).min(1.0);
+                        // 淺色眼圈照亮度給分，最多 EYE_LIGHT_FULL（比鮮黃的低：白色羽毛也是淺色）
+                        let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+                        let light = ((lum - EYE_LIGHT_MIN) / 80.0).clamp(0.0, 1.0) * EYE_LIGHT_FULL;
+                        yellow.max(light)
                     })
                     .sum::<f32>()
                     / 16.0;
@@ -1168,7 +1188,7 @@ pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32)> {
                     .sum::<f32>()
                     / 9.0;
                 let score = yel * blk;
-                found.push((fx / k, fy / k, score));
+                found.push((fx / k, fy / k, score, is_yellow));
             }
         }
     }
@@ -1205,6 +1225,16 @@ const EYE_PUPIL_DARK: f32 = 45.0;
 
 /// 眼圈的紅綠到這個亮度就算「夠亮」（分數不再加）
 const EYE_YELLOW_FULL: f32 = 100.0;
+
+/// 不黃的話，眼圈要亮過這個亮度才算（偏冷白平衡下的灰白眼圈）
+const EYE_LIGHT_MIN: f32 = 110.0;
+
+/// 淺色眼圈每一點最多給多少分（鮮黃的最多 1）
+const EYE_LIGHT_FULL: f32 = 0.5;
+
+/// 只靠淺色過關時，眼圈 16 點至少幾點亮、外圈 16 點至少幾點暗
+const EYE_LIGHT_RING_MIN: usize = 8;
+const EYE_LIGHT_OUTER_DARK_MIN: usize = 10;
 
 /// 瞳孔那一小圈（中心加周圍 8 點）至少幾點暗、眼圈 16 點至少幾點黃
 const EYE_PUPIL_MIN: usize = 6;

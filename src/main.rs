@@ -4493,7 +4493,11 @@ fn run_auto_boxes(
 /// 眼睛上。眼睛在原圖上只有二、三十個像素，工作圖上看不出來，所以每張再解一次
 /// 原圖、只取框中心附近一塊。框中心 [`EYE_REACH`] 個框寬內的照常找；再遠（到
 /// [`EYE_REACH_FAR`]）的要分數夠高才算，有把握的框附近有眼睛時不去遠處挑。
-/// 找到很像的眼睛（[`EYE_SURE_SCORE`]）就改成有把握。手動框不動
+/// 找到很像的眼睛（[`EYE_SURE_SCORE`]）就改成有把握。手動框不動。
+///
+/// 眼圈平常是黃的；整批幾乎找不到黃眼圈、淺色的倒是很多時（偏冷的白平衡把眼圈拍成
+/// 灰白，見 [`EYE_LIGHT_BATCH`]），才連只靠淺色過關的一起認。同一批連拍白平衡一樣，
+/// 整批一起判斷才不會在黃眼睛的批次裡撿到白肚子、水面反光（連拍5 實測）
 fn refine_by_eye(
     photos: &Arc<Vec<PathBuf>>,
     manual: &[Option<[f32; 4]>],
@@ -4517,7 +4521,9 @@ fn refine_by_eye(
     widths.sort_by(|a, b| a.total_cmp(b));
     let ref_w = widths[widths.len() / 2];
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
-    let moved: Vec<(usize, Option<Subject>)> = std::thread::scope(|sc| {
+    // 每張的候選：（眼睛中心相對座標 x, y, 分數, 離框中心幾個框寬, 黃的嗎）
+    type Cand = (f32, f32, f32, f32, bool);
+    let found: Vec<(usize, Subject, Vec<Cand>)> = std::thread::scope(|sc| {
         let hs: Vec<_> = todo
             .chunks(todo.len().div_ceil(threads))
             .map(|part| {
@@ -4530,35 +4536,30 @@ fn refine_by_eye(
                             let bw = ref_w * w;
                             let (cx, cy) = ((r[0] + r[2]) / 2.0 * w, (r[1] + r[3]) / 2.0 * h);
                             // 框錯的時候頭常在框外（使用者回報連拍1：框在胸口、翅膀尖、水裡的倒影，
-                            // 眼睛在 0.8～2 個框寬外），所以找到 EYE_REACH_FAR 那麼遠；框外的要更像才算
-                            let reach = EYE_REACH_FAR;
-                            // 眼圈本身最大約 0.1 個框寬，多帶這一圈，中心才找得到 reach 那麼遠
-                            let half = bw * (reach + 0.1);
+                            // 眼睛在 0.8～2 個框寬外），所以找到 EYE_REACH_FAR 那麼遠；框外的要更像才算。
+                            // 眼圈本身最大約 0.1 個框寬，多帶這一圈，中心才找得到那麼遠
+                            let half = bw * (EYE_REACH_FAR + 0.1);
                             let (x0, y0) = ((cx - half).max(0.0) as u32, (cy - half).max(0.0) as u32);
                             let (x1, y1) = (((cx + half) as u32).min(img.width()), ((cy + half) as u32).min(img.height()));
                             if x1 <= x0 + 8 || y1 <= y0 + 8 {
                                 return None;
                             }
                             let sub = image::imageops::crop_imm(&img, x0, y0, x1 - x0, y1 - y0).to_image();
-                            // 先去掉範圍外的再挑最像的：裁下來的是方塊，角落比 reach 遠，
-                            // 那裡的假眼睛分數較高時會把真的擠掉（實測連拍1 第 47 張）
-                            let cands: Vec<(f32, f32, f32, f32)> = track::eye_candidates(&sub, bw)
+                            // 先去掉範圍外的再挑最像的：裁下來的是方塊，角落比範圍遠，那裡的假眼睛
+                            // 分數較高時會把真的擠掉（實測連拍1 第 47 張）。只靠淺色過關的容易認錯，
+                            // 只在框中心 EYE_REACH_LIGHT 內找
+                            let cands: Vec<Cand> = track::eye_candidates(&sub, bw)
                                 .into_iter()
-                                .map(|(x, y, sc)| (x, y, sc, (x0 as f32 + x - cx).hypot(y0 as f32 + y - cy) / bw))
-                                .filter(|&(_, _, sc, d)| sc >= EYE_MIN_SCORE && d <= reach && (d <= EYE_REACH || sc >= EYE_FAR_SCORE))
+                                .map(|(x, y, sc, yel)| {
+                                    let (ax, ay) = (x0 as f32 + x, y0 as f32 + y);
+                                    (ax / w, ay / h, sc, (ax - cx).hypot(ay - cy) / bw, yel)
+                                })
+                                .filter(|&(_, _, sc, d, yel)| {
+                                    sc >= EYE_MIN_SCORE
+                                        && if yel { d <= EYE_REACH_FAR && (d <= EYE_REACH || sc >= EYE_FAR_SCORE) } else { d <= EYE_REACH_LIGHT }
+                                })
                                 .collect();
-                            // 有把握的框附近有眼睛就用附近的，不去遠處挑
-                            let near = s.sure() && cands.iter().any(|c| c.3 <= EYE_REACH);
-                            let (ex, ey, sc, _) = cands
-                                .into_iter()
-                                .filter(|c| !near || c.3 <= EYE_REACH)
-                                .max_by(|a, b| a.2.total_cmp(&b.2))?;
-                            let (ex, ey) = ((x0 as f32 + ex) / w, (y0 as f32 + ey) / h);
-                            let (dx, dy) = (ex - (r[0] + r[2]) / 2.0, ey - (r[1] + r[3]) / 2.0);
-                            let rect = clamp_rect([r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy]);
-                            // 找到很像的眼睛就是找到頭了，不必再標要檢查（使用者回報：眼睛找到了卻說要檢查）
-                            let score = if sc >= EYE_SURE_SCORE { s.score.max(TRACK_SURE) } else { s.score };
-                            Some((i, Some(Subject { rect, score, ..s })))
+                            Some((i, s, cands))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -4566,6 +4567,27 @@ fn refine_by_eye(
             .collect();
         hs.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
     });
+    // 整批是不是「灰白眼圈」的批次
+    let yellow_n = found.iter().filter(|f| f.2.iter().any(|c| c.4)).count();
+    let light_n = found.iter().filter(|f| f.2.iter().any(|c| !c.4)).count();
+    let light_ok = (yellow_n as f32) < EYE_LIGHT_BATCH * light_n as f32;
+    let moved: Vec<(usize, Option<Subject>)> = found
+        .into_iter()
+        .filter_map(|(i, s, cands)| {
+            let cands: Vec<Cand> = cands.into_iter().filter(|c| c.4 || light_ok).collect();
+            // 有把握的框附近有眼睛就用附近的，不去遠處挑
+            let near_d = |c: &Cand| c.3 <= if c.4 { EYE_REACH } else { EYE_REACH_LIGHT };
+            let near = s.sure() && cands.iter().any(near_d);
+            let (ex, ey, sc, _, yel) = cands.into_iter().filter(|c| !near || near_d(c)).max_by(|a, b| a.2.total_cmp(&b.2))?;
+            let r = s.rect;
+            let (dx, dy) = (ex - (r[0] + r[2]) / 2.0, ey - (r[1] + r[3]) / 2.0);
+            let rect = clamp_rect([r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy]);
+            // 找到很像的眼睛就是找到頭了，不必再標要檢查（使用者回報：眼睛找到了卻說要檢查）。
+            // 只靠淺色的不算
+            let score = if yel && sc >= EYE_SURE_SCORE { s.score.max(TRACK_SURE) } else { s.score };
+            Some((i, Some(Subject { rect, score, ..s })))
+        })
+        .collect();
     if !moved.is_empty() {
         send(TrackMsg::Boxes(moved));
     }
@@ -4573,6 +4595,13 @@ fn refine_by_eye(
 
 /// 框中心幾個框寬內算「附近」（網路找到的頭本來就在眼睛附近）
 const EYE_REACH: f32 = 0.4;
+
+/// 只靠淺色過關的眼睛最遠找到幾個框寬外（框寬照整批中位數）：連拍2 網路的十字常落在
+/// 眼睛後面 0.5 個框寬的過眼帶上；再遠就容易撿到白肚子、水面反光（連拍5 實測）
+const EYE_REACH_LIGHT: f32 = 0.7;
+
+/// 找得到黃眼圈的張數不到「找得到淺色眼圈的張數」的這個比例，才算灰白眼圈的批次
+const EYE_LIGHT_BATCH: f32 = 0.25;
 
 /// 最遠找到幾個框寬外（框寬照整批的中位數）：實測連拍1 框錯時（胸口、翅膀尖、水裡的倒影）
 /// 眼睛在 1～2.7 個框寬外
@@ -6798,6 +6827,7 @@ impl BirdKind {
     /// 魚鷹連拍5（使用者框的 94 張）一張都不框時，十字在眼睛上（0.1 個框寬內）
     /// 17 → 43 張、每 10 張框 1 張時 23 → 45 張，要檢查 43 → 36 張、框錯沒標 4 → 3 張；
     /// 連拍1 框在胸口、翅膀尖、倒影上的幾張都搬到眼睛上
+    /// 連拍2（偏冷白平衡、灰白眼圈，使用者框的 40 張）十字在眼睛上 38 張、全部在頭上
     fn find_eye(self) -> bool {
         matches!(self, BirdKind::Osprey)
     }
@@ -15186,7 +15216,6 @@ impl App {
                     &bg_resp,
                     photo_rect,
                     shown.map(|s| s.rect),
-                    shown.map(|s| s.src),
                 );
                 if let Some(r) = next {
                     self.track_set_subject(photo, r);
@@ -33194,6 +33223,9 @@ fn crop_overlay(
 /// 拖框要從按下去那一點移動超過這麼多像素才算數（見 [`track_overlay`]）
 const TRACK_DRAG_MIN_PX: f32 = 10.0;
 
+/// 主體框線畫多不透明（0~1）：半透明才看得到框底下的鳥頭，比較好對準
+const TRACK_BOX_ALPHA: f32 = 0.65;
+
 const TRACK_BOX_MIN: f32 = 0.006;
 
 /// 自動框選完把框統一成同一個大小時，至少要有這麼大（佔畫面的比例）。
@@ -33270,8 +33302,8 @@ const TRACK_CHAIN_SURE: f32 = 0.9;
 /// 在預覽上檢查／重畫「要跟的主體」。
 /// 回傳（拖出來的框（沒拖到就是 None）, 是否收工）。
 ///
-/// `img` 是整張照片畫出來的矩形（與裁切框同一塊畫布），`cur` 是這張現有的框、
-/// `src` 是它的來源（決定框上標什麼字）。每一次拖曳都是重畫一個新框，不做
+/// `img` 是整張照片畫出來的矩形（與裁切框同一塊畫布），`cur` 是這張現有的框。
+/// 框上不標來源（使用者要求：字擋住框、不好框；來源看面板上「第 N 張」那行）。每一次拖曳都是重畫一個新框，不做
 /// 把手微調：主體通常只佔畫面一小塊，重框一次比瞄準把手快得多；框大概圈住
 /// 就夠，比對只需要主體身上的花紋
 fn track_overlay(
@@ -33279,7 +33311,6 @@ fn track_overlay(
     resp: &egui::Response,
     img: egui::Rect,
     cur: Option<[f32; 4]>,
-    src: Option<BoxSrc>,
 ) -> (Option<[f32; 4]>, bool) {
     let to_rel = |p: egui::Pos2| -> (f32, f32) {
         (
@@ -33389,29 +33420,21 @@ fn track_overlay(
             out = Some(clamp_rect([cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0]));
         }
     }
-    // 搬家或重畫時畫的是「正在畫的手動框」；只拉把手改大小的話中心沒動，
-    // 還是原本的來源（見 App::track_set_subject）
-    let moving = (out.is_some() || resp.dragged()) && grabbed.is_none_or(|g| g < 0);
-    let tag = match (moving, src) {
-        (true, _) | (_, Some(BoxSrc::Manual)) => "✋ 主體（手動）",
-        (_, Some(BoxSrc::Auto)) => "⚡ 主體（自動）",
-        (_, Some(BoxSrc::Tracked)) => "🔗 主體（追蹤）",
-        _ => "主體",
-    };
-
     let p = ui.painter().with_clip_rect(img.intersect(ui.clip_rect()));
     match live {
         Some(r) => {
             let rect = to_screen(r);
+            // 框細一點、半透明（使用者要求）：框底下的鳥頭看得清楚，比較好對準、好拉
+            let col = theme::TRACK.gamma_multiply(TRACK_BOX_ALPHA);
             p.rect_stroke(
                 rect,
                 0,
-                egui::Stroke::new(2.0, theme::TRACK),
+                egui::Stroke::new(1.6, col),
                 egui::StrokeKind::Inside,
             );
             // 四角加粗：框畫在雜亂的背景上時，光一條細線並不好認
             let arm = 12.0_f32.min(rect.width() / 3.0).min(rect.height() / 3.0);
-            let thick = egui::Stroke::new(3.5, theme::TRACK);
+            let thick = egui::Stroke::new(2.8, col);
             for (corner, dx, dy) in [
                 (rect.left_top(), 1.0, 1.0),
                 (rect.right_top(), -1.0, 1.0),
@@ -33424,9 +33447,9 @@ fn track_overlay(
             // 四邊中點各一個小方塊：看得出「這裡可以拉」（角落已經有粗角了）
             for h in handles(rect).iter().skip(4) {
                 p.rect_filled(
-                    egui::Rect::from_center_size(*h, egui::vec2(7.0, 7.0)),
+                    egui::Rect::from_center_size(*h, egui::vec2(5.6, 5.6)),
                     1,
-                    theme::TRACK,
+                    col,
                 );
             }
             // 正中心的十字：鏡頭就是以這一點為中心，標出來才對得準主體。
@@ -33444,22 +33467,6 @@ fn track_overlay(
                 p.line_segment([a, b], egui::Stroke::new(3.2, egui::Color32::from_black_alpha(170)));
                 p.line_segment([a, b], egui::Stroke::new(1.4, egui::Color32::WHITE));
             }
-            // 標籤畫在框上緣外面；貼著畫面頂端時改畫到框裡，才不會被切掉
-            let galley = p.layout_no_wrap(
-                tag.into(),
-                egui::FontId::proportional(11.0),
-                egui::Color32::BLACK,
-            );
-            let size = galley.size() + egui::vec2(10.0, 4.0);
-            let above = rect.top() - size.y - 4.0 >= img.top();
-            let at = if above {
-                egui::pos2(rect.left(), rect.top() - size.y - 4.0)
-            } else {
-                egui::pos2(rect.left(), rect.top() + 4.0)
-            };
-            let chip = egui::Rect::from_min_size(at, size);
-            p.rect_filled(chip, 4, theme::TRACK);
-            p.galley(chip.min + egui::vec2(5.0, 2.0), galley, egui::Color32::BLACK);
         }
         None => {
             // 這張沒框到：講清楚可以自己框（自動框選找不到時的退路）
