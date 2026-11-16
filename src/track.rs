@@ -1099,6 +1099,7 @@ pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32, bool)> {
     };
     let (w, h) = (src.width() as usize, src.height() as usize);
     let mut yellow = vec![false; w * h];
+    let mut pale = vec![false; w * h];
     let mut light = vec![false; w * h];
     let mut dark = vec![false; w * h];
     let mut black = vec![false; w * h];
@@ -1108,7 +1109,11 @@ pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32, bool)> {
         // 眼圈：黃色，或夠亮的淺色——白平衡偏冷時眼圈拍成偏藍的灰白（連拍2 實測約
         // 140,150,160，連白色頭頂都帶藍），一點黃都沒有
         let lum = 0.299 * r + 0.587 * g + 0.114 * b;
-        yellow[y as usize * w + x as usize] = lo > EYE_YELLOW_MIN && b < lo * EYE_YELLOW_B && lo - b > 18.0 && r > EYE_RG * g && g > EYE_GR * r;
+        let hue = lo - b > 18.0 && r > EYE_RG * g && g > EYE_GR * r;
+        yellow[y as usize * w + x as usize] = lo > EYE_YELLOW_MIN && b < lo * EYE_YELLOW_B && hue;
+        // 很亮的眼圈被反光洗淡，藍色比較多（連拍4 裁過的小眼睛實測 243,212,119）。只有亮的
+        // 才算：同樣藍色比例的黃綠水面只有 100 上下（連拍5 第 A9309139 張翅膀尖旁的水）
+        pale[y as usize * w + x as usize] = lo >= EYE_PALE_MIN && b < lo * EYE_YELLOW_B_PALE && hue;
         light[y as usize * w + x as usize] = lum > EYE_LIGHT_MIN;
         dark[y as usize * w + x as usize] = 0.299 * r + 0.587 * g + 0.114 * b < EYE_DARK;
         black[y as usize * w + x as usize] = 0.299 * r + 0.587 * g + 0.114 * b < EYE_PUPIL_DARK;
@@ -1139,7 +1144,14 @@ pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32, bool)> {
                 if pd < EYE_PUPIL_MIN {
                     continue;
                 }
-                let ry = ring.iter().filter(|(s, c)| at(&yellow, fx + c * ri * 0.78, fy + s * ri * 0.78)).count();
+                let on_ring = |m: &[bool]| ring.iter().filter(|(s, c)| at(m, fx + c * ri * 0.78, fy + s * ri * 0.78)).count();
+                // 洗淡的黃只在整圈都亮的時候算：真的洗淡眼圈平均亮度約 185；暗處的空隙旁邊
+                // 只有幾點亮的枯草散景（連拍4 第 116 張，眼圈平均 53）
+                let ry = if on_ring(&light) >= EYE_RING_MIN {
+                    ring.iter().filter(|(s, c)| { let (qx, qy) = (fx + c * ri * 0.78, fy + s * ri * 0.78); at(&yellow, qx, qy) || at(&pale, qx, qy) }).count()
+                } else {
+                    on_ring(&yellow)
+                };
                 let rl = ring
                     .iter()
                     .filter(|(s, c)| {
@@ -1181,12 +1193,24 @@ pub fn eye_candidates(img: &RgbImage, bw: f32) -> Vec<(f32, f32, f32, bool)> {
                     })
                     .sum::<f32>()
                     / 16.0;
-                let blk = std::iter::once((0.0, 0.0))
+                // 瞳孔夠黑（舊規則），或比眼圈暗很多，兩種都算：裁切過、解析度低的照片眼睛只有
+                // 幾個像素，瞳孔被眼圈混亮（連拍4 實測瞳孔 44、眼圈 185），絕對門檻會擋掉；
+                // 陰影裡的眼睛連眼圈都暗（連拍5 實測瞳孔 25、眼圈 35），只看相對又會擋掉。
+                // 翅膀上橄欖褐的暗點（約 55 比 90）兩種都不過
+                let lum = |[r, g, b]: [f32; 3]| 0.299 * r + 0.587 * g + 0.114 * b;
+                let ring_lum = ring.iter().filter_map(|(s, c)| px(fx + c * ri * 0.78, fy + s * ri * 0.78)).map(lum).sum::<f32>() / 16.0;
+                let pupil: Vec<f32> = std::iter::once((0.0, 0.0))
                     .chain(inner.iter().map(|(s, c)| (c * rp * 0.6, s * rp * 0.6)))
                     .filter_map(|(dx, dy)| px(fx + dx, fy + dy))
-                    .map(|[r, g, b]| (1.0 - (0.299 * r + 0.587 * g + 0.114 * b) / EYE_PUPIL_DARK).max(0.0))
-                    .sum::<f32>()
-                    / 9.0;
+                    .map(lum)
+                    .collect();
+                let abs_ok = pupil.first().is_some_and(|&l| l < EYE_PUPIL_BLACK) && pupil.iter().filter(|&&l| l < EYE_PUPIL_BLACK).count() >= EYE_PUPIL_MIN;
+                let rel_ok = pupil.iter().sum::<f32>() / 9.0 <= EYE_PUPIL_RATIO * ring_lum;
+                if !abs_ok && !rel_ok {
+                    continue;
+                }
+                let darkness = |full: f32| pupil.iter().map(|l| (1.0 - l / full).max(0.0)).sum::<f32>() / 9.0;
+                let blk = darkness(EYE_PUPIL_BLACK).max(if rel_ok { darkness((ring_lum * 0.5).max(1.0)) } else { 0.0 });
                 let score = yel * blk;
                 found.push((fx / k, fy / k, score, is_yellow));
             }
@@ -1206,6 +1230,9 @@ const EYE_RADII: &[f32] = &[0.018, 0.021, 0.025, 0.032, 0.04, 0.05, 0.062];
 /// 偏暗的黃綠），所以亮度只要求一點點
 const EYE_YELLOW_MIN: f32 = 35.0;
 const EYE_YELLOW_B: f32 = 0.55;
+/// 紅綠都至少這麼亮的才用 EYE_YELLOW_B_PALE
+const EYE_PALE_MIN: f32 = 150.0;
+const EYE_YELLOW_B_PALE: f32 = 0.7;
 
 /// 紅至少是綠的幾倍：眼圈的紅綠差不多（實測 0.96～1.17），背景偏黃的綠在 0.8 左右
 const EYE_RG: f32 = 0.9;
@@ -1219,9 +1246,16 @@ const EYE_OUTER_DARK_MIN: usize = 4;
 /// 過眼帶要多暗（亮度 0~255）
 const EYE_DARK: f32 = 70.0;
 
-/// 瞳孔要多黑：真的瞳孔幾乎全黑（實測 3～15），翅膀上橄欖褐的暗處、羽毛旁的深綠
-/// 背景只是「有點暗」（約 50～70），用過眼帶那條門檻會被當成瞳孔（連拍1 實測）
-const EYE_PUPIL_DARK: f32 = 45.0;
+/// 瞳孔至少要多暗（亮度，先粗篩）；真正的判斷看 [`EYE_PUPIL_BLACK`] 或 [`EYE_PUPIL_RATIO`]。
+/// 清楚的瞳孔幾乎全黑（實測 3～15），解析度低的照片會被眼圈混到 45 左右（連拍4）
+const EYE_PUPIL_DARK: f32 = 70.0;
+
+/// 瞳孔中心和周圍 [`EYE_PUPIL_MIN`] 點都暗於這個就算夠黑：翅膀上橄欖褐的暗處、羽毛旁的
+/// 深綠背景只是「有點暗」（約 50～70），用過眼帶那條門檻會被當成瞳孔（連拍1 實測）
+const EYE_PUPIL_BLACK: f32 = 45.0;
+
+/// 瞳孔平均亮度最多是眼圈的幾倍：真眼睛 0.05～0.25，翅膀上橄欖褐的暗點約 0.6
+const EYE_PUPIL_RATIO: f32 = 0.4;
 
 /// 眼圈的紅綠到這個亮度就算「夠亮」（分數不再加）
 const EYE_YELLOW_FULL: f32 = 100.0;
