@@ -8,7 +8,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -12351,6 +12351,54 @@ impl App {
         });
     }
 
+    /// 「輸出成照片」：每張照片照目前的裁切／追蹤鏡頭與調色存成 JPG（使用者要拿去
+    /// Lightroom 修）。文字、轉場、動態縮放是影片才有的，不加。選一個位置，在裡面
+    /// 開一個新資料夾「<照片資料夾名>-<日期時間>_JPG」，不會蓋到任何舊檔
+    fn start_jpg_export(&mut self, ctx: &egui::Context) {
+        let first = self.photos.first().cloned();
+        // 預設在照片資料夾的**上一層**：存進照片資料夾裡，下次「加入資料夾」可能連
+        // 輸出的那批也一起加進來
+        let start = output_start_dir(LastDir::VideoOutput, first.as_deref().and_then(|p| p.parent()));
+        let Some(parent) =
+            pick_folder_remembering(LastDir::VideoOutput, "選擇照片要存到哪裡（會在裡面開一個新資料夾）", Some(&start))
+        else {
+            return;
+        };
+        let head = first.as_deref().and_then(folder_name).unwrap_or_else(|| "照片".into());
+        let base = format!("{}_JPG", project::with_stamp(&head, date_stamp().as_deref()));
+        // 同一分鐘再輸出一次就加「-2」，永遠是新資料夾：取消時會整個刪掉
+        let mut dir = parent.join(&base);
+        let mut k = 2;
+        while dir.exists() {
+            dir = parent.join(format!("{base}-{k}"));
+            k += 1;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        // 這不是單一檔案，異常中斷時不要拿去刪（見 poll_worker）
+        self.convert_output = None;
+        CONVERT_CANCEL.store(false, Ordering::Relaxed);
+        self.state = ConvertState::Working {
+            progress: 0.0,
+            status: "準備中…".into(),
+        };
+        let photos = self.photos.clone();
+        let adj = self.adj;
+        let adj_overrides = self.adj_overrides.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let send = |msg: WorkerMsg| {
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            };
+            match run_jpg_export(&photos, &adj, &adj_overrides, &dir, &send) {
+                Ok(()) => send(WorkerMsg::Done(dir.clone())),
+                Err(e) => send(WorkerMsg::Error(e)),
+            }
+        });
+    }
+
     /// 使用者按「取消」：設旗標並終止 ffmpeg。worker 的 ffmpeg 被 kill 後
     /// run_conversion 回錯誤，退回軟體編碼的邏輯因旗標而不重跑；
     /// poll_worker 收到錯誤時據旗標把狀態設回 Idle（取消不算轉換失敗），
@@ -13437,6 +13485,25 @@ impl App {
                         );
                         ui.add_space(8.0);
                     }
+                    // 輸出成照片：完成的是一個資料夾
+                    ConvertState::Done(path) if path.is_dir() => {
+                        let path = path.clone();
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("✔ 照片輸出完成").strong().color(theme::SUCCESS));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(path.display().to_string())
+                                        .size(11.5)
+                                        .color(theme::TEXT_WEAK),
+                                )
+                                .truncate(),
+                            );
+                            if ui.small_button("開啟資料夾").on_hover_text("在檔案總管中開啟這個資料夾").clicked() {
+                                open_file(&path);
+                            }
+                        });
+                        ui.add_space(8.0);
+                    }
                     ConvertState::Done(path) => {
                         let path = path.clone();
                         ui.horizontal(|ui| {
@@ -13608,6 +13675,17 @@ impl App {
                         let can_convert = has_photos && !working;
                         if primary_button(ui, "▶  開始轉換", can_convert).clicked() {
                             self.start_convert(ctx);
+                        }
+                        ui.add_space(8.0);
+                        if ui
+                            .add_enabled(can_convert, egui::Button::new("🖼  輸出成照片"))
+                            .on_hover_text(
+                                "每張照片照目前的裁切（追蹤鏡頭）與調色存成 JPG，可拿到 Lightroom 修；\
+                                 不放大、不加文字與轉場，原檔的拍攝資訊（EXIF）會一起抄過去",
+                            )
+                            .clicked()
+                        {
+                            self.start_jpg_export(ctx);
                         }
                         ui.add_space(8.0);
                         if ui
@@ -37439,6 +37517,12 @@ fn pre_adjust_photo(
         .args(["-vf", &vf])
         .args(["-frames:v", "1"])
         .output(out.to_string_lossy());
+    run_still_ffmpeg(cmd, photo, out, "調色")
+}
+
+/// 跑一個「一張照片進、一個檔案出」的 ffmpeg，失敗時把 ffmpeg 的錯誤訊息帶回來。
+/// `what` 是這一步叫什麼（調色、輸出），用在錯誤訊息裡
+fn run_still_ffmpeg(mut cmd: FfmpegCommand, photo: &Path, out: &Path, what: &str) -> Result<(), String> {
     let mut child = cmd.spawn().map_err(|e| format!("FFmpeg 啟動失敗：{e}"))?;
     let mut errs: Vec<String> = Vec::new();
     if let Ok(iter) = child.iter() {
@@ -37456,12 +37540,223 @@ fn pre_adjust_photo(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| photo.display().to_string());
         return Err(if errs.is_empty() {
-            format!("照片「{name}」調色失敗")
+            format!("照片「{name}」{what}失敗")
         } else {
-            format!("照片「{name}」調色失敗：{}", errs.join("\n"))
+            format!("照片「{name}」{what}失敗：{}", errs.join("\n"))
         });
     }
     Ok(())
+}
+
+/// 輸出成照片：一張照片照它的裁切（追蹤套用中就是鏡頭框）與調色存成 JPG。
+/// 不縮放——鏡頭切下多大就存多大，要拿去 Lightroom 修的人要的是原始像素，
+/// 放大只是多出糊掉的像素。4:4:4、最高品質：品質 2 時 6000×4000 的照片亮度
+/// PSNR 只有 40.8 dB（12.7MB 存成 5MB），要拿去修圖的不夠；品質 1 是 45.7 dB、9MB
+fn export_photo_jpg(photo: &Path, adj: &Adjustments, out: &Path) -> Result<(), String> {
+    let pre = adj.crop.vf_prefix();
+    let vf: Vec<String> = [pre.trim_end_matches(',').to_string()]
+        .into_iter()
+        .chain(adj.filter_chain(1.0))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut cmd = FfmpegCommand::new();
+    cmd.arg("-y").input(photo.to_string_lossy());
+    if !vf.is_empty() {
+        cmd.args(["-vf", &vf.join(",")]);
+    }
+    cmd.args(["-frames:v", "1", "-pix_fmt", "yuvj444p", "-q:v", "1", "-qmin", "1"]).output(out.to_string_lossy());
+    run_still_ffmpeg(cmd, photo, out, "輸出")?;
+    // 抄不過去只是少了拍攝資訊，照片本身是好的，不算失敗
+    let _ = copy_jpeg_exif(photo, out);
+    Ok(())
+}
+
+/// 輸出成照片的檔名：沿用原檔名、副檔名換成 .jpg；不同資料夾有同名的，
+/// 後面那張加「_2」「_3」，免得互相蓋掉
+fn jpg_export_names(photos: &[PathBuf]) -> Vec<String> {
+    let mut used: HashSet<String> = HashSet::new();
+    photos
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let stem = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("{:04}", i + 1));
+            let mut name = format!("{stem}.jpg");
+            let mut k = 2;
+            // Windows 的檔名不分大小寫，比對也不分
+            while !used.insert(name.to_lowercase()) {
+                name = format!("{stem}_{k}.jpg");
+                k += 1;
+            }
+            name
+        })
+        .collect()
+}
+
+/// 把原檔的 EXIF（拍攝時間、相機、鏡頭、光圈快門…）抄到輸出的 JPG：ffmpeg 存出來
+/// 的沒有，Lightroom 就排不出拍攝順序、也看不到拍攝資訊。像素已經照方向轉正了
+/// （ffmpeg 讀照片會自動轉），方向一律改成 1（正常），不然 Lightroom 會再轉一次。
+/// 原檔不是 JPG 或沒有 EXIF 就不動
+fn copy_jpeg_exif(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let Some(mut exif) = jpeg_exif_segment(&std::fs::read(src)?) else {
+        return Ok(());
+    };
+    exif_reset_orientation(&mut exif);
+    let out = std::fs::read(dst)?;
+    if !out.starts_with(&[0xFF, 0xD8]) {
+        return Ok(());
+    }
+    // 放在 JFIF（APP0）後面；沒有 APP0 就緊接著檔頭
+    let at = if out.len() >= 6 && out[2] == 0xFF && out[3] == 0xE0 {
+        4 + u16::from_be_bytes([out[4], out[5]]) as usize
+    } else {
+        2
+    };
+    if at > out.len() {
+        return Ok(());
+    }
+    let mut buf = Vec::with_capacity(out.len() + exif.len());
+    buf.extend_from_slice(&out[..at]);
+    buf.extend_from_slice(&exif);
+    buf.extend_from_slice(&out[at..]);
+    std::fs::write(dst, buf)
+}
+
+/// JPEG 裡整段 EXIF（APP1 區段，含 FF E1 標記與長度）；沒有就 None
+fn jpeg_exif_segment(b: &[u8]) -> Option<Vec<u8>> {
+    if !b.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut i = 2;
+    while i + 4 <= b.len() {
+        if b[i] != 0xFF {
+            return None;
+        }
+        let m = b[i + 1];
+        match m {
+            // 填充用的 FF
+            0xFF => i += 1,
+            // 沒有長度的標記
+            0x01 | 0xD0..=0xD8 => i += 2,
+            // 影像資料開始了，前面沒有就是沒有
+            0xD9 | 0xDA => return None,
+            _ => {
+                let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+                let end = i + 2 + len;
+                if len < 2 || end > b.len() {
+                    return None;
+                }
+                if m == 0xE1 && b[i + 4..end].starts_with(b"Exif\0\0") {
+                    return Some(b[i..end].to_vec());
+                }
+                i = end;
+            }
+        }
+    }
+    None
+}
+
+/// EXIF 區段（[`jpeg_exif_segment`] 拿到的整段）第一個 IFD 裡的方向（0x0112）改成 1
+fn exif_reset_orientation(seg: &mut [u8]) {
+    // FF E1、長度兩個位元組、"Exif\0\0" 之後才是 TIFF 檔頭
+    const TIFF: usize = 10;
+    let le = match seg.get(TIFF..TIFF + 2) {
+        Some(b"II") => true,
+        Some(b"MM") => false,
+        _ => return,
+    };
+    let rd16 = |s: &[u8], o: usize| s.get(o..o + 2).map(|x| if le { u16::from_le_bytes([x[0], x[1]]) } else { u16::from_be_bytes([x[0], x[1]]) });
+    let rd32 = |s: &[u8], o: usize| {
+        s.get(o..o + 4).map(|x| {
+            let a = [x[0], x[1], x[2], x[3]];
+            if le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }
+        })
+    };
+    let Some(ifd) = rd32(seg, TIFF + 4) else { return };
+    let base = TIFF + ifd as usize;
+    let Some(n) = rd16(seg, base) else { return };
+    for k in 0..n as usize {
+        let e = base + 2 + 12 * k;
+        if rd16(seg, e) == Some(0x0112) {
+            let one = if le { 1u16.to_le_bytes() } else { 1u16.to_be_bytes() };
+            if let Some(d) = seg.get_mut(e + 8..e + 10) {
+                d.copy_from_slice(&one);
+            }
+            return;
+        }
+    }
+}
+
+/// 整批輸出成照片（見 [`export_photo_jpg`]），存進 `dir`——呼叫端剛建好的新資料夾，
+/// 取消或全部失敗時整個刪掉。幾張同時轉：一張只要零點幾秒，一千多張一張一張來
+/// 大半時間在等 ffmpeg 開起來
+fn run_jpg_export(
+    photos: &[PathBuf],
+    adj: &Adjustments,
+    adj_overrides: &HashMap<PathBuf, Adjustments>,
+    dir: &Path,
+    send: &(dyn Fn(WorkerMsg) + Sync),
+) -> Result<(), String> {
+    if photos.is_empty() {
+        return Err("沒有照片可輸出".into());
+    }
+    if let Some(missing) = photos.iter().find(|p| !p.exists()) {
+        let name = missing
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| missing.display().to_string());
+        return Err(format!("找不到照片檔案「{name}」，可能已被移除或所在磁碟未連接"));
+    }
+    ensure_ffmpeg(|| {
+        send(WorkerMsg::Status("第一次使用，正在下載 FFmpeg（約 80MB，請稍候）…".into()));
+    })?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("無法建立資料夾「{}」：{e}", dir.display()))?;
+    let names = jpg_export_names(photos);
+    let total = photos.len();
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let failed: Mutex<Option<String>> = Mutex::new(None);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 6);
+    send(WorkerMsg::Status(format!("輸出照片…（0/{total}）")));
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| loop {
+                if CONVERT_CANCEL.load(Ordering::Relaxed) || failed.lock().unwrap().is_some() {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= total {
+                    break;
+                }
+                let eff = adj_overrides.get(&photos[i]).copied().unwrap_or(*adj);
+                match export_photo_jpg(&photos[i], &eff, &dir.join(&names[i])) {
+                    Ok(()) => {
+                        let k = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        send(WorkerMsg::Progress(k as f32 / total as f32));
+                        send(WorkerMsg::Status(format!("輸出照片…（{k}/{total}）")));
+                    }
+                    Err(e) => {
+                        failed.lock().unwrap().get_or_insert(e);
+                    }
+                }
+            });
+        }
+    });
+    let k = done.into_inner();
+    if CONVERT_CANCEL.load(Ordering::Relaxed) || k == 0 {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    if CONVERT_CANCEL.load(Ordering::Relaxed) {
+        return Err("已取消".into());
+    }
+    match failed.into_inner().unwrap() {
+        // 已經存好的留著（一千多張可能只壞一張），講清楚停在哪
+        Some(e) if k > 0 => Err(format!("{e}（已存好的 {k} 張在「{}」）", dir.display())),
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// 輸出用的一段文字（照片區間為 0-based 含端點）
@@ -40139,6 +40434,64 @@ mod tests {
         // 總長 ≤1 秒不淡出（淡出區間會超過影片）
         assert_eq!(audio_filter_string(100, true, 1.0), "volume=1.000");
         assert_eq!(audio_filter_string(100, true, 0.5), "volume=1.000");
+    }
+
+    #[test]
+    fn jpg_export_names_keep_stem_and_avoid_clash() {
+        let p = |s: &str| PathBuf::from(s);
+        let names = jpg_export_names(&[p("a/000224.jpg"), p("b/000224.JPG"), p("c/IMG_1.png"), p("d/img_1.tif"), p("e/000224.jpg")]);
+        assert_eq!(names, ["000224.jpg", "000224_2.jpg", "IMG_1.jpg", "img_1_2.jpg", "000224_3.jpg"]);
+    }
+
+    /// 做一段最小的 EXIF（APP1）：IFD0 有兩個欄位，第二個是方向
+    fn exif_seg(le: bool, orientation: u16) -> Vec<u8> {
+        let w16 = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let w32 = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let mut t = Vec::new();
+        t.extend_from_slice(if le { b"II" } else { b"MM" });
+        t.extend_from_slice(&w16(42));
+        t.extend_from_slice(&w32(8));
+        t.extend_from_slice(&w16(2));
+        // 0x010F Make，ASCII，4 個字元直接放在值欄
+        t.extend_from_slice(&w16(0x010F));
+        t.extend_from_slice(&w16(2));
+        t.extend_from_slice(&w32(4));
+        t.extend_from_slice(b"SNY\0");
+        // 0x0112 方向，SHORT，1 個
+        t.extend_from_slice(&w16(0x0112));
+        t.extend_from_slice(&w16(3));
+        t.extend_from_slice(&w32(1));
+        t.extend_from_slice(&w16(orientation));
+        t.extend_from_slice(&[0, 0]);
+        t.extend_from_slice(&w32(0));
+        let mut seg = vec![0xFF, 0xE1];
+        seg.extend_from_slice(&((t.len() + 8) as u16).to_be_bytes());
+        seg.extend_from_slice(b"Exif\0\0");
+        seg.extend_from_slice(&t);
+        seg
+    }
+
+    #[test]
+    fn exif_segment_found_and_orientation_reset() {
+        for le in [true, false] {
+            let seg = exif_seg(le, 6);
+            // 檔頭、JFIF、EXIF、影像開始
+            let mut jpg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x4A, 0x46];
+            jpg.extend_from_slice(&seg);
+            jpg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x12, 0x34, 0xFF, 0xD9]);
+            let mut got = jpeg_exif_segment(&jpg).expect("找得到 EXIF");
+            assert_eq!(got, seg);
+            exif_reset_orientation(&mut got);
+            assert_eq!(got, exif_seg(le, 1), "只有方向改成 1，其他不動");
+        }
+        // 沒有 EXIF、不是 JPEG
+        assert!(jpeg_exif_segment(&[0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]).is_none());
+        assert!(jpeg_exif_segment(b"\x89PNG\r\n\x1a\n").is_none());
+        // 壞掉的長度不會讀出界
+        assert!(jpeg_exif_segment(&[0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFF, 0x45]).is_none());
+        let mut short = exif_seg(true, 6);
+        short.truncate(20);
+        exif_reset_orientation(&mut short);
     }
 
     #[test]
