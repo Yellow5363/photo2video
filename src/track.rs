@@ -1076,6 +1076,226 @@ const CERE_ALONE_MAX: usize = 2;
 /// 十字擺在黃鼻子上方幾個頭寬：正面時兩眼就在這個高度的兩側
 const CERE_UP: f32 = 0.1;
 
+/// 找不到頭、也找不到眼睛時，改框**整隻鳥**（使用者提議，像相機的主體偵測那樣）：
+/// 在 (`cx`, `cy`) 附近 [`WHOLE_WIN`] 個框寬見方的原圖裡，把「跟背景不一樣的顏色」
+/// 連成一塊一塊，挑最靠近中心、夠大的那塊當鳥，回傳它的外框（`img` 的像素座標）。
+///
+/// 背景是用這塊的**四周邊緣**取樣的：拍鳥的背景多半是糊掉的樹叢、水面，顏色就那
+/// 幾種；鳥的褐色翅膀、白肚子不在裡面。整塊都是「不一樣的顏色」（鳥比範圍還大、
+/// 或背景太雜）時不硬猜，回 None
+pub fn whole_bird(img: &RgbImage, cx: f32, cy: f32, bw: f32) -> Option<WholeBird> {
+    if bw < 4.0 {
+        return None;
+    }
+    let side = bw * WHOLE_WIN;
+    let x0 = (cx - side / 2.0).clamp(0.0, (img.width() as f32 - 1.0).max(0.0)) as u32;
+    let y0 = (cy - side / 2.0).clamp(0.0, (img.height() as f32 - 1.0).max(0.0)) as u32;
+    let x1 = ((cx + side / 2.0) as u32).min(img.width());
+    let y1 = ((cy + side / 2.0) as u32).min(img.height());
+    if x1 <= x0 + 16 || y1 <= y0 + 16 {
+        return None;
+    }
+    let sub = image::imageops::crop_imm(img, x0, y0, x1 - x0, y1 - y0).to_image();
+    let k = (WHOLE_PX / side).min(1.0);
+    let (w, h) = (((sub.width() as f32 * k).round() as usize).max(8), ((sub.height() as f32 * k).round() as usize).max(8));
+    let small = image::imageops::resize(&sub, w as u32, h as u32, image::imageops::FilterType::Triangle);
+    // 鳥只佔這塊的一小部分，背景佔大半：在這塊裡**少見**的顏色就是鳥。
+    // 量化到 WHOLE_BIN 一格，一個顏色「有多常見」＝它那格連同相鄰格的像素數
+    const Q: usize = 256 / WHOLE_BIN;
+    let bin = |p: &image::Rgb<u8>| (p[0] as usize / WHOLE_BIN, p[1] as usize / WHOLE_BIN, p[2] as usize / WHOLE_BIN);
+    let mut hist = vec![0u32; Q * Q * Q];
+    for p in small.pixels() {
+        let (r, g, b) = bin(p);
+        hist[(r * Q + g) * Q + b] += 1;
+    }
+    let mut near = vec![0u32; Q * Q * Q];
+    for r in 0..Q {
+        for g in 0..Q {
+            for b in 0..Q {
+                let mut s = 0;
+                for dr in r.saturating_sub(1)..=(r + 1).min(Q - 1) {
+                    for dg in g.saturating_sub(1)..=(g + 1).min(Q - 1) {
+                        for db in b.saturating_sub(1)..=(b + 1).min(Q - 1) {
+                            s += hist[(dr * Q + dg) * Q + db];
+                        }
+                    }
+                }
+                near[(r * Q + g) * Q + b] = s;
+            }
+        }
+    }
+    let rare = (w * h) as f32 * WHOLE_RARE;
+    let foreign: Vec<bool> = small
+        .pixels()
+        .map(|p| {
+            let (r, g, b) = bin(p);
+            (near[(r * Q + g) * Q + b] as f32) < rare
+        })
+        .collect();
+    // 零星的雜點（水面反光、葉縫透光）不算：九宮格裡至少一半是才留；
+    // 再往外長兩格，翅膀和身體中間細細的一條斷開的地方接得起來
+    let at = |m: &[bool], x: isize, y: isize| x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h && m[y as usize * w + x as usize];
+    let mut keep = vec![false; w * h];
+    for y in 0..h as isize {
+        for x in 0..w as isize {
+            if at(&foreign, x, y) {
+                let n = (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dx, dy))).filter(|&(dx, dy)| at(&foreign, x + dx, y + dy)).count();
+                keep[y as usize * w + x as usize] = n >= 5;
+            }
+        }
+    }
+    let grow = WHOLE_GROW as isize;
+    let mut mask = vec![false; w * h];
+    for y in 0..h as isize {
+        for x in 0..w as isize {
+            if keep[y as usize * w + x as usize] {
+                for dy in -grow..=grow {
+                    for dx in -grow..=grow {
+                        let (xx, yy) = (x + dx, y + dy);
+                        if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                            mask[yy as usize * w + xx as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 連成一塊一塊，記每塊的外框與面積（只算原本的點，不算長出來的）
+    let mut label = vec![u32::MAX; w * h];
+    let mut blobs: Vec<([usize; 4], usize)> = Vec::new();
+    let mut stack = Vec::new();
+    for start in 0..w * h {
+        if !mask[start] || label[start] != u32::MAX {
+            continue;
+        }
+        let id = blobs.len() as u32;
+        let mut bb = [usize::MAX, usize::MAX, 0, 0];
+        let mut area = 0;
+        label[start] = id;
+        stack.push(start);
+        while let Some(p) = stack.pop() {
+            let (x, y) = (p % w, p / w);
+            if keep[p] {
+                area += 1;
+                bb = [bb[0].min(x), bb[1].min(y), bb[2].max(x), bb[3].max(y)];
+            }
+            let mut push = |q: usize| {
+                if mask[q] && label[q] == u32::MAX {
+                    label[q] = id;
+                    stack.push(q);
+                }
+            };
+            if x > 0 {
+                push(p - 1);
+            }
+            if x + 1 < w {
+                push(p + 1);
+            }
+            if y > 0 {
+                push(p - w);
+            }
+            if y + 1 < h {
+                push(p + w);
+            }
+        }
+        blobs.push((bb, area));
+    }
+    // 挑最靠近中心、又夠大的一塊：面積 ÷（1 + 離中心幾個框寬）
+    let (ccx, ccy) = ((cx - x0 as f32) * k, (cy - y0 as f32) * k);
+    let bwk = bw * k;
+    let min_area = (WHOLE_MIN * bwk).powi(2);
+    let best = blobs
+        .iter()
+        .filter(|(bb, a)| *a > 0 && *a as f32 >= min_area && bb[0] <= bb[2])
+        .map(|(bb, a)| {
+            let dx = (bb[0] as f32 - ccx).max(ccx - bb[2] as f32).max(0.0);
+            let dy = (bb[1] as f32 - ccy).max(ccy - bb[3] as f32).max(0.0);
+            (bb, *a as f32 / (1.0 + dx.hypot(dy) / bwk))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))?
+        .0;
+    // 翅膀、身體、白肚子顏色不同，常斷成好幾塊：離目前外框不到 WHOLE_JOIN 個框寬的
+    // 也併進來，一直併到沒有為止
+    let mut best = *best;
+    let join = WHOLE_JOIN * bwk;
+    let mut used = vec![false; blobs.len()];
+    loop {
+        let mut grew = false;
+        for (j, (bb, a)) in blobs.iter().enumerate() {
+            if used[j] || (*a as f32) < min_area * 0.25 || bb[0] > bb[2] {
+                continue;
+            }
+            let gx = (bb[0] as f32 - best[2] as f32).max(best[0] as f32 - bb[2] as f32).max(0.0);
+            let gy = (bb[1] as f32 - best[3] as f32).max(best[1] as f32 - bb[3] as f32).max(0.0);
+            if gx.hypot(gy) <= join {
+                used[j] = true;
+                if bb[0] < best[0] || bb[1] < best[1] || bb[2] > best[2] || bb[3] > best[3] {
+                    best = [best[0].min(bb[0]), best[1].min(bb[1]), best[2].max(bb[2]), best[3].max(bb[3])];
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let best = &best;
+    // 外框從這一頭貼到那一頭＝背景也被當成鳥了（水花連著整條水線、岸邊整排草）
+    let (bwid, bhgt) = ((best[2] - best[0] + 1) as f32, (best[3] - best[1] + 1) as f32);
+    if bwid > w as f32 * WHOLE_SPAN || bhgt > h as f32 * WHOLE_SPAN {
+        return None;
+    }
+    // 十字周圍有多少「少見的顏色」：白頭在白水線旁不算少見，整塊外框會漏掉它，
+    // 但頭上的過眼帶、黑眼睛算；落在水面、背景上的十字周圍一點都沒有
+    let rad = WHOLE_ON_R * bwk;
+    let (mut hit, mut all) = (0usize, 0usize);
+    for y in (ccy - rad).floor().max(0.0) as usize..((ccy + rad).ceil() as usize).min(h) {
+        for x in (ccx - rad).floor().max(0.0) as usize..((ccx + rad).ceil() as usize).min(w) {
+            if (x as f32 - ccx).hypot(y as f32 - ccy) <= rad {
+                all += 1;
+                hit += keep[y * w + x] as usize;
+            }
+        }
+    }
+    Some(WholeBird {
+        rect: [
+            x0 as f32 + best[0] as f32 / k,
+            y0 as f32 + best[1] as f32 / k,
+            x0 as f32 + (best[2] + 1) as f32 / k,
+            y0 as f32 + (best[3] + 1) as f32 / k,
+        ],
+        at_cross: if all > 0 { hit as f32 / all as f32 } else { 0.0 },
+    })
+}
+
+/// [`whole_bird`] 找到的整隻鳥
+pub struct WholeBird {
+    /// 外框（原圖像素座標）
+    pub rect: [f32; 4],
+    /// 十字周圍 [`WHOLE_ON_R`] 個框寬內，有幾成是少見的顏色（0～1）：高的話十字本來就在鳥身上
+    pub at_cross: f32,
+}
+
+/// 量「十字在不在鳥身上」的範圍（半徑，框寬的幾倍）
+const WHOLE_ON_R: f32 = 0.25;
+
+/// 找整隻鳥的範圍：框寬的幾倍見方（魚鷹張開翅膀約三、四個框寬）
+const WHOLE_WIN: f32 = 6.0;
+/// 縮到這麼寬再找（像素）：細節夠分出鳥和背景，又算得快
+const WHOLE_PX: f32 = 240.0;
+/// 顏色量化一格多大（0~255）：同一格與相鄰格都算同一種顏色
+const WHOLE_BIN: usize = 16;
+/// 一種顏色（連同相近的）佔這塊不到幾成就算少見
+const WHOLE_RARE: f32 = 0.02;
+/// 往外長幾格把斷開的翅膀和身體接起來
+const WHOLE_GROW: usize = 2;
+/// 整隻鳥的外框最多佔範圍的幾成（寬或高）；再大就是連背景一起框進來了
+const WHOLE_SPAN: f32 = 0.9;
+/// 離整隻鳥的外框不到幾個框寬的小塊也算同一隻（翅膀、身體斷開的地方）
+const WHOLE_JOIN: f32 = 0.3;
+/// 一塊至少要多大才算鳥（邊長，框寬的幾倍）
+const WHOLE_MIN: f32 = 0.35;
+
 /// 魚鷹：在主體框那一塊**原圖**裡找眼睛——黃色的眼圈、中間黑色的瞳孔（使用者
 /// 提供的特徵）。眼睛在原圖上只有二、三十個像素，縮成工作圖只剩五個像素左右，
 /// 所以要回原圖找。`img` 是框附近裁下來的一塊，`bw` 是框（整批的中位數）在這塊上的寬（像素）。

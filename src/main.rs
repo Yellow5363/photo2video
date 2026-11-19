@@ -2300,6 +2300,31 @@ fn folder_bird(dir: &Path, recent: &[PathBuf]) -> Option<BirdKind> {
     })
 }
 
+/// 資料夾名字裡寫了是哪種鳥（「魚鷹連拍11」「20260810_大安五色連拍」）就照它選，從最裡面
+/// 那層往外找（使用者要求：沒存過專案的資料夾，第一次加入照片時自動選鳥種）。
+///
+/// 試過看照片自己認：每種鳥的找頭網路整張找一遍、比誰分數高——十三批裡魚鷹、五色鳥、
+/// 翠鳥大多認得對，但灰澤鵟5 被認成魚鷹，八色鳥、赤翡翠（沒有網路的鳥種）都被認成灰澤鵟，
+/// 好幾批差距也只有一成多。各網路的分數不是同一把尺，沒採用
+fn bird_from_name(dir: &Path) -> Option<BirdKind> {
+    const WORDS: &[(&str, BirdKind)] = &[
+        ("魚鷹", BirdKind::Osprey),
+        ("osprey", BirdKind::Osprey),
+        ("翠鳥", BirdKind::Kingfisher),
+        ("kingfisher", BirdKind::Kingfisher),
+        ("五色", BirdKind::Barbet),
+        ("barbet", BirdKind::Barbet),
+        ("八色", BirdKind::Pitta),
+        ("pitta", BirdKind::Pitta),
+        ("澤鵟", BirdKind::Harrier),
+        ("harrier", BirdKind::Harrier),
+    ];
+    dir.ancestors().find_map(|d| {
+        let name = d.file_name()?.to_string_lossy().to_lowercase();
+        WORDS.iter().find(|(w, _)| name.contains(w)).map(|(_, b)| *b)
+    })
+}
+
 /// 「上次停在哪個資料夾」的記錄欄位：**每個模組、每種用途各記一份**。
 ///
 /// 開檔與存檔分開、模組之間也不共用——去煙霧的照片來源不會把影片的輸出
@@ -4484,7 +4509,10 @@ fn run_auto_boxes(
     }
     if bird.find_eye() {
         let last = sent.lock().unwrap().clone();
-        refine_by_eye(&photos, manual, &last, crop, send);
+        let eyes = refine_by_eye(&photos, manual, &last, crop, send);
+        // 頭和眼睛都沒找到、還在要檢查的：改對整隻鳥的中心（見 refine_by_whole）
+        let last = sent.lock().unwrap().clone();
+        refine_by_whole(&photos, manual, &last, &eyes, crop, send);
     }
     send(TrackMsg::Done(found + keep.iter().filter(|k| **k).count(), n));
 }
@@ -4504,14 +4532,14 @@ fn refine_by_eye(
     latest: &[Option<Subject>],
     crop: Crop,
     send: &dyn Fn(TrackMsg),
-) {
+) -> HashSet<usize> {
     let todo: Vec<(usize, Subject)> = latest
         .iter()
         .enumerate()
         .filter_map(|(i, s)| s.filter(|s| s.src != BoxSrc::Manual && manual.get(i).is_none_or(|m| m.is_none())).map(|s| (i, s)))
         .collect();
     if todo.is_empty() {
-        return;
+        return HashSet::new();
     }
     send(TrackMsg::Phase(format!("找眼睛（{} 張）…", todo.len())));
     // 眼睛多大、找多遠都照整批框寬的中位數換算：自動框選剛跑完時每張框大小不一（實測
@@ -4588,10 +4616,87 @@ fn refine_by_eye(
             Some((i, Some(Subject { rect, score, ..s })))
         })
         .collect();
+    let done: HashSet<usize> = moved.iter().map(|(i, _)| *i).collect();
+    if !moved.is_empty() {
+        send(TrackMsg::Boxes(moved));
+    }
+    done
+}
+
+/// 頭和眼睛都沒找到的照片（還在要檢查、找眼睛那一趟也沒動到），十字又不在鳥身上時，
+/// 改放在**整隻鳥**的中心（使用者提議，像相機的主體偵測框住整隻鳥那樣，見 [`track::whole_bird`]）：
+/// 迎面飛來、貼著水面低飛時十字常落在翅膀尖或鳥下方的水面，鏡頭會偏掉。
+/// 框的大小、把握程度都不變——仍然要使用者過目，只是鏡頭先對準鳥。手動框不動
+fn refine_by_whole(
+    photos: &Arc<Vec<PathBuf>>,
+    manual: &[Option<[f32; 4]>],
+    latest: &[Option<Subject>],
+    skip: &HashSet<usize>,
+    crop: Crop,
+    send: &dyn Fn(TrackMsg),
+) {
+    let todo: Vec<(usize, Subject)> = latest
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            s.filter(|s| s.src != BoxSrc::Manual && !s.sure() && !skip.contains(&i) && manual.get(i).is_none_or(|m| m.is_none())).map(|s| (i, s))
+        })
+        .collect();
+    if todo.is_empty() {
+        return;
+    }
+    send(TrackMsg::Phase(format!("找整隻鳥（{} 張）…", todo.len())));
+    // 鳥多大照整批框寬的中位數（同 refine_by_eye）
+    let mut widths: Vec<f32> = latest.iter().flatten().map(|s| s.rect[2] - s.rect[0]).collect();
+    widths.sort_by(f32::total_cmp);
+    let ref_w = widths[widths.len() / 2];
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    let moved: Vec<(usize, Option<Subject>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = todo
+            .chunks(todo.len().div_ceil(threads))
+            .map(|part| {
+                sc.spawn(move || {
+                    part.iter()
+                        .filter_map(|&(i, s)| {
+                            let img = decode_full_for_track(&photos[i], crop)?;
+                            let (w, h) = (img.width() as f32, img.height() as f32);
+                            let r = s.rect;
+                            let (cx, cy) = ((r[0] + r[2]) / 2.0 * w, (r[1] + r[3]) / 2.0 * h);
+                            let found = track::whole_bird(&img, cx, cy, ref_w * w)?;
+                            let b = found.rect;
+                            // 十字已經在鳥身上的不動：沒把握的框很多其實就在頭上、只是前後張
+                            // 驗證不了（連拍5 實測一律搬到身體中心，有一張從眼睛上被搬走 0.9 個
+                            // 框寬）。只救落在水面、背景、翅膀尖外面的。「在鳥身上」兩種都算：
+                            // 在整隻鳥的外框裡，或十字周圍有任何一點鳥的顏色——白頭在白水線旁
+                            // 顏色不少見，外框會漏掉它，只剩過眼帶、眼睛那幾點（連拍8 鳥坐在水裡
+                            // 那十幾張，十字本來在頭上，量到 0.3%～30%；落在水面上的一律是 0）
+                            if found.at_cross > 0.0 {
+                                return None;
+                            }
+                            // 找到的「鳥」離十字太遠就不信：白灰色的鳥在亮水面上顏色不少見，
+                            // 找出來的是遠處樹叢的一塊散景（連拍5 第 A9309211 張，十字原本就在
+                            // 鳥身旁，被搬到兩個框寬外的樹上）
+                            let gap = (b[0] - cx).max(cx - b[2]).max(0.0).hypot((b[1] - cy).max(cy - b[3]).max(0.0));
+                            if gap == 0.0 || gap > WHOLE_NEAR * ref_w * w {
+                                return None;
+                            }
+                            let (dx, dy) = ((b[0] + b[2]) / 2.0 / w - (r[0] + r[2]) / 2.0, (b[1] + b[3]) / 2.0 / h - (r[1] + r[3]) / 2.0);
+                            Some((i, Some(Subject { rect: clamp_rect([r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy]), ..s })))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    });
     if !moved.is_empty() {
         send(TrackMsg::Boxes(moved));
     }
 }
+
+/// 整隻鳥的外框離十字最多幾個框寬（框寬照整批中位數）：連拍8 十字落在鳥下方水面時，
+/// 離鳥身大約半個到一個框寬
+const WHOLE_NEAR: f32 = 1.0;
 
 /// 框中心幾個框寬內算「附近」（網路找到的頭本來就在眼睛附近）
 const EYE_REACH: f32 = 0.4;
@@ -10681,7 +10786,7 @@ impl App {
                 // 魚鷹：最後回原圖找眼睛，只動這一趟重追的那幾張（使用者要求追蹤也要找眼睛）
                 if eye && !TRACK_CANCEL.load(Ordering::Relaxed) {
                     let mine: Vec<Option<Subject>> = (0..latest.len()).map(|i| latest[i].filter(|_| todo[i])).collect();
-                    refine_by_eye(&photos, &manual, &mine, crop, &send);
+                    let _ = refine_by_eye(&photos, &manual, &mine, crop, &send);
                 }
             }
             send(TrackMsg::Done(a, b));
@@ -11099,12 +11204,13 @@ impl App {
         self.native_res_cache = None;
         // 加入前的照片順序：供下方把文字段落的編號對回排序後的新位置
         let old_photos: Vec<PathBuf> = self.photos.clone();
-        // 從空的開始加：這個資料夾存過專案就選回當時的鳥種（使用者要求）
+        // 從空的開始加：這個資料夾存過專案就選回當時的鳥種（使用者要求）；
+        // 沒存過的看資料夾名字有沒有寫鳥種（見 bird_from_name）
         if old_photos.is_empty() {
             if let Some(b) = files
                 .first()
                 .and_then(|f| f.parent())
-                .and_then(|d| folder_bird(d, &self.recent_projects))
+                .and_then(|d| folder_bird(d, &self.recent_projects).or_else(|| bird_from_name(d)))
             {
                 self.track.bird = b;
             }
@@ -38615,6 +38721,21 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bird_from_folder_name() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(bird_from_name(&p(r"F:\photo2video_圖庫\2026魚鷹連拍\魚鷹連拍11")), Some(BirdKind::Osprey));
+        assert_eq!(bird_from_name(&p(r"F:\20260810_大安五色連拍\連拍3")), Some(BirdKind::Barbet));
+        assert_eq!(bird_from_name(&p(r"F:\photo2video_圖庫\灰澤鵟圖庫\灰澤鵟5")), Some(BirdKind::Harrier));
+        assert_eq!(bird_from_name(&p(r"F:\photo2video_圖庫\20261025翠鳥青年公園_連拍")), Some(BirdKind::Kingfisher));
+        assert_eq!(bird_from_name(&p(r"F:\八色連拍_製作movie")), Some(BirdKind::Pitta));
+        assert_eq!(bird_from_name(&p(r"D:\Birds\Osprey 2026")), Some(BirdKind::Osprey));
+        // 最裡面那層先算：翠鳥圖庫底下放的魚鷹照片
+        assert_eq!(bird_from_name(&p(r"F:\翠鳥圖庫\魚鷹")), Some(BirdKind::Osprey));
+        assert_eq!(bird_from_name(&p(r"F:\連拍1")), None);
+        assert_eq!(bird_from_name(&p(r"F:\photo2video_圖庫\202505斗六赤翡翠_連拍")), None);
+    }
 
     /// 設定檔沒記的資料夾，從最近的專案找回鳥種：要照片在這個資料夾、而且是影片專案
     #[test]
